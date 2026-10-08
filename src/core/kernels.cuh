@@ -64,8 +64,8 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
                   float eps, float* q, float* gate, __nv_bfloat16* kcache, __nv_bfloat16* vcache,
                   cudaStream_t s);
 // Causal attention of M queries (positions pos0..) over the cache, split over key ranges and combined.
-// `scratch` needs attention_scratch_floats(M, Hq, D, ctx) floats.
-size_t attention_scratch_floats(int M, int Hq, int D, int ctx);
+// `scratch` needs attention_scratch_floats(M, Hq, Hkv, D, ctx) floats.
+size_t attention_scratch_floats(int M, int Hq, int Hkv, int D, int ctx);
 void attention(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, int pos0, int M,
                int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s);
 
