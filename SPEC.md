@@ -233,15 +233,23 @@ Compiler stages, in order:
 
 Runtime components:
 
+- One language: C++20 and CUDA for everything that ships, the HTTP layer included (decided 2026-10-08: the maintainer knows C++ far better than Rust, and the kernels it builds on, CUTLASS, CuTe and FlashInfer, are C++). Python appears only in tests and benchmark scripts, and in Triton or CuTe DSL kernel prototypes that are rewritten in CUDA C++ before they ship.
 - A C++/CUDA core with no Python on the hot path, behind a thin asynchronous HTTP layer that speaks the chat-completions and completions APIs with server-sent events, `reasoning_effort`, `enable_thinking`, `preserve_thinking`, and the Qwen3 tool-call format (section 12 lists exactly what Mightling calls).
 - A session manager keyed by conversation: paged FP8 KV, one DeltaNet snapshot slot, the conv window, the token history, and the target hidden features the drafter conditions on. Eviction is LRU inside the single memory pool.
 - A shared-prefix store: DeltaNet state checkpoints (with their KV pages) at message boundaries, keyed by a hash of the token prefix, so a new session that begins with a known prefix starts from its checkpoint (section 11).
 - A scheduler with a single-sequence fast path and a batch path for 2–4 sequences. One step is: verify graph (which also commits the previous step's DeltaNet replay) → accept → draft graph → emit tokens. In the batch path the sequences share the step's weight pass and split its row budget.
 - Draft sources: the DFlash2 drafter by default, a CPU context-lookup matcher whose proposal becomes a second branch of the same verify, and the model's MTP module as a fallback if a checkpoint ships without a DFlash2 drafter.
 - GPU-side sampling inside the graph: temperature, top-k 20, top-p, min-p, presence and repetition penalties (a 31 KB presence bitmap per session over the 248k vocabulary), exact rejection sampling for speculation, and device-resident RNG. One small device-to-host copy per step carries the accepted tokens.
-- The Qwen 248k BPE tokenizer through the Rust `tokenizers` C bindings, with incremental detokenization for streaming, and the Qwen3 tool-call and reasoning parsers in the same process.
+- The Qwen 248k BPE tokenizer in C++ (byte-level BPE with Qwen's pre-tokenizer pattern), tested token-for-token against the reference tokenizer on a large corpus, with incremental detokenization for streaming, and the Qwen3 tool-call and reasoning parsers in the same process.
 - The vision encoder, run only at prefill when a request carries images, producing visual tokens with their M-RoPE positions.
 - Telemetry per step: pass time, achieved GB/s, rows verified, tokens accepted by source (tree or lookup), drafter time, host time, batch size, exported as Prometheus metrics with the names Mightling already reads where SGLang has an equivalent.
+
+Build and safety rules:
+
+- **Rebuild time is dominated by CUTLASS/CuTe instantiations, so every kernel instance is its own translation unit,** compiled for `sm_121` only. A change to one kernel recompiles that file and relinks.
+- **The HTTP layer, the scheduler and the kernels are separate CMake targets,** so a front-end change never recompiles a kernel.
+- **Ninja on all cores, with ccache for both the host compiler and nvcc.** Builds, tests and profiling run on the development GB10, never on the production machine.
+- **Request parsing (HTTP, JSON, tool calls) uses a mature library and is fuzzed** (libFuzzer) in CI. The test suite also runs under AddressSanitizer and UndefinedBehaviorSanitizer. This is the discipline that stands in for Rust's memory safety at the network edge.
 
 ## 9. Kernel plan: five kernels per layer, all shape-specialized
 
