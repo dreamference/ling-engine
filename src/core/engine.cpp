@@ -20,11 +20,6 @@ void check(cudaError_t e, const char* what) {
   if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
 
-// Rows that go through the weight-streaming GEMVs; more rows dequantize to BF16 for cuBLAS. Slicing a
-// longer prompt into GEMV passes of 8 rows was measured slower (41 tokens: 1.25 s, against 0.68 s for
-// 71 tokens through cuBLAS): at 8 rows the GEMV is bound by its dequantization arithmetic, not by memory.
-constexpr int kGemvSliceLimit = kernels::kMaxGemvRows;
-
 struct NvtxRange {
   explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
   ~NvtxRange() { nvtxRangePop(); }
@@ -40,6 +35,10 @@ T* Engine::alloc(size_t count) {
   buffers_.push_back(p);
   return static_cast<T*>(p);
 }
+template float* Engine::alloc<float>(size_t);
+template int* Engine::alloc<int>(size_t);
+template __half* Engine::alloc<__half>(size_t);
+template __nv_bfloat16* Engine::alloc<__nv_bfloat16>(size_t);
 
 Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   model_ = std::make_unique<Model>(model_dir);
@@ -70,8 +69,12 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   q_ = alloc<float>(M * qsize);
   gate_ = alloc<float>(M * qsize);
   attn_ = alloc<float>(M * qsize);
-  attn_scratch_ = alloc<float>(kernels::attention_scratch_floats(M, c.heads, c.kv_heads, c.head_dim, opts_.max_context));
-  logits_dev_ = alloc<float>(c.vocab);
+  attn_scratch_ = alloc<float>(std::max(
+      kernels::attention_scratch_floats(M, c.heads, c.kv_heads, c.head_dim, opts_.max_context),
+      kernels::attention_rows_scratch_floats(kernels::kMaxStreamRows, c.heads, c.head_dim, opts_.max_context)));
+  logits_dev_ = alloc<float>(size_t(kernels::kMaxStreamRows) * c.vocab);
+  xh_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * std::max(c.intermediate, std::max(c.hidden, std::max(C, qsize))));
+  xinv_ = alloc<float>(kernels::kMaxStreamRows);
   x_bf16_ = alloc<__nv_bfloat16>(M * std::max(c.intermediate, std::max(c.hidden, C)));
   size_t largest = 0;
   for (const LayerWeights& L : model_->layers()) {
@@ -95,6 +98,11 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
       snap_gdn_.push_back(alloc<float>(size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim));
       snap_conv_.push_back(alloc<float>(size_t(C) * (c.conv_kernel - 1)));
     }
+  }
+  if (!opts_.draft_dir.empty()) {
+    draft_ = std::make_unique<DraftModel>(opts_.draft_dir);
+    alloc_drafter();
+    std::fprintf(stderr, "drafter: %.2f GB, block %d\n", draft_->device_bytes() / 1e9, opts_.draft_block);
   }
   logits_.resize(c.vocab);
   profile_ = std::getenv("LING_PROFILE") != nullptr;
@@ -122,6 +130,29 @@ void Engine::reset() {
   pos_ = 0;
 }
 
+uint64_t Engine::state_hash() {
+  const ModelConfig& c = model_->config();
+  const size_t gdn = size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim, conv = size_t(c.lin_conv_channels()) * (c.conv_kernel - 1);
+  std::vector<float> host(gdn);
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&](const float* d, size_t n) {
+    check(cudaMemcpy(host.data(), d, n * sizeof(float), cudaMemcpyDeviceToHost), "state_hash");
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(host.data());
+    for (size_t i = 0; i < n * sizeof(float); ++i) h = (h ^ b[i]) * 1099511628211ull;
+  };
+  check(cudaStreamSynchronize(stream_), "state_hash");
+  for (size_t i = 0; i < gdn_state_.size(); ++i) {
+    mix(gdn_state_[i], gdn);
+    mix(conv_state_[i], conv);
+  }
+  return h;
+}
+
+void Engine::set_draft_block(int b) {
+  if (b < 2 || b > kernels::kMaxStreamRows) throw std::runtime_error("draft block must be in [2, 32]");
+  opts_.draft_block = b;
+}
+
 void Engine::take_snapshot() {
   const ModelConfig& c = model_->config();
   const size_t gdn_bytes = size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim * sizeof(float);
@@ -147,11 +178,10 @@ void Engine::restore_snapshot() {
   pos_ = static_cast<int>(history_.size());
 }
 
-void Engine::linear_fp4(const Fp4Weight& w, const float* x, int M, float* y) {
-  if (M <= kGemvSliceLimit) {  // decode and tiny prompts: stream the weights, no BF16 copy
-    for (int m0 = 0; m0 < M; m0 += kernels::kMaxGemvRows)
-      kernels::gemv_nvfp4(x + size_t(m0) * w.K, std::min(kernels::kMaxGemvRows, M - m0), w.w, w.scale, w.scale2,
-                          y + size_t(m0) * w.N, w.N, w.K, stream_);
+void Engine::linear_fp4(const Fp4Weight& w, const float* x, int M, float* y, bool x_ready) {
+  if (M <= kernels::kMaxStreamRows) {  // the rows path: stream the weights once for every row
+    if (!x_ready) kernels::to_half_rows(x, M, w.K, xh_, xinv_, stream_);
+    kernels::stream_gemm_nvfp4(xh_, xinv_, M, w.w, w.scale, w.scale2, y, w.N, w.K, stream_);
     return;
   }
   kernels::dequant_nvfp4(w.w, w.scale, w.scale2, w_bf16_, w.N, w.K, stream_);
@@ -160,7 +190,7 @@ void Engine::linear_fp4(const Fp4Weight& w, const float* x, int M, float* y) {
 }
 
 void Engine::linear_bf16(const Bf16Weight& w, const float* x, int M, float* y) {
-  if (M <= kernels::kMaxGemvRows) {
+  if (M <= kernels::kMaxStreamRows) {  // row-invariant (each warp walks the rows one after another)
     kernels::gemv_bf16(x, M, w.w, y, w.N, w.K, stream_);
     return;
   }
@@ -168,11 +198,15 @@ void Engine::linear_bf16(const Bf16Weight& w, const float* x, int M, float* y) {
   kernels::gemm_bf16_cublas(cublas_, x_bf16_, M, w.w, y, w.N, w.K);
 }
 
-void Engine::linear_fp8(const Fp8Weight& w, const float* x, int M, float* y) {
-  if (M <= kGemvSliceLimit) {
-    for (int m0 = 0; m0 < M; m0 += kernels::kMaxGemvRows)
-      kernels::gemv_fp8(x + size_t(m0) * w.K, std::min(kernels::kMaxGemvRows, M - m0), w.w, w.scale,
-                        y + size_t(m0) * w.N, w.N, w.K, stream_);
+void Engine::linear_bf16_cublas(const Bf16Weight& w, const float* x, int M, float* y) {
+  kernels::to_bf16(x, x_bf16_, M * w.K, stream_);
+  kernels::gemm_bf16_cublas(cublas_, x_bf16_, M, w.w, y, w.N, w.K);
+}
+
+void Engine::linear_fp8(const Fp8Weight& w, const float* x, int M, float* y, bool x_ready) {
+  if (M <= kernels::kMaxStreamRows) {
+    if (!x_ready) kernels::to_half_rows(x, M, w.K, xh_, xinv_, stream_);
+    kernels::stream_gemm_fp8(xh_, xinv_, M, w.w, w.scale, y, w.N, w.K, stream_);
     return;
   }
   kernels::dequant_fp8(w.w, w.scale, w_bf16_, w.N, w.K, stream_);
@@ -180,19 +214,22 @@ void Engine::linear_fp8(const Fp8Weight& w, const float* x, int M, float* y) {
   kernels::gemm_bf16_cublas(cublas_, x_bf16_, M, w_bf16_, y, w.N, w.K);
 }
 
-void Engine::forward(const int* ids, int M) {
+void Engine::forward(const int* ids, int M, Pass pass) {
   const ModelConfig& c = model_->config();
   if (pos_ + M > opts_.max_context) throw std::runtime_error("context is longer than max_context");
-  NvtxRange range(M == 1 ? "decode" : "prefill_chunk");
+  const bool rows = M <= kernels::kMaxStreamRows, verify = pass == Pass::Verify;
+  if (verify && !rows) throw std::runtime_error("verify: at most 32 rows");
+  NvtxRange range(verify ? "verify" : M == 1 ? "decode" : "prefill_chunk");
   const int H = c.hidden, I = c.intermediate, C = c.lin_conv_channels(), Vs = c.lin_value_size();
   const int qsize = c.heads * c.head_dim;
   // LING_PROFILE=1: synchronize after each phase and add up its wall time (slow; for finding hot spots).
   auto t_last = std::chrono::steady_clock::now();
+  const char* kind = verify ? "verify/" : M == 1 ? "decode/" : rows ? "rows/" : "prefill/";
   auto mark = [&](const char* phase) {
     if (!profile_) return;
     check(cudaStreamSynchronize(stream_), phase);
     auto now = std::chrono::steady_clock::now();
-    phase_seconds_[std::string(M == 1 ? "decode/" : "prefill/") + phase] += std::chrono::duration<double>(now - t_last).count();
+    phase_seconds_[std::string(kind) + phase] += std::chrono::duration<double>(now - t_last).count();
     t_last = now;
   };
   check(cudaMemcpyAsync(ids_dev_, ids, M * sizeof(int), cudaMemcpyHostToDevice, stream_), "ids");
@@ -205,28 +242,47 @@ void Engine::forward(const int* ids, int M) {
     if (L.full) {
       NvtxRange r("attention");
       linear_fp8(L.q, xn_, M, q_gate_);
-      linear_fp8(L.k, xn_, M, k_);
-      linear_fp8(L.v, xn_, M, v_);
+      linear_fp8(L.k, xn_, M, k_, true);
+      linear_fp8(L.v, xn_, M, v_, true);
       mark("attn_proj");
       kernels::attn_prepare(q_gate_, k_, v_, L.q_norm, L.k_norm, pos_, M, c.heads, c.kv_heads, c.head_dim,
                             c.rotary_dim, c.rope_theta, c.eps, q_, gate_, kcache_[slot], vcache_[slot], stream_);
-      kernels::attention(q_, kcache_[slot], vcache_[slot], pos_, M, c.heads, c.kv_heads, c.head_dim,
-                         attn_scratch_, attn_, stream_);
+      if (rows)
+        kernels::attention_rows(q_, kcache_[slot], vcache_[slot], pos_, M, c.heads, c.kv_heads, c.head_dim,
+                                attn_scratch_, attn_, stream_);
+      else
+        kernels::attention(q_, kcache_[slot], vcache_[slot], pos_, M, c.heads, c.kv_heads, c.head_dim,
+                           attn_scratch_, attn_, stream_);
       kernels::sigmoid_mul(attn_, gate_, M * qsize, stream_);
       mark("attn_core");
       linear_fp8(L.o, attn_, M, t1_);
       mark("attn_proj");
     } else {
       NvtxRange r("deltanet");
-      linear_fp8(L.in_qkv, xn_, M, mixed_);
-      linear_fp8(L.in_z, xn_, M, z_);
+      // A verify keeps this layer's inputs for commit() and leaves the conv and recurrent state as they
+      // were: the conv runs on a copy of its window, the recurrence reads the state and does not write it.
+      float* mixed = verify ? v_post_[slot] : mixed_;
+      float* g = verify ? v_g_[slot] : g_;
+      float* beta = verify ? v_beta_[slot] : beta_;
+      linear_fp8(L.in_qkv, xn_, M, verify ? v_pre_[slot] : mixed);
+      linear_fp8(L.in_z, xn_, M, z_, true);
       linear_bf16(L.in_a, xn_, M, a_);
       linear_bf16(L.in_b, xn_, M, b_);
       mark("gdn_proj");
-      kernels::gdn_conv(mixed_, conv_state_[slot], L.conv, M, C, stream_);
-      kernels::gdn_gating(a_, b_, L.A_log, L.dt_bias, g_, beta_, M, c.lin_v_heads, stream_);
+      float* conv_state = conv_state_[slot];
+      if (verify) {
+        check(cudaMemcpyAsync(mixed, v_pre_[slot], size_t(M) * C * sizeof(float), cudaMemcpyDeviceToDevice, stream_),
+              "verify inputs");
+        check(cudaMemcpyAsync(conv_tmp_, conv_state, size_t(C) * (c.conv_kernel - 1) * sizeof(float),
+                              cudaMemcpyDeviceToDevice, stream_),
+              "verify conv");
+        conv_state = conv_tmp_;
+      }
+      kernels::gdn_conv(mixed, conv_state, L.conv, M, C, stream_);
+      kernels::gdn_gating(a_, b_, L.A_log, L.dt_bias, g, beta, M, c.lin_v_heads, stream_);
       mark("gdn_conv");
-      kernels::gdn_recurrent(mixed_, g_, beta_, gdn_state_[slot], core_, M, c.lin_k_heads, c.lin_v_heads, stream_);
+      kernels::gdn_recurrent(mixed, g, beta, gdn_state_[slot], verify ? nullptr : gdn_state_[slot], core_, M,
+                             c.lin_k_heads, c.lin_v_heads, stream_);
       mark("gdn_recurrent");
       kernels::gated_rmsnorm(core_, z_, L.lin_norm, normed_, M * c.lin_v_heads, c.lin_v_dim, c.eps, stream_);
       linear_fp8(L.out, normed_, M, t1_);
@@ -237,19 +293,29 @@ void Engine::forward(const int* ids, int M) {
       NvtxRange r("mlp");
       kernels::rmsnorm(h_, L.post_norm, xn_, M, H, c.eps, true, stream_);
       linear_fp4(L.gate, xn_, M, t1_);
-      linear_fp4(L.up, xn_, M, t2_);
+      linear_fp4(L.up, xn_, M, t2_, true);
       kernels::silu_mul(t1_, t2_, t1_, M * I, stream_);
       linear_fp4(L.down, t1_, M, t2_);
       kernels::add_inplace(h_, t2_, M * H, stream_);
       mark("mlp");
     }
+    // The drafter conditions on the residual stream after these layers (SGLang captures it at the input
+    // of the next layer).
+    if (draft_ && feature_layer_[li] >= 0)
+      kernels::copy_rows_bf16(h_, M, H, cap_ + size_t(feature_layer_[li]) * H, cap_stride_, stream_);
   }
   {
     NvtxRange r("lm_head");
+    const Fp4Weight& lm = model_->lm_head();
+    if (verify) {  // every row's logits stay on the GPU for the accept step
+      kernels::rmsnorm(h_, model_->final_norm(), xn_, M, H, c.eps, true, stream_);
+      linear_fp4(lm, xn_, M, logits_dev_);
+      mark("lm_head");
+      return;
+    }
     const float* last = h_ + size_t(M - 1) * H;
     kernels::rmsnorm(last, model_->final_norm(), xn_, 1, H, c.eps, true, stream_);
-    const Fp4Weight& lm = model_->lm_head();
-    kernels::gemv_nvfp4(xn_, 1, lm.w, lm.scale, lm.scale2, logits_dev_, lm.N, lm.K, stream_);
+    linear_fp4(lm, xn_, 1, logits_dev_);
   }
   check(cudaMemcpyAsync(logits_.data(), logits_dev_, logits_.size() * sizeof(float), cudaMemcpyDeviceToHost,
                         stream_),
@@ -282,9 +348,16 @@ const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, Engine
     snapshot_tokens_.clear();  // the prefill below overwrites the KV cache the snapshot relies on
     reset();
   }
+  // The drafter attends to a sliding window of 2048 positions: only the prompt's last ones need its KV.
+  if (draft_) window_start_ = std::max(0, static_cast<int>(prompt.size()) - draft_->config().sliding_window);
   for (size_t i = reuse; i < prompt.size();) {
     const int n = static_cast<int>(std::min<size_t>(opts_.prefill_chunk, prompt.size() - i));
-    forward(prompt.data() + i, n);
+    const int pos0 = pos_;
+    forward(prompt.data() + i, n, Pass::Prefill);
+    if (draft_) {
+      const int first = std::max(pos0, window_start_);
+      if (first < pos0 + n) draft_materialize(pos0 + n - first, first, first - pos0);
+    }
     i += n;
   }
   history_ = prompt;
@@ -298,7 +371,9 @@ const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, Engine
 }
 
 const std::vector<float>& Engine::step(int token) {
-  forward(&token, 1);
+  const int pos0 = pos_;
+  forward(&token, 1, Pass::Decode);
+  if (draft_) draft_materialize(1, pos0, 0);
   history_.push_back(token);
   return logits_;
 }

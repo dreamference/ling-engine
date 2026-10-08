@@ -7,6 +7,7 @@
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 namespace ling::kernels {
@@ -23,6 +24,24 @@ void gemv_fp8(const float* x, int M, const uint8_t* w, float wscale, float* y, i
               cudaStream_t s);
 // y = x . W^T, W BF16 [N][K].
 void gemv_bf16(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s);
+
+// ---- Weight-streaming GEMM on tensor cores for 1 to 32 rows (stream_gemm.cu): decode, verify, drafter. ----
+// Row-invariant: a row's result is bit-for-bit the same whatever M is, so a token verified in a block of
+// 16 gets exactly the numbers it would get decoded alone.
+constexpr int kMaxStreamRows = 32;
+// x [M][K] FP32 -> FP16 with a power-of-two scale per row (xinv[m] undoes it).
+void to_half_rows(const float* x, int M, int K, __half* out, float* xinv, cudaStream_t s);
+// y[M][N] = scale2 * x . W^T, W NVFP4 as for gemv_nvfp4. K must be a multiple of 128.
+void stream_gemm_nvfp4(const __half* x, const float* xinv, int M, const uint8_t* w, const uint8_t* wscale,
+                       float scale2, float* y, int N, int K, cudaStream_t s);
+// y[M][N] = wscale * x . W^T, W FP8 E4M3 [N][K]. K must be a multiple of 128.
+void stream_gemm_fp8(const __half* x, const float* xinv, int M, const uint8_t* w, float wscale, float* y, int N,
+                     int K, cudaStream_t s);
+
+// Top-K (K <= 64) of each row of x [rows][V]: values descending, ties to the lower index (so entry 0 is
+// what std::max_element returns). `scratch` needs topk_scratch_floats(rows, K) floats.
+size_t topk_scratch_floats(int rows, int K);
+void topk_rows(const float* x, int rows, int V, int K, float* scratch, float* vals, int* ids, cudaStream_t s);
 
 // Dequantize a whole matrix to BF16 (for the cuBLAS path).
 void dequant_nvfp4(const uint8_t* w, const uint8_t* wscale, float scale2, __nv_bfloat16* out, int N, int K,
@@ -50,8 +69,11 @@ void gdn_conv(float* mixed, float* conv_state, const __nv_bfloat16* w, int M, in
 void gdn_gating(const float* a, const float* b, const __nv_bfloat16* A_log, const __nv_bfloat16* dt_bias,
                 float* g, float* beta, int M, int HV, cudaStream_t s);
 // The delta rule over M tokens with q/k L2 normalization: state [HV][Dk][Dv] (k-major), out [M][HV*Dv].
-void gdn_recurrent(const float* mixed, const float* g, const float* beta, float* state, float* out, int M,
-                   int H, int HV, cudaStream_t s);
+// Reads the state from state_in and writes the advanced state to state_out (the same pointer to update in
+// place; nullptr to leave it unwritten, as a verify does). Each token's arithmetic is the same whatever M
+// is, so replaying accepted rows reproduces sequential decoding bit for bit.
+void gdn_recurrent(const float* mixed, const float* g, const float* beta, const float* state_in, float* state_out,
+                   float* out, int M, int H, int HV, cudaStream_t s);
 // out = rmsnorm(x) * w * silu(z), rows of length D.
 void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float* out, int rows, int D,
                    float eps, cudaStream_t s);
@@ -66,7 +88,31 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
 // Causal attention of M queries (positions pos0..) over the cache, split over key ranges and combined.
 // `scratch` needs attention_scratch_floats(M, Hq, Hkv, D, ctx) floats.
 size_t attention_scratch_floats(int M, int Hq, int Hkv, int D, int ctx);
+// The rows path's attention (M <= 32): fixed 1024-key ranges, so each row's result is independent of M.
+size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx);
+void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, int pos0, int M, int Hq,
+                    int Hkv, int D, float* scratch, float* out, cudaStream_t s);
 void attention(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, int pos0, int M,
                int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s);
+
+// ---- The DFlash2 drafter (draft_kernels.cu). ----
+// dst[r][0..H) = bf16(src[r][0..H)), rows dst_stride apart (the target features the drafter conditions on).
+void copy_rows_bf16(const float* src, int rows, int H, __nv_bfloat16* dst, int dst_stride, cudaStream_t s);
+// Per-head RMSNorm (plain weight) and NeoX RoPE over the full 128-dim head at positions pos0 + row, in place.
+void draft_qk_rope(float* x, int rows, int heads, int row_stride, const __nv_bfloat16* norm, int pos0, float theta,
+                   float eps, cudaStream_t s);
+// k/v rows [rows][kv_size] into the BF16 caches [position][kv_size] at positions pos0 ...
+void draft_store_kv(const float* k, const float* v, int rows, int kv_size, int pos0, __nv_bfloat16* kc,
+                    __nv_bfloat16* vc, cudaStream_t s);
+// The block's B queries (positions L .. L + B - 1) over the cached context [L + j - window_left, L) and the
+// whole block (bidirectional within it). q [B][Hq][128], kb/vb [B][Hkv][128].
+void draft_attention(const float* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, const float* kb,
+                     const float* vb, int L, int B, int window_left, int Hq, int Hkv, float* out, cudaStream_t s);
+// DFlash2's two-tap grouped dynamic convolution over a block (side 0 wraps a sublayer's input, 1 its output).
+void grouped_conv(const float* h, const float* coef, const __nv_bfloat16* base, int side, float* out, int rows,
+                  int C, int groups, int block, cudaStream_t s);
+// The candidate selector's 16 x 16 transition scores for E positions (hp: [E][256], cand/unary: [E][16]).
+void selector_lattice(const float* hp, const int* cand, const float* unary, const __nv_bfloat16* P,
+                      const __nv_bfloat16* S, int anchor, int E, float* scores, cudaStream_t s);
 
 }  // namespace ling::kernels
