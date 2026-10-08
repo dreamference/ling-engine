@@ -52,7 +52,7 @@ Measured on this machine from the SWE-bench rounds of 3–7 October 2026 (`im-*`
 
 Production's own counters agree: since its last start it generated 3.09M tokens in 615,532 verify steps (5.0 tokens per step), and its log of 2,290 single-stream decode intervals (30 September – 1 October, uncontrolled) shows a median of 30.1 tokens/s at an accept length of 4.62–4.87 out of 16 draft tokens, at a median context of 11.7k tokens.
 
-Two consequences shape everything below. First, the right speed benchmark is a replay of these sessions (section 13), not a prose or math suite: the greedy microbenchmarks in Mightling's CLAUDE.md (prose 25.5, code 50.3, JSON 87.0 tokens/s at short context) overstate agent throughput, and the gains here are larger on the agent workload than on those microbenchmarks, because the agent runs at long context and copies text. Second, concurrency is normal, not exotic: Night Shift, SWE-bench, refine's study and fix steps, subagents and paired nodes' lanes all run more than one agent.
+Two consequences shape everything below. First, the right speed benchmark is a replay of these sessions (section 13), not a prose or math suite: the greedy microbenchmarks in Mightling's AGENTS.md (prose 25.5, code 50.3, JSON 87.0 tokens/s at short context) overstate agent throughput, and the gains here are larger on the agent workload than on those microbenchmarks, because the agent runs at long context and copies text. Second, concurrency is normal, not exotic: Night Shift, SWE-bench, refine's study and fix steps, subagents and paired nodes' lanes all run more than one agent.
 
 ## 3. Goals and non-goals
 
@@ -180,7 +180,7 @@ Mightling serves the model with SGLang in Docker (`lmsysorg/sglang`, launched by
 | Step time | ~160 ms | Derived: 4.87 tokens per step at 30 tokens/s |
 | Fixed cost per warm request | 0.68 s | Least-squares fit over warm requests |
 | First request of a session | 9–13 s to the first token, 14.7k uncached tokens | Rollouts: median 16.5 s with 104 output tokens, two sessions at a time; ~9 s at the controlled prefill rate |
-| Prefill | ~1,700 tokens/s, ~1,000 at 116k context | Mightling's controlled measurement (CLAUDE.md) |
+| Prefill | ~1,700 tokens/s, ~1,000 at 116k context | Mightling's controlled measurement (AGENTS.md) |
 | Greedy microbenchmarks, short context | prose 25.5, code 50.3, JSON 87.0 tokens/s | Same |
 | Two streams at once | 27.4 tokens/s each (55 aggregate) | Server log, 14 intervals only |
 
