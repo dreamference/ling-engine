@@ -54,21 +54,24 @@ def main():
     ap.add_argument("--tokens", type=int, default=48)
     args = ap.parse_args()
 
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+        for prompt in PROMPTS:
+            f.write(json.dumps(prompt) + "\n")
+    run = subprocess.run([args.ling_run, "--model", args.model, "--prompts-file", f.name, "--max-tokens",
+                          str(args.tokens), "--ids-out", "--prompt-ids-out"],
+                         capture_output=True, text=True, check=True)
+    lines = run.stdout.strip().splitlines()
     total = top1 = top5 = 0
     lp_sum = 0.0
-    for prompt in PROMPTS:
-        run = subprocess.run([args.ling_run, "--model", args.model, "--text", prompt, "--max-tokens",
-                              str(args.tokens), "--ids-out", "--prompt-ids-out"],
-                             capture_output=True, text=True, check=True)
-        lines = run.stdout.strip().splitlines()
-        prompt_ids = [int(x) for x in lines[0].split(",")]
-        gen = [int(x) for x in lines[1].split(",") if x]
-        ids = prompt_ids + gen
-        token_lps, tops = sglang_logprobs(args.sglang, ids, len(prompt_ids))
+    for n, prompt in enumerate(PROMPTS):
+        prompt_ids = [int(x) for x in lines[2 * n].split(",")]
+        gen = [int(x) for x in lines[2 * n + 1].split(",") if x]
+        token_lps, tops = sglang_logprobs(args.sglang, prompt_ids + gen, len(prompt_ids))
         # Entries are aligned with ids[prompt_len - 1:]; the entry for position i scores ids[i].
         p_top1 = p_top5 = 0
         for j, tok in enumerate(gen):
-            idx = j + 1  # entry 0 is the last prompt token
+            idx = j + 1
             cands = [c[1] for c in tops[idx]] if tops[idx] else []
             p_top1 += bool(cands) and cands[0] == tok
             p_top5 += tok in cands
@@ -78,7 +81,6 @@ def main():
         top5 += p_top5
         print(f"{len(gen):3d} tokens  top1 {p_top1 / max(len(gen), 1):6.1%}  top5 {p_top5 / max(len(gen), 1):6.1%}  "
               f"{prompt[:50]!r}")
-        print("   ", run.stderr.strip().splitlines()[-1] if run.stderr.strip() else "")
     print(f"ALL {total} tokens: top1 {top1 / total:.1%}  top5 {top5 / total:.1%}  "
           f"mean logprob under SGLang {lp_sum / total:.3f}")
     return 0 if top5 / total > 0.95 else 1
