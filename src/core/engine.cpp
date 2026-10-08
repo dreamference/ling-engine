@@ -190,8 +190,8 @@ void Engine::linear_fp4(const Fp4Weight& w, const float* x, int M, float* y, boo
 }
 
 void Engine::linear_bf16(const Bf16Weight& w, const float* x, int M, float* y) {
-  if (M <= kernels::kMaxStreamRows) {  // row-invariant (each warp walks the rows one after another)
-    kernels::gemv_bf16(x, M, w.w, y, w.N, w.K, stream_);
+  if (M <= kernels::kMaxStreamRows) {  // the weights read once for every row, row-invariant
+    kernels::bf16_rows(x, M, w.w, y, w.N, w.K, stream_);
     return;
   }
   kernels::to_bf16(x, x_bf16_, M * w.K, stream_);

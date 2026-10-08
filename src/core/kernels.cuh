@@ -22,6 +22,8 @@ void gemv_nvfp4(const float* x, int M, const uint8_t* w, const uint8_t* wscale, 
 // y = wscale * x . W^T, W FP8 E4M3 [N][K]. K must be a multiple of 512.
 void gemv_fp8(const float* x, int M, const uint8_t* w, float wscale, float* y, int N, int K,
               cudaStream_t s);
+// y = x . W^T for narrow BF16 matrices and up to 32 rows, row-invariant (the rows path). K % 1024 == 0.
+void bf16_rows(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s);
 // y = x . W^T, W BF16 [N][K].
 void gemv_bf16(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s);
 
