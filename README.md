@@ -46,3 +46,5 @@ This engine is planned as a model server for [Mightling](https://github.com/drea
 ## License
 
 GNU Affero General Public License v3.0 ([LICENSE](LICENSE)), the same as Mightling.
+
+Contributions require a one-time [Contributor License Agreement](CLA.md); see [CONTRIBUTING.md](CONTRIBUTING.md).
