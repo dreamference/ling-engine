@@ -107,11 +107,8 @@ OutputParser::Delta OutputParser::drain(bool final) {
       if (end != std::string::npos) {
         d.reasoning += buf_.substr(0, end);
         buf_.erase(0, end + kThinkEnd.size());
-        // The template puts "\n\n" after </think>; it belongs to neither part.
-        size_t skip = 0;
-        while (skip < buf_.size() && skip < 2 && buf_[skip] == '\n') ++skip;
-        buf_.erase(0, skip);
         in_reasoning_ = false;
+        skip_newlines_ = 2;  // the template puts "\n\n" after </think>; it belongs to neither part
         continue;
       }
       const size_t hold = final ? 0 : partial_tag(buf_, kThinkEnd);
@@ -119,6 +116,12 @@ OutputParser::Delta OutputParser::drain(bool final) {
       buf_.erase(0, buf_.size() - hold);
       break;
     }
+    while (skip_newlines_ > 0 && !buf_.empty() && buf_[0] == '\n') {
+      buf_.erase(0, 1);
+      --skip_newlines_;
+    }
+    if (!buf_.empty()) skip_newlines_ = 0;
+    if (buf_.empty()) break;
     if (tools_.is_array() && !tools_.empty()) {
       size_t open = buf_.find(kCallOpen);
       if (open != std::string::npos) {

@@ -371,71 +371,93 @@ int attention_splits(int rows, int ctx) {
   return std::clamp(std::min(by_ctx, by_rows), 1, kAttnMaxSplits);
 }
 
-// D = 256: each lane owns 8 dims; each of the 8 warps walks its own keys with an online softmax.
+// D = 256: each lane owns 8 dims; each of the 8 warps walks its own keys with an online softmax. One block
+// serves the G query heads that share a KV head, so each key and value is read once for all of them.
+template <int G>
 __global__ void __launch_bounds__(256)
     attention_partial_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                              const __nv_bfloat16* __restrict__ vcache, int pos0, int Hq, int Hkv, int splits,
                              float* __restrict__ scratch) {
   constexpr int D = 256;
-  __shared__ float wm[8], wl[8];
+  __shared__ float wm[8][G], wl[8][G];
   __shared__ float wacc[8][D];
-  const int mh = blockIdx.x, split = blockIdx.y;
-  const int m = mh / Hq, h = mh % Hq, kvh = h / (Hq / Hkv);
+  const int mk = blockIdx.x, split = blockIdx.y;
+  const int m = mk / Hkv, kvh = mk % Hkv;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int ctx = pos0 + m + 1;
   const int per = (ctx + splits - 1) / splits;
   const int start = split * per, end = min(ctx, start + per);
   const float scale = rsqrtf(static_cast<float>(D));
-  float qv[8], acc[8];
-  const float* qrow = q + static_cast<size_t>(mh) * D + lane * 8;
+  float qv[G][8], acc[G][8], mx[G], l[G];
 #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    qv[i] = qrow[i] * scale;
-    acc[i] = 0.f;
+  for (int g = 0; g < G; ++g) {
+    const float* qrow = q + (static_cast<size_t>(m) * Hq + kvh * G + g) * D + lane * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      qv[g][i] = qrow[i] * scale;
+      acc[g][i] = 0.f;
+    }
+    mx[g] = -INFINITY;
+    l[g] = 0.f;
   }
-  float mx = -INFINITY, l = 0.f;
   for (int j = start + warp; j < end; j += 8) {
     const size_t off = (static_cast<size_t>(j) * Hkv + kvh) * D + lane * 8;
     uint4 kr = *reinterpret_cast<const uint4*>(kcache + off);
     uint4 vr = *reinterpret_cast<const uint4*>(vcache + off);
     const __nv_bfloat16* kb = reinterpret_cast<const __nv_bfloat16*>(&kr);
     const __nv_bfloat16* vb = reinterpret_cast<const __nv_bfloat16*>(&vr);
-    float dot = 0.f;
+    float kf[8], vf[8];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) dot = fmaf(qv[i], __bfloat162float(kb[i]), dot);
-    const float s = warp_sum(dot);
-    const float nm = fmaxf(mx, s);
-    const float corr = __expf(mx - nm), p = __expf(s - nm);
-    l = l * corr + p;
+    for (int i = 0; i < 8; ++i) {
+      kf[i] = __bfloat162float(kb[i]);
+      vf[i] = __bfloat162float(vb[i]);
+    }
 #pragma unroll
-    for (int i = 0; i < 8; ++i) acc[i] = acc[i] * corr + p * __bfloat162float(vb[i]);
-    mx = nm;
-  }
-  if (lane == 0) {
-    wm[warp] = mx;
-    wl[warp] = l;
-  }
+    for (int g = 0; g < G; ++g) {
+      float dot = 0.f;
 #pragma unroll
-  for (int i = 0; i < 8; ++i) wacc[warp][lane * 8 + i] = acc[i];
-  __syncthreads();
-  const int d = threadIdx.x;
-  float M = -INFINITY;
-  for (int w = 0; w < 8; ++w) M = fmaxf(M, wm[w]);
-  float L = 0.f, A = 0.f;
-  if (M != -INFINITY) {
-    for (int w = 0; w < 8; ++w) {
-      if (wm[w] == -INFINITY) continue;
-      const float c = __expf(wm[w] - M);
-      L += wl[w] * c;
-      A += wacc[w][d] * c;
+      for (int i = 0; i < 8; ++i) dot = fmaf(qv[g][i], kf[i], dot);
+      const float sc = warp_sum(dot);
+      const float nm = fmaxf(mx[g], sc);
+      const float corr = __expf(mx[g] - nm), p = __expf(sc - nm);
+      l[g] = l[g] * corr + p;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) acc[g][i] = acc[g][i] * corr + p * vf[i];
+      mx[g] = nm;
     }
   }
-  float* part = scratch + (static_cast<size_t>(mh) * splits + split) * (D + 2);
-  if (d == 0) {
-    part[0] = M;
-    part[1] = L;
+  if (lane == 0) {
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+      wm[warp][g] = mx[g];
+      wl[warp][g] = l[g];
+    }
   }
-  part[2 + d] = A;
+  const int d = threadIdx.x;
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 8; ++i) wacc[warp][lane * 8 + i] = acc[g][i];
+    __syncthreads();
+    float M = -INFINITY;
+    for (int w = 0; w < 8; ++w) M = fmaxf(M, wm[w][g]);
+    float L = 0.f, A = 0.f;
+    if (M != -INFINITY) {
+      for (int w = 0; w < 8; ++w) {
+        if (wm[w][g] == -INFINITY) continue;
+        const float c = __expf(wm[w][g] - M);
+        L += wl[w][g] * c;
+        A += wacc[w][d] * c;
+      }
+    }
+    float* part = scratch + ((static_cast<size_t>(m) * Hq + kvh * G + g) * splits + split) * (D + 2);
+    if (d == 0) {
+      part[0] = M;
+      part[1] = L;
+    }
+    part[2 + d] = A;
+  }
 }
 
 __global__ void attention_combine_kernel(const float* __restrict__ scratch, int splits, int D,
@@ -576,16 +598,17 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
   LING_LAUNCH_CHECK("attn_prepare");
 }
 
-size_t attention_scratch_floats(int M, int Hq, int D, int ctx) {
-  return static_cast<size_t>(M) * Hq * attention_splits(M * Hq, ctx) * (D + 2);
+size_t attention_scratch_floats(int M, int Hq, int Hkv, int D, int ctx) {
+  return static_cast<size_t>(M) * Hq * attention_splits(M * Hkv, ctx) * (D + 2);
 }
 
 void attention(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, int pos0, int M,
                int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s) {
   if (D != 256) throw std::runtime_error("attention: v0 supports head_dim 256 only");
-  const int splits = attention_splits(M * Hq, pos0 + M);
-  attention_partial_kernel<<<dim3(M * Hq, splits), 256, 0, s>>>(q, kcache, vcache, pos0, Hq, Hkv, splits,
-                                                                scratch);
+  if (Hq / Hkv != 6 || Hq % Hkv != 0) throw std::runtime_error("attention: v0 is built for 6 query heads per KV head");
+  const int splits = attention_splits(M * Hkv, pos0 + M);
+  attention_partial_kernel<6><<<dim3(M * Hkv, splits), 256, 0, s>>>(q, kcache, vcache, pos0, Hq, Hkv, splits,
+                                                                   scratch);
   LING_LAUNCH_CHECK("attention_partial");
   attention_combine_kernel<<<M * Hq, D, 0, s>>>(scratch, splits, D, out);
   LING_LAUNCH_CHECK("attention_combine");

@@ -65,7 +65,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   q_ = alloc<float>(M * qsize);
   gate_ = alloc<float>(M * qsize);
   attn_ = alloc<float>(M * qsize);
-  attn_scratch_ = alloc<float>(kernels::attention_scratch_floats(M, c.heads, c.head_dim, opts_.max_context));
+  attn_scratch_ = alloc<float>(kernels::attention_scratch_floats(M, c.heads, c.kv_heads, c.head_dim, opts_.max_context));
   logits_dev_ = alloc<float>(c.vocab);
   x_bf16_ = alloc<__nv_bfloat16>(M * std::max(c.intermediate, std::max(c.hidden, C)));
   size_t largest = 0;

@@ -54,6 +54,7 @@ class OutputParser {
   Delta drain(bool final);
 
   bool in_reasoning_;
+  int skip_newlines_ = 0;
   json tools_;
   std::string buf_;
 };
