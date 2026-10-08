@@ -34,7 +34,7 @@ prof() {  # label concurrency sessions window
 }
 prof "$TAG-c1" 1 set-prof-c1.txt 6
 prof "$TAG-c4" 4 set-prof-c4.txt 5
-rm -f ~/.ling-quiet
+rm -f ~/.ling-quiet; date +%s > ~/m0/last-quiet-end
 
 docker logs m0-nsys > "runs/$TAG.server.log" 2>&1
 docker stop -t 60 m0-nsys > /dev/null

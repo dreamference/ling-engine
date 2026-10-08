@@ -9,7 +9,7 @@ Usage:
            [--add FLAG]... [--log-requests] [--nsys] [--nvtx-patch FILE] [--env K=V]...
            [--print]
 
-  --set   replaces a flag's value (or adds the flag with that value)
+  --set   replaces a flag's value (or adds the flag with that value); flag names may omit "--"
   --drop  removes a flag and its value
   --add   adds a bare flag
   --nsys  launches the server inside an nsys session named m0 (CUDA graph nodes traced); windows
@@ -72,6 +72,12 @@ def main():
     ap.add_argument("--print", action="store_true")
     a = ap.parse_args()
 
+    # Flag names may be given without their dashes (`--set kv-cache-dtype fp8_e4m3`), because
+    # argparse cannot take a value that itself starts with "--".
+    dash = lambda f: f if f.startswith("--") else "--" + f
+    a.set = [(dash(k), v) for k, v in a.set]
+    a.drop = [dash(f) for f in a.drop]
+    a.add = [dash(f) for f in a.add]
     flags = [list(f) for f in PROD]
     flags = [f for f in flags if f[0] not in a.drop]
     for k, v in a.set:
