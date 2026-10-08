@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1344" height="1250" viewBox="0 0 1344 1250" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b9b8ae"/>
+    </marker>
+  </defs>
+  <style>
+    .box { fill: #ffffff; stroke: #cfcec5; stroke-width: 2; }
+    .h { font-size: 23px; font-weight: 600; fill: #141413; }
+    .t { font-size: 20px; fill: #5e5d59; }
+    .line { stroke: #b9b8ae; stroke-width: 2; fill: none; }
+  </style>
+  <rect x="0" y="0" width="1344" height="1250" fill="#ffffff"/>
+  <text x="42" y="50" font-size="26" font-weight="600" fill="#141413">The compiler decides everything before the first request; the runtime only runs</text>
+  <rect class="box" x="42" y="92" width="545" height="98" rx="12"/>
+  <text class="h" x="64" y="133">Inputs</text>
+  <text class="t" x="64" y="162">Qwen3.8-27B BF16 weights, DFlash2 drafter</text>
+  <rect class="box" x="757" y="92" width="545" height="98" rx="12"/>
+  <text class="h" x="779" y="133">Clients</text>
+  <text class="t" x="779" y="162">any OpenAI-compatible client, user or agent</text>
+  <path class="line" d="M315,190 V238" marker-end="url(#arrow)"/>
+  <path class="line" d="M1029,190 V238" marker-end="url(#arrow)"/>
+  <rect class="box" x="42" y="240" width="545" height="970" rx="12"/>
+  <rect class="box" x="757" y="240" width="545" height="970" rx="12"/>
+  <text class="h" x="70" y="283">ling-compile · runs once per machine</text>
+  <text class="h" x="785" y="283">ling-serve · runs for weeks</text>
+  <rect class="box" x="70" y="311" width="488" height="99" rx="12"/>
+  <text class="h" x="92" y="354">1 Ingest</text>
+  <text class="t" x="92" y="383">split text stack, head, vision, drafter</text>
+  <rect class="box" x="70" y="438" width="488" height="99" rx="12"/>
+  <text class="h" x="92" y="481">2 Quantize to NVFP4</text>
+  <text class="t" x="92" y="510">ModelOpt recipe; FP8 where gate fails</text>
+  <rect class="box" x="70" y="566" width="488" height="99" rx="12"/>
+  <text class="h" x="92" y="609">3 Fold norms</text>
+  <text class="t" x="92" y="638">RMSNorm γ into the next projection</text>
+  <rect class="box" x="70" y="693" width="488" height="99" rx="12"/>
+  <text class="h" x="92" y="736">4 Tile weights</text>
+  <text class="t" x="92" y="765">bytes on disk in kernel fragment order</text>
+  <rect class="box" x="70" y="820" width="488" height="99" rx="12"/>
+  <text class="h" x="92" y="863">5 Instantiate kernels</text>
+  <text class="t" x="92" y="892">one per matrix × row bucket, sm_121 only</text>
+  <rect class="box" x="70" y="948" width="488" height="99" rx="12"/>
+  <text class="h" x="92" y="991">6 Plan memory</text>
+  <text class="t" x="92" y="1020">fixed offsets, nothing allocated at run</text>
+  <rect class="box" x="70" y="1075" width="488" height="99" rx="12"/>
+  <text class="h" x="92" y="1118">7 Capture CUDA graphs</text>
+  <text class="t" x="92" y="1147">one per row bucket and prefill chunk</text>
+  <rect class="box" x="785" y="311" width="488" height="127" rx="12"/>
+  <text class="h" x="807" y="354">HTTP layer</text>
+  <text class="t" x="807" y="383">OpenAI chat API, SSE streaming</text>
+  <text class="t" x="807" y="411">thinking flags, reasoning effort, tools</text>
+  <rect class="box" x="785" y="460" width="488" height="127" rx="12"/>
+  <text class="h" x="807" y="503">Session manager</text>
+  <text class="t" x="807" y="532">FP8 KV pages, DeltaNet snapshot</text>
+  <text class="t" x="807" y="560">token history, drafter cache, LRU</text>
+  <rect class="box" x="785" y="608" width="488" height="127" rx="12"/>
+  <text class="h" x="807" y="651">Scheduler</text>
+  <text class="t" x="807" y="680">verify graph → accept → draft graph</text>
+  <text class="t" x="807" y="708">one sequence first, 2–4 agents later</text>
+  <rect class="box" x="785" y="757" width="488" height="127" rx="12"/>
+  <text class="h" x="807" y="800">Draft sources</text>
+  <text class="t" x="807" y="829">DFlash2 block 8, NVFP4, 32k-token head</text>
+  <text class="t" x="807" y="857">prompt lookup splice · MTP fallback</text>
+  <rect class="box" x="785" y="905" width="488" height="127" rx="12"/>
+  <text class="h" x="807" y="948">GPU sampling</text>
+  <text class="t" x="807" y="977">temperature, top-k 20, top-p, penalties</text>
+  <text class="t" x="807" y="1005">exact rejection sampling, device RNG</text>
+  <rect class="box" x="785" y="1054" width="488" height="127" rx="12"/>
+  <text class="h" x="807" y="1097">Telemetry</text>
+  <text class="t" x="807" y="1126">pass ms, GB/s, rows, accepted per step</text>
+  <text class="t" x="807" y="1154">drafter ms, host ms, Prometheus</text>
+  <path class="line" d="M587,725 H755" marker-end="url(#arrow)"/>
+  <text class="t" x="672" y="693" text-anchor="middle">blob, kernels,</text>
+  <text class="t" x="672" y="718" text-anchor="middle">graphs, plan</text>
+</svg>

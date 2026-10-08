@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1344" height="1330" viewBox="0 0 1344 1330" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b9b8ae"/>
+    </marker>
+  </defs>
+  <style>
+    .box { fill: #ffffff; stroke: #cfcec5; stroke-width: 2; }
+    .hl { fill: #e4eef9; stroke: #2a74d1; stroke-width: 3; }
+    .h { font-size: 23px; font-weight: 600; fill: #141413; }
+    .t { font-size: 20px; fill: #5e5d59; }
+    .g { font-size: 20px; fill: #5e5d59; }
+    .line { stroke: #b9b8ae; stroke-width: 2; fill: none; }
+    .dia { fill: #c9c8bd; }
+  </style>
+  <rect x="0" y="0" width="1344" height="1330" fill="#ffffff"/>
+  <text x="42" y="50" font-size="26" font-weight="600" fill="#141413">M1’s single-row pass gates every speculation milestone</text>
+  <rect class="box" x="42" y="99" width="1260" height="127" rx="12"/>
+  <text class="h" x="71" y="141">M0 · Baselines</text>
+  <text class="t" x="71" y="170">Streaming-bandwidth microbenchmark, public SGLang recipe and BF16 quality reference on this box</text>
+  <text class="t" x="71" y="198">Every target below is restated against the measured bus</text>
+  <path class="line" d="M672,226 V302" marker-end="url(#arrow)"/>
+  <path class="dia" d="M672,248 L689,265 L672,282 L655,265 z"/>
+  <text class="g" x="708" y="272">Gate: measured GB/s recorded; all targets restated</text>
+  <rect class="hl" x="42" y="304" width="1260" height="127" rx="12"/>
+  <text class="h" x="71" y="346">M1 · Single-row fused path</text>
+  <text class="t" x="71" y="375">NVFP4 blob in tile order, five kernels per layer, FP8 KV, one CUDA graph, memory plan</text>
+  <text class="t" x="71" y="403">Quality gate on the quantized model; greedy output matches the reference</text>
+  <path class="line" d="M672,431 V507" marker-end="url(#arrow)"/>
+  <path class="dia" d="M672,453 L689,470 L672,487 L655,470 z"/>
+  <text class="g" x="708" y="477">Gate: 90% of the measured bus at 1 row; host under 1 ms</text>
+  <rect class="box" x="42" y="509" width="1260" height="127" rx="12"/>
+  <text class="h" x="71" y="551">M2 · Exact speculation</text>
+  <text class="t" x="71" y="580">Row buckets 8, 16 and 32, DFlash2 as shipped, DeltaNet replay, prompt-lookup splice</text>
+  <text class="t" x="71" y="608">Exactness suite green for every bucket</text>
+  <path class="line" d="M672,636 V712" marker-end="url(#arrow)"/>
+  <path class="dia" d="M672,658 L689,675 L672,692 L655,675 z"/>
+  <text class="g" x="708" y="682">Gate: greedy output identical; prose at 55 tokens/s or more</text>
+  <rect class="box" x="42" y="714" width="1260" height="127" rx="12"/>
+  <text class="h" x="71" y="756">M3 · Fast speculation</text>
+  <text class="t" x="71" y="785">NVFP4 drafter, 32k-token draft head, drafter inside the step graph, tree of 16, block-16 trial</text>
+  <text class="t" x="71" y="813">Acceptance measured per workload against the shipped drafter</text>
+  <path class="line" d="M672,841 V917" marker-end="url(#arrow)"/>
+  <path class="dia" d="M672,863 L689,880 L672,897 L655,880 z"/>
+  <text class="g" x="708" y="887">Gate: prose 60, code 90, edits 150 tokens/s or more</text>
+  <rect class="box" x="42" y="919" width="1260" height="127" rx="12"/>
+  <text class="h" x="71" y="961">M4 · Product</text>
+  <text class="t" x="71" y="990">Sessions with prefix check and background re-prefill, chunked prefill, images, OpenAI API, tool calls</text>
+  <text class="t" x="71" y="1018">16-task speed suite run against the public recipe on the same box</text>
+  <path class="line" d="M672,1046 V1122" marker-end="url(#arrow)"/>
+  <path class="dia" d="M672,1068 L689,1085 L672,1102 L655,1085 z"/>
+  <text class="g" x="708" y="1092">Gate: follow-up first token 80 ms or less; suite published</text>
+  <rect class="box" x="42" y="1124" width="1260" height="127" rx="12"/>
+  <text class="h" x="71" y="1166">M5 · Hardening</text>
+  <text class="t" x="71" y="1195">10-minute thermal runs, 262k context, 4-bit KV option, telemetry, small-batch mode for 2–4 agents</text>
+  <text class="t" x="71" y="1223">Release manifest with precision map, template hash and Nsight traces</text>
+  <path class="dia" d="M672,1273 L689,1290 L672,1307 L655,1290 z"/>
+  <text class="g" x="708" y="1297">Gate: all three validation gates green; release</text>
+</svg>
