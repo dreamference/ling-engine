@@ -108,6 +108,49 @@ int main() {
     cudaFree(dx);
     cudaFree(dy);
   }
+  // Bandwidth of the decode path (M = 1) on the model's largest shapes; informational, not a pass/fail.
+  {
+    const int BN = 17408, BK = 5120;
+    uint8_t *bw4, *bs4, *bw8;
+    float *bx, *by;
+    cudaMalloc(&bw4, size_t(BN) * BK / 2);
+    cudaMalloc(&bs4, size_t(BN) * BK / 16);
+    cudaMalloc(&bw8, size_t(BN) * BK);
+    cudaMalloc(&bx, BK * sizeof(float));
+    cudaMalloc(&by, BN * sizeof(float));
+    cudaMemset(bw4, 0x11, size_t(BN) * BK / 2);
+    cudaMemset(bs4, 0x38, size_t(BN) * BK / 16);
+    cudaMemset(bw8, 0x38, size_t(BN) * BK);
+    cudaMemset(bx, 0, BK * sizeof(float));
+    cudaEvent_t a, b;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+    for (int pass = 0; pass < 2; ++pass) {
+      const bool fp4 = pass == 0;
+      for (int i = 0; i < 3; ++i) {
+        if (fp4) ling::kernels::gemv_nvfp4(bx, 1, bw4, bs4, 1.f, by, BN, BK, nullptr);
+        else ling::kernels::gemv_fp8(bx, 1, bw8, 1.f, by, BN, BK, nullptr);
+      }
+      cudaEventRecord(a);
+      const int iters = 50;
+      for (int i = 0; i < iters; ++i) {
+        if (fp4) ling::kernels::gemv_nvfp4(bx, 1, bw4, bs4, 1.f, by, BN, BK, nullptr);
+        else ling::kernels::gemv_fp8(bx, 1, bw8, 1.f, by, BN, BK, nullptr);
+      }
+      cudaEventRecord(b);
+      cudaEventSynchronize(b);
+      float ms = 0;
+      cudaEventElapsedTime(&ms, a, b);
+      const double bytes = fp4 ? double(BN) * BK * (0.5 + 1.0 / 16) : double(BN) * BK;
+      std::printf("bench %-8s M=1 %dx%d: %.3f ms, %.0f GB/s\n", fp4 ? "nvfp4" : "fp8", BN, BK, ms / iters,
+                  bytes / (ms / iters * 1e-3) / 1e9);
+    }
+    cudaFree(bw4);
+    cudaFree(bs4);
+    cudaFree(bw8);
+    cudaFree(bx);
+    cudaFree(by);
+  }
   cudaError_t e = cudaDeviceSynchronize();
   if (e != cudaSuccess) {
     std::printf("CUDA error: %s\n", cudaGetErrorString(e));
