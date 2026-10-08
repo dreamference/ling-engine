@@ -1,6 +1,6 @@
 # ling-engine
 
-**A single-model inference engine for Qwen3.8-27B on the NVIDIA DGX Spark (GB10).** Proposed; nothing is built yet.
+**A single-model inference engine for Qwen3.8-27B on the NVIDIA DGX Spark (GB10).** v0 runs: it serves the production checkpoint end to end ([docs/V0.md](docs/V0.md)); the speed levers below are next.
 
 Decoding Qwen3.8-27B on a DGX Spark is bound by its 273 GB/s memory bus, not by compute: every generated token streams the model's weights (17.6 GB per pass for the checkpoint Mightling serves), which caps plain decoding near 15 tokens/s. Speculation is the only multiplier, and removing everything that is not weight traffic is the other half.
 
