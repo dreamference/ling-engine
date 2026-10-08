@@ -4,13 +4,13 @@
 
 Decoding Qwen3.8-27B on a DGX Spark is bound by its 273 GB/s memory bus, not by compute: every generated token streams about 15 GB of 4-bit weights, which caps plain decoding near 17 tokens/s. The best public recipe today (SGLang with the DFlash2 drafter) reaches 47.9 tokens/s. This engine aims to get more tokens out of each weight read, then remove every other cost.
 
-**Spec:** [spec-qwen3.8-27b-dgx-spark.pdf](spec-qwen3.8-27b-dgx-spark.pdf) (20 pages, 8 October 2026)
+**Spec:** [SPEC.md](SPEC.md) (8 October 2026)
 
 ## The plan in brief
 
-Two programs: `q38-compile`, an offline compiler that quantizes to NVFP4, folds the norms, lays the weights out on disk in kernel order, instantiates one fused CUDA kernel per matrix shape and captures each decode step as a CUDA graph; and `q38-serve`, a resident runtime that keeps every conversation's KV cache and DeltaNet state on the GPU.
+Two programs: `ling-compile`, an offline compiler that quantizes to NVFP4, folds the norms, lays the weights out on disk in kernel order, instantiates one fused CUDA kernel per matrix shape and captures each decode step as a CUDA graph; and `ling-serve`, a resident runtime that keeps every conversation's KV cache and DeltaNet state on the GPU.
 
-![Compiler and runtime](images/compiler-and-runtime.png)
+![Compiler and runtime](images/compiler-and-runtime.svg)
 
 Four levers, in order of expected payoff:
 
@@ -23,7 +23,7 @@ Four levers, in order of expected payoff:
 
 ## Milestones
 
-![Roadmap](images/roadmap.png)
+![Roadmap](images/roadmap.svg)
 
 ## Part of Mightling
 
