@@ -28,3 +28,7 @@ Four levers, in order of expected payoff:
 ## Part of Mightling
 
 This engine is planned as a model server for [Mightling](https://github.com/dreamference/mightling), Dreamference's local, confidential AI for DGX Spark, where Qwen3.8-27B is the default model.
+
+## License
+
+GNU Affero General Public License v3.0 ([LICENSE](LICENSE)), the same as Mightling.
