@@ -59,7 +59,7 @@
   <text class="t" x="807" y="708">1 sequence, or 2–4 agents in one pass</text>
   <rect class="box" x="785" y="757" width="488" height="127" rx="12"/>
   <text class="h" x="807" y="800">Draft sources</text>
-  <text class="t" x="807" y="829">DFlash2 16-node tree, 32k-token head</text>
+  <text class="t" x="807" y="829">DFlash2, 16 drafts, 32k-token head</text>
   <text class="t" x="807" y="857">context-lookup branch · MTP fallback</text>
   <rect class="box" x="785" y="905" width="488" height="127" rx="12"/>
   <text class="h" x="807" y="948">GPU sampling</text>

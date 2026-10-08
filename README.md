@@ -14,12 +14,12 @@ Two programs: `ling-compile`, an offline compiler that fixes the precision map, 
 
 ![Compiler and runtime](images/compiler-and-runtime.svg)
 
-Six levers, in order of payoff:
+Six levers, the first four in order of payoff on one agent's session:
 
 1. **Step time at the bandwidth bound:** fused shape-specialized kernels, one CUDA graph per step, GPU-side sampling, FP8 KV and a DeltaNet replay scheme: ~160 ms per step to 76–90 ms.
-2. **A hybrid draft tree:** DFlash2's 16-node tree plus a context-lookup branch in the same verify, because agents copy: 4.87 accepted tokens per step to ≥ 5.8.
-3. **New sessions start warm:** DeltaNet checkpoints at shared-prefix boundaries, so a new session's first answer comes in ≤ 1 s instead of ~13 s.
-4. **Short requests stay short:** FP4 prefill and no host work before the first pass: 0.68 s of fixed cost per request to ≤ 0.25 s.
+2. **A hybrid draft:** DFlash2's 16 draft tokens plus a context-lookup branch in the same verify, because agents copy: 4.87 accepted tokens per step to ≥ 5.8.
+3. **Short requests stay short:** FP4 prefill and no host work before the first pass: 0.68 s of fixed cost per request to ≤ 0.25 s.
+4. **New sessions start warm:** DeltaNet checkpoints at shared-prefix boundaries, so a new session's first answer comes in ≤ 1 s instead of 9–13 s.
 5. **Several agents share one weight read:** 2–4 sequences per pass for Night Shift, benchmarks, refine and subagents: ≥ 175 tokens/s aggregate.
 6. **An agent-tuned drafter (stretch):** fine-tuned on the user's own sessions, on the Spark, overnight.
 
@@ -29,8 +29,8 @@ Six levers, in order of payoff:
 | --- | --- | --- | --- |
 | Decode on agent output | ~30 tokens/s | ≥ 70 tokens/s (2.3×) | ≥ 100 |
 | Mean model time per agent request | ~6.6 s | ≤ 2.8 s | ≤ 2.0 s |
-| First answer of a new session | ~13 s | ≤ 1 s | ≤ 0.5 s |
-| Agent session wall time | 1× | ≥ 2.1× faster | ≥ 2.8× faster |
+| First answer of a new session | 9–13 s | ≤ 1 s | ≤ 0.5 s |
+| Agent session wall time | 1× | ≥ 1.9–2.1× faster | ≥ 2.4–2.8× faster |
 | Aggregate decode, 4 agents at once | measured in M0 | ≥ 175 tokens/s | ≥ 220 |
 
 Greedy output stays identical to non-speculative decoding.

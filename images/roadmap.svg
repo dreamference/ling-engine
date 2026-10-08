@@ -31,7 +31,7 @@
   <text class="g" x="708" y="477">Gate: 90% of the measured bus at 1 row; host under 1 ms</text>
   <rect class="box" x="42" y="509" width="1260" height="127" rx="12"/>
   <text class="h" x="71" y="551">M2 · Exact speculation</text>
-  <text class="t" x="71" y="580">Row buckets 16–64, DFlash2’s 16-node tree, DeltaNet replay, context-lookup branch</text>
+  <text class="t" x="71" y="580">Row buckets 16–64, DFlash2 with 16 drafts, DeltaNet replay, context-lookup branch</text>
   <text class="t" x="71" y="608">Exactness suite green for every bucket</text>
   <path class="line" d="M672,636 V712" marker-end="url(#arrow)"/>
   <path class="dia" d="M672,658 L689,675 L672,692 L655,675 z"/>
