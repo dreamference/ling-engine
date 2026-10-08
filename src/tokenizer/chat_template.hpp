@@ -1,5 +1,6 @@
-// The Qwen3.8 chat template (the checkpoint's chat_template.jinja) written out in C++, for text
-// messages, tools and tool calls. Images and video are not supported in v0.
+// The Qwen3.8 chat template (the checkpoint's chat_template.jinja, with the two patches Mightling's
+// production server applies) written out in C++, for text messages, tools and tool calls. Images and
+// video are not supported in v0.
 #pragma once
 
 #include <optional>
@@ -12,7 +13,7 @@ namespace ling {
 struct ChatOptions {
   bool add_generation_prompt = true;
   std::optional<bool> enable_thinking;          // undefined = thinking on
-  std::optional<std::string> reasoning_effort;  // xhigh (default), high, medium, low, minimal
+  std::optional<std::string> reasoning_effort;  // max/xhigh/high, medium (default), low/minimal
   std::optional<bool> preserve_thinking;        // undefined = keep reasoning of earlier turns
 };
 

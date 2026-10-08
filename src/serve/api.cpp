@@ -209,3 +209,154 @@ std::string OutputParser::convert_value(const std::string& function, const std::
 }
 
 }  // namespace ling::serve
+
+namespace ling::serve {
+namespace {
+
+std::string text_of_parts(const json& parts) {
+  std::string out;
+  if (parts.is_string()) return parts.get<std::string>();
+  if (!parts.is_array()) return out;
+  for (const json& p : parts)
+    if (p.is_object() && p.contains("text") && p["text"].is_string()) out += p["text"].get<std::string>();
+  return out;
+}
+
+// One Responses input item as a chat message, or null to drop it.
+json normalize_item(const json& item) {
+  const std::string type = item.value("type", "message");
+  if (type == "function_call") {
+    std::string args = "{}";
+    if (item.contains("arguments")) {
+      const json& raw = item["arguments"];
+      if (raw.is_string()) {
+        json parsed = json::parse(raw.get<std::string>(), nullptr, false);
+        if (!parsed.is_discarded() && parsed.is_object()) args = raw.get<std::string>();
+      } else if (raw.is_object()) {
+        args = raw.dump();
+      }
+    }
+    const std::string id = item.contains("call_id") && item["call_id"].is_string() ? item["call_id"].get<std::string>()
+                                                                                    : item.value("id", "");
+    return json{{"role", "assistant"},
+                {"tool_calls", json::array({json{{"id", id},
+                                                 {"type", "function"},
+                                                 {"function", {{"name", item.value("name", "")}, {"arguments", args}}}}})}};
+  }
+  if (type == "function_call_output") {
+    const json& out = item.contains("output") ? item["output"] : json("");
+    return json{{"role", "tool"}, {"tool_call_id", item.value("call_id", "")}, {"content", text_of_parts(out)}};
+  }
+  if (type == "reasoning") {
+    std::string text;
+    auto collect = [&](const char* key) {
+      if (!item.contains(key) || !item[key].is_array()) return;
+      for (const json& e : item[key]) {
+        if (e.is_object() && e.contains("text") && e["text"].is_string() && !e["text"].get<std::string>().empty()) {
+          if (!text.empty()) text += "\n";
+          text += e["text"].get<std::string>();
+        }
+      }
+    };
+    collect("summary");
+    if (text.empty()) collect("content");
+    if (text.empty()) return json();
+    return json{{"role", "assistant"}, {"reasoning_content", text}};
+  }
+  if (type != "message") return json();  // built-in tool calls this server never offered
+  std::string role = item.value("role", "user");
+  if (role == "developer") role = "system";
+  json msg = {{"role", role}};
+  if (item.contains("content")) msg["content"] = item["content"].is_string() ? item["content"] : json(text_of_parts(item["content"]));
+  return msg;
+}
+
+}  // namespace
+
+Request parse_responses_request(const json& body) {
+  if (!body.is_object()) throw std::invalid_argument("the request body must be a JSON object");
+  json messages = json::array();
+  if (body.contains("instructions") && body["instructions"].is_string() && !body["instructions"].get<std::string>().empty())
+    messages.push_back({{"role", "system"}, {"content", body["instructions"]}});
+  if (!body.contains("input")) throw std::invalid_argument("input is required");
+  if (body["input"].is_string()) {
+    messages.push_back({{"role", "user"}, {"content", body["input"]}});
+  } else if (body["input"].is_array()) {
+    for (const json& item : body["input"]) {
+      json m = normalize_item(item);
+      if (!m.is_null()) messages.push_back(std::move(m));
+    }
+  } else {
+    throw std::invalid_argument("input must be a string or a list of items");
+  }
+  // One assistant turn arrives as several items (reasoning, message, function calls): merge them.
+  json merged = json::array();
+  for (json& m : messages) {
+    if (m["role"] == "assistant" && !merged.empty() && merged.back()["role"] == "assistant") {
+      json& prev = merged.back();
+      const std::string nc = m.contains("content") && m["content"].is_string() ? m["content"].get<std::string>() : "";
+      if (!nc.empty()) {
+        const std::string pc = prev.contains("content") && prev["content"].is_string() ? prev["content"].get<std::string>() : "";
+        prev["content"] = pc.empty() ? nc : pc + "\n\n" + nc;
+      }
+      if (m.contains("tool_calls")) {
+        if (!prev.contains("tool_calls")) prev["tool_calls"] = json::array();
+        for (const json& c : m["tool_calls"]) prev["tool_calls"].push_back(c);
+      }
+      if (m.contains("reasoning_content")) {
+        const std::string nr = m["reasoning_content"];
+        prev["reasoning_content"] = prev.contains("reasoning_content")
+                                        ? prev["reasoning_content"].get<std::string>() + "\n" + nr
+                                        : nr;
+      }
+      continue;
+    }
+    merged.push_back(std::move(m));
+  }
+  // Every system chunk goes into one leading system message.
+  std::string system;
+  json others = json::array();
+  for (json& m : merged) {
+    if (m["role"] == "system") {
+      const std::string c = m.contains("content") && m["content"].is_string() ? m["content"].get<std::string>() : "";
+      if (!c.empty()) system += (system.empty() ? "" : "\n\n") + c;
+    } else {
+      others.push_back(std::move(m));
+    }
+  }
+  json final_messages = json::array();
+  if (!system.empty()) final_messages.push_back({{"role", "system"}, {"content", system}});
+  for (json& m : others) final_messages.push_back(std::move(m));
+
+  json chat = json::object();
+  chat["messages"] = final_messages;
+  json tools = json::array();
+  if (body.contains("tools") && body["tools"].is_array()) {
+    for (const json& t : body["tools"]) {
+      if (t.value("type", "") != "function") continue;
+      json fn = {{"name", t.value("name", "")}};
+      fn["description"] = t.contains("description") ? t["description"] : json();
+      fn["parameters"] = t.contains("parameters") ? t["parameters"] : json();
+      fn["strict"] = t.contains("strict") ? t["strict"] : json();
+      tools.push_back({{"type", "function"}, {"function", fn}});
+    }
+  }
+  if (!tools.empty() && body.value("tool_choice", json("auto")) != "none") chat["tools"] = tools;
+  for (const char* k : {"stream", "temperature", "top_p", "top_k", "min_p", "presence_penalty",
+                        "repetition_penalty", "seed", "stop", "chat_template_kwargs"})
+    if (body.contains(k)) chat[k] = body[k];
+  if (body.contains("max_output_tokens") && body["max_output_tokens"].is_number()) chat["max_tokens"] = body["max_output_tokens"];
+  if (body.contains("reasoning") && body["reasoning"].is_object() && body["reasoning"].contains("effort") &&
+      body["reasoning"]["effort"].is_string()) {
+    const std::string effort = body["reasoning"]["effort"];
+    if (effort == "none") {
+      if (!chat.contains("chat_template_kwargs")) chat["chat_template_kwargs"] = json::object();
+      if (!chat["chat_template_kwargs"].contains("enable_thinking")) chat["chat_template_kwargs"]["enable_thinking"] = false;
+    } else {
+      chat["reasoning_effort"] = effort;
+    }
+  }
+  return parse_request(chat, true);
+}
+
+}  // namespace ling::serve

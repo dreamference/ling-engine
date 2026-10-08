@@ -16,6 +16,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <cstdio>
 #include <ctime>
 #include <deque>
 #include <functional>
@@ -99,6 +100,7 @@ class Worker {
     const int limit = job.req.max_tokens > 0 ? std::min(job.req.max_tokens, ctx_left) : ctx_left;
     EngineStats stats;
     std::vector<float> logits = eng.prefill(job.prompt, &stats);
+    const auto t_decode = std::chrono::steady_clock::now();
     StreamDecoder dec(*ctx_.tok);
     std::string all;
     size_t emitted = 0, max_stop = 0;
@@ -139,6 +141,10 @@ class Worker {
       all += dec.flush();
       if (all.size() > emitted) job.sink.text(all.substr(emitted));
     }
+    const double decode_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_decode).count();
+    std::fprintf(stderr, "request: %zu prompt tokens (%d reused), prefill %.2f s; %d tokens in %.2f s (%.1f tok/s), %s\n",
+                 job.prompt.size(), stats.reused_tokens, stats.prefill_seconds, produced, decode_s,
+                 decode_s > 0 ? produced / decode_s : 0.0, finish.c_str());
     job.sink.done(finish == "cancelled" ? "stop" : finish, static_cast<int>(job.prompt.size()), produced,
                   stats.reused_tokens);
   }
@@ -216,6 +222,14 @@ class Handler : public proxygen::RequestHandler {
                     {"owned_by", "ling-engine"}, {"root", ctx_.model_name},
                     {"max_model_len", ctx_.engine->max_context()}};
       send_json(downstream_, 200, json{{"object", "list"}, {"data", json::array({model})}});
+    } else if (method_ == "GET" && path_ == "/metrics") {
+      ResponseBuilder(downstream_)
+          .status(200, "OK")
+          .header("Content-Type", "text/plain; version=0.0.4")
+          .body("# ling-engine v0 exports no metrics yet\n")
+          .sendWithEOM();
+    } else if (method_ == "POST" && path_ == "/v1/responses") {
+      generate_responses();
     } else if (method_ == "POST" && (path_ == "/v1/chat/completions" || path_ == "/v1/completions")) {
       generate(path_ == "/v1/chat/completions");
     } else {
@@ -354,6 +368,151 @@ class Handler : public proxygen::RequestHandler {
       json body = {{"id", id}, {"object", chat ? "chat.completion" : "text_completion"}, {"created", created},
                    {"model", model}, {"choices", json::array({choice})}, {"usage", usage}};
       post(ex, [body](proxygen::ResponseHandler* d) { send_json(d, 200, body); });
+    };
+    worker_.submit(std::move(job));
+  }
+
+  // The Responses API, streamed as the event sequence Mightling's agent parses: response.created, then
+  // per output item output_item.added, its text deltas and output_item.done, then response.completed.
+  void generate_responses() {
+    if (too_large_) {
+      send_json(downstream_, 413, error_body("request body too large", "invalid_request_error"));
+      return;
+    }
+    Job job;
+    try {
+      std::string text;
+      if (auto buf = body_.move()) text = buf->moveToFbString().toStdString();
+      job.req = parse_responses_request(json::parse(text));
+    } catch (const std::exception& e) {
+      send_json(downstream_, 400, error_body(e.what(), "invalid_request_error"));
+      return;
+    }
+    job.prompt = ctx_.tok->encode(job.req.prompt_text);
+    job.cancelled = ex_->cancelled;
+    const Request req = job.req;
+    auto ex = ex_;
+    const std::string model = ctx_.model_name;
+    const long created = std::time(nullptr);
+
+    struct State {
+      OutputParser parser;
+      std::string id = new_id("resp_");
+      int seq = 0;
+      json output = json::array();   // finished items, in order
+      std::string reasoning, content;
+      std::string reasoning_id, message_id;
+      int reasoning_index = -1, message_index = -1;
+      bool reasoning_open = false, message_open = false;
+      State(bool r, const json& t) : parser(r, t) {}
+    };
+    auto st = std::make_shared<State>(req.reasoning, req.tools);
+    auto response_obj = [=](const std::string& status) {
+      return json{{"id", st->id}, {"object", "response"}, {"created_at", created}, {"status", status},
+                  {"model", model}, {"output", st->output}, {"tools", json::array()}};
+    };
+    auto event = [=](const std::string& type, json payload) {
+      payload["type"] = type;
+      payload["sequence_number"] = st->seq++;
+      if (!req.stream) return;
+      std::string data = "event: " + type + "\ndata: " + payload.dump() + "\n\n";
+      post(ex, [data](proxygen::ResponseHandler* d) { ResponseBuilder(d).body(data).send(); });
+    };
+    auto close_reasoning = [=]() {
+      if (!st->reasoning_open) return;
+      st->reasoning_open = false;
+      json item = {{"type", "reasoning"}, {"id", st->reasoning_id}, {"summary", json::array()},
+                   {"content", json::array({json{{"type", "reasoning_text"}, {"text", st->reasoning}}})}};
+      st->output.push_back(item);
+      event("response.output_item.done", {{"output_index", st->reasoning_index}, {"item", item}});
+    };
+    auto close_message = [=]() {
+      if (!st->message_open) return;
+      st->message_open = false;
+      json item = {{"type", "message"}, {"id", st->message_id}, {"role", "assistant"}, {"status", "completed"},
+                   {"content", json::array({json{{"type", "output_text"}, {"text", st->content}, {"annotations", json::array()}}})}};
+      st->output.push_back(item);
+      event("response.output_item.done", {{"output_index", st->message_index}, {"item", item}});
+    };
+    auto deliver = [=](const OutputParser::Delta& d) {
+      if (!d.reasoning.empty()) {
+        if (!st->reasoning_open && st->reasoning.empty()) {
+          st->reasoning_open = true;
+          st->reasoning_id = new_id("rs_");
+          st->reasoning_index = static_cast<int>(st->output.size());
+          event("response.output_item.added",
+                {{"output_index", st->reasoning_index},
+                 {"item", {{"type", "reasoning"}, {"id", st->reasoning_id}, {"summary", json::array()}, {"content", json::array()}}}});
+        }
+        st->reasoning += d.reasoning;
+        event("response.reasoning_text.delta",
+              {{"item_id", st->reasoning_id}, {"output_index", st->reasoning_index}, {"content_index", 0}, {"delta", d.reasoning}});
+      }
+      if (!d.content.empty()) {
+        close_reasoning();
+        if (!st->message_open && st->content.empty()) {
+          st->message_open = true;
+          st->message_id = new_id("msg_");
+          st->message_index = static_cast<int>(st->output.size());
+          event("response.output_item.added",
+                {{"output_index", st->message_index},
+                 {"item", {{"type", "message"}, {"id", st->message_id}, {"role", "assistant"}, {"status", "in_progress"}, {"content", json::array()}}}});
+        }
+        st->content += d.content;
+        event("response.output_text.delta",
+              {{"item_id", st->message_id}, {"output_index", st->message_index}, {"content_index", 0}, {"delta", d.content}});
+      }
+      for (const ToolCall& c : d.tool_calls) {
+        close_reasoning();
+        close_message();
+        json item = {{"type", "function_call"}, {"id", new_id("fc_")}, {"call_id", new_id("call_")},
+                     {"name", c.name}, {"arguments", c.arguments}, {"status", "completed"}};
+        const int index = static_cast<int>(st->output.size());
+        event("response.output_item.added", {{"output_index", index}, {"item", item}});
+        st->output.push_back(item);
+        event("response.output_item.done", {{"output_index", index}, {"item", item}});
+      }
+    };
+
+    if (req.stream) {
+      ResponseBuilder(downstream_)
+          .status(200, "OK")
+          .header("Content-Type", "text/event-stream")
+          .header("Cache-Control", "no-cache")
+          .send();
+    }
+    event("response.created", {{"response", response_obj("in_progress")}});
+
+    job.sink.text = [=](const std::string& piece) { deliver(st->parser.push(piece)); };
+    job.sink.error = [=](const std::string& msg) {
+      if (req.stream) {
+        json failed = response_obj("failed");
+        failed["error"] = {{"code", "server_error"}, {"message", msg}};
+        event("response.failed", {{"response", failed}});
+        post(ex, [](proxygen::ResponseHandler* d) { ResponseBuilder(d).sendWithEOM(); });
+      } else {
+        post(ex, [msg](proxygen::ResponseHandler* d) { send_json(d, 500, error_body(msg, "server_error")); });
+      }
+    };
+    job.sink.done = [=](const std::string& finish, int prompt_tokens, int completion_tokens, int cached) {
+      deliver(st->parser.finish());
+      close_reasoning();
+      close_message();
+      json resp = response_obj(finish == "length" ? "incomplete" : "completed");
+      if (finish == "length") resp["incomplete_details"] = {{"reason", "max_output_tokens"}};
+      resp["usage"] = {{"input_tokens", prompt_tokens},
+                       {"input_tokens_details", {{"cached_tokens", cached}}},
+                       {"output_tokens", completion_tokens},
+                       {"output_tokens_details", {{"reasoning_tokens", 0}}},
+                       {"total_tokens", prompt_tokens + completion_tokens}};
+      if (req.stream) {
+        // A response cut at max_output_tokens still ends with response.completed: the agent treats
+        // response.incomplete as a failed turn and discards what was written.
+        event("response.completed", {{"response", resp}});
+        post(ex, [](proxygen::ResponseHandler* d) { ResponseBuilder(d).sendWithEOM(); });
+      } else {
+        post(ex, [resp](proxygen::ResponseHandler* d) { send_json(d, 200, resp); });
+      }
     };
     worker_.submit(std::move(job));
   }

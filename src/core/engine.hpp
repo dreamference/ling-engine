@@ -66,6 +66,8 @@ class Engine {
   void linear_fp4(const Fp4Weight& w, const float* x, int M, float* y);
   void linear_fp8(const Fp8Weight& w, const float* x, int M, float* y);
   void linear_bf16(const Bf16Weight& w, const float* x, int M, float* y);
+  void take_snapshot();
+  void restore_snapshot();
 
   EngineOptions opts_;
   std::unique_ptr<Model> model_;
@@ -88,6 +90,9 @@ class Engine {
   std::vector<float*> gdn_state_, conv_state_;    // per linear layer
   std::vector<int> layer_slot_;                   // layer -> index into the vectors above
   std::vector<int> history_;
+  // DeltaNet and conv state at the end of the last prompt, and that prompt.
+  std::vector<float*> snap_gdn_, snap_conv_;
+  std::vector<int> snapshot_tokens_;
   int pos_ = 0;
 
   std::vector<float> logits_;

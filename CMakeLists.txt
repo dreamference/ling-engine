@@ -65,13 +65,17 @@ target_link_libraries(ling_api PUBLIC ling_core ling_tokenizer)
 
 # ling-serve: the HTTP server (proxygen), built when proxygen is found.
 set(LING_PROXYGEN_PREFIX "$ENV{HOME}/ling-deps/proxygen" CACHE PATH "Where proxygen and its dependencies are installed")
-list(APPEND CMAKE_PREFIX_PATH "${LING_PROXYGEN_PREFIX}")
-file(GLOB _ling_dep_prefixes "${LING_PROXYGEN_PREFIX}/../scratch/installed/*")
+# getdeps installs each project under its own directory of the prefix (folly/, fizz/, proxygen/, ...).
+file(GLOB _ling_dep_prefixes "${LING_PROXYGEN_PREFIX}/*")
 list(APPEND CMAKE_PREFIX_PATH ${_ling_dep_prefixes})
+# proxygen's dependency configs look for Sodium, Zstd and others through fbcode_builder's Find modules.
+set(LING_FBCODE_CMAKE "$ENV{HOME}/ling-deps/src/proxygen/build/fbcode_builder/CMake" CACHE PATH
+    "fbcode_builder's CMake modules (from the proxygen checkout used to build the dependencies)")
+list(APPEND CMAKE_MODULE_PATH "${LING_FBCODE_CMAKE}")
 find_package(proxygen CONFIG QUIET)
 if(proxygen_FOUND)
   add_executable(ling-serve src/serve/main.cpp)
-  target_link_libraries(ling-serve PRIVATE ling_api proxygen::proxygenhttpserver)
+  target_link_libraries(ling-serve PRIVATE ling_api proxygen::proxygenhttpserver Folly::folly_init_init)
 else()
   message(WARNING "proxygen not found under ${LING_PROXYGEN_PREFIX}: ling-serve is not built")
 endif()

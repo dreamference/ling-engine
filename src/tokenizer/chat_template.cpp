@@ -83,8 +83,10 @@ std::string render_chat(const json& messages, const json& tools, const ChatOptio
   std::string reasoning;
   const bool thinking = !opts.enable_thinking.has_value() || *opts.enable_thinking;
   if (thinking) {
-    std::string effort = opts.reasoning_effort.value_or("xhigh");
-    if (effort == "high") effort = "xhigh";
+    // As production serves the template (Mightling's ChatTemplatePatcher): the default is medium, not the
+    // checkpoint's xhigh, max and high mean xhigh, and minimal means low.
+    std::string effort = opts.reasoning_effort.value_or("medium");
+    if (effort == "high" || effort == "max") effort = "xhigh";
     if (effort == "minimal") effort = "low";
     if (effort == "xhigh") {
       reasoning =
@@ -97,7 +99,7 @@ std::string render_chat(const json& messages, const json& tools, const ChatOptio
           "conclusion without unnecessary elaboration.";
     } else if (effort != "medium") {
       throw std::invalid_argument("Unexpected reasoning effort " + effort +
-                                  ". Supported types are xhigh (default), high, medium, low and minimal.");
+                                  ". Supported types are max, xhigh, high, medium (default), low and minimal.");
     }
   }
   const bool has_system = messages[0].value("role", "") == "system";
@@ -153,7 +155,8 @@ std::string render_chat(const json& messages, const json& tools, const ChatOptio
     const std::string role = m.value("role", "");
     const std::string content = trim(render_content(m.contains("content") ? m["content"] : json(), false));
     if (role == "system") {
-      if (i != 0) throw std::invalid_argument("System message must be at the beginning.");
+      // Production's second patch: a later system message becomes a reminder in the conversation.
+      if (i != 0) out += "<|im_start|>user\n<system-reminder>\n" + content + "\n</system-reminder><|im_end|>\n";
     } else if (role == "user") {
       out += "<|im_start|>user\n" + content + "<|im_end|>\n";
     } else if (role == "assistant") {

@@ -30,6 +30,12 @@ struct Request {
 // Throws std::invalid_argument with a message for the client.
 Request parse_request(const json& body, bool chat);
 
+// The Responses API (what Mightling's agent calls), converted to a chat request the way SGLang does:
+// instructions and developer messages become one leading system message, function calls and their
+// outputs become assistant tool calls and tool messages, reasoning items become reasoning_content, and
+// only `function` tools reach the template.
+Request parse_responses_request(const json& body);
+
 struct ToolCall {
   std::string name;
   std::string arguments;  // JSON text
