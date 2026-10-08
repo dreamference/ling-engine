@@ -249,6 +249,8 @@ Build and safety rules:
 - **Rebuild time is dominated by CUTLASS/CuTe instantiations, so every kernel instance is its own translation unit,** compiled for `sm_121` only. A change to one kernel recompiles that file and relinks.
 - **The HTTP layer, the scheduler and the kernels are separate CMake targets,** so a front-end change never recompiles a kernel.
 - **Ninja on all cores, with ccache for both the host compiler and nvcc.** Builds, tests and profiling run on the development GB10, never on the production machine.
+- **Toolchain:** C++20, GCC 13 (Ubuntu 24.04's), nvcc from the CUDA toolkit on the Spark. The HTTP/2 and HTTP/1.1 server is **proxygen**, with folly, fizz and wangle (decided 2026-10-08). It is a large dependency tree, so it is built once with its own `getdeps` and cached on the development machine. The engine links it as a prebuilt.
+- **Debuggable from day one:** a debug build compiles every kernel with `-G` and line info. Every phase of a step (verify, accept, draft, emit, and the HTTP and scheduler work around them) carries an NVTX range, so a single Nsight Systems timeline explains a step. A runtime switch runs a step without its CUDA graph, so one kernel can be stepped through in cuda-gdb and checked with `compute-sanitizer`.
 - **Request parsing (HTTP, JSON, tool calls) uses a mature library and is fuzzed** (libFuzzer) in CI. The test suite also runs under AddressSanitizer and UndefinedBehaviorSanitizer. This is the discipline that stands in for Rust's memory safety at the network edge.
 
 ## 9. Kernel plan: five kernels per layer, all shape-specialized
@@ -356,6 +358,8 @@ Three gates, run on the Spark itself, and a release does not pass unless all thr
 Six milestones, each gated by a measurement on the Spark; M1 is the long pole, because everything after it multiplies the pass time it establishes. Rough effort for one engineer with review, labelled as an estimate: about four months end to end, M1 taking a third of it, M0 two weeks.
 
 ![M1's single-row pass gates every speculation milestone](images/roadmap.svg)
+
+M1 starts as soon as M0's breakdown shows the engine can be meaningfully faster than tuned SGLang, without a separate review (the maintainer's decision, 2026-10-08). All milestone work runs on the development Spark, never on the production machine.
 
 *roadmap · 6 milestones, 6 gates*
 
