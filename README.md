@@ -1,4 +1,4 @@
-# q38-engine
+# ling-engine
 
 **A single-model inference engine for Qwen3.8-27B on the NVIDIA DGX Spark (GB10).** Proposed; nothing is built yet.
 
