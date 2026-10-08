@@ -56,20 +56,20 @@ constexpr int kGemvWarps = 8;
 constexpr int kFp4Tile = 1024;
 constexpr int kFp4Stride = kFp4Tile + kFp4Tile / 32;  // one pad float per 32: no bank conflicts
 
-template <int MT>
+template <int MT, int R>
 __global__ void __launch_bounds__(kGemvWarps * 32)
     gemv_nvfp4_kernel(const float* __restrict__ x, int M, const uint8_t* __restrict__ w,
                       const uint8_t* __restrict__ ws, float scale2, float* __restrict__ y, int N, int K) {
   __shared__ float xs[MT * kFp4Stride];
   __shared__ float lut[16];
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int n = blockIdx.x * kGemvWarps + warp;
+  const int n0 = (blockIdx.x * kGemvWarps + warp) * R;  // this warp's first row; it owns R rows
   if (threadIdx.x < 16) lut[threadIdx.x] = kFp4Values[threadIdx.x];
-  float acc[MT];
+  float acc[R][MT];
 #pragma unroll
-  for (int m = 0; m < MT; ++m) acc[m] = 0.f;
-  const uint8_t* wrow = w + static_cast<size_t>(n) * (K / 2);
-  const uint8_t* srow = ws + static_cast<size_t>(n) * (K / 16);
+  for (int r = 0; r < R; ++r)
+#pragma unroll
+    for (int m = 0; m < MT; ++m) acc[r][m] = 0.f;
 
   for (int t0 = 0; t0 < K; t0 += kFp4Tile) {
     __syncthreads();
@@ -78,13 +78,20 @@ __global__ void __launch_bounds__(kGemvWarps * 32)
       xs[m * kFp4Stride + k + (k >> 5)] = m < M ? x[static_cast<size_t>(m) * K + t0 + k] : 0.f;
     }
     __syncthreads();
-    if (n < N) {
-      const int k0 = t0 + lane * 32;
-      uint4 packed = __ldg(reinterpret_cast<const uint4*>(wrow + k0 / 2));
-      uint16_t sc = __ldg(reinterpret_cast<const uint16_t*>(srow + k0 / 16));
-      const float s0 = fp8_to_float(sc & 0xff), s1 = fp8_to_float(sc >> 8);
-      const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
-      const int base = lane * 33;
+    const int k0 = t0 + lane * 32;
+    uint4 packed[R];
+    uint16_t sc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {  // issue every row's loads before using any of them
+      const int n = min(n0 + r, N - 1);
+      packed[r] = __ldg(reinterpret_cast<const uint4*>(w + static_cast<size_t>(n) * (K / 2) + k0 / 2));
+      sc[r] = __ldg(reinterpret_cast<const uint16_t*>(ws + static_cast<size_t>(n) * (K / 16) + k0 / 16));
+    }
+    const int base = lane * 33;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      const float s0 = fp8_to_float(sc[r] & 0xff), s1 = fp8_to_float(sc[r] >> 8);
+      const uint32_t words[4] = {packed[r].x, packed[r].y, packed[r].z, packed[r].w};
 #pragma unroll
       for (int wd = 0; wd < 4; ++wd) {
         const float s = wd < 2 ? s0 : s1;
@@ -93,33 +100,36 @@ __global__ void __launch_bounds__(kGemvWarps * 32)
           const float wv = lut[(words[wd] >> (4 * b)) & 0xf] * s;
           const int kk = base + wd * 8 + b;
 #pragma unroll
-          for (int m = 0; m < MT; ++m) acc[m] = fmaf(wv, xs[m * kFp4Stride + kk], acc[m]);
+          for (int m = 0; m < MT; ++m) acc[r][m] = fmaf(wv, xs[m * kFp4Stride + kk], acc[r][m]);
         }
       }
     }
   }
 #pragma unroll
-  for (int m = 0; m < MT; ++m) {
-    float v = warp_sum(acc[m]);
-    if (lane == 0 && n < N && m < M) y[static_cast<size_t>(m) * N + n] = v * scale2;
-  }
+  for (int r = 0; r < R; ++r)
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+      float v = warp_sum(acc[r][m]);
+      if (lane == 0 && n0 + r < N && m < M) y[static_cast<size_t>(m) * N + n0 + r] = v * scale2;
+    }
 }
 
 // ---- FP8 weight-streaming GEMV: tiles of 512 values, 16 per lane. ----
 constexpr int kFp8Tile = 512;
 constexpr int kFp8Stride = kFp8Tile + kFp8Tile / 32;
 
-template <int MT>
+template <int MT, int R>
 __global__ void __launch_bounds__(kGemvWarps * 32)
     gemv_fp8_kernel(const float* __restrict__ x, int M, const uint8_t* __restrict__ w, float wscale,
                     float* __restrict__ y, int N, int K) {
   __shared__ float xs[MT * kFp8Stride];
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int n = blockIdx.x * kGemvWarps + warp;
-  float acc[MT];
+  const int n0 = (blockIdx.x * kGemvWarps + warp) * R;
+  float acc[R][MT];
 #pragma unroll
-  for (int m = 0; m < MT; ++m) acc[m] = 0.f;
-  const uint8_t* wrow = w + static_cast<size_t>(n) * K;
+  for (int r = 0; r < R; ++r)
+#pragma unroll
+    for (int m = 0; m < MT; ++m) acc[r][m] = 0.f;
 
   for (int t0 = 0; t0 < K; t0 += kFp8Tile) {
     __syncthreads();
@@ -128,11 +138,17 @@ __global__ void __launch_bounds__(kGemvWarps * 32)
       xs[m * kFp8Stride + k + (k >> 5)] = m < M ? x[static_cast<size_t>(m) * K + t0 + k] : 0.f;
     }
     __syncthreads();
-    if (n < N) {
-      const int k0 = t0 + lane * 16;
-      uint4 packed = __ldg(reinterpret_cast<const uint4*>(wrow + k0));
-      const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
-      const int base = lane * 16 + (lane >> 1);
+    const int k0 = t0 + lane * 16;
+    uint4 packed[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      const int n = min(n0 + r, N - 1);
+      packed[r] = __ldg(reinterpret_cast<const uint4*>(w + static_cast<size_t>(n) * K + k0));
+    }
+    const int base = lane * 16 + (lane >> 1);
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      const uint32_t words[4] = {packed[r].x, packed[r].y, packed[r].z, packed[r].w};
 #pragma unroll
       for (int wd = 0; wd < 4; ++wd) {
 #pragma unroll
@@ -141,18 +157,20 @@ __global__ void __launch_bounds__(kGemvWarps * 32)
           const int kk = base + wd * 4 + h * 2;
 #pragma unroll
           for (int m = 0; m < MT; ++m) {
-            acc[m] = fmaf(f.x, xs[m * kFp8Stride + kk], acc[m]);
-            acc[m] = fmaf(f.y, xs[m * kFp8Stride + kk + 1], acc[m]);
+            acc[r][m] = fmaf(f.x, xs[m * kFp8Stride + kk], acc[r][m]);
+            acc[r][m] = fmaf(f.y, xs[m * kFp8Stride + kk + 1], acc[r][m]);
           }
         }
       }
     }
   }
 #pragma unroll
-  for (int m = 0; m < MT; ++m) {
-    float v = warp_sum(acc[m]);
-    if (lane == 0 && n < N && m < M) y[static_cast<size_t>(m) * N + n] = v * wscale;
-  }
+  for (int r = 0; r < R; ++r)
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+      float v = warp_sum(acc[r][m]);
+      if (lane == 0 && n0 + r < N && m < M) y[static_cast<size_t>(m) * N + n0 + r] = v * wscale;
+    }
 }
 
 __global__ void gemv_bf16_kernel(const float* __restrict__ x, int M, const __nv_bfloat16* __restrict__ w,
@@ -483,25 +501,40 @@ int grid_for(size_t n, int threads) {
 
 }  // namespace
 
+// Rows per warp: with one or two token rows each warp streams 2 weight rows (measured best of 1, 2, 4, 8:
+// 235 GB/s NVFP4 and 263 GB/s FP8 at M = 1, against 262 GB/s for a plain read); more rows need the registers.
+template <int MT, int R>
+void launch_nvfp4(const float* x, int M, const uint8_t* w, const uint8_t* wscale, float scale2, float* y, int N,
+                  int K, cudaStream_t s) {
+  const int rows_per_block = kGemvWarps * R;
+  gemv_nvfp4_kernel<MT, R><<<(N + rows_per_block - 1) / rows_per_block, kGemvWarps * 32, 0, s>>>(x, M, w, wscale,
+                                                                                               scale2, y, N, K);
+}
+
+template <int MT, int R>
+void launch_fp8(const float* x, int M, const uint8_t* w, float wscale, float* y, int N, int K, cudaStream_t s) {
+  const int rows_per_block = kGemvWarps * R;
+  gemv_fp8_kernel<MT, R><<<(N + rows_per_block - 1) / rows_per_block, kGemvWarps * 32, 0, s>>>(x, M, w, wscale, y,
+                                                                                             N, K);
+}
+
 void gemv_nvfp4(const float* x, int M, const uint8_t* w, const uint8_t* wscale, float scale2, float* y, int N,
                 int K, cudaStream_t s) {
   if (K % kFp4Tile != 0) throw std::runtime_error("gemv_nvfp4: K must be a multiple of 1024");
-  dim3 grid((N + kGemvWarps - 1) / kGemvWarps), block(kGemvWarps * 32);
-  if (M <= 1) gemv_nvfp4_kernel<1><<<grid, block, 0, s>>>(x, M, w, wscale, scale2, y, N, K);
-  else if (M <= 2) gemv_nvfp4_kernel<2><<<grid, block, 0, s>>>(x, M, w, wscale, scale2, y, N, K);
-  else if (M <= 4) gemv_nvfp4_kernel<4><<<grid, block, 0, s>>>(x, M, w, wscale, scale2, y, N, K);
-  else if (M <= 8) gemv_nvfp4_kernel<8><<<grid, block, 0, s>>>(x, M, w, wscale, scale2, y, N, K);
+  if (M <= 1) launch_nvfp4<1, 2>(x, M, w, wscale, scale2, y, N, K, s);
+  else if (M <= 2) launch_nvfp4<2, 2>(x, M, w, wscale, scale2, y, N, K, s);
+  else if (M <= 4) launch_nvfp4<4, 2>(x, M, w, wscale, scale2, y, N, K, s);
+  else if (M <= 8) launch_nvfp4<8, 1>(x, M, w, wscale, scale2, y, N, K, s);
   else throw std::runtime_error("gemv_nvfp4: M > 8");
   LING_LAUNCH_CHECK("gemv_nvfp4");
 }
 
 void gemv_fp8(const float* x, int M, const uint8_t* w, float wscale, float* y, int N, int K, cudaStream_t s) {
   if (K % kFp8Tile != 0) throw std::runtime_error("gemv_fp8: K must be a multiple of 512");
-  dim3 grid((N + kGemvWarps - 1) / kGemvWarps), block(kGemvWarps * 32);
-  if (M <= 1) gemv_fp8_kernel<1><<<grid, block, 0, s>>>(x, M, w, wscale, y, N, K);
-  else if (M <= 2) gemv_fp8_kernel<2><<<grid, block, 0, s>>>(x, M, w, wscale, y, N, K);
-  else if (M <= 4) gemv_fp8_kernel<4><<<grid, block, 0, s>>>(x, M, w, wscale, y, N, K);
-  else if (M <= 8) gemv_fp8_kernel<8><<<grid, block, 0, s>>>(x, M, w, wscale, y, N, K);
+  if (M <= 1) launch_fp8<1, 2>(x, M, w, wscale, y, N, K, s);
+  else if (M <= 2) launch_fp8<2, 2>(x, M, w, wscale, y, N, K, s);
+  else if (M <= 4) launch_fp8<4, 2>(x, M, w, wscale, y, N, K, s);
+  else if (M <= 8) launch_fp8<8, 1>(x, M, w, wscale, y, N, K, s);
   else throw std::runtime_error("gemv_fp8: M > 8");
   LING_LAUNCH_CHECK("gemv_fp8");
 }
