@@ -13,14 +13,11 @@ def enc(s): return TOK.encode(s, add_special_tokens=False).ids if s else []
 
 reqs = []          # per request dicts
 sessions = []      # per session (wall, model time)
-global_out = collections.defaultdict(list)   # cross-session 4-gram -> continuation start (session outputs)
-global_seqs = []
-def lookup_sim(out, ctx_index, ctx, n=3, k=16, glob_index=None):
+def lookup_sim(out, ctx_index, ctx, n=3, k=16):
     """Greedy prompt-lookup: per verify step propose up to k tokens following the most recent
     earlier occurrence of the last n tokens (context + generated so far). Returns steps, copied."""
-    seq = ctx  # list, we append outputs as generated
     i = 0; steps = 0; copied = 0; L = len(out)
-    hist = list(seq)
+    hist = list(ctx)
     idx = ctx_index
     while i < L:
         prop = []
@@ -28,9 +25,6 @@ def lookup_sim(out, ctx_index, ctx, n=3, k=16, glob_index=None):
             key = tuple(hist[-n:]); pos = idx.get(key)
             if pos is not None:
                 prop = hist[pos:pos+k]
-        if not prop and glob_index is not None and len(hist) >= 4:
-            g = glob_index.get(tuple(hist[-4:]))
-            if g: s_, p_ = g; prop = global_seqs[s_][p_:p_+k]
         a = 0
         while a < len(prop) and i + a < L and prop[a] == out[i + a]: a += 1
         step = a + 1 if i + a < L else a  # accepted + bonus token
