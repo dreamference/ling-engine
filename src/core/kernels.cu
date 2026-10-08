@@ -280,12 +280,12 @@ constexpr int kGdnDk = 128, kGdnDv = 128;
 
 __global__ void __launch_bounds__(kGdnDv)
     gdn_recurrent_kernel(const float* __restrict__ mixed, const float* __restrict__ g,
-                         const float* __restrict__ beta, float* __restrict__ state, float* __restrict__ out, int M,
-                         int H, int HV) {
+                         const float* __restrict__ beta, const float* state_in, float* state_out,
+                         float* __restrict__ out, int M, int H, int HV) {
   __shared__ float qs[kGdnDk], ks[kGdnDk], red[32];
   const int hv = blockIdx.x, v = threadIdx.x, h = hv / (HV / H);
   const int C = 2 * H * kGdnDk + HV * kGdnDv;
-  float* st = state + static_cast<size_t>(hv) * kGdnDk * kGdnDv;
+  const float* st = state_in + static_cast<size_t>(hv) * kGdnDk * kGdnDv;
   float S[kGdnDk];
 #pragma unroll
   for (int k = 0; k < kGdnDk; ++k) S[k] = st[k * kGdnDv + v];
@@ -317,8 +317,10 @@ __global__ void __launch_bounds__(kGdnDv)
     }
     out[static_cast<size_t>(t) * HV * kGdnDv + hv * kGdnDv + v] = o;
   }
+  if (state_out == nullptr) return;  // a verify: the state is advanced later, over the accepted rows only
+  float* so = state_out + static_cast<size_t>(hv) * kGdnDk * kGdnDv;
 #pragma unroll
-  for (int k = 0; k < kGdnDk; ++k) st[k * kGdnDv + v] = S[k];
+  for (int k = 0; k < kGdnDk; ++k) so[k * kGdnDv + v] = S[k];
 }
 
 __global__ void gated_rmsnorm_kernel(const float* __restrict__ x, const float* __restrict__ z,
@@ -396,7 +398,7 @@ template <int G>
 __global__ void __launch_bounds__(256)
     attention_partial_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                              const __nv_bfloat16* __restrict__ vcache, int pos0, int Hq, int Hkv, int splits,
-                             float* __restrict__ scratch) {
+                             int chunk, float* __restrict__ scratch) {
   constexpr int D = 256;
   __shared__ float wm[8][G], wl[8][G];
   __shared__ float wacc[8][D];
@@ -404,7 +406,7 @@ __global__ void __launch_bounds__(256)
   const int m = mk / Hkv, kvh = mk % Hkv;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int ctx = pos0 + m + 1;
-  const int per = (ctx + splits - 1) / splits;
+  const int per = chunk > 0 ? chunk : (ctx + splits - 1) / splits;  // chunk > 0: fixed key ranges
   const int start = split * per, end = min(ctx, start + per);
   const float scale = rsqrtf(static_cast<float>(D));
   float qv[G][8], acc[G][8], mx[G], l[G];
@@ -725,9 +727,9 @@ void gdn_gating(const float* a, const float* b, const __nv_bfloat16* A_log, cons
   LING_LAUNCH_CHECK("gdn_gating");
 }
 
-void gdn_recurrent(const float* mixed, const float* g, const float* beta, float* state, float* out, int M,
-                   int H, int HV, cudaStream_t s) {
-  gdn_recurrent_kernel<<<HV, kGdnDv, 0, s>>>(mixed, g, beta, state, out, M, H, HV);
+void gdn_recurrent(const float* mixed, const float* g, const float* beta, const float* state_in, float* state_out,
+                   float* out, int M, int H, int HV, cudaStream_t s) {
+  gdn_recurrent_kernel<<<HV, kGdnDv, 0, s>>>(mixed, g, beta, state_in, state_out, out, M, H, HV);
   LING_LAUNCH_CHECK("gdn_recurrent");
 }
 
@@ -745,6 +747,27 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
   attn_prepare_kernel<<<grid, D, D * sizeof(float), s>>>(q_gate, k, v, q_norm, k_norm, pos0, Hq, Hkv, D, rot,
                                                          theta, eps, q, gate, kcache, vcache);
   LING_LAUNCH_CHECK("attn_prepare");
+}
+
+// Rows path (M <= 32: decode and verify): key ranges of a fixed size at fixed positions, so a query's
+// partial sums, and their combination, do not depend on how many other rows are in the call.
+constexpr int kAttnRowsChunk = 1024;
+
+int attention_rows_splits(int ctx) { return (ctx + kAttnRowsChunk - 1) / kAttnRowsChunk; }
+
+size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx) {
+  return static_cast<size_t>(M) * Hq * attention_rows_splits(ctx) * (D + 2);
+}
+
+void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, int pos0, int M, int Hq,
+                    int Hkv, int D, float* scratch, float* out, cudaStream_t s) {
+  if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
+  const int splits = attention_rows_splits(pos0 + M);
+  attention_partial_kernel<6><<<dim3(M * Hkv, splits), 256, 0, s>>>(q, kcache, vcache, pos0, Hq, Hkv, splits,
+                                                                   kAttnRowsChunk, scratch);
+  LING_LAUNCH_CHECK("attention_rows");
+  attention_combine_kernel<<<M * Hq, D, 0, s>>>(scratch, splits, D, out);
+  LING_LAUNCH_CHECK("attention_rows_combine");
 }
 
 size_t attention_scratch_floats(int M, int Hq, int Hkv, int D, int ctx) {
@@ -769,7 +792,7 @@ void attention(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16*
     return;
   }
   const int splits = attention_splits(M * Hkv, pos0 + M);
-  attention_partial_kernel<6><<<dim3(M * Hkv, splits), 256, 0, s>>>(q, kcache, vcache, pos0, Hq, Hkv, splits,
+  attention_partial_kernel<6><<<dim3(M * Hkv, splits), 256, 0, s>>>(q, kcache, vcache, pos0, Hq, Hkv, splits, 0,
                                                                    scratch);
   LING_LAUNCH_CHECK("attention_partial");
   attention_combine_kernel<<<M * Hq, D, 0, s>>>(scratch, splits, D, out);

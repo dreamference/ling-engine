@@ -37,11 +37,17 @@ MappedFile::~MappedFile() {
 }
 
 Checkpoint::Checkpoint(const std::string& dir) : dir_(dir) {
-  std::ifstream index_file(dir + "/model.safetensors.index.json");
-  if (!index_file) throw std::runtime_error("no model.safetensors.index.json in " + dir);
-  nlohmann::json index = nlohmann::json::parse(index_file);
+  // A sharded checkpoint has an index; a small one (the drafter) is a single model.safetensors.
   std::set<std::string> shards;
-  for (auto& [name, shard] : index["weight_map"].items()) shards.insert(shard.get<std::string>());
+  std::ifstream index_file(dir + "/model.safetensors.index.json");
+  if (index_file) {
+    nlohmann::json index = nlohmann::json::parse(index_file);
+    for (auto& [name, shard] : index["weight_map"].items()) shards.insert(shard.get<std::string>());
+  } else if (std::ifstream(dir + "/model.safetensors")) {
+    shards.insert("model.safetensors");
+  } else {
+    throw std::runtime_error("no model.safetensors.index.json or model.safetensors in " + dir);
+  }
 
   for (const std::string& shard : shards) {
     auto file = std::make_unique<MappedFile>(dir + "/" + shard);

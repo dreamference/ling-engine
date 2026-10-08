@@ -9,7 +9,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_ARCHITECTURES 121)
+# sm_121a, not sm_121: the FP4 conversions and block-scaled MMAs are arch-specific (reports/M0.md §2).
+set(CMAKE_CUDA_ARCHITECTURES 121a)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -37,6 +38,11 @@ find_package(ICU REQUIRED COMPONENTS uc)
 add_library(ling_core STATIC
   src/core/safetensors.cpp
   src/core/kernels.cu
+  src/core/stream_gemm.cu
+  src/core/topk.cu
+  src/core/draft_kernels.cu
+  src/core/drafter.cpp
+  src/core/speculate.cpp
   src/core/model.cu
   src/core/engine.cpp
 )
@@ -84,6 +90,9 @@ enable_testing()
 add_executable(ling-kernel-tests tests/kernel_tests.cu)
 target_link_libraries(ling-kernel-tests PRIVATE ling_core)
 add_test(NAME kernels COMMAND ling-kernel-tests)
+add_executable(ling-stream-tests tests/stream_tests.cu)
+target_link_libraries(ling-stream-tests PRIVATE ling_core)
+add_test(NAME stream COMMAND ling-stream-tests)
 add_executable(ling-api-tests tests/api_tests.cpp)
 target_link_libraries(ling-api-tests PRIVATE ling_api)
 add_test(NAME api COMMAND ling-api-tests)
