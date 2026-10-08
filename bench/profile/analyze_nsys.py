@@ -113,9 +113,14 @@ def main():
         return (best[2] if best else ("step-other" if step else None)), step
 
     kern = []
-    for s, e, corr, nid in c.execute(
-            "select start, end, correlationId, demangledName from CUPTI_ACTIVITY_KIND_KERNEL"):
-        kern.append((s, e, corr, strings.get(nid, str(nid))))
+    for s, e, corr, nid, gx, gy, gz in c.execute(
+            "select start, end, correlationId, demangledName, gridX, gridY, gridZ from CUPTI_ACTIVITY_KIND_KERNEL"):
+        name = strings.get(nid, str(nid))
+        # Element types make CUTLASS instances legible (e2m1 = NVFP4, e4m3 = FP8); the grid
+        # separates instances of one template that serve different matrices.
+        types = sorted(set(re.findall(r"float_e[245]m[0-9]_t|float_ue4m3_t|float_ue8m0_t", name)))
+        tag = f" [{','.join(types)}]" if types and "cutlass" in name else ""
+        kern.append((s, e, corr, f"{name[:70]}{tag} grid={gx}x{gy}x{gz}"))
     mem = []
     if "CUPTI_ACTIVITY_KIND_MEMCPY" in tables:
         for s, e, corr, kind in c.execute(
@@ -196,10 +201,10 @@ def main():
         for k in keys:
             for x in steps[k]:
                 if x[2] == ph:
-                    tk[x[3][:110]] += x[1] - x[0]
-                    cnt[x[3][:110]] += 1
+                    tk[x[3]] += x[1] - x[0]
+                    cnt[x[3]] += 1
         print(f"top kernels in {ph} (mean ms/step, launches/step):")
-        for name, v in tk.most_common(12):
+        for name, v in tk.most_common(16):
             print(f"  {ms(v / len(rows)):7.3f} {cnt[name] / len(rows):6.1f}  {name}")
     if a.json:
         json.dump(out, open(a.json, "w"), indent=1)

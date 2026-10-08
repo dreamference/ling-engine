@@ -58,6 +58,23 @@ def summarize(ms):
     out["warm_out_mean"] = st.mean([m["completion_tokens"] for m in warm]) if warm else None
     out["warm_prompt_mean"] = st.mean([m["prompt_tokens"] for m in warm]) if warm else None
     out["accept_histogram"] = [hist[i] for i in range(max(hist) + 1)] if hist else []
+    # Aggregate decode throughput over all requests (warm and cold): decoded tokens over the
+    # union of the intervals in which at least one request was decoding. With several streams
+    # this is the "tokens/s for N agents at once" number, free of prefill and idle time.
+    iv = sorted((m["prefill_finished_time"], m["request_finished_ts"]) for m in ms
+                if m.get("completion_tokens", 0) > 1)
+    union = 0.0
+    if iv:
+        cs, ce = iv[0]
+        for a, b in iv[1:]:
+            if a > ce:
+                union += ce - cs
+                cs, ce = a, b
+            else:
+                ce = max(ce, b)
+        union += ce - cs
+    out["aggregate_decode_tps"] = (sum(m["completion_tokens"] - 1 for m in ms if m.get("completion_tokens", 0) > 1)
+                                   / union) if union else None
     return out
 
 
