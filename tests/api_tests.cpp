@@ -69,7 +69,7 @@ int main() {
        "arguments":"{\"command\": [\"ls\"]}"}}]},{"role":"tool","tool_call_id":"c1","content":"a.txt"}])");
     ling::ChatOptions o;
     std::string out = ling::render_chat(messages, tools, o);
-    EXPECT(out.find("<|im_start|>system\nReasoning effort is set to xhigh.") == 0);
+    EXPECT(out.find("<|im_start|>system\n# Tools\n\n") == 0);  // medium effort: no reasoning instructions
     EXPECT(out.find("\n\nBe brief.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n") != std::string::npos);
     EXPECT(out.find("<tool_call>\n<function=shell>\n<parameter=command>\n[\"ls\"]\n</parameter>\n</function>\n</tool_call><|im_end|>\n") !=
            std::string::npos);

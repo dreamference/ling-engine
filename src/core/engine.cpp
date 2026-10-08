@@ -87,6 +87,8 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
       layer_slot_[i] = static_cast<int>(gdn_state_.size());
       gdn_state_.push_back(alloc<float>(size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim));
       conv_state_.push_back(alloc<float>(size_t(C) * (c.conv_kernel - 1)));
+      snap_gdn_.push_back(alloc<float>(size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim));
+      snap_conv_.push_back(alloc<float>(size_t(C) * (c.conv_kernel - 1)));
     }
   }
   logits_.resize(c.vocab);
@@ -113,6 +115,31 @@ void Engine::reset() {
   check(cudaStreamSynchronize(stream_), "reset");
   history_.clear();
   pos_ = 0;
+}
+
+void Engine::take_snapshot() {
+  const ModelConfig& c = model_->config();
+  const size_t gdn_bytes = size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim * sizeof(float);
+  const size_t conv_bytes = size_t(c.lin_conv_channels()) * (c.conv_kernel - 1) * sizeof(float);
+  for (size_t i = 0; i < gdn_state_.size(); ++i) {
+    check(cudaMemcpyAsync(snap_gdn_[i], gdn_state_[i], gdn_bytes, cudaMemcpyDeviceToDevice, stream_), "snapshot");
+    check(cudaMemcpyAsync(snap_conv_[i], conv_state_[i], conv_bytes, cudaMemcpyDeviceToDevice, stream_), "snapshot");
+  }
+  check(cudaStreamSynchronize(stream_), "snapshot");
+  snapshot_tokens_ = history_;
+}
+
+void Engine::restore_snapshot() {
+  const ModelConfig& c = model_->config();
+  const size_t gdn_bytes = size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim * sizeof(float);
+  const size_t conv_bytes = size_t(c.lin_conv_channels()) * (c.conv_kernel - 1) * sizeof(float);
+  for (size_t i = 0; i < gdn_state_.size(); ++i) {
+    check(cudaMemcpyAsync(gdn_state_[i], snap_gdn_[i], gdn_bytes, cudaMemcpyDeviceToDevice, stream_), "restore");
+    check(cudaMemcpyAsync(conv_state_[i], snap_conv_[i], conv_bytes, cudaMemcpyDeviceToDevice, stream_), "restore");
+  }
+  check(cudaStreamSynchronize(stream_), "restore");
+  history_ = snapshot_tokens_;
+  pos_ = static_cast<int>(history_.size());
 }
 
 void Engine::linear_fp4(const Fp4Weight& w, const float* x, int M, float* y) {
@@ -227,11 +254,23 @@ const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, Engine
   if (prompt.empty()) throw std::runtime_error("empty prompt");
   auto t0 = std::chrono::steady_clock::now();
   size_t reuse = 0;
-  // Reuse only a state that exactly matches history_ (a failed request can leave it half-advanced).
-  if (pos_ == static_cast<int>(history_.size()) && history_.size() < prompt.size() &&
-      std::equal(history_.begin(), history_.end(), prompt.begin())) {
+  auto extends = [&](const std::vector<int>& prefix) {
+    return !prefix.empty() && prefix.size() < prompt.size() && std::equal(prefix.begin(), prefix.end(), prompt.begin());
+  };
+  // Two states can be resumed: the current one (when the prompt extends everything processed so far)
+  // and the snapshot taken at the end of the previous prompt. An agent's next turn re-renders the
+  // model's output, so it rarely extends the current state, but it always extends the previous prompt.
+  // The current state counts only if it exactly matches history_ (a failed request can leave it
+  // half-advanced). Full-attention KV beyond the resumed position is simply overwritten.
+  const bool current_ok = pos_ == static_cast<int>(history_.size()) && extends(history_);
+  const bool snapshot_ok = extends(snapshot_tokens_);
+  if (current_ok && (!snapshot_ok || history_.size() >= snapshot_tokens_.size())) {
     reuse = history_.size();
+  } else if (snapshot_ok) {
+    restore_snapshot();
+    reuse = snapshot_tokens_.size();
   } else {
+    snapshot_tokens_.clear();  // the prefill below overwrites the KV cache the snapshot relies on
     reset();
   }
   for (size_t i = reuse; i < prompt.size();) {
@@ -240,6 +279,7 @@ const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, Engine
     i += n;
   }
   history_ = prompt;
+  take_snapshot();
   if (stats) {
     stats->reused_tokens = static_cast<int>(reuse);
     stats->prefill_tokens = static_cast<int>(prompt.size() - reuse);

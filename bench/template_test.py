@@ -34,9 +34,29 @@ CONVS = [
          {"id": "2", "type": "function", "function": {"name": "apply_patch", "arguments": {"input": "*** Begin Patch\n*** End Patch"}}}]},
      {"role": "tool", "tool_call_id": "1", "content": "/w"}, {"role": "tool", "tool_call_id": "2", "content": "ok"}],
     [{"role": "user", "content": [{"type": "text", "text": "part one, "}, {"type": "text", "text": "part two"}]}],
+    [{"role": "system", "content": "first"}, {"role": "user", "content": "q"}, {"role": "system", "content": "later"},
+     {"role": "user", "content": "q2"}],
 ]
-KWARGS = [{}, {"enable_thinking": False}, {"reasoning_effort": "low"}, {"reasoning_effort": "medium"},
-          {"preserve_thinking": False}]
+PATCHES = [
+    ("    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}\n"
+     "    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}",
+     "    {%- set resolved_reasoning_effort = reasoning_effort|default('medium') %}\n"
+     "    {%- if resolved_reasoning_effort in ('max', 'high') %}\n"
+     "        {%- set resolved_reasoning_effort = 'xhigh' %}\n"
+     "    {%- elif resolved_reasoning_effort == 'minimal' %}\n"
+     "        {%- set resolved_reasoning_effort = 'low' %}\n"
+     "    {%- endif %}\n"
+     "    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}"),
+    ("        {%- if not loop.first %}\n"
+     "            {{- raise_exception('System message must be at the beginning.') }}\n"
+     "        {%- endif %}",
+     "        {%- if not loop.first %}\n"
+     "            {{- '<|im_start|>user\\n<system-reminder>\\n' + content + "
+     "'\\n</system-reminder><|im_end|>\\n' }}\n"
+     "        {%- endif %}"),
+]
+KWARGS = [{}, {"enable_thinking": False}, {"reasoning_effort": "low"}, {"reasoning_effort": "xhigh"},
+          {"reasoning_effort": "high"}, {"reasoning_effort": "minimal"}, {"preserve_thinking": False}]
 
 
 def main():
@@ -45,6 +65,11 @@ def main():
     ap.add_argument("--model", required=True)
     args = ap.parse_args()
     tok = AutoTokenizer.from_pretrained(args.model)
+    # The two patches production applies to the template (Mightling's model registry,
+    # chat_template_patches), which the C++ template reproduces.
+    for old, new in PATCHES:
+        assert tok.chat_template.count(old) == 1, old
+        tok.chat_template = tok.chat_template.replace(old, new)
     cases = []
     for conv in CONVS:
         for tools in (None, TOOLS):
