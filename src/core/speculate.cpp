@@ -23,6 +23,8 @@
 
 #include "core/engine.hpp"
 #include "core/kernels.cuh"
+#include "core/accept.hpp"
+#include "core/lookup.hpp"
 
 namespace ling {
 namespace {
@@ -37,7 +39,7 @@ double seconds_since(std::chrono::steady_clock::time_point t) {
 
 // The target's sampling distribution for one row from its top-K logits (sorted, descending): the chain
 // of Engine::sample (temperature, top-k, top-p, min-p), as (token, probability) pairs.
-std::vector<std::pair<int, double>> target_dist(const float* vals, const int* ids, int K, const SamplingParams& p) {
+Dist target_dist(const float* vals, const int* ids, int K, const SamplingParams& p) {
   const int k = (p.top_k > 0 && p.top_k < K) ? p.top_k : K;
   std::vector<double> probs(k);
   double sum = 0;
@@ -62,15 +64,9 @@ std::vector<std::pair<int, double>> target_dist(const float* vals, const int* id
   }
   double kept = 0;
   for (int i = 0; i < keep; ++i) kept += probs[i];
-  std::vector<std::pair<int, double>> d(keep);
+  Dist d(keep);
   for (int i = 0; i < keep; ++i) d[i] = {ids[i], probs[i] / kept};
   return d;
-}
-
-double prob_of(const std::vector<std::pair<int, double>>& d, int token) {
-  for (const auto& [t, pr] : d)
-    if (t == token) return pr;
-  return 0.0;
 }
 
 }  // namespace
@@ -230,16 +226,33 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p) {
     step(anchor);
     return {sample(logits_, p, history_)};
   }
-  const int E = B - 1, K16 = draft_->config().selector_top_k;
+  const int K16 = draft_->config().selector_top_k;
+  int E = B - 1;
   if (p.seed != 0) rng_.seed(p.seed + history_.size());
   std::uniform_real_distribution<double> uni(0.0, 1.0);
+  auto t0 = std::chrono::steady_clock::now();
+
+  // 0. The context lookup: verified instead of the drafter's chain on a long verbatim match (auto), or
+  // only recorded and scored later (shadow).
+  LookupProposal lp;
+  if (opts_.lookup_mode > 0) {
+    std::vector<int> seq(history_);
+    seq.push_back(anchor);
+    lp = lookup_propose(seq, E);
+  }
+  const bool use_lookup = opts_.lookup_mode == 2 && !lp.tokens.empty() && lp.match >= opts_.lookup_min_match;
+  std::vector<int> rows(1, anchor);
+  std::vector<std::vector<double>> q;
+  if (use_lookup) {
+    rows.insert(rows.end(), lp.tokens.begin(), lp.tokens.end());
+    E = static_cast<int>(lp.tokens.size());
+  }
 
   // 1. Draft, and walk the selector's lattice (SGLang's sample_path).
-  auto t0 = std::chrono::steady_clock::now();
+  if (!use_lookup) {
   draft_propose(anchor, B);
-  std::vector<int> rows(B);
-  rows[0] = anchor;
-  std::vector<std::vector<double>> q(E, std::vector<double>(K16, 0.0));
+  rows.resize(B);
+  q.assign(E, std::vector<double>(K16, 0.0));
   int prev = 0;
   for (int e = 0; e < E; ++e) {
     const float* s = scores_host_.data() + (size_t(e) * K16 + (e == 0 ? 0 : prev)) * K16;
@@ -269,70 +282,44 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p) {
     rows[e + 1] = cand_host_[size_t(e) * K16 + pick];
     prev = pick;
   }
+  }
+  const int V = E + 1;  // rows verified
   auto t1 = std::chrono::steady_clock::now();
   spec_stats_.draft_seconds += std::chrono::duration<double>(t1 - t0).count();
 
   // 2. Verify.
-  forward(rows.data(), B, Pass::Verify);
+  forward(rows.data(), V, Pass::Verify);
 
   // 3. Accept.
   int accepted = 0, next = 0;
   if (greedy) {
-    std::vector<float> vals(B);
-    std::vector<int> am(B);
-    kernels::topk_rows(logits_dev_, B, c.vocab, 1, topk_scratch_, vals_dev_, ids_out_dev_, stream_);
-    check(cudaMemcpyAsync(am.data(), ids_out_dev_, B * sizeof(int), cudaMemcpyDeviceToHost, stream_), "argmax");
+    std::vector<int> am(V);
+    kernels::topk_rows(logits_dev_, V, c.vocab, 1, topk_scratch_, vals_dev_, ids_out_dev_, stream_);
+    check(cudaMemcpyAsync(am.data(), ids_out_dev_, V * sizeof(int), cudaMemcpyDeviceToHost, stream_), "argmax");
     check(cudaStreamSynchronize(stream_), "verify");
     while (accepted < E && rows[accepted + 1] == am[accepted]) ++accepted;
     next = am[accepted];
   } else {
     const int K = p.top_k;
-    std::vector<float> vals(size_t(B) * K);
-    std::vector<int> ids(size_t(B) * K);
-    kernels::topk_rows(logits_dev_, B, c.vocab, K, topk_scratch_, vals_dev_, ids_out_dev_, stream_);
+    std::vector<float> vals(size_t(V) * K);
+    std::vector<int> ids(size_t(V) * K);
+    kernels::topk_rows(logits_dev_, V, c.vocab, K, topk_scratch_, vals_dev_, ids_out_dev_, stream_);
     check(cudaMemcpyAsync(vals.data(), vals_dev_, vals.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_), "topk");
     check(cudaMemcpyAsync(ids.data(), ids_out_dev_, ids.size() * sizeof(int), cudaMemcpyDeviceToHost, stream_), "topk");
     check(cudaStreamSynchronize(stream_), "verify");
-    auto draw = [&](const std::vector<std::pair<int, double>>& d) {
-      const double u = uni(rng_);
-      double cum = 0;
-      for (const auto& [t, pr] : d) {
-        cum += pr;
-        if (u < cum) return t;
-      }
-      return d.back().first;
-    };
     auto q_of = [&](int e, int token) {  // the draft's probability of `token` at drafted position e
+      if (use_lookup) return token == rows[e + 1] ? 1.0 : 0.0;  // a deterministic proposal
       double qt = 0;
       const int* cand = cand_host_.data() + size_t(e) * K16;
       for (int k = 0; k < K16; ++k)
         if (cand[k] == token) qt += q[e][k];
       return qt;
     };
-    bool rejected = false;
-    for (int i = 1; i <= E && !rejected; ++i) {  // row i - 1's logits judge draft i
-      const auto P = target_dist(vals.data() + size_t(i - 1) * K, ids.data() + size_t(i - 1) * K, K, p);
-      const int tok = rows[i];
-      const double qd = q_of(i - 1, tok), pd = prob_of(P, tok);
-      if (uni(rng_) * qd < pd) {  // accept with probability min(1, p / q)
-        ++accepted;
-        continue;
-      }
-      // Rejected: draw from the residual max(0, p - q), normalized.
-      std::vector<std::pair<int, double>> R;
-      double total = 0;
-      for (const auto& [t, pr] : P) {
-        const double r = std::max(0.0, pr - q_of(i - 1, t));
-        if (r > 0) {
-          R.push_back({t, r});
-          total += r;
-        }
-      }
-      for (auto& [t, r] : R) r /= total;
-      next = total > 0 ? draw(R) : draw(P);
-      rejected = true;
-    }
-    if (!rejected) next = draw(target_dist(vals.data() + size_t(E) * K, ids.data() + size_t(E) * K, K, p));
+    std::vector<Dist> P(V);
+    for (int i = 0; i < V; ++i) P[i] = target_dist(vals.data() + size_t(i) * K, ids.data() + size_t(i) * K, K, p);
+    const auto [acc, tok] = accept_sampled(P, std::vector<int>(rows.begin() + 1, rows.end()), q_of, rng_);
+    accepted = acc;
+    next = tok;
   }
   auto t2 = std::chrono::steady_clock::now();
   spec_stats_.verify_seconds += std::chrono::duration<double>(t2 - t1).count();
@@ -349,10 +336,45 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p) {
   spec_stats_.drafted += E;
   spec_stats_.accepted += accepted;
   spec_stats_.accept_hist[accepted] += 1;
+  if (use_lookup) {
+    spec_stats_.lookup_steps += 1;
+    spec_stats_.lookup_accepted += accepted;
+  } else if (opts_.lookup_mode == 1 && !lp.tokens.empty()) {
+    const int bucket = lp.match >= 32 ? 4 : lp.match >= 16 ? 3 : lp.match >= 8 ? 2 : lp.match >= 4 ? 1 : 0;
+    shadow_.push_back({pos_ - n, std::move(lp.tokens), lp.match, accepted, bucket});
+  }
+  if (!use_lookup && opts_.lookup_mode == 1) {
+    spec_stats_.shadow_total_steps += 1;
+    spec_stats_.shadow_dflash_all += accepted;
+    if (shadow_.empty() || shadow_.back().pos != pos_ - n) spec_stats_.shadow_best += accepted;  // no proposal
+  }
+  score_shadow(false);
 
   std::vector<int> out(rows.begin() + 1, rows.begin() + n);
   out.push_back(next);
   return out;
+}
+
+void Engine::score_shadow(bool all) {
+  // A record is scored once the tokens after its anchor are known (or, with `all`, as far as they are):
+  // the proposal would have had accepted its leading tokens that equal what was generated.
+  const int L = static_cast<int>(history_.size());
+  size_t keep = 0;
+  for (size_t i = 0; i < shadow_.size(); ++i) {
+    ShadowRecord& r = shadow_[i];
+    const int need = r.pos + 1 + static_cast<int>(r.tokens.size());
+    if (need > L && !all) {
+      shadow_[keep++] = std::move(r);
+      continue;
+    }
+    int k = 0;
+    while (k < static_cast<int>(r.tokens.size()) && r.pos + 1 + k < L && history_[r.pos + 1 + k] == r.tokens[k]) ++k;
+    spec_stats_.shadow_steps[r.bucket] += 1;
+    spec_stats_.shadow_lookup[r.bucket] += k;
+    spec_stats_.shadow_dflash[r.bucket] += r.dflash_accepted;
+    spec_stats_.shadow_best += std::max(k, r.dflash_accepted);
+  }
+  shadow_.resize(keep);
 }
 
 }  // namespace ling

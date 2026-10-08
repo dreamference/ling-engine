@@ -43,6 +43,8 @@ add_library(ling_core STATIC
   src/core/draft_kernels.cu
   src/core/drafter.cpp
   src/core/speculate.cpp
+  src/core/lookup.cpp
+  src/core/accept.cpp
   src/core/model.cu
   src/core/engine.cpp
 )
@@ -93,6 +95,9 @@ add_test(NAME kernels COMMAND ling-kernel-tests)
 add_executable(ling-stream-tests tests/stream_tests.cu)
 target_link_libraries(ling-stream-tests PRIVATE ling_core)
 add_test(NAME stream COMMAND ling-stream-tests)
+add_executable(ling-spec-tests tests/spec_tests.cpp)
+target_link_libraries(ling-spec-tests PRIVATE ling_core)
+add_test(NAME spec COMMAND ling-spec-tests)
 add_executable(ling-api-tests tests/api_tests.cpp)
 target_link_libraries(ling-api-tests PRIVATE ling_api)
 add_test(NAME api COMMAND ling-api-tests)

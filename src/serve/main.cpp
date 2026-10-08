@@ -2,6 +2,10 @@
 // time; the HTTP threads parse requests and stream server-sent events back.
 //
 //   ling-serve --model DIR [--host 0.0.0.0] [--port 8000] [--served-model-name NAME] [--max-context N]
+//              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]]
+//
+// With --draft, requests decode speculatively with the DFlash2 drafter (requests that set penalties
+// decode plainly). GET /metrics exports SGLang's counter names, so M0's replay harness reads them as is.
 #include <folly/SocketAddress.h>
 #include <folly/init/Init.h>
 #include <folly/io/IOBufQueue.h>
@@ -34,11 +38,60 @@ namespace {
 using proxygen::HTTPMessage;
 using proxygen::ResponseBuilder;
 
+// Prometheus counters under SGLang's names (the ones bench/replay/replay.py reads).
+struct Metrics {
+  std::mutex mu;
+  double prompt_tokens = 0, cached_tokens = 0, generation_tokens = 0, verify_calls = 0;
+  double e2e_sum = 0, e2e_count = 0, ttft_sum = 0, ttft_count = 0;
+  double accepted_drafts = 0, drafted = 0;
+  SpecStats spec;  // the engine's speculation counters after the last request
+
+  json spec_json() {
+    std::lock_guard<std::mutex> l(mu);
+    json j = {{"steps", spec.steps}, {"drafted", spec.drafted}, {"accepted", spec.accepted},
+              {"accept_histogram", spec.accept_hist}, {"draft_seconds", spec.draft_seconds},
+              {"verify_seconds", spec.verify_seconds}, {"commit_seconds", spec.commit_seconds},
+              {"lookup_steps", spec.lookup_steps}, {"lookup_accepted", spec.lookup_accepted},
+              {"shadow_total_steps", spec.shadow_total_steps}, {"shadow_dflash_all", spec.shadow_dflash_all},
+              {"shadow_best", spec.shadow_best}};
+    for (int b = 0; b < 5; ++b) {
+      j["shadow_steps"].push_back(spec.shadow_steps[b]);
+      j["shadow_lookup"].push_back(spec.shadow_lookup[b]);
+      j["shadow_dflash"].push_back(spec.shadow_dflash[b]);
+    }
+    return j;
+  }
+
+  std::string render(const std::string& model) {
+    std::lock_guard<std::mutex> l(mu);
+    const std::string lab = "{model_name=\"" + model + "\"}";
+    std::string out;
+    auto counter = [&](const char* name, double v, const char* help) {
+      out += std::string("# HELP ") + name + " " + help + "\n# TYPE " + name + " counter\n";
+      char buf[64];
+      std::snprintf(buf, sizeof buf, "%.6f", v);
+      out += std::string(name) + lab + " " + buf + "\n";
+    };
+    counter("sglang:prompt_tokens_total", prompt_tokens, "Prompt tokens.");
+    counter("sglang:cached_tokens_total", cached_tokens, "Prompt tokens served from the cache.");
+    counter("sglang:generation_tokens_total", generation_tokens, "Generated tokens.");
+    counter("sglang:spec_verify_calls_total", verify_calls, "Decode passes (speculative verify steps, or plain steps).");
+    counter("sglang:e2e_request_latency_seconds_sum", e2e_sum, "Request latency, sum.");
+    counter("sglang:e2e_request_latency_seconds_count", e2e_count, "Requests.");
+    counter("sglang:time_to_first_token_seconds_sum", ttft_sum, "Time to first token, sum.");
+    counter("sglang:time_to_first_token_seconds_count", ttft_count, "Time to first token, count.");
+    counter("ling:spec_drafted_tokens_total", drafted, "Drafted tokens offered to the verify.");
+    counter("ling:spec_accepted_tokens_total", accepted_drafts, "Drafted tokens accepted.");
+    return out;
+  }
+};
+
 struct ServerContext {
   Engine* engine = nullptr;
   Tokenizer* tok = nullptr;
   std::string model_name;
   int im_end = -1;
+  Metrics metrics;
 };
 
 // What a job reports back, called on the engine thread.
@@ -49,6 +102,7 @@ struct JobSink {
 };
 
 struct Job {
+  std::chrono::steady_clock::time_point received = std::chrono::steady_clock::now();
   Request req;
   std::vector<int> prompt;
   JobSink sink;
@@ -100,51 +154,100 @@ class Worker {
     const int limit = job.req.max_tokens > 0 ? std::min(job.req.max_tokens, ctx_left) : ctx_left;
     EngineStats stats;
     std::vector<float> logits = eng.prefill(job.prompt, &stats);
+    const bool spec = eng.can_speculate(job.req.sampling);
+    const long steps0 = eng.spec_stats().steps, drafted0 = eng.spec_stats().drafted, accepted0 = eng.spec_stats().accepted;
     const auto t_decode = std::chrono::steady_clock::now();
     StreamDecoder dec(*ctx_.tok);
     std::string all;
     size_t emitted = 0, max_stop = 0;
     for (const auto& s : job.req.stop) max_stop = std::max(max_stop, s.size());
     std::string finish = "length";
-    int produced = 0;
-    for (; produced < limit;) {
-      if (job.cancelled->load()) {
-        finish = "cancelled";
-        break;
+    int produced = 0, passes = 0;
+    bool ended_by_eos = false;
+    double ttft = -1;
+    // `pending` holds chosen tokens not yet emitted: the first from the prefill's logits, then a
+    // speculative step's accepted drafts and its next token, or a plain step's sample.
+    std::vector<int> pending = {eng.sample(logits, job.req.sampling, eng.history())};
+    bool done = false;
+    while (!done) {
+      for (int t : pending) {
+        if (ttft < 0) ttft = std::chrono::duration<double>(std::chrono::steady_clock::now() - job.received).count();
+        if (job.cancelled->load()) {
+          finish = "cancelled";
+          done = true;
+          break;
+        }
+        if (t == eng.config().eos_token || t == ctx_.im_end) {
+          finish = "stop";
+          ended_by_eos = true;
+          done = true;
+          break;
+        }
+        ++produced;
+        all += dec.push(t);
+        size_t stop_at = std::string::npos;
+        for (const auto& s : job.req.stop) {
+          size_t p = all.find(s, emitted > s.size() ? emitted - s.size() : 0);
+          if (p != std::string::npos) stop_at = std::min(stop_at, p);
+        }
+        if (stop_at != std::string::npos) {
+          if (stop_at > emitted) job.sink.text(all.substr(emitted, stop_at - emitted));
+          emitted = all.size();
+          finish = "stop";
+          done = true;
+          break;
+        }
+        const size_t safe = max_stop > 0 && all.size() >= max_stop - 1 ? all.size() - (max_stop - 1) : (max_stop ? 0 : all.size());
+        if (safe > emitted) {
+          job.sink.text(all.substr(emitted, safe - emitted));
+          emitted = safe;
+        }
+        if (produced >= limit) {
+          done = true;
+          break;
+        }
       }
-      const int t = eng.sample(logits, job.req.sampling, eng.history());
-      if (t == eng.config().eos_token || t == ctx_.im_end) {
-        finish = "stop";
-        break;
+      if (done) break;
+      ++passes;
+      if (spec) {
+        pending = eng.speculate(pending.back(), job.req.sampling);
+      } else {
+        logits = eng.step(pending.back());
+        pending = {eng.sample(logits, job.req.sampling, eng.history())};
       }
-      ++produced;
-      all += dec.push(t);
-      size_t stop_at = std::string::npos;
-      for (const auto& s : job.req.stop) {
-        size_t p = all.find(s, emitted > s.size() ? emitted - s.size() : 0);
-        if (p != std::string::npos) stop_at = std::min(stop_at, p);
-      }
-      if (stop_at != std::string::npos) {
-        if (stop_at > emitted) job.sink.text(all.substr(emitted, stop_at - emitted));
-        emitted = all.size();
-        finish = "stop";
-        break;
-      }
-      const size_t safe = max_stop > 0 && all.size() >= max_stop - 1 ? all.size() - (max_stop - 1) : (max_stop ? 0 : all.size());
-      if (safe > emitted) {
-        job.sink.text(all.substr(emitted, safe - emitted));
-        emitted = safe;
-      }
-      if (produced < limit) logits = eng.step(t);
     }
     if (finish != "stop" || emitted < all.size()) {
       all += dec.flush();
       if (all.size() > emitted) job.sink.text(all.substr(emitted));
     }
-    const double decode_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_decode).count();
-    std::fprintf(stderr, "request: %zu prompt tokens (%d reused), prefill %.2f s; %d tokens in %.2f s (%.1f tok/s), %s\n",
+    const auto now = std::chrono::steady_clock::now();
+    const double decode_s = std::chrono::duration<double>(now - t_decode).count();
+    const long steps = eng.spec_stats().steps - steps0;
+    {
+      Metrics& m = ctx_.metrics;
+      std::lock_guard<std::mutex> l(m.mu);
+      m.prompt_tokens += job.prompt.size();
+      m.cached_tokens += stats.reused_tokens;
+      m.generation_tokens += produced + (ended_by_eos ? 1 : 0);  // SGLang counts the stop token
+      m.verify_calls += passes;
+      m.e2e_sum += std::chrono::duration<double>(now - job.received).count();
+      m.e2e_count += 1;
+      if (ttft >= 0) {
+        m.ttft_sum += ttft;
+        m.ttft_count += 1;
+      }
+      m.drafted += eng.spec_stats().drafted - drafted0;
+      m.accepted_drafts += eng.spec_stats().accepted - accepted0;
+      m.spec = eng.spec_stats();
+    }
+    std::fprintf(stderr,
+                 "request: %zu prompt tokens (%d reused), prefill %.2f s; %d tokens in %.2f s (%.1f tok/s), %s; "
+                 "%d passes%s\n",
                  job.prompt.size(), stats.reused_tokens, stats.prefill_seconds, produced, decode_s,
-                 decode_s > 0 ? produced / decode_s : 0.0, finish.c_str());
+                 decode_s > 0 ? produced / decode_s : 0.0, finish.c_str(), passes,
+                 spec && steps > 0 ? (", " + std::to_string(double(produced) / std::max(1, passes)).substr(0, 4) +
+                                      " tokens/pass").c_str()
+                                   : "");
     job.sink.done(finish == "cancelled" ? "stop" : finish, static_cast<int>(job.prompt.size()), produced,
                   stats.reused_tokens);
   }
@@ -226,8 +329,10 @@ class Handler : public proxygen::RequestHandler {
       ResponseBuilder(downstream_)
           .status(200, "OK")
           .header("Content-Type", "text/plain; version=0.0.4")
-          .body("# ling-engine v0 exports no metrics yet\n")
+          .body(ctx_.metrics.render(ctx_.model_name))
           .sendWithEOM();
+    } else if (method_ == "GET" && path_ == "/spec_stats") {
+      send_json(downstream_, 200, ctx_.metrics.spec_json());
     } else if (method_ == "POST" && path_ == "/v1/responses") {
       generate_responses();
     } else if (method_ == "POST" && (path_ == "/v1/chat/completions" || path_ == "/v1/completions")) {
@@ -544,7 +649,8 @@ class Factory : public proxygen::RequestHandlerFactory {
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "0.0.0.0", name;
-  int port = 8000, max_context = 65536;
+  int port = 8000, max_context = 65536, draft_block = 16, lookup = 1, lookup_min = 8;
+  std::string draft_dir;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -559,13 +665,17 @@ int main(int argc, char** argv) {
     else if (a == "--port") port = std::stoi(next());
     else if (a == "--served-model-name") name = next();
     else if (a == "--max-context") max_context = std::stoi(next());
+    else if (a == "--draft") draft_dir = next();
+    else if (a == "--draft-block") draft_block = std::stoi(next());
+    else if (a == "--lookup") lookup = std::stoi(next());
+    else if (a == "--lookup-min") lookup_min = std::stoi(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]]\n";
     return 2;
   }
   int fake_argc = 1;
@@ -575,6 +685,10 @@ int main(int argc, char** argv) {
   ling::Tokenizer tok(model_dir + "/tokenizer.json");
   ling::EngineOptions opts;
   opts.max_context = max_context;
+  opts.draft_dir = draft_dir;
+  opts.draft_block = draft_block;
+  opts.lookup_mode = lookup;
+  opts.lookup_min_match = lookup_min;
   std::cerr << "loading " << model_dir << " ...\n";
   ling::Engine engine(model_dir, opts);
   std::cerr << "loaded " << engine.model().device_bytes() / 1e9 << " GB of weights\n";

@@ -41,6 +41,11 @@ struct EngineOptions {
   int prefill_chunk = 2048;  // measured: 647 tokens/s against 582 at 1024 on a 7.7K-token prompt
   std::string draft_dir;     // the DFlash2 drafter's checkpoint; empty: no speculation
   int draft_block = 16;      // rows per verify: the anchor and block - 1 drafted tokens (2 .. 32)
+  // The context-lookup source: 0 off; 1 shadow (proposed and scored afterwards against what was really
+  // generated, never verified); 2 auto (verified instead of the drafter's chain when the match is at
+  // least lookup_min_match tokens long, and the drafter's pass is skipped).
+  int lookup_mode = 1;
+  int lookup_min_match = 8;
 };
 
 struct EngineStats {
@@ -56,6 +61,12 @@ struct SpecStats {
   long accepted = 0;  // drafted tokens accepted
   std::vector<long> accept_hist = std::vector<long>(33, 0);
   double draft_seconds = 0, verify_seconds = 0, commit_seconds = 0;
+  long lookup_steps = 0, lookup_accepted = 0;  // steps that verified the lookup chain, and its accepted tokens
+  // Shadow scoring, per bucket of match length (3, 4-7, 8-15, 16-31, 32+): steps with a proposal, the
+  // tokens the proposal would have had accepted (its agreement with what was generated next), and the
+  // drafter's accepted tokens on the same steps. `shadow_best` adds up the better of the two per step.
+  long shadow_steps[5] = {}, shadow_lookup[5] = {}, shadow_dflash[5] = {};
+  long shadow_best = 0, shadow_total_steps = 0, shadow_dflash_all = 0;
 };
 
 class Engine {
@@ -85,8 +96,18 @@ class Engine {
   bool has_drafter() const { return draft_ != nullptr; }
   bool can_speculate(const SamplingParams& p) const;
   std::vector<int> speculate(int anchor, const SamplingParams& p);
-  const SpecStats& spec_stats() const { return spec_stats_; }
-  void reset_spec_stats() { spec_stats_ = SpecStats{}; }
+  const SpecStats& spec_stats() {
+    score_shadow(true);
+    return spec_stats_;
+  }
+  void reset_spec_stats() {
+    spec_stats_ = SpecStats{};
+    shadow_.clear();
+  }
+  void set_lookup(int mode, int min_match) {
+    opts_.lookup_mode = mode;
+    opts_.lookup_min_match = min_match;
+  }
   int draft_block() const { return opts_.draft_block; }
   void set_draft_block(int b);
 
@@ -164,7 +185,14 @@ class Engine {
   int* ids_out_dev_ = nullptr;
   std::vector<int> cand_host_;
   std::vector<float> scores_host_;
-  int window_start_ = 0;  // the prompt's drafter context starts here (positions before are not needed)
+  int window_start_ = 0;
+  struct ShadowRecord {
+    int pos;                  // the anchor's position
+    std::vector<int> tokens;  // the lookup's proposal for the positions after it
+    int match, dflash_accepted, bucket;
+  };
+  std::vector<ShadowRecord> shadow_;
+  void score_shadow(bool all);  // scores records whose continuation is known (all: the rest as far as known)  // the prompt's drafter context starts here (positions before are not needed)
 
   std::vector<float> logits_;
   bool profile_ = false;

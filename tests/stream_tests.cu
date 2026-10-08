@@ -114,6 +114,41 @@ bool test_gemm() {
   return ok;
 }
 
+bool test_bf16_rows() {
+  std::mt19937 rng(9);
+  std::normal_distribution<float> normal(0.f, 1.f);
+  const int N = 48, K = 5120, MMAX = 32;
+  std::vector<__nv_bfloat16> w(size_t(N) * K);
+  for (auto& v : w) v = __float2bfloat16(normal(rng) * 0.05f);
+  std::vector<float> x(size_t(MMAX) * K);
+  for (auto& v : x) v = normal(rng);
+  __nv_bfloat16* dw = upload(w);
+  float* dx = upload(x);
+  float* dy;
+  cudaMalloc(&dy, size_t(MMAX) * N * sizeof(float));
+  ling::kernels::bf16_rows(dx, MMAX, dw, dy, N, K, nullptr);
+  const std::vector<float> full = download(dy, size_t(MMAX) * N);
+  bool ok = true;
+  for (int M : {1, 5, 16, 32}) {
+    ling::kernels::bf16_rows(dx, M, dw, dy, N, K, nullptr);
+    const std::vector<float> got = download(dy, size_t(M) * N);
+    double worst = 0;
+    for (int m = 0; m < M; ++m)
+      for (int n = 0; n < N; ++n) {
+        double a = 0;
+        for (int k = 0; k < K; ++k) a += double(__bfloat162float(w[size_t(n) * K + k])) * x[size_t(m) * K + k];
+        worst = std::max(worst, std::abs(got[size_t(m) * N + n] - a) / (std::abs(a) + 1.0));
+      }
+    const bool same = std::memcmp(got.data(), full.data(), got.size() * sizeof(float)) == 0;
+    const bool good = worst < 1e-4 && same;
+    ok &= good;
+    std::printf("bf16_rows M=%-2d max rel err %.2e, rows identical to M=32: %s %s\n", M, worst, same ? "yes" : "NO",
+                good ? "ok" : "FAIL");
+  }
+  cudaFree(dw), cudaFree(dx), cudaFree(dy);
+  return ok;
+}
+
 bool test_topk() {
   std::mt19937 rng(5);
   std::normal_distribution<float> normal(0.f, 3.f);
@@ -227,6 +262,7 @@ void bench() {
 
 int main(int argc, char** argv) {
   bool ok = test_gemm();
+  ok &= test_bf16_rows();
   ok &= test_topk();
   if (argc > 1 && std::string(argv[1]) == "--bench") bench();
   const cudaError_t e = cudaDeviceSynchronize();

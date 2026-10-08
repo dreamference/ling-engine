@@ -187,6 +187,62 @@ __global__ void gemv_bf16_kernel(const float* __restrict__ x, int M, const __nv_
   }
 }
 
+// Narrow BF16 matrices (the DeltaNet beta/alpha projections, N = 48) for up to 32 rows: one block per
+// output, each thread a fixed slice of K for every row, then a fixed-order reduction, so the weights are
+// read once and a row's result does not depend on M.
+constexpr int kBf16RowsThreads = 128;
+__global__ void __launch_bounds__(kBf16RowsThreads)
+    bf16_rows_kernel(const float* __restrict__ x, int M, const __nv_bfloat16* __restrict__ w, float* __restrict__ y,
+                     int N, int K) {
+  constexpr int MT = 32;
+  __shared__ float red[kBf16RowsThreads / 32][MT];
+  const int n = blockIdx.x, t = threadIdx.x, lane = t & 31, warp = t >> 5;
+  float acc[MT];
+#pragma unroll
+  for (int m = 0; m < MT; ++m) acc[m] = 0.f;
+  const __nv_bfloat16* wr = w + static_cast<size_t>(n) * K;
+  for (int k0 = t * 8; k0 < K; k0 += kBf16RowsThreads * 8) {
+    const uint4 raw = *reinterpret_cast<const uint4*>(wr + k0);
+    const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
+    float wf[8];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const float2 f = __bfloat1622float2(w2[i]);
+      wf[2 * i] = f.x;
+      wf[2 * i + 1] = f.y;
+    }
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+      if (m >= M) break;
+      const float4 a = *reinterpret_cast<const float4*>(x + static_cast<size_t>(m) * K + k0);
+      const float4 b = *reinterpret_cast<const float4*>(x + static_cast<size_t>(m) * K + k0 + 4);
+      float v = acc[m];
+      v = fmaf(wf[0], a.x, v);
+      v = fmaf(wf[1], a.y, v);
+      v = fmaf(wf[2], a.z, v);
+      v = fmaf(wf[3], a.w, v);
+      v = fmaf(wf[4], b.x, v);
+      v = fmaf(wf[5], b.y, v);
+      v = fmaf(wf[6], b.z, v);
+      v = fmaf(wf[7], b.w, v);
+      acc[m] = v;
+    }
+  }
+#pragma unroll
+  for (int m = 0; m < MT; ++m) {
+    if (m >= M) break;
+    const float v = warp_sum(acc[m]);
+    if (lane == 0) red[warp][m] = v;
+  }
+  __syncthreads();
+  if (t < M) {
+    float v = 0.f;
+#pragma unroll
+    for (int i = 0; i < kBf16RowsThreads / 32; ++i) v += red[i][t];
+    y[static_cast<size_t>(t) * N + n] = v;
+  }
+}
+
 __global__ void dequant_nvfp4_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws,
                                      float scale2, __nv_bfloat16* __restrict__ out, size_t total_bytes,
                                      int K) {
@@ -495,7 +551,7 @@ constexpr size_t kPrefillSmem = kPrefillRows * kPrefillD * sizeof(float) +
 __global__ void __launch_bounds__(256)
     attention_prefill_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                              const __nv_bfloat16* __restrict__ vcache, int pos0, int M, int Hq, int Hkv,
-                             float* __restrict__ out) {
+                             float* __restrict__ out, int chunk, int splits, float* __restrict__ scratch) {
   constexpr int D = kPrefillD, G = kPrefillG, TQ = kPrefillTQ, TK = kPrefillTK, R = kPrefillRows;
   constexpr int KS = kPrefillKStride;
   extern __shared__ __align__(16) unsigned char smem[];
@@ -521,13 +577,19 @@ __global__ void __launch_bounds__(256)
 #pragma unroll
   for (int r = 0; r < R; ++r) acc[r] = 0.f;
   const int kend = pos0 + q0 + nq;  // keys [0, kend) are visible to some row of this block
-  for (int k0 = 0; k0 < kend; k0 += TK) {
+  // chunk > 0 (the rows path): this block takes the fixed key range [split * chunk, (split + 1) * chunk)
+  // and leaves its partial softmax state in `scratch` for attention_combine_kernel. A tile past a row's
+  // own last key is fully masked and leaves that row's state bit for bit unchanged, so a row's result does
+  // not depend on which other rows share the block.
+  const int split = blockIdx.z;
+  const int klo = chunk > 0 ? split * chunk : 0, khi = chunk > 0 ? min(kend, klo + chunk) : kend;
+  for (int k0 = klo; k0 < khi; k0 += TK) {
     __syncthreads();
     for (int i = t; i < TK * D; i += blockDim.x) {
       const int j = i / D, d = i % D, key = k0 + j;
       const size_t off = (static_cast<size_t>(key) * Hkv + kvh) * D + d;
-      ks[j * KS + d] = key < kend ? kcache[off] : __float2bfloat16(0.f);
-      vs[j * D + d] = key < kend ? vcache[off] : __float2bfloat16(0.f);
+      ks[j * KS + d] = key < khi ? kcache[off] : __float2bfloat16(0.f);
+      vs[j * D + d] = key < khi ? vcache[off] : __float2bfloat16(0.f);
     }
     __syncthreads();
     {
@@ -588,6 +650,20 @@ __global__ void __launch_bounds__(256)
         acc[r] = fmaf(p.x, v0, fmaf(p.y, v1, fmaf(p.z, v2, fmaf(p.w, v3, acc[r]))));
       }
     }
+  }
+  if (chunk > 0) {
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      const int qi = r / G, g = r % G;
+      if (qi >= nq) continue;
+      float* part = scratch + ((static_cast<size_t>(q0 + qi) * Hq + kvh * G + g) * splits + split) * (D + 2);
+      if (t == 0) {
+        part[0] = rowm[r];
+        part[1] = rowl[r];
+      }
+      part[2 + t] = acc[r];
+    }
+    return;
   }
 #pragma unroll
   for (int r = 0; r < R; ++r) {
@@ -660,6 +736,12 @@ void gemv_fp8(const float* x, int M, const uint8_t* w, float wscale, float* y, i
 void gemv_bf16(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s) {
   gemv_bf16_kernel<<<(N + kGemvWarps - 1) / kGemvWarps, kGemvWarps * 32, 0, s>>>(x, M, w, y, N, K);
   LING_LAUNCH_CHECK("gemv_bf16");
+}
+
+void bf16_rows(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s) {
+  if (M < 1 || M > 32 || K % (kBf16RowsThreads * 8) != 0) throw std::runtime_error("bf16_rows: M <= 32, K % 1024 == 0");
+  bf16_rows_kernel<<<N, kBf16RowsThreads, 0, s>>>(x, M, w, y, N, K);
+  LING_LAUNCH_CHECK("bf16_rows");
 }
 
 void dequant_nvfp4(const uint8_t* w, const uint8_t* wscale, float scale2, __nv_bfloat16* out, int N, int K,
@@ -763,8 +845,16 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
                     int Hkv, int D, float* scratch, float* out, cudaStream_t s) {
   if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
   const int splits = attention_rows_splits(pos0 + M);
-  attention_partial_kernel<6><<<dim3(M * Hkv, splits), 256, 0, s>>>(q, kcache, vcache, pos0, Hq, Hkv, splits,
-                                                                   kAttnRowsChunk, scratch);
+  // The tiled kernel: each key and value tile is read once for 8 positions x 6 query heads.
+  static bool configured = false;
+  if (!configured) {
+    check(cudaFuncSetAttribute(attention_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               static_cast<int>(kPrefillSmem)),
+          "attention_rows smem");
+    configured = true;
+  }
+  attention_prefill_kernel<<<dim3((M + kPrefillTQ - 1) / kPrefillTQ, Hkv, splits), 256, kPrefillSmem, s>>>(
+      q, kcache, vcache, pos0, M, Hq, Hkv, nullptr, kAttnRowsChunk, splits, scratch);
   LING_LAUNCH_CHECK("attention_rows");
   attention_combine_kernel<<<M * Hq, D, 0, s>>>(scratch, splits, D, out);
   LING_LAUNCH_CHECK("attention_rows_combine");
@@ -787,7 +877,7 @@ void attention(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16*
       configured = true;
     }
     attention_prefill_kernel<<<dim3((M + kPrefillTQ - 1) / kPrefillTQ, Hkv), 256, kPrefillSmem, s>>>(
-        q, kcache, vcache, pos0, M, Hq, Hkv, out);
+        q, kcache, vcache, pos0, M, Hq, Hkv, out, 0, 1, nullptr);
     LING_LAUNCH_CHECK("attention_prefill");
     return;
   }

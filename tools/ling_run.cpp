@@ -3,7 +3,7 @@
 //
 //   ling-run --model DIR [--text "..." | --chat "..." | --ids 1,2,3] [--max-tokens N] [--temperature T]
 //            [--prompts-file F] [--ids-out] [--prompt-ids-out] [--max-context N]
-//            [--draft DIR [--block N] [--spec] [--spec-check]]
+//            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N]]
 //
 // --spec decodes with the DFlash2 drafter. --spec-check (greedy) decodes each prompt plainly and then
 // speculatively, and checks that the tokens are identical and that the recurrent state after the
@@ -27,7 +27,7 @@ int main(int argc, char** argv) {
   float temperature = 0.f;
   bool ids_out = false, prompt_ids_out = false, spec = false, spec_check = false;
   std::string draft;
-  int block = 16;
+  int block = 16, lookup = 1, lookup_min = 8;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -50,6 +50,8 @@ int main(int argc, char** argv) {
     else if (a == "--draft") draft = next();
     else if (a == "--block") block = std::stoi(next());
     else if (a == "--spec") spec = true;
+    else if (a == "--lookup") lookup = std::stoi(next());
+    else if (a == "--lookup-min") lookup_min = std::stoi(next());
     else if (a == "--spec-check") spec_check = true;
     else {
       std::cerr << "unknown argument " << a << "\n";
@@ -88,6 +90,8 @@ int main(int argc, char** argv) {
     opts.max_context = max_context;
     opts.draft_dir = draft;
     opts.draft_block = block;
+    opts.lookup_mode = lookup;
+    opts.lookup_min_match = lookup_min;
     ling::Engine engine(model, opts);
     auto t1 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "loaded %.1f GB of weights in %.1f s\n", engine.model().device_bytes() / 1e9,
@@ -182,6 +186,19 @@ int main(int argc, char** argv) {
                      st.steps ? 1e3 * (st.draft_seconds + st.verify_seconds + st.commit_seconds) / st.steps : 0.0,
                      st.steps ? 1e3 * st.draft_seconds / st.steps : 0.0, st.steps ? 1e3 * st.verify_seconds / st.steps : 0.0,
                      st.steps ? 1e3 * st.commit_seconds / st.steps : 0.0);
+        if (st.lookup_steps)
+          std::fprintf(stderr, "lookup: %ld steps verified its chain, %.2f tokens/step\n", st.lookup_steps,
+                       double(st.lookup_accepted + st.lookup_steps) / st.lookup_steps);
+        if (st.shadow_total_steps) {
+          std::fprintf(stderr, "lookup shadow: drafter alone %.2f accepted/step, best of both %.2f\n",
+                       double(st.shadow_dflash_all) / st.shadow_total_steps, double(st.shadow_best) / st.shadow_total_steps);
+          const char* names[5] = {"3", "4-7", "8-15", "16-31", "32+"};
+          for (int b = 0; b < 5; ++b)
+            if (st.shadow_steps[b])
+              std::fprintf(stderr, "  match %-5s %5ld steps: lookup %.2f, drafter %.2f accepted/step\n", names[b],
+                           st.shadow_steps[b], double(st.shadow_lookup[b]) / st.shadow_steps[b],
+                           double(st.shadow_dflash[b]) / st.shadow_steps[b]);
+        }
       }
     }
     if (spec_check) {
