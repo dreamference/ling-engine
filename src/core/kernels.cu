@@ -379,6 +379,7 @@ __global__ void attn_prepare_kernel(const float* __restrict__ q_gate, const floa
 }
 
 constexpr int kAttnSplitKeys = 1024;
+constexpr int kAttnPrefillRows = 16;  // from this many query positions on, the tiled prefill kernel
 constexpr int kAttnMaxSplits = 64;
 
 // Enough key-range splits to fill the GPU when there are few (query, head) pairs, as in decode; none
@@ -475,6 +476,121 @@ __global__ void __launch_bounds__(256)
       part[1] = L;
     }
     part[2 + d] = A;
+  }
+}
+
+// Prefill attention: one block takes TQ query positions of one KV head (TQ * G query rows) and walks
+// the keys in tiles of TK held in shared memory, so each key and value is read once per 48 rows instead
+// of once per 6. Thread d owns output dimension d for every row; scores are computed 6 per thread.
+constexpr int kPrefillTQ = 8, kPrefillTK = 32, kPrefillG = 6, kPrefillD = 256;
+constexpr int kPrefillRows = kPrefillTQ * kPrefillG;
+constexpr int kPrefillKStride = kPrefillD + 2;  // padded so the 32 keys of a warp sit in distinct banks
+constexpr size_t kPrefillSmem = kPrefillRows * kPrefillD * sizeof(float) +
+                                kPrefillTK * kPrefillKStride * sizeof(__nv_bfloat16) +
+                                kPrefillTK * kPrefillD * sizeof(__nv_bfloat16) +
+                                kPrefillRows * kPrefillTK * sizeof(float) + 3 * kPrefillRows * sizeof(float);
+
+__global__ void __launch_bounds__(256)
+    attention_prefill_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
+                             const __nv_bfloat16* __restrict__ vcache, int pos0, int M, int Hq, int Hkv,
+                             float* __restrict__ out) {
+  constexpr int D = kPrefillD, G = kPrefillG, TQ = kPrefillTQ, TK = kPrefillTK, R = kPrefillRows;
+  constexpr int KS = kPrefillKStride;
+  extern __shared__ __align__(16) unsigned char smem[];
+  float* qs = reinterpret_cast<float*>(smem);                          // R x D
+  __nv_bfloat16* ks = reinterpret_cast<__nv_bfloat16*>(qs + R * D);    // TK x KS
+  __nv_bfloat16* vs = ks + TK * KS;                                    // TK x D
+  float* ps = reinterpret_cast<float*>(vs + TK * D);                   // R x TK
+  float* rowm = ps + R * TK;
+  float* rowl = rowm + R;
+  float* alpha = rowl + R;
+  const int t = threadIdx.x, kvh = blockIdx.y, q0 = blockIdx.x * TQ;
+  const int nq = min(TQ, M - q0);
+  const float scale = rsqrtf(static_cast<float>(D));
+  for (int i = t; i < R * D; i += blockDim.x) {
+    const int r = i / D, d = i % D, qi = r / G, g = r % G;
+    qs[i] = qi < nq ? q[(static_cast<size_t>(q0 + qi) * Hq + kvh * G + g) * D + d] * scale : 0.f;
+  }
+  if (t < R) {
+    rowm[t] = -INFINITY;
+    rowl[t] = 0.f;
+  }
+  float acc[R];
+#pragma unroll
+  for (int r = 0; r < R; ++r) acc[r] = 0.f;
+  const int kend = pos0 + q0 + nq;  // keys [0, kend) are visible to some row of this block
+  for (int k0 = 0; k0 < kend; k0 += TK) {
+    __syncthreads();
+    for (int i = t; i < TK * D; i += blockDim.x) {
+      const int j = i / D, d = i % D, key = k0 + j;
+      const size_t off = (static_cast<size_t>(key) * Hkv + kvh) * D + d;
+      ks[j * KS + d] = key < kend ? kcache[off] : __float2bfloat16(0.f);
+      vs[j * D + d] = key < kend ? vcache[off] : __float2bfloat16(0.f);
+    }
+    __syncthreads();
+    {
+      // This thread scores key j = t % TK against rows r0 + 8u (u < 6): the key is loaded once per
+      // step and shared by the six rows, four independent sums per row.
+      constexpr int U = R * TK / 256;
+      const int j = t % TK, r0 = t / TK;
+      const __nv_bfloat162* krow = reinterpret_cast<const __nv_bfloat162*>(ks + j * KS);
+      float sum[U][4];
+#pragma unroll
+      for (int u = 0; u < U; ++u) sum[u][0] = sum[u][1] = sum[u][2] = sum[u][3] = 0.f;
+#pragma unroll 2
+      for (int d2 = 0; d2 < D / 2; d2 += 2) {
+        const float2 ka = __bfloat1622float2(krow[d2]);
+        const float2 kb = __bfloat1622float2(krow[d2 + 1]);
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          const float4 qv = *reinterpret_cast<const float4*>(qs + (r0 + 8 * u) * D + 2 * d2);
+          sum[u][0] = fmaf(qv.x, ka.x, sum[u][0]);
+          sum[u][1] = fmaf(qv.y, ka.y, sum[u][1]);
+          sum[u][2] = fmaf(qv.z, kb.x, sum[u][2]);
+          sum[u][3] = fmaf(qv.w, kb.y, sum[u][3]);
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < U; ++u) {
+        const int r = r0 + 8 * u, qi = r / G, key = k0 + j;
+        const bool valid = qi < nq && key <= pos0 + q0 + qi;
+        ps[r * TK + j] = valid ? (sum[u][0] + sum[u][1]) + (sum[u][2] + sum[u][3]) : -INFINITY;
+      }
+    }
+    __syncthreads();
+    if (t < R) {
+      const float m_old = rowm[t];
+      float mx = m_old;
+      for (int j = 0; j < TK; ++j) mx = fmaxf(mx, ps[t * TK + j]);
+      float sum = 0.f;
+      for (int j = 0; j < TK; ++j) {
+        const float sc = ps[t * TK + j];
+        const float e = (mx == -INFINITY || sc == -INFINITY) ? 0.f : __expf(sc - mx);
+        ps[t * TK + j] = e;
+        sum += e;
+      }
+      const float a = (mx == -INFINITY) ? 1.f : (m_old == -INFINITY ? 0.f : __expf(m_old - mx));
+      rowl[t] = rowl[t] * a + sum;
+      rowm[t] = mx;
+      alpha[t] = a;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] *= alpha[r];
+    for (int j = 0; j < TK; j += 4) {  // four keys per step: one float4 of scores feeds four FMAs
+      const float v0 = __bfloat162float(vs[j * D + t]), v1 = __bfloat162float(vs[(j + 1) * D + t]);
+      const float v2 = __bfloat162float(vs[(j + 2) * D + t]), v3 = __bfloat162float(vs[(j + 3) * D + t]);
+#pragma unroll
+      for (int r = 0; r < R; ++r) {
+        const float4 p = *reinterpret_cast<const float4*>(ps + r * TK + j);
+        acc[r] = fmaf(p.x, v0, fmaf(p.y, v1, fmaf(p.z, v2, fmaf(p.w, v3, acc[r]))));
+      }
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    const int qi = r / G, g = r % G;
+    if (qi < nq) out[(static_cast<size_t>(q0 + qi) * Hq + kvh * G + g) * D + t] = acc[r] / rowl[r];
   }
 }
 
@@ -639,6 +755,19 @@ void attention(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16*
                int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s) {
   if (D != 256) throw std::runtime_error("attention: v0 supports head_dim 256 only");
   if (Hq / Hkv != 6 || Hq % Hkv != 0) throw std::runtime_error("attention: v0 is built for 6 query heads per KV head");
+  if (M >= kAttnPrefillRows) {
+    static bool configured = false;
+    if (!configured) {
+      check(cudaFuncSetAttribute(attention_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(kPrefillSmem)),
+            "attention_prefill smem");
+      configured = true;
+    }
+    attention_prefill_kernel<<<dim3((M + kPrefillTQ - 1) / kPrefillTQ, Hkv), 256, kPrefillSmem, s>>>(
+        q, kcache, vcache, pos0, M, Hq, Hkv, out);
+    LING_LAUNCH_CHECK("attention_prefill");
+    return;
+  }
   const int splits = attention_splits(M * Hkv, pos0 + M);
   attention_partial_kernel<6><<<dim3(M * Hkv, splits), 256, 0, s>>>(q, kcache, vcache, pos0, Hq, Hkv, splits,
                                                                    scratch);
