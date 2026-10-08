@@ -28,8 +28,8 @@
   <text class="h" x="92" y="354">1 Ingest</text>
   <text class="t" x="92" y="383">split text stack, head, vision, drafter</text>
   <rect class="box" x="70" y="438" width="488" height="99" rx="12"/>
-  <text class="h" x="92" y="481">2 Quantize to NVFP4</text>
-  <text class="t" x="92" y="510">ModelOpt recipe; FP8 where gate fails</text>
+  <text class="h" x="92" y="481">2 Fix the precision map</text>
+  <text class="t" x="92" y="510">NVFP4 where the quality gate holds, else FP8</text>
   <rect class="box" x="70" y="566" width="488" height="99" rx="12"/>
   <text class="h" x="92" y="609">3 Fold norms</text>
   <text class="t" x="92" y="638">RMSNorm γ into the next projection</text>
@@ -38,10 +38,10 @@
   <text class="t" x="92" y="765">bytes on disk in kernel fragment order</text>
   <rect class="box" x="70" y="820" width="488" height="99" rx="12"/>
   <text class="h" x="92" y="863">5 Instantiate kernels</text>
-  <text class="t" x="92" y="892">one per matrix × row bucket, sm_121 only</text>
+  <text class="t" x="92" y="892">per matrix × precision × rows 1–64, sm_121</text>
   <rect class="box" x="70" y="948" width="488" height="99" rx="12"/>
   <text class="h" x="92" y="991">6 Plan memory</text>
-  <text class="t" x="92" y="1020">fixed offsets, nothing allocated at run</text>
+  <text class="t" x="92" y="1020">~57 GB budget, nothing allocated at run</text>
   <rect class="box" x="70" y="1075" width="488" height="99" rx="12"/>
   <text class="h" x="92" y="1118">7 Capture CUDA graphs</text>
   <text class="t" x="92" y="1147">one per row bucket and prefill chunk</text>
@@ -51,16 +51,16 @@
   <text class="t" x="807" y="411">thinking flags, reasoning effort, tools</text>
   <rect class="box" x="785" y="460" width="488" height="127" rx="12"/>
   <text class="h" x="807" y="503">Session manager</text>
-  <text class="t" x="807" y="532">FP8 KV pages, DeltaNet snapshot</text>
-  <text class="t" x="807" y="560">token history, drafter cache, LRU</text>
+  <text class="t" x="807" y="532">FP8 KV pages, DeltaNet snapshot, LRU</text>
+  <text class="t" x="807" y="560">shared-prefix state checkpoints</text>
   <rect class="box" x="785" y="608" width="488" height="127" rx="12"/>
   <text class="h" x="807" y="651">Scheduler</text>
   <text class="t" x="807" y="680">verify graph → accept → draft graph</text>
-  <text class="t" x="807" y="708">one sequence first, 2–4 agents later</text>
+  <text class="t" x="807" y="708">1 sequence, or 2–4 agents in one pass</text>
   <rect class="box" x="785" y="757" width="488" height="127" rx="12"/>
   <text class="h" x="807" y="800">Draft sources</text>
-  <text class="t" x="807" y="829">DFlash2 block 8, NVFP4, 32k-token head</text>
-  <text class="t" x="807" y="857">prompt lookup splice · MTP fallback</text>
+  <text class="t" x="807" y="829">DFlash2 16-node tree, 32k-token head</text>
+  <text class="t" x="807" y="857">context-lookup branch · MTP fallback</text>
   <rect class="box" x="785" y="905" width="488" height="127" rx="12"/>
   <text class="h" x="807" y="948">GPU sampling</text>
   <text class="t" x="807" y="977">temperature, top-k 20, top-p, penalties</text>
