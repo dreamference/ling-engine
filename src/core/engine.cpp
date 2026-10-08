@@ -20,6 +20,11 @@ void check(cudaError_t e, const char* what) {
   if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
 
+// Rows that go through the weight-streaming GEMVs; more rows dequantize to BF16 for cuBLAS. Slicing a
+// longer prompt into GEMV passes of 8 rows was measured slower (41 tokens: 1.25 s, against 0.68 s for
+// 71 tokens through cuBLAS): at 8 rows the GEMV is bound by its dequantization arithmetic, not by memory.
+constexpr int kGemvSliceLimit = kernels::kMaxGemvRows;
+
 struct NvtxRange {
   explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
   ~NvtxRange() { nvtxRangePop(); }
@@ -143,8 +148,10 @@ void Engine::restore_snapshot() {
 }
 
 void Engine::linear_fp4(const Fp4Weight& w, const float* x, int M, float* y) {
-  if (M <= kernels::kMaxGemvRows) {
-    kernels::gemv_nvfp4(x, M, w.w, w.scale, w.scale2, y, w.N, w.K, stream_);
+  if (M <= kGemvSliceLimit) {  // decode and tiny prompts: stream the weights, no BF16 copy
+    for (int m0 = 0; m0 < M; m0 += kernels::kMaxGemvRows)
+      kernels::gemv_nvfp4(x + size_t(m0) * w.K, std::min(kernels::kMaxGemvRows, M - m0), w.w, w.scale, w.scale2,
+                          y + size_t(m0) * w.N, w.N, w.K, stream_);
     return;
   }
   kernels::dequant_nvfp4(w.w, w.scale, w.scale2, w_bf16_, w.N, w.K, stream_);
@@ -162,8 +169,10 @@ void Engine::linear_bf16(const Bf16Weight& w, const float* x, int M, float* y) {
 }
 
 void Engine::linear_fp8(const Fp8Weight& w, const float* x, int M, float* y) {
-  if (M <= kernels::kMaxGemvRows) {
-    kernels::gemv_fp8(x, M, w.w, w.scale, y, w.N, w.K, stream_);
+  if (M <= kGemvSliceLimit) {
+    for (int m0 = 0; m0 < M; m0 += kernels::kMaxGemvRows)
+      kernels::gemv_fp8(x + size_t(m0) * w.K, std::min(kernels::kMaxGemvRows, M - m0), w.w, w.scale,
+                        y + size_t(m0) * w.N, w.N, w.K, stream_);
     return;
   }
   kernels::dequant_fp8(w.w, w.scale, w_bf16_, w.N, w.K, stream_);
