@@ -64,7 +64,7 @@ Goals:
 - Start a new session from shared-prefix state, and answer a follow-up in a cached conversation with first-token latency of one weight pass plus its new tokens' prefill.
 - Batch 2–4 concurrent sequences into one weight pass, so overnight and multi-agent work gets aggregate throughput nearly for free.
 - Live inside Mightling's memory budget (section 12): about 60 GB for weights, sessions and scratch, the same as production's `--mem-fraction-static 0.5`, configurable.
-- Serve an OpenAI-compatible streaming API so existing clients work unchanged, including `reasoning_effort`, `enable_thinking` and `preserve_thinking`.
+- Serve the standard streaming chat API so existing clients work unchanged, including `reasoning_effort`, `enable_thinking` and `preserve_thinking`.
 - Support thinking and non-thinking modes, the Qwen3 tool-call format, and image input through the model's own vision encoder.
 
 Non-goals:

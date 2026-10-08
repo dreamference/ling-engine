@@ -17,7 +17,7 @@
   <text class="t" x="64" y="162">Qwen3.8-27B BF16 weights, DFlash2 drafter</text>
   <rect class="box" x="757" y="92" width="545" height="98" rx="12"/>
   <text class="h" x="779" y="133">Clients</text>
-  <text class="t" x="779" y="162">any OpenAI-compatible client, user or agent</text>
+  <text class="t" x="779" y="162">any standard chat API client, user or agent</text>
   <path class="line" d="M315,190 V238" marker-end="url(#arrow)"/>
   <path class="line" d="M1029,190 V238" marker-end="url(#arrow)"/>
   <rect class="box" x="42" y="240" width="545" height="970" rx="12"/>
@@ -47,7 +47,7 @@
   <text class="t" x="92" y="1147">one per row bucket and prefill chunk</text>
   <rect class="box" x="785" y="311" width="488" height="127" rx="12"/>
   <text class="h" x="807" y="354">HTTP layer</text>
-  <text class="t" x="807" y="383">OpenAI chat API, SSE streaming</text>
+  <text class="t" x="807" y="383">standard chat API, SSE streaming</text>
   <text class="t" x="807" y="411">thinking flags, reasoning effort, tools</text>
   <rect class="box" x="785" y="460" width="488" height="127" rx="12"/>
   <text class="h" x="807" y="503">Session manager</text>
