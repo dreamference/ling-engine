@@ -371,6 +371,30 @@ M0 produces the numbers every later target is restated against (plus the five me
 
 **Status (9 October 2026).** M0 is done ([reports/M0.md](reports/M0.md)). M1 is done ([reports/M1.md](reports/M1.md)): exact speculation with the DFlash2 drafter, 45.5 tokens/s on the replay, 97% of production's decode. Prefill came next, ahead of M2's tree speculation, by the maintainer's choice ([reports/M2-prefill.md](reports/M2-prefill.md)): from M4, the prompt template of section 12 (ling-serve's prompts are now token-identical to production's on 396 replayed requests), FP4 prefill (section 11's numerics: NVFP4 activations for the FFN, FP8 for the projections, on block-scaled tensor cores; 2,640 / 2,580 / 2,110 tokens/s at 1K / 8K / 35K tokens against production's 2,140-2,460 / 1,930 / 1,680) and shared-prefix checkpoints (a new session resumes after the shared system message). The DeltaNet prefill runs the chunked form in 32-token chunks rather than 64, the KV cache stays BF16, and prefill attention is the rows path's tensor-core kernel. Open: M2's tree speculation, M3, the rest of M4 (paged FP8 KV, images, batches of 2-4) and M5.
 
+**Agreement gate (standing, from 9 October 2026).** It replaces the 98.6% top-1 target on validate_v0.py's six prompts, whose 288 tokens cannot detect a change smaller than about 4.5 points ([reports/M2-prefill.md](reports/M2-prefill.md) section 6). Measured with `bench/agreement/` on 54 prompts (validate_v0.py's six, 24 short chat prompts, 24 replayed agent prompts), teacher-forced on production's greedy 48-token continuation, against production at concurrency 1 with a cold cache; a flip is a position where the engine's top token scores strictly below production's top:
+
+- flip rate ≤ 2.6% (production's own decode against its own prefill on the same inputs);
+- every flip's gap (production's top against the engine's choice) ≤ 1.75 nats;
+- top-5 agreement 100%;
+- no late concentration of flips by position in the continuation or by prompt length;
+- tool-name match on the 24 agent prompts' first answers ≥ production's match with itself;
+- exact-argument match judged only against production's match with itself (13 of 24 when measured).
+
+M1 measured 2.25%, M2 2.65% (66 flips against production's 65); every other line passes for both.
+
+**Exactness policy.** The engine's numerics are the exact path: decode and verify on the rows path, prefill as M2 built it. Every non-exact mode (a change of numerics, not of speed) sits behind a switch and is off by default. One may become the default only if:
+
+- mean KL(exact engine ‖ mode) ≤ 0.0008 nats (twice production's own warm-against-cold spread at concurrency 1);
+- the KL shows no growth with position at 25K and at 64K tokens of context;
+- top-5 agreement with the exact engine is 100%;
+- tool calls on the 24 replayed agent prompts are no worse;
+- `--spec-check` and `--prefix-check` are bit-exact within the mode;
+- a SWE-bench night is no worse.
+
+BF16 prefill intermediates may be built behind a switch now. FP8 KV (§16.10) and the all-NVFP4 projections (§16.2) wait until the exact engine has beaten SGLang in a night.
+
+**Backlog (9 October 2026).** The surveys of 9 October are merged and ranked in [reports/backlog-2026-10-09.md](reports/backlog-2026-10-09.md); only measured wins move from it into this spec.
+
 ## 15. Risks and open questions
 
 The two risks that can sink the targets are the bus and the toolchain; the third is that the gap closes from the other side.
@@ -658,3 +682,74 @@ Pages opened for the figures in this document, as of 8 October 2026.
 - [Ollama DGX Spark performance](https://registry.ollama.ai/blog/nvidia-spark-performance) and [llama.cpp on DGX Spark](https://jetsonhacks.com/wp-content/uploads/2025/10/spark-llamacpp-bench.html): what generic engines achieve on this box.
 - [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4): the mixed-precision NVFP4 recipe this design starts from.
 - Measured on this machine, 8 October 2026: the served checkpoints' configs and safetensors headers; production SGLang's launch flags, Prometheus counters and decode log; and 168 recorded agent sessions from Mightling's SWE-bench rounds of 3–7 October, analysed with the scripts in [`bench/`](bench/) (`workload.py`, `lookup_sim.py`).
+
+## 18. Known pitfalls
+
+Bug classes that SGLang and vLLM shipped between October 2025 and October 2026 and that ling-engine must not repeat. They come from a survey of their issue trackers ([reports/engine-issues-2026-10-09.md](reports/engine-issues-2026-10-09.md), 98 issues read in depth).
+
+Each row names the guard:
+- `tests/server/test_regressions.py` (HTTP, against a running ling-serve);
+- `tests/api_tests.cpp` (CPU);
+- or an existing `ling-run` check.
+
+**Open** means ling-serve has the bug today: an xfail or `KNOWN(...)` test states the right behaviour.
+
+| Pitfall | What went wrong upstream | ling-engine | Guard |
+| --- | --- | --- | --- |
+| Hybrid state after a prefix hit | Outputs diverge or turn to `!` after a cache hit, mostly with speculation on; a checkpoint attached to the wrong length; NaN when a prompt ends just past a block boundary ([vllm#60174](https://github.com/vllm-project/vllm/issues/60174), [vllm#43559](https://github.com/vllm-project/vllm/issues/43559), [vllm#55766](https://github.com/vllm-project/vllm/issues/55766), [sglang#38815](https://github.com/sgl-project/sglang/issues/38815), [sglang#41351](https://github.com/sgl-project/sglang/issues/41351)) | Answered by design: row invariance, commit by replay, chunking-independent prefill. Now also tested through the server. | `ling-run --prefix-check`; `test_prompt_length_near_chunk_boundary`; `test_growing_conversation_warm_equals_cold` |
+| Identical resend loses its hit | Holding back the last token for its logits dropped the hit to zero ([sglang#22935](https://github.com/sgl-project/sglang/issues/22935)) | Tested | `test_prompt_length_near_chunk_boundary` (resend reports cached tokens) |
+| Greedy output not reproducible | Top-k tie order, autotuned kernels and verify numerics changed greedy output between identical requests ([sglang#38009](https://github.com/sgl-project/sglang/issues/38009), [vllm#54928](https://github.com/vllm-project/vllm/issues/54928), [vllm#54521](https://github.com/vllm-project/vllm/issues/54521), [sglang#39597](https://github.com/sgl-project/sglang/issues/39597)) | No autotuning at runtime; ties must break to the lower token id everywhere, the selector's top-16 included. Batches (lever 5) must keep a sequence's output independent of its neighbours ([sglang#36548](https://github.com/sgl-project/sglang/issues/36548)). | `ling-run --spec-check`; `test_greedy_is_deterministic_across_repeats` |
+| NaN or inf logits become text | A NaN row sampled as token 0 (`!`) until `max_tokens`, or sanitised into a uniform sample and streamed as a healthy answer; a NaN state reused by later requests ([vllm#53305](https://github.com/vllm-project/vllm/issues/53305), [vllm#55291](https://github.com/vllm-project/vllm/issues/55291), [sglang#33187](https://github.com/sgl-project/sglang/issues/33187)) | **Open.** `Engine::sample` has no finiteness check. A non-finite row must end the request with an error and a counter, and a non-finite state must never become a prefix checkpoint. | `degenerate()` checks in four server tests; `test_untruncated_sampling_is_not_degenerate` (production's completions canary) |
+| Truncation skipped under rejection sampling | min_p and logit_bias not applied to verified tokens ([vllm#42744](https://github.com/vllm-project/vllm/issues/42744)) | The accept step uses the full chain | `test_truncation_to_one_token_equals_greedy` |
+| Penalties over the wrong history | Penalties used a history shifted by one ([sglang#41124](https://github.com/sgl-project/sglang/issues/41124)). Production counts output tokens only. | **Open.** Presence and repetition penalties are applied over prompt and output. | `test_penalties_ignore_prompt_tokens` (xfail) |
+| Seed ignored on one endpoint | [sglang#15481](https://github.com/sgl-project/sglang/issues/15481) | Read on every endpoint | `test_seed_reproduces` |
+| Quoted tool-call markup becomes a call | Examples in code fences, the template's placeholder name, or a literal `<tool_call>` in prose executed as calls; text after the marker lost ([vllm#57541](https://github.com/vllm-project/vllm/issues/57541), [vllm#58147](https://github.com/vllm-project/vllm/issues/58147), [vllm#56658](https://github.com/vllm-project/vllm/issues/56658)) | **Open** for fences, unoffered names and prose before a real call. Markup in the reasoning is safe. | `api_tests.cpp` (`KNOWN`) |
+| Tool parameter boundaries | `strip()` destroyed indentation ([vllm#48753](https://github.com/vllm-project/vllm/issues/48753)); an unclosed parameter dropped or swallowed its neighbour ([vllm#57699](https://github.com/vllm-project/vllm/issues/57699)); arguments were not JSON ([vllm#55495](https://github.com/vllm-project/vllm/issues/55495)) | One newline trimmed each side; an unclosed last parameter is kept; arguments are always a JSON dump. **Open:** an unclosed middle parameter swallows the next. | `api_tests.cpp` |
+| A tool call inside the reasoning | A complete call before `</think>` is lost, which stops the agent loop ([vllm#39056](https://github.com/vllm-project/vllm/issues/39056)) | Same behaviour. Promoting such calls collides with quoted markup, so measure the rate on the replay before changing it. | `api_tests.cpp` (quoted markup stays reasoning) |
+| History the server cannot render | A prior tool call with invalid JSON arguments made every later request a 400 ([vllm#47761](https://github.com/vllm-project/vllm/issues/47761)) | **Open** on chat completions (the Responses path substitutes `{}`) | `api_tests.cpp` (`KNOWN`); `test_history_with_invalid_tool_arguments_is_accepted` (xfail) |
+| Template tokens and empty chunks in the stream | `</think>` or an end-of-turn token in content, reasoning streamed as content, an empty-content chunk that ends an AI-SDK client's turn, a stream without a finish_reason ([vllm#51679](https://github.com/vllm-project/vllm/issues/51679), [vllm#49955](https://github.com/vllm-project/vllm/issues/49955), [sglang#29441](https://github.com/sgl-project/sglang/issues/29441), [vllm#27572](https://github.com/vllm-project/vllm/issues/27572)) | Tested | `test_no_template_tokens_leak`; `test_stream_chunk_shape` |
+| Streaming and non-streaming disagree | Text before or after a call dropped in one mode; arguments lost when several tokens arrive per step ([vllm#56263](https://github.com/vllm-project/vllm/issues/56263), [sglang#34214](https://github.com/sgl-project/sglang/issues/34214), [vllm#31501](https://github.com/vllm-project/vllm/issues/31501)) | One incremental parser serves both modes; a speculative step emits up to 16 tokens at once | `test_stream_matches_non_stream` |
+| Stop strings in the stream | Stop strings matched inside the reasoning end the turn ([sglang#40529](https://github.com/sgl-project/sglang/issues/40529)); partial UTF-8 in streamed text | **Open.** Stops match raw text including the reasoning; decide against production first. The stop hold-back counts bytes and can split a UTF-8 character, which fails the chunk's JSON dump. | `test_streaming_with_stop_and_multibyte_text` (xfail) |
+| Responses turns rendered apart | One assistant turn replayed as separate blocks, so agents ended turns early ([sglang#42110](https://github.com/sgl-project/sglang/issues/42110), [vllm#37167](https://github.com/vllm-project/vllm/issues/37167)) | Items merged as production merges them | `bench/render/render_test.py`; `api_tests.cpp`; `test_responses_replayed_turn_renders_like_merged_chat` |
+| Effort values refused or aborting | An accepted effort aborted the stream; unsupported values refused ([sglang#40789](https://github.com/sgl-project/sglang/issues/40789), [vllm#52738](https://github.com/vllm-project/vllm/issues/52738), [vllm#53284](https://github.com/vllm-project/vllm/issues/53284)) | **Open** for `none` on chat completions (400) | `test_reasoning_efforts_chat`; `test_responses_stream_event_order`; `test_reasoning_effort_none_chat` (xfail) |
+| Usage counts | reasoning_tokens 0 or larger than output_tokens under speculation ([vllm#49711](https://github.com/vllm-project/vllm/issues/49711), [sglang#39826](https://github.com/sgl-project/sglang/issues/39826)) | **Open:** reasoning_tokens is always 0 | `test_responses_reasoning_tokens_counted` (xfail); `test_stream_matches_non_stream` |
+| Unbounded request values | Huge top_k, logprobs or n killed the server ([sglang#41482](https://github.com/sgl-project/sglang/issues/41482)) | Bounded. A negative max_tokens still means "unlimited" and should be a 400. | `test_absurd_values_leave_the_server_healthy` |
+| Abandoned requests keep running | A disconnected client's request decoded to max_tokens ([sglang#36333](https://github.com/sgl-project/sglang/issues/36333)) | Checked per token. A queued or prefilling request still runs its prefill, which blocks the single worker. | `test_disconnect_frees_the_engine` |
+| Drafter silently wrong | A quantized or mislaid drafter accepted ~0 tokens with no error; acceptance decayed over uptime ([sglang#39087](https://github.com/sgl-project/sglang/issues/39087), [sglang#40144](https://github.com/sgl-project/sglang/issues/40144), [sglang#37326](https://github.com/sgl-project/sglang/issues/37326)) | The loader should assert every drafter tensor is consumed; acceptance belongs in `/metrics` and a startup probe | `test_many_short_requests_do_not_degrade_later_ones`; `bench/replay/spec_report.py` |
+| SM121 is not SM120 | Feature gates written `== 120` sent GB10 down Hopper paths; first-match kernel selection picked a weight-only NVFP4 kernel, −31% prefill ([sglang#36551](https://github.com/sgl-project/sglang/issues/36551), [vllm#55397](https://github.com/vllm-project/vllm/issues/55397)) | One target, `sm_121a`; no runtime selection | Build rule (section 8) |
+| Unified memory is not device memory | Memory fractions did not bound startup on GB10; the host froze instead of an OOM kill ([vllm#56824](https://github.com/vllm-project/vllm/issues/56824), [vllm#46307](https://github.com/vllm-project/vllm/issues/46307), [sglang#36941](https://github.com/sgl-project/sglang/issues/36941)) | Fixed budget (section 12). Prefill scratch must stay bounded by the chunk, never by the prompt. | Mightling's host-safety checks; a 100k-token prefill with peak-memory logging (M4) |
+
+## 19. Backlog from user requests
+
+What users of SGLang and vLLM asked for, and what the four clients send that ling-serve does not handle ([reports/api-compat-checklist.md](reports/api-compat-checklist.md)). Ranked for one owner on one GB10 running 1–4 agents.
+
+1. **Context overflow the clients can recognise.**
+   - Chat completions and completions: HTTP 400 before any header, code `context_length_exceeded`, with a message that matches LiteLLM's patterns ("maximum context length is …").
+   - The Responses API: `response.failed` with that code, the only shape Codex compacts on.
+
+   Today Codex retries the same prompt five times and OpenHands for two minutes; neither compacts.
+2. **Images.** Answer with a placeholder instead of a 400 until the vision encoder (M4) lands, and set `input_modalities: ["text"]` in the launcher's catalog meanwhile. Codex treats a 400 as the end of the turn.
+3. **Stream fixes:**
+   - hold back stop-string output to a character boundary;
+   - end every started stream with a finish chunk and `[DONE]`;
+   - validate before sending headers.
+4. **Cancellation before work.** Check the cancel flag before dequeuing and between prefill chunks. With one worker, an abandoned 30-second prefill delays every agent.
+5. **A NaN guard** (section 18) with a counter in `/metrics`.
+6. **Parser fixes** from section 18:
+   - fences;
+   - unoffered names;
+   - prose before a call;
+   - unclosed middle parameter;
+   - unrenderable history arguments rendered instead of refused.
+7. **Small request fixes:**
+   - presence and repetition penalties over output tokens only;
+   - `reasoning_effort: "none"` on chat completions;
+   - `reasoning_tokens` counted;
+   - `reasoning` accepted as an alias of `reasoning_content` on input;
+   - a negative `max_tokens` refused.
+8. **Several resident sessions** (section 11). Two interleaved agents evict each other's history today, and each then re-prefills from its last checkpoint. With several sessions resident, `prompt_cache_key` (Codex sends the thread id) is the natural session key. Upstream's equivalent complaint is lost prefix hits per turn ([vllm#53670](https://github.com/vllm-project/vllm/issues/53670), [vllm#53477](https://github.com/vllm-project/vllm/issues/53477)).
+9. **Short requests ahead of long prefills.** Run a short request (autocomplete, a title) between the chunks of a long prefill ([sglang#42530](https://github.com/sgl-project/sglang/issues/42530)).
+10. **Speculation measured at long context.** Plain against speculative decode at 8k, 32k, 128k and 200k ([vllm#54691](https://github.com/vllm-project/vllm/issues/54691): DFlash fell to 16 tokens/s against 71 at 185k), with an automatic switch-off if it ever loses.
+11. **Reject what is not built.** Answer a 400 for `logprobs`, `n > 1`, `response_format` and `tool_choice: "required"` until each exists. When structured output is built, it must still allow tool calls ([vllm#39929](https://github.com/vllm-project/vllm/issues/39929)), bound whitespace ([vllm#38696](https://github.com/vllm-project/vllm/issues/38696)) and mask every verify row ([vllm#60830](https://github.com/vllm-project/vllm/issues/60830)).
+12. **A thinking budget** (force `</think>` after N tokens). Users ask for it on both engines ([sglang#25536](https://github.com/sgl-project/sglang/issues/25536)). OpenHands sends effort `high` on every call.
+13. **Custom tools for Codex Code Mode**, if the launcher keeps Code Mode. Today they are dropped exactly as SGLang drops them.

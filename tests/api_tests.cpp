@@ -1,5 +1,6 @@
 // Tests the output parsers and the chat template without a server or a GPU.
 #include <cstdio>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -17,6 +18,26 @@ static int failures = 0;
       ++failures;                                                 \
     }                                                             \
   } while (0)
+
+// A behaviour SGLang or vLLM got wrong and ling-serve still gets wrong (reports/engine-issues-2026-10-09.md):
+// reported, not counted as a failure, so the suite stays green until the fix lands; the fix then turns
+// the line into an EXPECT.
+static int known_gaps = 0;
+#define KNOWN(cond)                                                                        \
+  do {                                                                                     \
+    if (!(cond)) {                                                                         \
+      std::printf("KNOWN GAP %s:%d: %s\n", __FILE__, __LINE__, #cond);                     \
+      ++known_gaps;                                                                        \
+    } else {                                                                               \
+      std::printf("known gap now passes, make it an EXPECT: %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+    }                                                                                      \
+  } while (0)
+
+static int count_of(const std::string& s, const std::string& sub) {
+  int n = 0;
+  for (size_t p = s.find(sub); p != std::string::npos; p = s.find(sub, p + sub.size())) ++n;
+  return n;
+}
 
 // Feeds `text` one byte at a time, as a stream would, and collects everything.
 static OutputParser::Delta feed(OutputParser& p, const std::string& text) {
@@ -97,6 +118,165 @@ int main() {
     const std::string tail = "<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
     EXPECT(t.size() >= tail.size() && t.compare(t.size() - tail.size(), tail.size(), tail) == 0);
   }
+  // Bug classes from SGLang's and vLLM's trackers (reports/engine-issues-2026-10-09.md, SPEC "Known
+  // pitfalls"). Each block names the upstream issue it guards against.
+  const json edit_tools = json::parse(R"([{"type":"function","function":{"name":"edit","parameters":{"type":"object",
+    "properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}}}}}])");
+  {
+    // vllm#48753: string values keep their indentation and trailing newline (only the template's one
+    // newline on each side is markup); a string that looks like JSON stays a string.
+    OutputParser p(false, edit_tools);
+    auto d = feed(p,
+                  "<tool_call>\n<function=edit>\n<parameter=path>\nsrc/a.py\n</parameter>\n<parameter=old_string>\n"
+                  "    if x:\n        return 1\n\n</parameter>\n<parameter=new_string>\n{\"a\": 1}\n</parameter>\n"
+                  "</function>\n</tool_call>");
+    EXPECT(d.tool_calls.size() == 1);
+    if (d.tool_calls.size() == 1) {
+      json args = json::parse(d.tool_calls[0].arguments);
+      EXPECT(args["path"] == "src/a.py");
+      EXPECT(args["old_string"] == "    if x:\n        return 1\n");
+      EXPECT(args["new_string"].is_string() && args["new_string"] == "{\"a\": 1}");
+    }
+  }
+  {
+    // vllm#57699: a last parameter the model did not close is kept (ended at </function>).
+    OutputParser p(false, tools);
+    auto d = feed(p,
+                  "<tool_call>\n<function=shell>\n<parameter=command>\n[\"ls\"]\n</parameter>\n<parameter=workdir>\n/tmp\n"
+                  "</function>\n</tool_call>");
+    EXPECT(d.tool_calls.size() == 1);
+    if (d.tool_calls.size() == 1) {
+      json args = json::parse(d.tool_calls[0].arguments);
+      EXPECT(args["command"] == json::parse(R"(["ls"])"));
+      EXPECT(args["workdir"] == "/tmp");
+    }
+  }
+  {
+    // vllm#57699, the other half: an unclosed parameter followed by another must not swallow it.
+    OutputParser p(false, tools);
+    auto d = feed(p,
+                  "<tool_call>\n<function=shell>\n<parameter=workdir>\n/tmp\n<parameter=timeout_ms>\n5\n</parameter>\n"
+                  "</function>\n</tool_call>");
+    EXPECT(d.tool_calls.size() == 1);
+    if (d.tool_calls.size() == 1) {
+      json args = json::parse(d.tool_calls[0].arguments);
+      KNOWN(args["workdir"] == "/tmp" && args.contains("timeout_ms") && args["timeout_ms"] == 5);
+    }
+  }
+  {
+    // vllm#50989: a call without parameters parses to an empty object.
+    OutputParser p(false, tools);
+    auto d = feed(p, "<tool_call>\n<function=shell>\n</function>\n</tool_call>");
+    EXPECT(d.tool_calls.size() == 1);
+    if (d.tool_calls.size() == 1) EXPECT(d.tool_calls[0].name == "shell" && d.tool_calls[0].arguments == "{}");
+  }
+  {
+    // vllm#56658: a literal <tool_call> in prose, with no call after it, loses no text.
+    const std::string text = "Wrap calls in a `<tool_call>` tag; the rest of this sentence must survive.";
+    OutputParser p(false, tools);
+    auto d = feed(p, text);
+    EXPECT(d.tool_calls.empty());
+    EXPECT(d.content == text);
+  }
+  {
+    // vllm#56658: a literal marker followed by a real call keeps the prose between them.
+    OutputParser p(false, tools);
+    auto d = feed(p,
+                  "Wrap calls in `<tool_call>` tags.\n<tool_call>\n<function=shell>\n<parameter=command>\n[\"pwd\"]\n"
+                  "</parameter>\n</function>\n</tool_call>");
+    EXPECT(d.tool_calls.size() == 1);
+    KNOWN(d.content == "Wrap calls in `<tool_call>` tags.\n");
+  }
+  {
+    // vllm#57541: an example inside a markdown code fence is text, not a call.
+    const std::string text =
+        "Example:\n```xml\n<tool_call>\n<function=shell>\n<parameter=command>\n[\"ls\"]\n</parameter>\n</function>\n"
+        "</tool_call>\n```\nThat is the format.";
+    OutputParser p(false, tools);
+    auto d = feed(p, text);
+    KNOWN(d.tool_calls.empty() && d.content == text);
+  }
+  {
+    // vllm#58147: a call to a function the request did not offer (here the template's own placeholder)
+    // is not executed as a tool call.
+    OutputParser p(false, tools);
+    auto d = feed(p,
+                  "<tool_call>\n<function=function_name>\n<parameter=parameter_name>\nvalue\n</parameter>\n</function>\n"
+                  "</tool_call>");
+    KNOWN(d.tool_calls.empty());
+  }
+  {
+    // vllm#58147: tool-call markup quoted inside the reasoning never becomes a call. (The opposite
+    // complaint, vllm#39056, is a real call written before </think>; it stays in the reasoning too.)
+    OutputParser p(true, tools);
+    auto d = feed(p,
+                  "The format is <tool_call>\n<function=shell>\n</function>\n</tool_call>, but I will answer directly.\n"
+                  "</think>\n\nNo call needed.");
+    EXPECT(d.tool_calls.empty());
+    EXPECT(d.reasoning.find("<tool_call>") != std::string::npos);
+    EXPECT(d.content == "No call needed.");
+  }
+  {
+    // vllm#55495: a replayed function_call whose arguments are not valid JSON must not make every later
+    // request of the conversation fail (the Responses path renders it with no parameters).
+    json body = json::parse(R"({"tools":[{"type":"function","name":"shell","parameters":{"type":"object",
+      "properties":{"command":{"type":"array"}}}}],
+      "input":[{"type":"message","role":"user","content":"run it"},
+               {"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"command\": [\"ec"},
+               {"type":"function_call_output","call_id":"c1","output":"error"}]})");
+    bool ok = true;
+    std::string prompt;
+    try {
+      prompt = ling::serve::parse_responses_request(body).prompt_text;
+    } catch (const std::exception&) {
+      ok = false;
+    }
+    EXPECT(ok);
+    EXPECT(prompt.find("<function=shell>\n</function>") != std::string::npos);
+  }
+  {
+    // vllm#47761: the same on chat completions (Continue and Cline replay their history there).
+    json body = json::parse(R"({"messages":[{"role":"user","content":"run it"},
+      {"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"shell",
+       "arguments":"{\"command\": [\"ec"}}]},
+      {"role":"tool","tool_call_id":"c1","content":"error"}]})");
+    bool ok = true;
+    try {
+      (void)ling::serve::parse_request(body, true);
+    } catch (const std::exception&) {
+      ok = false;
+    }
+    KNOWN(ok);
+  }
+  {
+    // vllm#37167, sglang#42110: one assistant turn replayed as reasoning, a commentary message and two
+    // function calls renders as ONE assistant block (plus the generation prompt).
+    json body = json::parse(R"({"input":[{"type":"message","role":"user","content":"fix it"},
+      {"type":"reasoning","summary":[{"type":"summary_text","text":"Look first."}]},
+      {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Checking."}]},
+      {"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"command\": [\"ls\"]}"},
+      {"type":"function_call","call_id":"c2","name":"shell","arguments":"{\"command\": [\"pwd\"]}"},
+      {"type":"function_call_output","call_id":"c1","output":"a.txt"},
+      {"type":"function_call_output","call_id":"c2","output":"/w"}]})");
+    const std::string t = ling::serve::parse_responses_request(body).prompt_text;
+    EXPECT(count_of(t, "<|im_start|>assistant") == 2);
+    EXPECT(count_of(t, "<tool_call>") == 2);
+    EXPECT(count_of(t, "<tool_response>") == 2);
+    EXPECT(t.find("Look first.") != std::string::npos && t.find("Checking.") != std::string::npos);
+  }
+  {
+    // vllm#53284, vllm#52738: reasoning_effort "none" on chat completions means thinking off, as it
+    // already does on the Responses path (today: 400 "Unexpected reasoning effort none").
+    json body = json::parse(R"({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"})");
+    bool ok = true, thinking_off = false;
+    try {
+      thinking_off = !ling::serve::parse_request(body, true).reasoning;
+    } catch (const std::exception&) {
+      ok = false;
+    }
+    KNOWN(ok && thinking_off);
+  }
+  if (known_gaps) std::printf("%d known gaps (not failures; see reports/engine-issues-2026-10-09.md)\n", known_gaps);
   std::printf(failures ? "%d API TEST FAILURES\n" : "all api tests passed\n", failures);
   return failures ? 1 : 0;
 }
