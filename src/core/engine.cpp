@@ -121,6 +121,10 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   }
   graphs_ = graphs && draft_ != nullptr;
   if (graphs_) std::fprintf(stderr, "step graphs on\n");
+  bool pdl = opts_.pdl;
+  if (const char* e = std::getenv("LING_PDL")) pdl = std::atoi(e) != 0;
+  kernels::set_pdl(pdl);
+  if (pdl) std::fprintf(stderr, "programmatic dependent launch on\n");
 }
 
 Engine::~Engine() {

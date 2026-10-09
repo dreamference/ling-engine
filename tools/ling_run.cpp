@@ -4,9 +4,10 @@
 //   ling-run --model DIR [--text "..." | --chat "..." | --ids 1,2,3] [--max-tokens N] [--temperature T]
 //            [--prompts-file F] [--ids-out] [--prompt-ids-out] [--max-context N]
 //            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N]]
-//            [--graphs]
+//            [--graphs] [--pdl]
 //
-// --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3).
+// --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
+// the rows path's kernels with programmatic dependent launch (M3).
 //
 // --spec decodes with the DFlash2 drafter. --spec-check (greedy) decodes each prompt plainly and then
 // speculatively, and checks that the tokens are identical and that the recurrent state after the
@@ -34,7 +35,7 @@ int main(int argc, char** argv) {
   int max_tokens = 64, max_context = 32768;
   float temperature = 0.f;
   bool ids_out = false, prompt_ids_out = false, spec = false, spec_check = false, prefix_check = false;
-  bool graphs = false;
+  bool graphs = false, pdl = false;
   std::string draft;
   int block = 16, lookup = 1, lookup_min = 8;
   for (int i = 1; i < argc; ++i) {
@@ -64,6 +65,7 @@ int main(int argc, char** argv) {
     else if (a == "--spec-check") spec_check = true;
     else if (a == "--prefix-check") prefix_check = true;
     else if (a == "--graphs") graphs = true;
+    else if (a == "--pdl") pdl = true;
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
@@ -105,6 +107,7 @@ int main(int argc, char** argv) {
     opts.lookup_min_match = lookup_min;
     opts.boundary_token = tok.token_id("<|im_end|>");
     opts.step_graphs = graphs;
+    opts.pdl = pdl;
     ling::Engine engine(model, opts);
     auto t1 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "loaded %.1f GB of weights in %.1f s\n", engine.model().device_bytes() / 1e9,

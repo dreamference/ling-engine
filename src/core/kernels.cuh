@@ -29,6 +29,11 @@ struct DevPos {
 __device__ __forceinline__ int pos_value(const DevPos& p) { return p.dev ? *p.dev + p.off : p.host; }
 #endif
 
+// Programmatic dependent launch (launch.cuh) for the rows path's kernels (decode, verify, drafter, commit):
+// off by default. Set before launching; it applies to every later launch, captured or not.
+void set_pdl(bool on);
+bool pdl_enabled();
+
 // Largest M the weight-streaming GEMV kernels handle; larger M dequantizes to BF16 and uses cuBLAS.
 constexpr int kMaxGemvRows = 8;
 

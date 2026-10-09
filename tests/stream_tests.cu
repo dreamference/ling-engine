@@ -4,11 +4,13 @@
 //
 //   ling-stream-tests            correctness only
 //   ling-stream-tests --bench    plus timings
+//   LING_PDL=1 ling-stream-tests  the same with programmatic dependent launch (launch.cuh)
 #include <cuda_fp8.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <random>
@@ -414,6 +416,7 @@ void bench() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (const char* e = std::getenv("LING_PDL")) ling::kernels::set_pdl(std::atoi(e) != 0);
   bool ok = test_gemm();
   ok &= test_bf16_rows();
   ok &= test_attention_rows();

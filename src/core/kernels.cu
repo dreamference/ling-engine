@@ -1,4 +1,5 @@
 #include "core/kernels.cuh"
+#include "core/launch.cuh"
 
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
@@ -224,6 +225,10 @@ __global__ void __launch_bounds__(kBf16RowsThreads)
 #pragma unroll
   for (int m = 0; m < MT; ++m) acc[m] = 0.f;
   const __nv_bfloat16* wr = w + static_cast<size_t>(n) * K;
+  // PDL prologue (launch.cuh): the weights never change, so this thread's first 16 bytes of them are
+  // requested before waiting for the kernel that writes x.
+  if (t * 8 < K) asm volatile("prefetch.global.L2 [%0];" ::"l"(wr + t * 8));
+  pdl_begin();
   for (int k0 = t * 8; k0 < K; k0 += kBf16RowsThreads * 8) {
     const uint4 raw = *reinterpret_cast<const uint4*>(wr + k0);
     const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
@@ -287,6 +292,7 @@ __global__ void to_bf16_kernel(const float* __restrict__ x, __nv_bfloat16* __res
 
 __global__ void embed_kernel(const __nv_bfloat16* __restrict__ table, const int* __restrict__ ids, int H,
                              float* __restrict__ out) {
+  pdl_begin();  // first statement: see launch.cuh
   const int m = blockIdx.x;
   const __nv_bfloat16* row = table + static_cast<size_t>(ids[m]) * H;
   for (int h = threadIdx.x; h < H; h += blockDim.x) out[static_cast<size_t>(m) * H + h] = __bfloat162float(row[h]);
@@ -294,6 +300,7 @@ __global__ void embed_kernel(const __nv_bfloat16* __restrict__ table, const int*
 
 __global__ void rmsnorm_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w,
                                float* __restrict__ out, int H, float eps, bool gemma) {
+  pdl_begin();  // first statement: see launch.cuh
   __shared__ float red[32];
   const float* row = x + static_cast<size_t>(blockIdx.x) * H;
   float ss = 0.f;
@@ -306,20 +313,24 @@ __global__ void rmsnorm_kernel(const float* __restrict__ x, const __nv_bfloat16*
 }
 
 __global__ void add_kernel(float* h, const float* d, int n) {
+  pdl_begin();  // first statement: see launch.cuh
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) h[i] += d[i];
 }
 
 __global__ void silu_mul_kernel(const float* g, const float* u, float* out, int n) {
+  pdl_begin();  // first statement: see launch.cuh
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
     out[i] = silu(g[i]) * u[i];
 }
 
 __global__ void sigmoid_mul_kernel(float* x, const float* gate, int n) {
+  pdl_begin();  // first statement: see launch.cuh
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
     x[i] *= 1.f / (1.f + __expf(-gate[i]));
 }
 
 __global__ void gdn_conv_kernel(float* mixed, float* state, const __nv_bfloat16* __restrict__ w, int M, int C) {
+  pdl_begin();  // first statement: see launch.cuh
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= C) return;
   float s0 = state[c * 3], s1 = state[c * 3 + 1], s2 = state[c * 3 + 2];
@@ -340,6 +351,7 @@ __global__ void gdn_conv_kernel(float* mixed, float* state, const __nv_bfloat16*
 
 __global__ void gdn_gating_kernel(const float* a, const float* b, const __nv_bfloat16* A_log,
                                   const __nv_bfloat16* dt_bias, float* g, float* beta, int n, int HV) {
+  pdl_begin();  // first statement: see launch.cuh
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   const int hv = i % HV;
@@ -358,6 +370,7 @@ __global__ void __launch_bounds__(32)
     gdn_recurrent_warp_kernel(const float* __restrict__ mixed, const float* __restrict__ g,
                               const float* __restrict__ beta, const float* state_in, float* state_out,
                               float* __restrict__ out, int M, int H, int HV) {
+  pdl_begin();  // first statement: see launch.cuh
   __shared__ float qs[kGdnDk], ks[kGdnDk];
   const int hv = blockIdx.x / 4, part = blockIdx.x % 4, lane = threadIdx.x, v = part * 32 + lane;
   const int h = hv / (HV / H);
@@ -410,6 +423,7 @@ __global__ void __launch_bounds__(32)
 __global__ void gated_rmsnorm_kernel(const float* __restrict__ x, const float* __restrict__ z,
                                      const __nv_bfloat16* __restrict__ w, float* __restrict__ out, int D,
                                      float eps) {
+  pdl_begin();  // first statement: see launch.cuh
   __shared__ float red[32];
   const size_t r = blockIdx.x;
   float ss = 0.f;
@@ -425,6 +439,7 @@ __global__ void attn_prepare_kernel(const float* __restrict__ q_gate, const floa
                                     int rot, float theta, float eps, float* __restrict__ q,
                                     float* __restrict__ gate, __nv_bfloat16* __restrict__ kcache,
                                     __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps) {
+  pdl_begin();  // first statement: see launch.cuh
   extern __shared__ float xn[];
   __shared__ float red[32];
   const int m = blockIdx.x, slot = blockIdx.y, d = threadIdx.x;
@@ -518,6 +533,7 @@ __global__ void __launch_bounds__(ROWS * 2)
     attention_mma_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                          const __nv_bfloat16* __restrict__ vcache, DevPos pos0_arg, int M, int Hq, int Hkv,
                          int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps) {
+  pdl_begin();  // first statement: see launch.cuh
   constexpr int D = kMmaD, G = 6, KS = kMmaKS;
   extern __shared__ __align__(16) unsigned char smem[];
   auto stage = [&](int i) { return reinterpret_cast<__nv_bfloat16*>(smem + (i % NS) * mma_stage(TK)); };
@@ -680,6 +696,7 @@ __global__ void __launch_bounds__(ROWS * 2)
 
 __global__ void attention_combine_kernel(const float* __restrict__ scratch, int splits, int D,
                                          float* __restrict__ out) {
+  pdl_begin();  // first statement: see launch.cuh
   const int mh = blockIdx.x, d = threadIdx.x;
   const float* base = scratch + static_cast<size_t>(mh) * splits * (D + 2);
   float M = -INFINITY;
@@ -705,7 +722,19 @@ size_t g_kv_hs = 0, g_kv_ps = 0;
 size_t kv_hs(int D) { return g_kv_hs ? g_kv_hs : D; }
 size_t kv_ps(int Hkv, int D) { return g_kv_ps ? g_kv_ps : static_cast<size_t>(Hkv) * D; }
 
+bool g_pdl = false;
+
 }  // namespace
+
+void set_pdl(bool on) { g_pdl = on; }
+bool pdl_enabled() { return g_pdl; }
+bool pdl_attention_enabled() {
+  static const bool attn = [] {
+    const char* e = std::getenv("LING_PDL_ATTN");
+    return e && std::atoi(e) != 0;
+  }();
+  return g_pdl && attn;
+}
 
 void set_kv_layout(size_t head_stride, size_t pos_stride) {
   g_kv_hs = head_stride;
@@ -758,14 +787,14 @@ void gemv_bf16(const float* x, int M, const __nv_bfloat16* w, float* y, int N, i
 void bf16_rows(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s,
                const __nv_bfloat16* w2, float* y2) {
   if (M < 1 || M > 32 || K % (kBf16RowsThreads * 8) != 0) throw std::runtime_error("bf16_rows: M <= 32, K % 1024 == 0");
-  bf16_rows_kernel<float><<<w2 ? 2 * N : N, kBf16RowsThreads, 0, s>>>(x, M, w, y, w2, y2, N, K);
-  LING_LAUNCH_CHECK("bf16_rows");
+  launch_kernel("bf16_rows", bf16_rows_kernel<float>, dim3(w2 ? 2 * N : N), dim3(kBf16RowsThreads), 0, s, x, M, w, y,
+                w2, y2, N, K);
 }
 
 void bf16_rows_bf16in(const __nv_bfloat16* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s) {
   if (M < 1 || M > 32 || K % (kBf16RowsThreads * 8) != 0) throw std::runtime_error("bf16_rows: M <= 32, K % 1024 == 0");
-  bf16_rows_kernel<__nv_bfloat16><<<N, kBf16RowsThreads, 0, s>>>(x, M, w, y, nullptr, nullptr, N, K);
-  LING_LAUNCH_CHECK("bf16_rows_bf16in");
+  launch_kernel("bf16_rows_bf16in", bf16_rows_kernel<__nv_bfloat16>, dim3(N), dim3(kBf16RowsThreads), 0, s, x, M, w,
+                y, nullptr, nullptr, N, K);
 }
 
 void dequant_nvfp4(const uint8_t* w, const uint8_t* wscale, float scale2, __nv_bfloat16* out, int N, int K,
@@ -796,53 +825,46 @@ void gemm_bf16_cublas(cublasHandle_t h, const __nv_bfloat16* x, int M, const __n
 }
 
 void embed(const __nv_bfloat16* table, const int* ids, int M, int H, float* out, cudaStream_t s) {
-  embed_kernel<<<M, 256, 0, s>>>(table, ids, H, out);
-  LING_LAUNCH_CHECK("embed");
+  launch_kernel("embed", embed_kernel, dim3(M), dim3(256), 0, s, table, ids, H, out);
 }
 
 void rmsnorm(const float* x, const __nv_bfloat16* w, float* out, int rows, int H, float eps, bool gemma,
              cudaStream_t s) {
-  rmsnorm_kernel<<<rows, H >= 1024 ? 1024 : H, 0, s>>>(x, w, out, H, eps, gemma);
-  LING_LAUNCH_CHECK("rmsnorm");
+  launch_kernel("rmsnorm", rmsnorm_kernel, dim3(rows), dim3(H >= 1024 ? 1024 : H), 0, s, x, w, out, H, eps, gemma);
 }
 
 void add_inplace(float* h, const float* d, int n, cudaStream_t s) {
-  add_kernel<<<grid_for(n, 256), 256, 0, s>>>(h, d, n);
-  LING_LAUNCH_CHECK("add");
+  launch_kernel("add", add_kernel, dim3(grid_for(n, 256)), dim3(256), 0, s, h, d, n);
 }
 
 void silu_mul(const float* g, const float* u, float* out, int n, cudaStream_t s) {
-  silu_mul_kernel<<<grid_for(n, 256), 256, 0, s>>>(g, u, out, n);
-  LING_LAUNCH_CHECK("silu_mul");
+  launch_kernel("silu_mul", silu_mul_kernel, dim3(grid_for(n, 256)), dim3(256), 0, s, g, u, out, n);
 }
 
 void sigmoid_mul(float* x, const float* gate, int n, cudaStream_t s) {
-  sigmoid_mul_kernel<<<grid_for(n, 256), 256, 0, s>>>(x, gate, n);
-  LING_LAUNCH_CHECK("sigmoid_mul");
+  launch_kernel("sigmoid_mul", sigmoid_mul_kernel, dim3(grid_for(n, 256)), dim3(256), 0, s, x, gate, n);
 }
 
 void gdn_conv(float* mixed, float* conv_state, const __nv_bfloat16* w, int M, int C, cudaStream_t s) {
-  gdn_conv_kernel<<<(C + 255) / 256, 256, 0, s>>>(mixed, conv_state, w, M, C);
-  LING_LAUNCH_CHECK("gdn_conv");
+  launch_kernel("gdn_conv", gdn_conv_kernel, dim3((C + 255) / 256), dim3(256), 0, s, mixed, conv_state, w, M, C);
 }
 
 void gdn_gating(const float* a, const float* b, const __nv_bfloat16* A_log, const __nv_bfloat16* dt_bias,
                 float* g, float* beta, int M, int HV, cudaStream_t s) {
   const int n = M * HV;
-  gdn_gating_kernel<<<(n + 255) / 256, 256, 0, s>>>(a, b, A_log, dt_bias, g, beta, n, HV);
-  LING_LAUNCH_CHECK("gdn_gating");
+  launch_kernel("gdn_gating", gdn_gating_kernel, dim3((n + 255) / 256), dim3(256), 0, s, a, b, A_log, dt_bias, g, beta,
+                n, HV);
 }
 
 void gdn_recurrent(const float* mixed, const float* g, const float* beta, const float* state_in, float* state_out,
                    float* out, int M, int H, int HV, cudaStream_t s) {
-  gdn_recurrent_warp_kernel<<<HV * 4, 32, 0, s>>>(mixed, g, beta, state_in, state_out, out, M, H, HV);
-  LING_LAUNCH_CHECK("gdn_recurrent");
+  launch_kernel("gdn_recurrent", gdn_recurrent_warp_kernel, dim3(HV * 4), dim3(32), 0, s, mixed, g, beta, state_in,
+                state_out, out, M, H, HV);
 }
 
 void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float* out, int rows, int D,
                    float eps, cudaStream_t s) {
-  gated_rmsnorm_kernel<<<rows, D, 0, s>>>(x, z, w, out, D, eps);
-  LING_LAUNCH_CHECK("gated_rmsnorm");
+  launch_kernel("gated_rmsnorm", gated_rmsnorm_kernel, dim3(rows), dim3(D), 0, s, x, z, w, out, D, eps);
 }
 
 void attn_prepare(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
@@ -850,9 +872,8 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
                   float eps, float* q, float* gate, __nv_bfloat16* kcache, __nv_bfloat16* vcache,
                   cudaStream_t s) {
   dim3 grid(M, Hq + 2 * Hkv);
-  attn_prepare_kernel<<<grid, D, D * sizeof(float), s>>>(q_gate, k, v, q_norm, k_norm, pos0, Hq, Hkv, D, rot,
-                                                         theta, eps, q, gate, kcache, vcache, kv_hs(D), kv_ps(Hkv, D));
-  LING_LAUNCH_CHECK("attn_prepare");
+  launch_kernel("attn_prepare", attn_prepare_kernel, grid, dim3(D), D * sizeof(float), s, q_gate, k, v, q_norm, k_norm,
+                pos0, Hq, Hkv, D, rot, theta, eps, q, gate, kcache, vcache, kv_hs(D), kv_ps(Hkv, D));
 }
 
 // Fixed key ranges at fixed positions (row invariance); LING_ATTN_CHUNK picks the size for experiments.
@@ -892,11 +913,11 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
   constexpr int rows = kAttnRows, tk = kAttnTk, ns = kAttnNs;
   prepare_kernels();
   const int R = M * 6;
-  attention_mma_kernel<rows, tk, ns><<<dim3((R + rows - 1) / rows, Hkv, splits), rows * 2, mma_smem(tk, ns), s>>>(
-      q, kcache, vcache, pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D));
-  LING_LAUNCH_CHECK("attention_rows");
-  attention_combine_kernel<<<M * Hq, D, 0, s>>>(scratch, splits, D, out);
-  LING_LAUNCH_CHECK("attention_rows_combine");
+  launch_kernel_pdl(pdl_attention_enabled(), "attention_rows", attention_mma_kernel<rows, tk, ns>,
+                    dim3((R + rows - 1) / rows, Hkv, splits), dim3(rows * 2), mma_smem(tk, ns), s, q, kcache, vcache,
+                    pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D));
+  launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel, dim3(M * Hq), dim3(D),
+                    0, s, scratch, splits, D, out);
 }
 
 }  // namespace ling::kernels

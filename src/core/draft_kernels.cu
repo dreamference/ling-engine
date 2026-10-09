@@ -1,6 +1,7 @@
 // Kernels of the DFlash2 drafter (z-lab's block-diffusion drafter with DFlash2's grouped convolutions and
 // candidate selector), written against SGLang's reference implementation (models/dflash.py).
 #include "core/kernels.cuh"
+#include "core/launch.cuh"
 
 #include <cmath>
 #include <stdexcept>
@@ -8,11 +9,6 @@
 
 namespace ling::kernels {
 namespace {
-
-void check_launch(const char* what) {
-  const cudaError_t e = cudaGetLastError();
-  if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
-}
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -26,6 +22,7 @@ constexpr int kDD = 128;  // drafter head dim
 // one thread per dim.
 __global__ void draft_qk_rope_kernel(float* __restrict__ x, int row_stride, const __nv_bfloat16* __restrict__ w,
                                      DevPos pos0, float theta, float eps) {
+  pdl_begin();  // first statement: see launch.cuh
   __shared__ float red[4], xs[kDD];
   const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
   float* p = x + static_cast<size_t>(r) * row_stride + h * kDD;
@@ -45,6 +42,7 @@ __global__ void draft_qk_rope_kernel(float* __restrict__ x, int row_stride, cons
 
 __global__ void draft_store_kv_kernel(const float* __restrict__ k, const float* __restrict__ v, int kv_size,
                                       DevPos pos0_arg, __nv_bfloat16* __restrict__ kc, __nv_bfloat16* __restrict__ vc) {
+  pdl_begin();  // first statement: see launch.cuh
   const int r = blockIdx.x, pos0 = pos_value(pos0_arg);
   for (int i = threadIdx.x; i < kv_size; i += blockDim.x) {
     const size_t dst = static_cast<size_t>(pos0 + r) * kv_size + i;
@@ -61,6 +59,7 @@ __global__ void __launch_bounds__(256)
     draft_attention_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
                            const __nv_bfloat16* __restrict__ vc, const float* __restrict__ kb,
                            const float* __restrict__ vb, DevPos L_arg, int window_left, int Hkv, float* __restrict__ out) {
+  pdl_begin();  // first statement: see launch.cuh
   __shared__ float wm[8][G], wl[8][G], wacc[8][kDD];
   const int j = blockIdx.x, kvh = blockIdx.y, B = gridDim.x, L = pos_value(L_arg);
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -150,6 +149,7 @@ __global__ void __launch_bounds__(256)
 __global__ void grouped_conv_kernel(const float* __restrict__ h, const float* __restrict__ coef,
                                     const __nv_bfloat16* __restrict__ base, int side, float* __restrict__ out, int C,
                                     int groups, int block) {
+  pdl_begin();  // first statement: see launch.cuh
   const int n = blockIdx.x, gs = C / groups;
   const float* cf = coef + static_cast<size_t>(n) * 4 * groups + side * 2 * groups;
   const bool prev = n % block >= 1;
@@ -173,6 +173,7 @@ __global__ void __launch_bounds__(256)
                             const float* __restrict__ unary, const __nv_bfloat16* __restrict__ P,
                             const __nv_bfloat16* __restrict__ S, int anchor_arg, const int* __restrict__ anchor_dev,
                             float* __restrict__ scores) {
+  pdl_begin();  // first statement: see launch.cuh
   __shared__ float Ps[kSelK][kSelR + 1], Ss[kSelK][kSelR + 1], hs[kSelR];
   const int e = blockIdx.x, t = threadIdx.x;
   const int anchor = anchor_dev ? *anchor_dev : anchor_arg;
@@ -192,6 +193,7 @@ __global__ void __launch_bounds__(256)
 
 __global__ void copy_rows_bf16_kernel(const float* __restrict__ src, int H, __nv_bfloat16* __restrict__ dst,
                                       int dst_stride) {
+  pdl_begin();  // first statement: see launch.cuh
   const int r = blockIdx.x;
   for (int i = threadIdx.x; i < H; i += blockDim.x)
     dst[static_cast<size_t>(r) * dst_stride + i] = __float2bfloat16(src[static_cast<size_t>(r) * H + i]);
@@ -201,39 +203,37 @@ __global__ void copy_rows_bf16_kernel(const float* __restrict__ src, int H, __nv
 
 void copy_rows_bf16(const float* src, int rows, int H, __nv_bfloat16* dst, int dst_stride, cudaStream_t s) {
   if (rows <= 0) return;
-  copy_rows_bf16_kernel<<<rows, 256, 0, s>>>(src, H, dst, dst_stride);
-  check_launch("copy_rows_bf16");
+  launch_kernel("copy_rows_bf16", copy_rows_bf16_kernel, dim3(rows), dim3(256), 0, s, src, H, dst, dst_stride);
 }
 
 void draft_qk_rope(float* x, int rows, int heads, int row_stride, const __nv_bfloat16* norm, DevPos pos0, float theta,
                    float eps, cudaStream_t s) {
-  draft_qk_rope_kernel<<<dim3(rows, heads), kDD, 0, s>>>(x, row_stride, norm, pos0, theta, eps);
-  check_launch("draft_qk_rope");
+  launch_kernel("draft_qk_rope", draft_qk_rope_kernel, dim3(rows, heads), dim3(kDD), 0, s, x, row_stride, norm, pos0,
+                theta, eps);
 }
 
 void draft_store_kv(const float* k, const float* v, int rows, int kv_size, DevPos pos0, __nv_bfloat16* kc,
                     __nv_bfloat16* vc, cudaStream_t s) {
-  draft_store_kv_kernel<<<rows, 256, 0, s>>>(k, v, kv_size, pos0, kc, vc);
-  check_launch("draft_store_kv");
+  launch_kernel("draft_store_kv", draft_store_kv_kernel, dim3(rows), dim3(256), 0, s, k, v, kv_size, pos0, kc, vc);
 }
 
 void draft_attention(const float* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, const float* kb,
                      const float* vb, DevPos L, int B, int window_left, int Hq, int Hkv, float* out, cudaStream_t s) {
   if (Hq != 4 * Hkv) throw std::runtime_error("draft_attention: built for 4 query heads per KV head");
-  draft_attention_kernel<4><<<dim3(B, Hkv), 256, 0, s>>>(q, kc, vc, kb, vb, L, window_left, Hkv, out);
-  check_launch("draft_attention");
+  launch_kernel("draft_attention", draft_attention_kernel<4>, dim3(B, Hkv), dim3(256), 0, s, q, kc, vc, kb, vb, L,
+                window_left, Hkv, out);
 }
 
 void grouped_conv(const float* h, const float* coef, const __nv_bfloat16* base, int side, float* out, int rows,
                   int C, int groups, int block, cudaStream_t s) {
-  grouped_conv_kernel<<<rows, 256, 0, s>>>(h, coef, base, side, out, C, groups, block);
-  check_launch("grouped_conv");
+  launch_kernel("grouped_conv", grouped_conv_kernel, dim3(rows), dim3(256), 0, s, h, coef, base, side, out, C, groups,
+                block);
 }
 
 void selector_lattice(const float* hp, const int* cand, const float* unary, const __nv_bfloat16* P,
                       const __nv_bfloat16* S, int anchor, int E, float* scores, cudaStream_t s, const int* anchor_dev) {
-  selector_lattice_kernel<<<E, 256, 0, s>>>(hp, cand, unary, P, S, anchor, anchor_dev, scores);
-  check_launch("selector_lattice");
+  launch_kernel("selector_lattice", selector_lattice_kernel, dim3(E), dim3(256), 0, s, hp, cand, unary, P, S, anchor,
+                anchor_dev, scores);
 }
 
 }  // namespace ling::kernels
