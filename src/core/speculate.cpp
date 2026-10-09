@@ -200,6 +200,7 @@ void Engine::run_graph(cudaGraphExec_t& slot, const char* what, const std::funct
     }
   }
   if (graphs_ && slot) {
+    NvtxRange range(what);  // the same names as the eager ranges, so a trace attributes graph kernels alike
     check(cudaGraphLaunch(slot, stream_), what);
     return;
   }
