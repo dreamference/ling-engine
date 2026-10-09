@@ -242,6 +242,10 @@ void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
 
 void Engine::draft_launch(int B) {
   NvtxRange range("draft");
+  // The drafter's block always takes the rows path. quantized_ is whatever the last forward() left: after a
+  // prefill it is set, which made the first draft after each prompt take the quantized prefill path (and a
+  // draft graph captured on that step would have kept it for every later step).
+  quantized_ = false;
   const ModelConfig& c = model_->config();
   const DraftConfig& d = draft_->config();
   const int H = d.hidden, E = B - 1, dq = d.heads * d.head_dim, dkv = d.kv_heads * d.head_dim;
@@ -310,6 +314,7 @@ void Engine::verify_launch(int V, int K) {
 
 void Engine::commit_launch(int n) {
   NvtxRange range("commit");
+  quantized_ = false;  // at most 32 rows: the rows path, whatever the last forward() left (see draft_launch)
   commit(n);
   draft_materialize(n, dpos(), 0);
 }
