@@ -147,8 +147,12 @@ void Engine::draft_materialize(int rows, int pos0, int cap_row0) {
   const int dkv = d.kv_heads * d.head_dim;
   // fc over the concatenated target features (already BF16), then the hidden norm. The context goes
   // straight to each layer's K and V: no input norm, no convolution (SGLang's prepare_context_hidden_for_kv).
-  kernels::gemm_bf16_cublas(cublas_, cap_ + size_t(cap_row0) * cap_stride_, rows, draft_->fc().w, dctx_, d.hidden,
-                            cap_stride_);
+  if (rows <= kernels::kMaxStreamRows)
+    kernels::bf16_rows_bf16in(cap_ + size_t(cap_row0) * cap_stride_, rows, draft_->fc().w, dctx_, d.hidden, cap_stride_,
+                              stream_);
+  else
+    kernels::gemm_bf16_cublas(cublas_, cap_ + size_t(cap_row0) * cap_stride_, rows, draft_->fc().w, dctx_, d.hidden,
+                              cap_stride_);
   kernels::rmsnorm(dctx_, draft_->hidden_norm(), dctx_, rows, d.hidden, d.eps, false, stream_);
   for (int l = 0; l < d.layers; ++l) {
     const DraftLayer& L = draft_->layers()[l];

@@ -193,12 +193,33 @@ __global__ void gemv_bf16_kernel(const float* __restrict__ x, int M, const __nv_
 // output, each thread a fixed slice of K for every row, then a fixed-order reduction, so the weights are
 // read once and a row's result does not depend on M.
 constexpr int kBf16RowsThreads = 128;
+
+__device__ __forceinline__ void load8(const float* p, float (&v)[8]) {
+  const float4 a = *reinterpret_cast<const float4*>(p), b = *reinterpret_cast<const float4*>(p + 4);
+  v[0] = a.x, v[1] = a.y, v[2] = a.z, v[3] = a.w, v[4] = b.x, v[5] = b.y, v[6] = b.z, v[7] = b.w;
+}
+__device__ __forceinline__ void load8(const __nv_bfloat16* p, float (&v)[8]) {
+  const uint4 raw = *reinterpret_cast<const uint4*>(p);
+  const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float2 f = __bfloat1622float2(h[i]);
+    v[2 * i] = f.x;
+    v[2 * i + 1] = f.y;
+  }
+}
+
+template <typename XT>  // the input: FP32 activations, or BF16 (the drafter's target features)
 __global__ void __launch_bounds__(kBf16RowsThreads)
-    bf16_rows_kernel(const float* __restrict__ x, int M, const __nv_bfloat16* __restrict__ w, float* __restrict__ y,
-                     int N, int K) {
+    bf16_rows_kernel(const XT* __restrict__ x, int M, const __nv_bfloat16* __restrict__ w0, float* __restrict__ y0,
+                     const __nv_bfloat16* __restrict__ w1, float* __restrict__ y1, int N, int K) {
   constexpr int MT = 32;
   __shared__ float red[kBf16RowsThreads / 32][MT];
-  const int n = blockIdx.x, t = threadIdx.x, lane = t & 31, warp = t >> 5;
+  // Blocks [0, N) take the first matrix, [N, 2N) the second (when given).
+  const bool second = static_cast<int>(blockIdx.x) >= N;
+  const __nv_bfloat16* __restrict__ w = second ? w1 : w0;
+  float* __restrict__ y = second ? y1 : y0;
+  const int n = blockIdx.x - (second ? N : 0), t = threadIdx.x, lane = t & 31, warp = t >> 5;
   float acc[MT];
 #pragma unroll
   for (int m = 0; m < MT; ++m) acc[m] = 0.f;
@@ -216,17 +237,11 @@ __global__ void __launch_bounds__(kBf16RowsThreads)
 #pragma unroll
     for (int m = 0; m < MT; ++m) {
       if (m >= M) break;
-      const float4 a = *reinterpret_cast<const float4*>(x + static_cast<size_t>(m) * K + k0);
-      const float4 b = *reinterpret_cast<const float4*>(x + static_cast<size_t>(m) * K + k0 + 4);
+      float xv[8];
+      load8(x + static_cast<size_t>(m) * K + k0, xv);
       float v = acc[m];
-      v = fmaf(wf[0], a.x, v);
-      v = fmaf(wf[1], a.y, v);
-      v = fmaf(wf[2], a.z, v);
-      v = fmaf(wf[3], a.w, v);
-      v = fmaf(wf[4], b.x, v);
-      v = fmaf(wf[5], b.y, v);
-      v = fmaf(wf[6], b.z, v);
-      v = fmaf(wf[7], b.w, v);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) v = fmaf(wf[i], xv[i], v);
       acc[m] = v;
     }
   }
@@ -676,12 +691,12 @@ __global__ void __launch_bounds__(256)
 
 // ---- Rows-path attention on tensor cores (decode and verify, M <= 32). ----
 // One block takes all query rows of one KV head (row r = position m * 6 + head g, up to 96 rows: 16
-// positions) and one fixed range of kMmaChunk keys, in tiles of 32 keys staged in shared memory.
+// positions) and one fixed range of attention_chunk() keys, in tiles staged in shared memory.
 // S = Q K^T and O += P V run as BF16 m16n8k16 MMAs with FP32 accumulation, one warp per 16 rows, and
 // the online softmax lives in the accumulator fragments. Partial (max, sum, O) per row go to `scratch`
 // for attention_combine_kernel. A row's arithmetic depends only on its own query and keys: tiles past
 // its last key are fully masked and leave its state bit for bit unchanged, so results are row-invariant.
-constexpr int kMmaD = 256, kMmaChunk = 512;
+constexpr int kMmaD = 256;
 constexpr int kMmaKS = kMmaD + 8;  // padded row stride (bf16) of the K and V tiles: conflict-free fragments
 // One K tile and one V tile per stage, double-buffered.
 constexpr size_t mma_smem(int tk) { return 2 * size_t(2) * tk * kMmaKS * sizeof(__nv_bfloat16); }
@@ -727,7 +742,7 @@ template <int ROWS, int TK>  // query rows per block (16 per warp), keys per til
 __global__ void __launch_bounds__(ROWS * 2)
     attention_mma_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                          const __nv_bfloat16* __restrict__ vcache, int pos0, int M, int Hq, int Hkv, int splits,
-                         float* __restrict__ scratch) {
+                         int chunk, float* __restrict__ scratch) {
   constexpr int D = kMmaD, G = 6, KS = kMmaKS;
   extern __shared__ __align__(16) unsigned char smem[];
   __nv_bfloat16* stages[2] = {reinterpret_cast<__nv_bfloat16*>(smem),
@@ -738,7 +753,7 @@ __global__ void __launch_bounds__(ROWS * 2)
   const bool active = warp * 16 < nrows;
   const int last_m = (r0 + nrows - 1) / G;
   const int kend = pos0 + last_m + 1;  // keys [0, kend) are visible to some row of this block
-  const int klo = split * kMmaChunk, khi = min(kend, klo + kMmaChunk);
+  const int klo = split * chunk, khi = min(kend, klo + chunk);
   // This thread's two rows (g and g + 8 of the warp's 16), their positions, and their queries as MMA
   // A fragments in BF16, scaled by 1 / sqrt(D) (a power of two: exact).
   const int ra = r0 + warp * 16 + g, rb = ra + 8;
@@ -942,10 +957,17 @@ void gemv_bf16(const float* x, int M, const __nv_bfloat16* w, float* y, int N, i
   LING_LAUNCH_CHECK("gemv_bf16");
 }
 
-void bf16_rows(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s) {
+void bf16_rows(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s,
+               const __nv_bfloat16* w2, float* y2) {
   if (M < 1 || M > 32 || K % (kBf16RowsThreads * 8) != 0) throw std::runtime_error("bf16_rows: M <= 32, K % 1024 == 0");
-  bf16_rows_kernel<<<N, kBf16RowsThreads, 0, s>>>(x, M, w, y, N, K);
+  bf16_rows_kernel<float><<<w2 ? 2 * N : N, kBf16RowsThreads, 0, s>>>(x, M, w, y, w2, y2, N, K);
   LING_LAUNCH_CHECK("bf16_rows");
+}
+
+void bf16_rows_bf16in(const __nv_bfloat16* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s) {
+  if (M < 1 || M > 32 || K % (kBf16RowsThreads * 8) != 0) throw std::runtime_error("bf16_rows: M <= 32, K % 1024 == 0");
+  bf16_rows_kernel<__nv_bfloat16><<<N, kBf16RowsThreads, 0, s>>>(x, M, w, y, nullptr, nullptr, N, K);
+  LING_LAUNCH_CHECK("bf16_rows_bf16in");
 }
 
 void dequant_nvfp4(const uint8_t* w, const uint8_t* wscale, float scale2, __nv_bfloat16* out, int N, int K,
@@ -1035,7 +1057,16 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
   LING_LAUNCH_CHECK("attn_prepare");
 }
 
-int attention_rows_splits(int ctx) { return (ctx + kMmaChunk - 1) / kMmaChunk; }
+// Fixed key ranges at fixed positions (row invariance); LING_ATTN_CHUNK picks the size for experiments.
+int attention_chunk() {
+  static const int c = [] {
+    const char* e = std::getenv("LING_ATTN_CHUNK");
+    return e ? std::atoi(e) : 4096;  // measured at 24K, 16 rows: 512 keys 0.77 ms per layer, 1024 0.64, 2048 0.52, 4096 0.48
+  }();
+  return c;
+}
+
+int attention_rows_splits(int ctx) { return (ctx + attention_chunk() - 1) / attention_chunk(); }
 
 size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx) {
   return static_cast<size_t>(M) * Hq * attention_rows_splits(ctx) * (D + 2);
@@ -1060,7 +1091,8 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
       configured[idx] = true;
     }
     kernel<<<dim3((R + rows - 1) / rows, Hkv, splits), rows * 2, mma_smem(tk), s>>>(q, kcache, vcache, pos0, M, Hq,
-                                                                                     Hkv, splits, scratch);
+                                                                                     Hkv, splits, attention_chunk(),
+                                                                                     scratch);
   };
   switch (variant) {
     case 4816: run(attention_mma_kernel<48, 16>, 48, 16); break;

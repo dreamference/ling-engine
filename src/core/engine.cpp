@@ -189,7 +189,8 @@ void Engine::linear_fp4(const Fp4Weight& w, const float* x, int M, float* y, boo
   kernels::gemm_bf16_cublas(cublas_, x_bf16_, M, w_bf16_, y, w.N, w.K);
 }
 
-void Engine::linear_fp4_multi(std::initializer_list<std::pair<const Fp4Weight*, float*>> ws, const float* x, int M) {
+void Engine::linear_fp4_multi(std::initializer_list<std::pair<const Fp4Weight*, float*>> ws, const float* x, int M,
+                              bool x_ready) {
   if (M > kernels::kMaxStreamRows) {
     for (const auto& [w, y] : ws) linear_fp4(*w, x, M, y);
     return;
@@ -200,11 +201,12 @@ void Engine::linear_fp4_multi(std::initializer_list<std::pair<const Fp4Weight*, 
     t[n++] = {w->w, nullptr, w->scale2, y, w->N};
     K = w->K;
   }
-  kernels::to_half_rows(x, M, K, xh_, xinv_, stream_);
+  if (!x_ready) kernels::to_half_rows(x, M, K, xh_, xinv_, stream_);
   kernels::stream_gemm_multi(true, xh_, xinv_, M, t, n, K, stream_);
 }
 
-void Engine::linear_fp8_multi(std::initializer_list<std::pair<const Fp8Weight*, float*>> ws, const float* x, int M) {
+void Engine::linear_fp8_multi(std::initializer_list<std::pair<const Fp8Weight*, float*>> ws, const float* x, int M,
+                              bool x_ready) {
   if (M > kernels::kMaxStreamRows) {
     for (const auto& [w, y] : ws) linear_fp8(*w, x, M, y);
     return;
@@ -215,8 +217,18 @@ void Engine::linear_fp8_multi(std::initializer_list<std::pair<const Fp8Weight*, 
     t[n++] = {w->w, nullptr, w->scale, y, w->N};
     K = w->K;
   }
-  kernels::to_half_rows(x, M, K, xh_, xinv_, stream_);
+  if (!x_ready) kernels::to_half_rows(x, M, K, xh_, xinv_, stream_);
   kernels::stream_gemm_multi(false, xh_, xinv_, M, t, n, K, stream_);
+}
+
+bool Engine::norm_rows(const float* x, const __nv_bfloat16* w, float* out, int M) {
+  const ModelConfig& c = model_->config();
+  if (M <= kernels::kMaxStreamRows) {
+    kernels::rmsnorm_half(x, w, out, xh_, xinv_, M, c.hidden, c.eps, true, stream_);
+    return true;
+  }
+  kernels::rmsnorm(x, w, out, M, c.hidden, c.eps, true, stream_);
+  return false;
 }
 
 void Engine::linear_bf16(const Bf16Weight& w, const float* x, int M, float* y) {
@@ -229,6 +241,10 @@ void Engine::linear_bf16(const Bf16Weight& w, const float* x, int M, float* y) {
 }
 
 void Engine::linear_bf16_cublas(const Bf16Weight& w, const float* x, int M, float* y) {
+  if (M <= kernels::kMaxStreamRows && w.K % 1024 == 0) {  // stream the weights once (cuBLAS: ~90 GB/s here)
+    kernels::bf16_rows(x, M, w.w, y, w.N, w.K, stream_);
+    return;
+  }
   kernels::to_bf16(x, x_bf16_, M * w.K, stream_);
   kernels::gemm_bf16_cublas(cublas_, x_bf16_, M, w.w, y, w.N, w.K);
 }
@@ -268,10 +284,10 @@ void Engine::forward(const int* ids, int M, Pass pass) {
   for (int li = 0; li < c.layers; ++li) {
     const LayerWeights& L = model_->layers()[li];
     const int slot = layer_slot_[li];
-    kernels::rmsnorm(h_, L.input_norm, xn_, M, H, c.eps, true, stream_);
+    const bool xn_half = norm_rows(h_, L.input_norm, xn_, M);
     if (L.full) {
       NvtxRange r("attention");
-      linear_fp8_multi({{&L.q, q_gate_}, {&L.k, k_}, {&L.v, v_}}, xn_, M);
+      linear_fp8_multi({{&L.q, q_gate_}, {&L.k, k_}, {&L.v, v_}}, xn_, M, xn_half);
       mark("attn_proj");
       kernels::attn_prepare(q_gate_, k_, v_, L.q_norm, L.k_norm, pos_, M, c.heads, c.kv_heads, c.head_dim,
                             c.rotary_dim, c.rope_theta, c.eps, q_, gate_, kcache_[slot], vcache_[slot], stream_);
@@ -292,9 +308,13 @@ void Engine::forward(const int* ids, int M, Pass pass) {
       float* mixed = verify ? v_post_[slot] : mixed_;
       float* g = verify ? v_g_[slot] : g_;
       float* beta = verify ? v_beta_[slot] : beta_;
-      linear_fp8_multi({{&L.in_qkv, verify ? v_pre_[slot] : mixed}, {&L.in_z, z_}}, xn_, M);
-      linear_bf16(L.in_a, xn_, M, a_);
-      linear_bf16(L.in_b, xn_, M, b_);
+      linear_fp8_multi({{&L.in_qkv, verify ? v_pre_[slot] : mixed}, {&L.in_z, z_}}, xn_, M, xn_half);
+      if (M <= kernels::kMaxStreamRows && L.in_a.N == L.in_b.N) {  // both in one launch
+        kernels::bf16_rows(xn_, M, L.in_a.w, a_, L.in_a.N, L.in_a.K, stream_, L.in_b.w, b_);
+      } else {
+        linear_bf16(L.in_a, xn_, M, a_);
+        linear_bf16(L.in_b, xn_, M, b_);
+      }
       mark("gdn_proj");
       float* conv_state = conv_state_[slot];
       if (verify) {
@@ -318,8 +338,8 @@ void Engine::forward(const int* ids, int M, Pass pass) {
     kernels::add_inplace(h_, t1_, M * H, stream_);
     {
       NvtxRange r("mlp");
-      kernels::rmsnorm(h_, L.post_norm, xn_, M, H, c.eps, true, stream_);
-      linear_fp4_multi({{&L.gate, t1_}, {&L.up, t2_}}, xn_, M);
+      const bool post_half = norm_rows(h_, L.post_norm, xn_, M);
+      linear_fp4_multi({{&L.gate, t1_}, {&L.up, t2_}}, xn_, M, post_half);
       kernels::silu_mul(t1_, t2_, t1_, M * I, stream_);
       linear_fp4(L.down, t1_, M, t2_);
       kernels::add_inplace(h_, t2_, M * H, stream_);

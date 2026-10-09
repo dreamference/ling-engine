@@ -23,7 +23,11 @@ void gemv_nvfp4(const float* x, int M, const uint8_t* w, const uint8_t* wscale, 
 void gemv_fp8(const float* x, int M, const uint8_t* w, float wscale, float* y, int N, int K,
               cudaStream_t s);
 // y = x . W^T for narrow BF16 matrices and up to 32 rows, row-invariant (the rows path). K % 1024 == 0.
-void bf16_rows(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s);
+// With w2/y2: a second matrix of the same shape and input in the same launch.
+void bf16_rows(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s,
+               const __nv_bfloat16* w2 = nullptr, float* y2 = nullptr);
+// The same with a BF16 input (rows of `x` K apart): the drafter's fc over the target features.
+void bf16_rows_bf16in(const __nv_bfloat16* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s);
 // y = x . W^T, W BF16 [N][K].
 void gemv_bf16(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s);
 
@@ -43,6 +47,9 @@ void retile_fp8(const uint8_t* w, uint8_t* out, int N, int K, cudaStream_t s);
 void dequant_tiled_nvfp4(const uint8_t* tw, float scale2, __nv_bfloat16* out, int N, int K, cudaStream_t s);
 void dequant_tiled_fp8(const uint8_t* tw, float wscale, __nv_bfloat16* out, int N, int K, cudaStream_t s);
 
+// RMSNorm (as rmsnorm) that also writes the FP16 copy and scales to_half_rows would make from its output.
+void rmsnorm_half(const float* x, const __nv_bfloat16* w, float* out, __half* xh, float* xinv, int rows, int H, float eps,
+                  bool gemma, cudaStream_t s);
 // x [M][K] FP32 -> FP16 with a power-of-two scale per row (xinv[m] undoes it).
 void to_half_rows(const float* x, int M, int K, __half* out, float* xinv, cudaStream_t s);
 // y[M][N] = scale2 * x . W^T, W NVFP4 in the tiled layout (wscale is unused: the scales are in the blob).

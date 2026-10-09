@@ -245,6 +245,44 @@ __global__ void split_reduce_kernel(const float* __restrict__ part, int ksplit, 
   y[i] = sum * gscale * xinv[i / N];
 }
 
+// RMSNorm of each row, written in FP32 and as the scaled FP16 copy the streaming GEMM reads (the same
+// values to_half_rows would produce from the FP32 output).
+__global__ void rmsnorm_half_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+                                    float* __restrict__ out, __half* __restrict__ xh, float* __restrict__ xinv, int H,
+                                    float eps, bool gemma) {
+  __shared__ float red[32];
+  const size_t r = blockIdx.x;
+  const float* row = x + r * H;
+  float ss = 0.f;
+  for (int h = threadIdx.x; h < H; h += blockDim.x) ss += row[h] * row[h];
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+  __syncthreads();
+  float tot = 0.f;
+  for (int i = 0; i < (blockDim.x + 31) / 32; ++i) tot += red[i];
+  const float rstd = rsqrtf(tot / H + eps);
+  float mx = 0.f;
+  for (int h = threadIdx.x; h < H; h += blockDim.x) {
+    const float wv = __bfloat162float(w[h]);
+    const float v = row[h] * rstd * (gemma ? 1.f + wv : wv);
+    out[r * H + h] = v;
+    mx = fmaxf(mx, fabsf(v));
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+  __syncthreads();
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = mx;
+  __syncthreads();
+  mx = 0.f;
+  for (int i = 0; i < (blockDim.x + 31) / 32; ++i) mx = fmaxf(mx, red[i]);
+  int e = 0;
+  if (mx > 0.f && isfinite(mx)) frexpf(mx, &e);
+  const float sc = ldexpf(1.f, 15 - e);
+  for (int h = threadIdx.x; h < H; h += blockDim.x) xh[r * H + h] = __float2half_rn(out[r * H + h] * sc);
+  if (threadIdx.x == 0) xinv[r] = ldexpf(1.f, e - 15);
+}
+
 // One block per row: a power-of-two scale that puts the row's largest magnitude in [2^14, 2^15).
 __global__ void to_half_rows_kernel(const float* __restrict__ x, int K, __half* __restrict__ out,
                                     float* __restrict__ xinv) {
@@ -443,6 +481,13 @@ void dequant_tiled_fp8(const uint8_t* tw, float wscale, __nv_bfloat16* out, int 
   dequant_tiled_fp8_kernel<<<grid_of(static_cast<size_t>(N) * K), 256, 0, s>>>(tw, wscale, out, N, K);
   const cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) throw std::runtime_error(std::string("dequant_tiled_fp8: ") + cudaGetErrorString(e));
+}
+
+void rmsnorm_half(const float* x, const __nv_bfloat16* w, float* out, __half* xh, float* xinv, int rows, int H, float eps,
+                  bool gemma, cudaStream_t s) {
+  rmsnorm_half_kernel<<<rows, 1024, 0, s>>>(x, w, out, xh, xinv, H, eps, gemma);
+  const cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess) throw std::runtime_error(std::string("rmsnorm_half: ") + cudaGetErrorString(e));
 }
 
 void to_half_rows(const float* x, int M, int K, __half* out, float* xinv, cudaStream_t s) {
