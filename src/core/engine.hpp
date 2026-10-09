@@ -27,18 +27,9 @@
 
 #include "core/drafter.hpp"
 #include "core/model.hpp"
+#include "core/sampling.hpp"
 
 namespace ling {
-
-struct SamplingParams {
-  float temperature = 1.0f;  // 0 = greedy
-  int top_k = 20;
-  float top_p = 0.95f;
-  float min_p = 0.f;
-  float presence_penalty = 0.f;
-  float repetition_penalty = 1.f;
-  uint64_t seed = 0;  // 0 = random
-};
 
 struct EngineOptions {
   int max_context = 65536;
@@ -91,11 +82,12 @@ class Engine {
   int max_context() const { return opts_.max_context; }
 
   // Brings the state to exactly `prompt` (reusing the current state when `prompt` extends the tokens
-  // already processed) and returns the logits after its last token.
+  // already processed) and returns the logits after its last token. Throws NonFiniteLogits, keeping no
+  // state from the failed pass, when a pass's logits are not finite.
   const std::vector<float>& prefill(const std::vector<int>& prompt, EngineStats* stats = nullptr);
   // Appends one token and returns the logits after it.
   const std::vector<float>& step(int token);
-  // Picks the next token from logits.
+  // Picks the next token from logits (sample_logits). Throws NonFiniteLogits if any logit is NaN or inf.
   int sample(const std::vector<float>& logits, const SamplingParams& p, const std::vector<int>& history);
 
   // Speculation. `anchor` is the next token, chosen but not yet processed (what step() would take).

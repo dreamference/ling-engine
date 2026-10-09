@@ -7,9 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
-#include <numeric>
 #include <stdexcept>
-#include <unordered_set>
 
 #include "core/kernels.cuh"
 
@@ -534,6 +532,14 @@ const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, Engine
     if (keep_at > 0) snap_pos_ = -1;  // snap_ is rewritten by the pass
     const int n = end - i, pos0 = pos_;
     forward(prompt.data() + i, n, Pass::Prefill, keep_at);
+    // A pass whose logits are not finite left a broken state (a NaN anywhere in it reaches the last
+    // token's logits). Keep nothing from it: snap_ stays invalid if the pass wrote it, no checkpoint is
+    // saved and its tokens do not join history_. A non-finite checkpoint would be reused by every later
+    // prompt that shares the prefix. (A decode step's state is never kept, so only prefill needs this.)
+    if (!all_finite(logits_)) {
+      pos_ = i;
+      throw NonFiniteLogits();
+    }
     if (keep_at > 0) snap_pos_ = snap_at;
     if (draft_) {
       const int first = std::max(pos0, window);
@@ -565,47 +571,8 @@ const std::vector<float>& Engine::step(int token) {
 }
 
 int Engine::sample(const std::vector<float>& logits, const SamplingParams& p, const std::vector<int>& history) {
-  const int V = static_cast<int>(logits.size());
-  std::vector<float> l(logits);
-  if (p.presence_penalty != 0.f || p.repetition_penalty != 1.f) {
-    std::unordered_set<int> seen(history.begin(), history.end());
-    for (int t : seen) {
-      if (t < 0 || t >= V) continue;
-      if (p.repetition_penalty != 1.f) l[t] = l[t] > 0 ? l[t] / p.repetition_penalty : l[t] * p.repetition_penalty;
-      l[t] -= p.presence_penalty;
-    }
-  }
-  if (p.temperature <= 0.f) return static_cast<int>(std::max_element(l.begin(), l.end()) - l.begin());
-  const int k = (p.top_k > 0 && p.top_k < V) ? p.top_k : V;
-  std::vector<int> idx(V);
-  std::iota(idx.begin(), idx.end(), 0);
-  std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) { return l[a] > l[b]; });
-  idx.resize(k);
-  std::vector<double> probs(k);
-  const double mx = l[idx[0]];
-  double sum = 0;
-  for (int i = 0; i < k; ++i) sum += probs[i] = std::exp((l[idx[i]] - mx) / p.temperature);
-  for (double& pr : probs) pr /= sum;
-  int keep = k;
-  if (p.top_p < 1.f) {
-    double cum = 0;
-    for (int i = 0; i < k; ++i) {
-      cum += probs[i];
-      if (cum >= p.top_p) {
-        keep = i + 1;
-        break;
-      }
-    }
-  }
-  if (p.min_p > 0.f) {
-    const double floor = probs[0] * p.min_p;
-    int n = 0;
-    while (n < keep && probs[n] >= floor) ++n;
-    keep = std::max(n, 1);
-  }
-  if (p.seed != 0) rng_.seed(p.seed + history.size());
-  std::discrete_distribution<int> dist(probs.begin(), probs.begin() + keep);
-  return idx[dist(rng_)];
+  if (p.seed != 0 && p.temperature > 0.f) rng_.seed(p.seed + history.size());
+  return sample_logits(logits, p, history, rng_);
 }
 
 }  // namespace ling

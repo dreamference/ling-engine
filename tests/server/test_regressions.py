@@ -255,6 +255,17 @@ def test_untruncated_sampling_is_not_degenerate(server, top_k):
     assert not degenerate((m.get("reasoning_content") or "") + (m.get("content") or ""))
 
 
+def test_nonfinite_logits_are_counted(server):
+    """vllm#53305, vllm#55291, sglang#33187.
+
+    Their bug: a NaN or inf logits row was sampled (token 0, '!', to max_tokens, or a uniform draw
+    streamed as a healthy answer). ling-serve ends such a request with an error and counts it. A NaN
+    cannot be caused over HTTP (tests/sampling_tests.cpp injects one on the host). Check: /metrics
+    exports the counter."""
+    status, text = server.request("/metrics")
+    assert status == 200 and "ling:nonfinite_logits_total" in text
+
+
 # --- Correctness: reasoning and tool-call parsing, streaming ------------------------------------------
 
 
