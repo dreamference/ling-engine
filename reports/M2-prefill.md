@@ -87,9 +87,10 @@ M1 resumed only from the end of the previous prompt: right for a session's next 
 
 ## 4. Prefix checkpoints
 
-ling-serve runs one sequence; its KV cache holds the tokens of the last request. Prefill now keeps states besides the end of the last prompt: the DeltaNet and conv state at the end of the first two messages (the system message, then the first user message) and at multiples of 2,048 tokens up to 32K, in 8 slots of ~157 MB, the earliest positions kept when they run out. A new prompt resumes from the furthest kept state inside its common prefix with the cache. Two details:
+ling-serve runs one sequence; its KV cache holds the tokens of the last request. Prefill now keeps states besides the end of the last prompt: the DeltaNet and conv state at the end of the first two messages (the system message, then the first user message) and at multiples of 2,048 tokens up to 32K, in 8 slots of ~157 MB, the earliest positions kept when they run out. A new prompt resumes from the furthest kept state inside its common prefix with the cache. Three details:
 
 - **Positions are multiples of 32,** the DeltaNet chunk: the end-of-prompt state is kept at the last multiple of 32, and up to 31 tokens are prefilled again. Resuming there computes exactly what a prefill from scratch does.
+- **Memory.** The eight slots and the end-of-prompt state take 1.4 GB; the prefill path's quantized-activation buffers ~60 MB and the attention partials ~0.1 GB at 64K context. That is ~1.5 GB over M1's footprint, inside SPEC §12's 2 GB shared-prefix store.
 - **The drafter's context.** It attends to the last 2,048 positions; resuming at a position inside that window needs its context KV from the window's start, which the engine now tracks (`dkv_lo_`), and otherwise resumes further back.
 
 `ling-run --prefix-check` prefills a sequence of replayed prompts (three turns of one session, two of another, a third session, back to the first), each after the previous one and again from scratch, and compares the states: all identical, bit for bit, along with the next token. The cross-session prompts resume at 11,360-11,488 tokens (the system message's end); the next turn of a session resumes at the previous prompt's end.
@@ -133,6 +134,7 @@ M0's harness and main set, unchanged (12 sessions x 12 requests, single stream, 
 - **Prefill time over the whole run** (the server's time-to-first-token sum): 121 / 120 s, against M1's 701 s and production's 119 / 148 s.
 - **The first request of each window** is not a cold start for production either: its cache holds 8,192-11,648 of the request's tokens (section 3). ling-serve resumes after the system message as well, and prefills the remaining median 14,348 tokens in about 5 s.
 - **Decode.** The step is unchanged from M1 (114.5 ms; 115.3-115.4 here, with prompts 129 tokens longer), so decode follows acceptance, which sampling moves between runs: 4.80-5.20 over the four M2 runs, against M1's single run at 5.21 and its first build's 4.92. Greedy acceptance on 12 replayed prompts, which sampling cannot move, is the same for M1's and M2's builds: 5.85 and 5.89 tokens per step.
+- **Time to first token is the client's first streamed delta.** ling-serve's output parser holds a tool call back until `</tool_call>` arrives, so a response that opens with a tool call shows its first delta at the end; production streams a call's argument deltas as they come. This makes ling-serve's numbers look slower, not faster.
 - **The intermediate builds** show what moved: the first M2 build already took most of the gap; the chunked recurrence and the fused SwiGLU GEMM cut the first requests' time to first token (8.3 to 5.4 s), but aligning kept states to 32 tokens added a separate pass for each prompt's tail and so 0.1 s to every warm request (`7c4aa6b`); the final build captures that state inside the last pass.
 
 ### Agreement with production
