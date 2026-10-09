@@ -14,6 +14,11 @@ engine shows top1 well above 90% and top5 near 100%. A broken layer shows near-z
 few tokens.
 
     validate_v0.py --ling-run build/ling-run --model DIR [--sglang http://127.0.0.1:8000] [--tokens 48]
+                   [--prompts-file F [--max-prompts N]]
+
+The built-in prompts are short, so they exercise the rows path only (32 tokens or fewer). --prompts-file
+takes prompts of its own (one JSON string per line, or a line {"text": ...} as bench/render/sglang_render.py
+writes them for replayed agent requests): long prompts run through the prefill path (M2).
 """
 import argparse
 import json
@@ -52,19 +57,30 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--sglang", default="http://127.0.0.1:8000")
     ap.add_argument("--tokens", type=int, default=48)
+    ap.add_argument("--prompts-file")
+    ap.add_argument("--max-prompts", type=int, default=0)
+    ap.add_argument("--max-context", type=int, default=65536)
     args = ap.parse_args()
+    prompts = PROMPTS
+    if args.prompts_file:
+        prompts = []
+        for line in open(args.prompts_file):
+            v = json.loads(line)
+            prompts.append(v["text"] if isinstance(v, dict) else v)
+        if args.max_prompts:
+            prompts = prompts[:args.max_prompts]
 
     import tempfile
     with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
-        for prompt in PROMPTS:
+        for prompt in prompts:
             f.write(json.dumps(prompt) + "\n")
     run = subprocess.run([args.ling_run, "--model", args.model, "--prompts-file", f.name, "--max-tokens",
-                          str(args.tokens), "--ids-out", "--prompt-ids-out"],
+                          str(args.tokens), "--ids-out", "--prompt-ids-out", "--max-context", str(args.max_context)],
                          capture_output=True, text=True, check=True)
     lines = run.stdout.strip().splitlines()
     total = top1 = top5 = 0
     lp_sum = 0.0
-    for n, prompt in enumerate(PROMPTS):
+    for n, prompt in enumerate(prompts):
         prompt_ids = [int(x) for x in lines[2 * n].split(",")]
         gen = [int(x) for x in lines[2 * n + 1].split(",") if x]
         token_lps, tops = sglang_logprobs(args.sglang, prompt_ids + gen, len(prompt_ids))
@@ -80,7 +96,7 @@ def main():
         top1 += p_top1
         top5 += p_top5
         print(f"{len(gen):3d} tokens  top1 {p_top1 / max(len(gen), 1):6.1%}  top5 {p_top5 / max(len(gen), 1):6.1%}  "
-              f"{prompt[:50]!r}")
+              f"{len(prompt_ids)} prompt tokens" if args.prompts_file else f"{prompt[:50]!r}")
     print(f"ALL {total} tokens: top1 {top1 / total:.1%}  top5 {top5 / total:.1%}  "
           f"mean logprob under SGLang {lp_sum / total:.3f}")
     return 0 if top5 / total > 0.95 else 1

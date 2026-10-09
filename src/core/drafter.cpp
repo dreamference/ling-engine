@@ -84,6 +84,9 @@ DraftModel::DraftModel(const std::string& dir) {
     const TensorView& s2 = ck.get(prefix + ".weight_scale_2");
     if (s2.dtype != "F32" || s2.bytes != 4) throw std::runtime_error(prefix + ".weight_scale_2 is not an F32 scalar");
     std::memcpy(&w.scale2, s2.data, 4);
+    const TensorView& is = ck.get(prefix + ".input_scale");
+    if (is.dtype != "F32" || is.bytes != 4) throw std::runtime_error(prefix + ".input_scale is not an F32 scalar");
+    std::memcpy(&w.in_scale, is.data, 4);
     return w;
   };
   fc_ = bf_w("fc.weight");

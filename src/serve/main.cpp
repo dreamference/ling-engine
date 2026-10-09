@@ -649,7 +649,7 @@ class Factory : public proxygen::RequestHandlerFactory {
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "0.0.0.0", name;
-  int port = 8000, max_context = 65536, draft_block = 16, lookup = 1, lookup_min = 8;
+  int port = 8000, max_context = 65536, draft_block = 16, lookup = 1, lookup_min = 8, checkpoints = 8;
   std::string draft_dir, pretokenizer = "production";
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -670,13 +670,14 @@ int main(int argc, char** argv) {
     else if (a == "--lookup") lookup = std::stoi(next());
     else if (a == "--lookup-min") lookup_min = std::stoi(next());
     else if (a == "--pretokenizer") pretokenizer = next();
+    else if (a == "--prefix-checkpoints") checkpoints = std::stoi(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]] [--pretokenizer production|checkpoint]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N]\n";
     return 2;
   }
   int fake_argc = 1;
@@ -696,6 +697,8 @@ int main(int argc, char** argv) {
   opts.draft_block = draft_block;
   opts.lookup_mode = lookup;
   opts.lookup_min_match = lookup_min;
+  opts.prefix_checkpoints = checkpoints;
+  opts.boundary_token = tok.token_id("<|im_end|>");
   std::cerr << "loading " << model_dir << " ...\n";
   ling::Engine engine(model_dir, opts);
   std::cerr << "loaded " << engine.model().device_bytes() / 1e9 << " GB of weights\n";

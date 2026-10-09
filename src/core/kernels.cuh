@@ -47,6 +47,36 @@ void retile_fp8(const uint8_t* w, uint8_t* out, int N, int K, cudaStream_t s);
 void dequant_tiled_nvfp4(const uint8_t* tw, float scale2, __nv_bfloat16* out, int N, int K, cudaStream_t s);
 void dequant_tiled_fp8(const uint8_t* tw, float wscale, __nv_bfloat16* out, int N, int K, cudaStream_t s);
 
+// ---- Prefill GEMMs for more than 32 rows (prefill_gemm.cu): block-scaled tensor cores over the same tiled
+// weights, with the activations quantized as production quantizes them (SPEC.md §11). ----
+// x [M][K] -> NVFP4: q packed [M][K/2] (low nibble first), E4M3 scales sf [M][K/16], global scale
+// 1 / input_scale. K % 16 == 0.
+void quant_act_nvfp4(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf, cudaStream_t s);
+// The same for silu(g) * u (the FFN's activation, never written in FP32).
+void silu_mul_quant_nvfp4(const float* g, const float* u, int M, int K, float input_scale, uint8_t* q, uint8_t* sf,
+                          cudaStream_t s);
+// x [M][K] -> FP8 E4M3 [M][K], x / input_scale saturated. K % 4 == 0.
+void quant_act_fp8(const float* x, int M, int K, float input_scale, uint8_t* q, cudaStream_t s);
+// Producers of the prefill GEMMs' inputs, fused with the quantization (the FP32 tensor is never written, except
+// `out` of rmsnorm_quant when given): Gemma RMSNorm (H % 1024 == 0), the DeltaNet gated norm (D = 128) and the
+// attention's sigmoid gate (n % 4 == 0).
+void rmsnorm_quant(const float* x, const __nv_bfloat16* w, float* out, int M, int H, float eps, bool nvfp4,
+                   float input_scale, uint8_t* q, uint8_t* sf, cudaStream_t s);
+void gated_rmsnorm_fp8(const float* x, const float* z, const __nv_bfloat16* w, int rows, int D, float eps,
+                       float input_scale, uint8_t* q, cudaStream_t s);
+void sigmoid_mul_fp8(const float* x, const float* gate, size_t n, float input_scale, uint8_t* q, cudaStream_t s);
+// y[M][0..N) (rows ldy apart) = alpha * xq . W^T, or += with `accumulate`; W tiled (retile_*), alpha =
+// input_scale * the weight's global scale. N % 128 == 0, K % 128 == 0.
+void prefill_gemm_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8_t* w, float alpha, float* y, int ldy,
+                        int N, int K, bool accumulate, cudaStream_t s);
+void prefill_gemm_fp8(const uint8_t* xq, int M, const uint8_t* w, float alpha, float* y, int ldy, int N, int K,
+                      bool accumulate, cudaStream_t s);
+
+// ya = x . Wa^T, yb = x . Wb^T for two BF16 [48][K] matrices and any M, row-invariant (the prefill path's
+// DeltaNet a and b projections).
+void narrow_bf16(const float* x, int M, const __nv_bfloat16* wa, const __nv_bfloat16* wb, float* ya, float* yb, int N,
+                 int K, cudaStream_t s);
+
 // RMSNorm (as rmsnorm) that also writes the FP16 copy and scales to_half_rows would make from its output.
 void rmsnorm_half(const float* x, const __nv_bfloat16* w, float* out, __half* xh, float* xinv, int rows, int H, float eps,
                   bool gemma, cudaStream_t s);
@@ -107,6 +137,10 @@ void gdn_gating(const float* a, const float* b, const __nv_bfloat16* A_log, cons
 // is, so replaying accepted rows reproduces sequential decoding bit for bit.
 void gdn_recurrent(const float* mixed, const float* g, const float* beta, const float* state_in, float* state_out,
                    float* out, int M, int H, int HV, cudaStream_t s);
+// The prefill path's conv (prefill_gdn.cu), parallel over tokens: out of place (in: the raw projections,
+// out: after the conv and SiLU), and the window updated. Each token is computed the same way whatever M is.
+void gdn_conv_prefill(const float* in, float* out, float* conv_state, const __nv_bfloat16* w, int M, int C,
+                      cudaStream_t s);
 // out = rmsnorm(x) * w * silu(z), rows of length D.
 void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float* out, int rows, int D,
                    float eps, cudaStream_t s);
@@ -123,16 +157,12 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
                   const __nv_bfloat16* k_norm, int pos0, int M, int Hq, int Hkv, int D, int rot, float theta,
                   float eps, float* q, float* gate, __nv_bfloat16* kcache, __nv_bfloat16* vcache,
                   cudaStream_t s);
-// Causal attention of M queries (positions pos0..) over the cache, split over key ranges and combined.
-// `scratch` needs attention_scratch_floats(M, Hq, Hkv, D, ctx) floats.
-size_t attention_scratch_floats(int M, int Hq, int Hkv, int D, int ctx);
-// The rows path's attention (M <= 32): fixed 1024-key ranges, so each row's result is independent of M.
+// Causal attention of M queries (positions pos0..) over the cache, on tensor cores over fixed 4096-key ranges at
+// fixed positions (combined afterwards), so each row's result is independent of M: decode, verify and prefill
+// (in slices of queries). `scratch` needs attention_rows_scratch_floats(M, Hq, D, ctx) floats.
 size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx);
 void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, int pos0, int M, int Hq,
                     int Hkv, int D, float* scratch, float* out, cudaStream_t s);
-void attention(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, int pos0, int M,
-               int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s);
-
 // ---- The DFlash2 drafter (draft_kernels.cu). ----
 // dst[r][0..H) = bf16(src[r][0..H)), rows dst_stride apart (the target features the drafter conditions on).
 void copy_rows_bf16(const float* src, int rows, int H, __nv_bfloat16* dst, int dst_stride, cudaStream_t s);

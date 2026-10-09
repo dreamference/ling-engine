@@ -39,6 +39,8 @@ add_library(ling_core STATIC
   src/core/safetensors.cpp
   src/core/kernels.cu
   src/core/stream_gemm.cu
+  src/core/prefill_gemm.cu
+  src/core/prefill_gdn.cu
   src/core/topk.cu
   src/core/draft_kernels.cu
   src/core/drafter.cpp
@@ -97,6 +99,9 @@ add_test(NAME kernels COMMAND ling-kernel-tests)
 add_executable(ling-stream-tests tests/stream_tests.cu)
 target_link_libraries(ling-stream-tests PRIVATE ling_core)
 add_test(NAME stream COMMAND ling-stream-tests)
+add_executable(ling-prefill-tests tests/prefill_tests.cu)
+target_link_libraries(ling-prefill-tests PRIVATE ling_core)
+add_test(NAME prefill COMMAND ling-prefill-tests)
 add_executable(ling-spec-tests tests/spec_tests.cpp)
 target_link_libraries(ling-spec-tests PRIVATE ling_core)
 add_test(NAME spec COMMAND ling-spec-tests)
