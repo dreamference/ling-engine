@@ -131,7 +131,9 @@ class Engine {
   // Appends M tokens at position pos_ (a verify writes their KV but leaves pos_ and the recurrent state
   // to commit()). Prefill and Decode leave the logits after the last token in logits_; Verify leaves the
   // logits of every row in logits_dev_.
-  void forward(const int* ids, int M, Pass pass);
+  // keep_at (prefill only, 0 < keep_at < M): also keep the DeltaNet and conv state after the first keep_at
+  // tokens in snap_ (the end-of-prompt state at a multiple of 32, without a separate pass for the tail).
+  void forward(const int* ids, int M, Pass pass, int keep_at = -1);
   // The rows path's linear layers take x through an FP16 copy; `x_ready` reuses the previous call's copy
   // (the same x feeding several matrices).
   void linear_fp4(const Fp4Weight& w, const float* x, int M, float* y, bool x_ready = false);

@@ -314,7 +314,7 @@ void Engine::linear_fp8(const Fp8Weight& w, const float* x, int M, float* y, boo
   kernels::prefill_gemm_fp8(xq_, M, w.w, w.in_scale * w.scale, y, w.N, w.N, w.K, false, stream_);
 }
 
-void Engine::forward(const int* ids, int M, Pass pass) {
+void Engine::forward(const int* ids, int M, Pass pass, int keep_at) {
   const ModelConfig& c = model_->config();
   if (pos_ + M > opts_.max_context) throw std::runtime_error("context is longer than max_context");
   const bool rows = M <= kernels::kMaxStreamRows, verify = pass == Pass::Verify;
@@ -397,13 +397,16 @@ void Engine::forward(const int* ids, int M, Pass pass) {
               "verify conv");
         conv_state = conv_tmp_;
       }
-      if (quantized_) kernels::gdn_conv_prefill(t2_, mixed, conv_state, L.conv, M, C, stream_);
+      const bool keep = quantized_ && keep_at > 0 && keep_at < M;
+      if (quantized_)
+        kernels::gdn_conv_prefill(t2_, mixed, conv_state, L.conv, M, C, stream_, keep ? snap_.conv[slot] : nullptr,
+                                  keep_at);
       else kernels::gdn_conv(mixed, conv_state, L.conv, M, C, stream_);
       kernels::gdn_gating(a_, b_, L.A_log, L.dt_bias, g, beta, M, c.lin_v_heads, stream_);
       mark("gdn_conv");
       if (quantized_)
         kernels::gdn_recurrent_prefill(mixed, g, beta, gdn_state_[slot], core_, M, c.lin_k_heads, c.lin_v_heads, pos_,
-                                       stream_);
+                                       stream_, keep ? snap_.gdn[slot] : nullptr, keep_at);
       else
         kernels::gdn_recurrent(mixed, g, beta, gdn_state_[slot], verify ? nullptr : gdn_state_[slot], core_, M,
                                c.lin_k_heads, c.lin_v_heads, stream_);
@@ -526,9 +529,12 @@ const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, Engine
         end = b;
         break;
       }
-    if (snap_at > i && snap_at < end) end = snap_at;
+    // The end-of-prompt state at snap_at < end is captured inside the pass (no separate pass for the tail).
+    const int keep_at = snap_at > i && snap_at < end ? snap_at - i : -1;
+    if (keep_at > 0) snap_pos_ = -1;  // snap_ is rewritten by the pass
     const int n = end - i, pos0 = pos_;
-    forward(prompt.data() + i, n, Pass::Prefill);
+    forward(prompt.data() + i, n, Pass::Prefill, keep_at);
+    if (keep_at > 0) snap_pos_ = snap_at;
     if (draft_) {
       const int first = std::max(pos0, window);
       if (first < pos0 + n) draft_materialize(pos0 + n - first, first, first - pos0);  // still quantized_
