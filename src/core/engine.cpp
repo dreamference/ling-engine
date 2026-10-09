@@ -127,6 +127,9 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   if (const char* e = std::getenv("LING_ATTN_BULK")) bulk = std::atoi(e) != 0;
   kernels::set_attention_bulk(bulk);
   if (bulk) std::fprintf(stderr, "attention: bulk-copy tiles\n");
+  int prefetch = opts_.attention_prefetch;
+  if (const char* e = std::getenv("LING_ATTN_PREFETCH")) prefetch = std::atoi(e);
+  kernels::set_attention_prefetch(prefetch);
 }
 
 Engine::~Engine() {

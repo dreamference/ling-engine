@@ -68,6 +68,10 @@ struct EngineOptions {
   // M3: the rows path's attention loads its KV tiles through the bulk-copy engine (kernels.cuh,
   // set_attention_bulk); bit for bit the same output. Off by default; LING_ATTN_BULK=0/1 overrides.
   bool attention_bulk = false;
+  // M3: the rows path's attention prefetches its KV tiles into L2 this many tiles ahead (kernels.cuh,
+  // set_attention_prefetch); bit for bit the same output. Measured at 24K: -12% per layer at 2. 0 turns it off;
+  // LING_ATTN_PREFETCH overrides.
+  int attention_prefetch = 2;
 };
 
 struct EngineStats {

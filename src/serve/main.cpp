@@ -3,11 +3,12 @@
 //
 //   ling-serve --model DIR [--host 0.0.0.0] [--port 8000] [--served-model-name NAME] [--max-context N]
 //              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs] [--pdl]
-//              [--attn-bulk]
+//              [--attn-bulk] [--attn-prefetch N]
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
-// tiles with bulk copies (M3).
+// tiles with bulk copies (M3); --attn-prefetch N sets how many KV tiles ahead its attention prefetches into L2
+// (default 2, 0 off; M3).
 //
 // With --draft, requests decode speculatively with the DFlash2 drafter (requests that set penalties
 // decode plainly). GET /metrics exports SGLang's counter names, so M0's replay harness reads them as is.
@@ -657,6 +658,7 @@ int main(int argc, char** argv) {
   int port = 8000, max_context = 65536, draft_block = 16, lookup = 1, lookup_min = 8, checkpoints = 8;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false;
+  int attn_prefetch = 2;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -680,6 +682,7 @@ int main(int argc, char** argv) {
     else if (a == "--graphs") graphs = true;
     else if (a == "--pdl") pdl = true;
     else if (a == "--attn-bulk") attn_bulk = true;
+    else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
@@ -711,6 +714,7 @@ int main(int argc, char** argv) {
   opts.step_graphs = graphs;
   opts.pdl = pdl;
   opts.attention_bulk = attn_bulk;
+  opts.attention_prefetch = attn_prefetch;
   std::cerr << "loading " << model_dir << " ...\n";
   ling::Engine engine(model_dir, opts);
   std::cerr << "loaded " << engine.model().device_bytes() / 1e9 << " GB of weights\n";
