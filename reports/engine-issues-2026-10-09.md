@@ -4,7 +4,7 @@ October 9, 2026 · a survey of 12 months of SGLang's and vLLM's GitHub issues (O
 
 ## Summary
 
-1. **98 issues read in depth, out of 3,585 found.** 58 are vLLM's and 40 SGLang's. The fixing pull request was read where one exists. By kind: 61 correctness, 17 API, 10 performance, 10 hardware. For ling-engine the verdicts are 12 *yes* (the same bug is possible today), 42 *maybe* (possible under some condition, or not yet tested), and 44 *no*.
+1. **98 issues read in depth, out of 3,585 found.** 58 are vLLM's and 40 SGLang's. Each fixing pull request was identified (title and merge state); its description was read where the root cause was unclear. By kind: 61 correctness, 17 API, 10 performance, 10 hardware. For ling-engine the verdicts are 12 *yes* (the same bug is possible today), 42 *maybe* (possible under some condition, or not yet tested), and 44 *no*.
 
 2. **The correctness classes that could hit ling-engine:**
    - **State corruption after a prefix hit.** This is the largest class on hybrid models, and it mostly shows up with speculation on. Output diverges after a cache hit, or degenerates into `!` (token 0). Examples: [vllm#60174](https://github.com/vllm-project/vllm/issues/60174), [vllm#55766](https://github.com/vllm-project/vllm/issues/55766), [sglang#41351](https://github.com/sgl-project/sglang/issues/41351). ling-engine's design (row invariance, commit by replay, chunking-independent prefill) answers it, and `--prefix-check` proves it offline bit for bit. Through the server, nothing tested it until now.
@@ -44,7 +44,7 @@ October 9, 2026 · a survey of 12 months of SGLang's and vLLM's GitHub issues (O
 | Unique issues and pull requests returned | 3,585 |
 | After a noise filter | 2,218 |
 | Titles screened by eye, ranked by how many queries hit them | about 530 |
-| Read in depth (body, comments, fixing PR via GraphQL `closedByPullRequestsReferences` and cross-references) | 98 |
+| Read in depth (body and comments; fixing PRs identified via GraphQL `closedByPullRequestsReferences` and cross-references, their descriptions read where the root cause was unclear) | 98 |
 
 **The three sets of queries:**
 - 45 keyword queries: model family, DFlash, speculation, NVFP4, SM12x/GB10/Spark, the tool and reasoning parsers, the Responses API, stop, logprobs, sampling, penalties, NaN, chat template, structured output, hybrid prefix cache, cancellation, context errors, client names, seed.
