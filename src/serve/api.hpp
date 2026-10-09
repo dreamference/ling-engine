@@ -42,6 +42,10 @@ struct ToolCall {
 };
 
 // Splits generated text into reasoning, content and tool calls as it streams in.
+//
+// A `<tool_call>` marker starts a call only when it is followed by `<function=` and the function is one
+// the request offered, and never inside a markdown code fence: an example in a fence, the template's own
+// placeholder name, or a marker quoted in prose stays text (vllm#57541, vllm#58147, vllm#56658).
 class OutputParser {
  public:
   OutputParser(bool reasoning, const json& tools) : in_reasoning_(reasoning), tools_(tools) {}
@@ -55,14 +59,38 @@ class OutputParser {
   Delta finish();
 
  private:
+  // Whether the content seen so far ends inside a markdown code fence: a line that starts (after spaces or
+  // tabs) with three or more backticks or tildes opens one; a line holding only a run of the same
+  // character, at least as long, closes it. Fed incrementally; a line is judged when its newline arrives.
+  class FenceTracker {
+   public:
+    void feed(const std::string& text);
+    bool open() const { return open_; }
+
+   private:
+    void end_line();
+    bool open_ = false;
+    char fence_char_ = 0;
+    size_t fence_len_ = 0;
+    // The current line: still in its indentation, then its run of one fence character, then whether
+    // anything but whitespace followed the run.
+    bool indent_ = true;
+    char run_char_ = 0;
+    size_t run_len_ = 0;
+    bool in_run_ = false, tail_ = false;
+  };
+
   std::string convert_value(const std::string& function, const std::string& param, const std::string& raw) const;
   std::optional<ToolCall> parse_call(const std::string& block) const;
+  bool offered(const std::string& function) const;
+  void emit_content(Delta& d, const std::string& text);
   Delta drain(bool final);
 
   bool in_reasoning_;
   int skip_newlines_ = 0;
   json tools_;
   std::string buf_;
+  FenceTracker fence_;
 };
 
 std::string new_id(const std::string& prefix);
