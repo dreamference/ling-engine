@@ -129,10 +129,14 @@ class Engine {
   void linear_fp4(const Fp4Weight& w, const float* x, int M, float* y, bool x_ready = false);
   void linear_fp8(const Fp8Weight& w, const float* x, int M, float* y, bool x_ready = false);
   // Several matrices with the same input: one launch on the rows path, separate calls otherwise.
-  void linear_fp4_multi(std::initializer_list<std::pair<const Fp4Weight*, float*>> ws, const float* x, int M);
-  void linear_fp8_multi(std::initializer_list<std::pair<const Fp8Weight*, float*>> ws, const float* x, int M);
+  void linear_fp4_multi(std::initializer_list<std::pair<const Fp4Weight*, float*>> ws, const float* x, int M,
+                        bool x_ready = false);
+  void linear_fp8_multi(std::initializer_list<std::pair<const Fp8Weight*, float*>> ws, const float* x, int M,
+                        bool x_ready = false);
+  // RMSNorm; on the rows path it also leaves the FP16 copy for the next linear call (x_ready).
+  bool norm_rows(const float* x, const __nv_bfloat16* w, float* out, int M);
   void linear_bf16(const Bf16Weight& w, const float* x, int M, float* y);
-  void linear_bf16_cublas(const Bf16Weight& w, const float* x, int M, float* y);  // drafter only: not row-invariant
+  void linear_bf16_cublas(const Bf16Weight& w, const float* x, int M, float* y);  // the drafter's BF16 matrices
   void take_snapshot();
   void restore_snapshot();
 
