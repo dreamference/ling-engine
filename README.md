@@ -1,6 +1,6 @@
 # ling-engine
 
-**A single-model inference engine for Qwen3.8-27B on the NVIDIA DGX Spark (GB10).** v0 runs: it serves the production checkpoint end to end ([docs/V0.md](docs/V0.md)). M1 adds exact speculative decoding with the DFlash2 drafter: 45.5 tokens/s on replayed agent sessions, 97% of production's decode speed ([reports/M1.md](reports/M1.md)).
+**A single-model inference engine for Qwen3.8-27B on the NVIDIA DGX Spark (GB10).** v0 runs: it serves the production checkpoint end to end ([docs/V0.md](docs/V0.md)). M1 adds exact speculative decoding with the DFlash2 drafter: 45.5 tokens/s on replayed agent sessions, 97% of production's decode speed ([reports/M1.md](reports/M1.md)). Prefill came next ([reports/M2-prefill.md](reports/M2-prefill.md)): prompts token-identical to production's, prefill on block-scaled tensor cores at 2,100-2,600 tokens/s (3-5x M1's, 1.1-1.3x production's on long prompts) and shared-prefix checkpoints, so a replayed agent request now takes 4.3-4.4 s against M1's 8.1 s and production's 4.2 s.
 
 Decoding Qwen3.8-27B on a DGX Spark is bound by its 273 GB/s memory bus, not by compute: every generated token streams the model's weights (17.6 GB per pass for the checkpoint Mightling serves), which caps plain decoding near 15 tokens/s. Speculation is the only multiplier, and removing everything that is not weight traffic is the other half.
 
