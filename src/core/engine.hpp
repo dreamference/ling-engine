@@ -61,6 +61,10 @@ struct EngineOptions {
   // M3: run each part of a speculative step (draft, verify, commit) as a captured CUDA graph instead of
   // ~1,400 separate launches (speculate.cpp). Off by default until measured; LING_STEP_GRAPHS=0/1 overrides.
   bool step_graphs = false;
+  // M3: programmatic dependent launch for the rows path's kernels (launch.cuh): each kernel may start, and
+  // issue its first weight loads, while the one before it finishes. Off by default; LING_PDL=0/1 overrides.
+  // Process-wide (the kernels' launch setting), like the KV layout.
+  bool pdl = false;
 };
 
 struct EngineStats {
