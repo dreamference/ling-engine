@@ -56,6 +56,9 @@ __device__ void warp_topk(Get get, int n, int K, WarpList L, int& count_out) {
     if (base + lane < n) get(base + lane, v, idx);
     const bool full = count_s == K;
     const bool cand = (base + lane < n) && v == v && (!full || better(v, idx, thr_v, thr_i));
+    // Every lane has read count_s and the threshold before lane 0 may change them (a ballot synchronizes the
+    // lanes but does not order their memory accesses; compute-sanitizer's racecheck flagged it).
+    __syncwarp();
     unsigned mask = __ballot_sync(0xffffffffu, cand);
     while (mask) {
       const int src = __ffs(mask) - 1;

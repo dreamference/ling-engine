@@ -252,7 +252,8 @@ __global__ void split_reduce_kernel(const float* __restrict__ part, int ksplit, 
 
 // RMSNorm of each row, written in FP32 and as the scaled FP16 copy the streaming GEMM reads (the same
 // values to_half_rows would produce from the FP32 output).
-__global__ void rmsnorm_half_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+// 1024 threads: the bound keeps a Debug (-G) build within the register file.
+__global__ void __launch_bounds__(1024) rmsnorm_half_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w,
                                     float* __restrict__ out, __half* __restrict__ xh, float* __restrict__ xinv, int H,
                                     float eps, bool gemma) {
   pdl_begin();  // first statement: see launch.cuh
