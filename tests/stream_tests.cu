@@ -4,11 +4,14 @@
 //
 //   ling-stream-tests            correctness only
 //   ling-stream-tests --bench    plus timings
+//   LING_PDL=1 ling-stream-tests  the same with programmatic dependent launch (launch.cuh)
+//   LING_NO_TIMING=1 ling-stream-tests  skips the attention timings (under compute-sanitizer)
 #include <cuda_fp8.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <random>
@@ -247,6 +250,41 @@ bool test_attention_rows() {
   same &= std::memcmp(sixteen.data(), full.data(), sixteen.size() * sizeof(float)) == 0;
   ok &= same;
   std::printf("attention_rows rows identical across M = 1, 16, 32: %s\n", same ? "yes ok" : "NO FAIL");
+  // As a step graph launches it: the position read on the device (the host's value deliberately wrong),
+  // every key range up to a fixed context. Must be bit for bit the eager launch.
+  {
+    const int fixed = 3 * 4096;
+    float* gscratch;
+    cudaMalloc(&gscratch, ling::kernels::attention_rows_scratch_floats(MMAX, Hq, D, fixed) * sizeof(float));
+    int* dpos = upload(std::vector<int>{P});
+    ling::kernels::attention_rows(dq, dk, dv, ling::kernels::DevPos(-1, dpos, 0), 16, Hq, Hkv, D, gscratch, out, nullptr,
+                                  fixed);
+    const std::vector<float> g = download(out, size_t(16) * Hq * D);
+    const bool gsame = std::memcmp(g.data(), full.data(), g.size() * sizeof(float)) == 0;
+    ok &= gsame;
+    std::printf("attention_rows with a device position and fixed ranges identical: %s\n", gsame ? "yes ok" : "NO FAIL");
+    cudaFree(gscratch), cudaFree(dpos);
+  }
+  // The bulk-copy tiles (M3): every row bit for bit the cp.async kernel's, at M = 32, 16 and 1, with a
+  // range that ends inside a tile (the rows past it are not copied).
+  {
+    ling::kernels::set_attention_bulk(true);
+    bool bsame = true;
+    ling::kernels::attention_rows(dq, dk, dv, P, MMAX, Hq, Hkv, D, scratch, out, nullptr);
+    const std::vector<float> b32 = download(out, size_t(MMAX) * Hq * D);
+    bsame &= std::memcmp(b32.data(), full.data(), b32.size() * sizeof(float)) == 0;
+    ling::kernels::attention_rows(dq, dk, dv, P, 16, Hq, Hkv, D, scratch, out, nullptr);
+    const std::vector<float> b16 = download(out, size_t(16) * Hq * D);
+    bsame &= std::memcmp(b16.data(), full.data(), b16.size() * sizeof(float)) == 0;
+    for (int m : {0, 13, 31}) {
+      ling::kernels::attention_rows(dq + size_t(m) * Hq * D, dk, dv, P + m, 1, Hq, Hkv, D, scratch, out, nullptr);
+      const std::vector<float> one = download(out, size_t(Hq) * D);
+      bsame &= std::memcmp(one.data(), full.data() + size_t(m) * Hq * D, one.size() * sizeof(float)) == 0;
+    }
+    ling::kernels::set_attention_bulk(false);
+    ok &= bsame;
+    std::printf("attention_rows bulk-copy tiles identical to cp.async: %s\n", bsame ? "yes ok" : "NO FAIL");
+  }
   // Speed at the workload's median context, 16 rows (one layer).
   {
     const int big = 24576 + 32;
@@ -265,19 +303,40 @@ bool test_attention_rows() {
     cudaMalloc(&bs, ling::kernels::attention_rows_scratch_floats(MMAX, Hq, D, big) * sizeof(float));
     cudaEvent_t a, b;
     cudaEventCreate(&a), cudaEventCreate(&b);
-    for (int layout = 0; layout < 2; ++layout) {
-      if (layout == 1) ling::kernels::set_kv_layout(size_t(big) * D, D);  // head-major, as the engine uses
-      for (int M : {1, 16}) {
-        cudaEventRecord(a);
-        for (int i = 0; i < 20; ++i) ling::kernels::attention_rows(dq, bk, bv, 24576, M, Hq, Hkv, D, bs, out, nullptr);
-        cudaEventRecord(b);
-        cudaEventSynchronize(b);
-        float ms = 0;
-        cudaEventElapsedTime(&ms, a, b);
-        std::printf("attention_rows 24K context, %s KV, M=%-2d: %.3f ms per layer (%.0f GB/s of KV)\n",
-                    layout ? "head-major " : "interleaved", M, ms / 20, 2.0 * 24576 * Hkv * D * 2 / (ms / 20 * 1e-3) / 1e9);
-      }
+    // The L2 prefetch (head-major only) moves data, never arithmetic: bit for bit the same output.
+    {
+      ling::kernels::set_kv_layout(size_t(big) * D, D);
+      ling::kernels::attention_rows(dq, bk, bv, 24576, 16, Hq, Hkv, D, bs, out, nullptr);
+      const std::vector<float> plain = download(out, size_t(16) * Hq * D);
+      ling::kernels::set_attention_prefetch(2);
+      ling::kernels::attention_rows(dq, bk, bv, 24576, 16, Hq, Hkv, D, bs, out, nullptr);
+      const std::vector<float> pref = download(out, size_t(16) * Hq * D);
+      ling::kernels::set_attention_prefetch(0);
+      ling::kernels::set_kv_layout(0, 0);
+      const bool psame = std::memcmp(plain.data(), pref.data(), plain.size() * sizeof(float)) == 0;
+      ok &= psame;
+      std::printf("attention_rows with L2 prefetch identical (24K, head-major): %s\n", psame ? "yes ok" : "NO FAIL");
     }
+    for (int layout = 0; layout < (std::getenv("LING_NO_TIMING") ? 0 : 3); ++layout) {
+      if (layout >= 1) ling::kernels::set_kv_layout(size_t(big) * D, D);  // head-major, as the engine uses
+      ling::kernels::set_attention_prefetch(layout == 2 ? 2 : 0);
+      for (int bulk = 0; bulk < 2; ++bulk) {
+        ling::kernels::set_attention_bulk(bulk == 1);
+        for (int M : {1, 16}) {
+          cudaEventRecord(a);
+          for (int i = 0; i < 20; ++i) ling::kernels::attention_rows(dq, bk, bv, 24576, M, Hq, Hkv, D, bs, out, nullptr);
+          cudaEventRecord(b);
+          cudaEventSynchronize(b);
+          float ms = 0;
+          cudaEventElapsedTime(&ms, a, b);
+          std::printf("attention_rows 24K context, %s KV, %s, M=%-2d: %.3f ms per layer (%.0f GB/s of KV)\n",
+                      layout == 0 ? "interleaved " : layout == 1 ? "head-major  " : "head-major+L2 prefetch", bulk ? "bulk   " : "cp.async", M, ms / 20,
+                      2.0 * 24576 * Hkv * D * 2 / (ms / 20 * 1e-3) / 1e9);
+        }
+      }
+      ling::kernels::set_attention_bulk(false);
+    }
+    ling::kernels::set_attention_prefetch(0);
     ling::kernels::set_kv_layout(0, 0);
     cudaFree(bk), cudaFree(bv), cudaFree(bs);
   }
@@ -399,6 +458,7 @@ void bench() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (const char* e = std::getenv("LING_PDL")) ling::kernels::set_pdl(std::atoi(e) != 0);
   bool ok = test_gemm();
   ok &= test_bf16_rows();
   ok &= test_attention_rows();

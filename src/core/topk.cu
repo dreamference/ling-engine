@@ -5,6 +5,7 @@
 // keeps a sorted list of its best K; stage two merges the segments' lists with the same comparison, so
 // the result does not depend on how the row was split.
 #include "core/kernels.cuh"
+#include "core/launch.cuh"
 
 #include <cfloat>
 #include <stdexcept>
@@ -55,6 +56,9 @@ __device__ void warp_topk(Get get, int n, int K, WarpList L, int& count_out) {
     if (base + lane < n) get(base + lane, v, idx);
     const bool full = count_s == K;
     const bool cand = (base + lane < n) && v == v && (!full || better(v, idx, thr_v, thr_i));
+    // Every lane has read count_s and the threshold before lane 0 may change them (a ballot synchronizes the
+    // lanes but does not order their memory accesses; compute-sanitizer's racecheck flagged it).
+    __syncwarp();
     unsigned mask = __ballot_sync(0xffffffffu, cand);
     while (mask) {
       const int src = __ffs(mask) - 1;
@@ -77,6 +81,7 @@ __device__ void warp_topk(Get get, int n, int K, WarpList L, int& count_out) {
 }
 
 __global__ void topk_stage1(const float* __restrict__ x, int V, int K, float* __restrict__ pv, int* __restrict__ pi) {
+  pdl_begin();  // first statement: see launch.cuh
   __shared__ float lv[64];
   __shared__ int li[64];
   const int row = blockIdx.y, seg = blockIdx.x;
@@ -96,6 +101,7 @@ __global__ void topk_stage1(const float* __restrict__ x, int V, int K, float* __
 
 __global__ void topk_stage2(const float* __restrict__ pv, const int* __restrict__ pi, int K, float* __restrict__ vals,
                             int* __restrict__ ids) {
+  pdl_begin();  // first statement: see launch.cuh
   __shared__ float lv[64];
   __shared__ int li[64];
   const int row = blockIdx.x;
@@ -118,10 +124,8 @@ void topk_rows(const float* x, int rows, int V, int K, float* scratch, float* va
   if (K < 1 || K > 64) throw std::runtime_error("topk_rows: K must be in [1, 64]");
   float* pv = scratch;
   int* pi = reinterpret_cast<int*>(scratch + static_cast<size_t>(rows) * kSegments * K);
-  topk_stage1<<<dim3(kSegments, rows), 32, 0, s>>>(x, V, K, pv, pi);
-  topk_stage2<<<rows, 32, 0, s>>>(pv, pi, K, vals, ids);
-  const cudaError_t e = cudaGetLastError();
-  if (e != cudaSuccess) throw std::runtime_error(std::string("topk_rows: ") + cudaGetErrorString(e));
+  launch_kernel("topk_rows", topk_stage1, dim3(kSegments, rows), dim3(32), 0, s, x, V, K, pv, pi);
+  launch_kernel("topk_rows", topk_stage2, dim3(rows), dim3(32), 0, s, pv, pi, K, vals, ids);
 }
 
 }  // namespace ling::kernels

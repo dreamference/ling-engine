@@ -12,6 +12,28 @@
 
 namespace ling::kernels {
 
+// A sequence position as a kernel argument. Eager launches pass the host's value (an int converts
+// implicitly). A launch captured into a CUDA graph is replayed at every step, at a different position each
+// time, so it passes `dev`: the kernel then reads the position from device memory (*dev + off), where the
+// engine writes it before each replay. `host` is the host's view at launch time; it is never used for
+// launch geometry inside a graph (kernels whose grid would depend on it take a fixed grid instead).
+struct DevPos {
+  int host = 0;
+  int off = 0;               // added to *dev
+  const int* dev = nullptr;  // nullptr: the position is `host`
+  DevPos(int p) : host(p) {}  // NOLINT: implicit on purpose, so eager call sites pass a plain int
+  DevPos(int p, const int* d, int o) : host(p), off(o), dev(d) {}
+  DevPos plus(int k) const { return DevPos(host + k, dev, off + k); }
+};
+#ifdef __CUDACC__
+__device__ __forceinline__ int pos_value(const DevPos& p) { return p.dev ? *p.dev + p.off : p.host; }
+#endif
+
+// Programmatic dependent launch (launch.cuh) for the rows path's kernels (decode, verify, drafter, commit):
+// off by default. Set before launching; it applies to every later launch, captured or not.
+void set_pdl(bool on);
+bool pdl_enabled();
+
 // Largest M the weight-streaming GEMV kernels handle; larger M dequantizes to BF16 and uses cuBLAS.
 constexpr int kMaxGemvRows = 8;
 
@@ -167,33 +189,46 @@ void set_kv_layout(size_t head_stride, size_t pos_stride);
 // q/k norms and NeoX RoPE on the first `rot` dims, writes q [M][Hq][D] and gate [M][Hq][D], and appends
 // k/v to the BF16 caches [pos][Hkv][D] at positions pos0 .. pos0+M-1.
 void attn_prepare(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
-                  const __nv_bfloat16* k_norm, int pos0, int M, int Hq, int Hkv, int D, int rot, float theta,
+                  const __nv_bfloat16* k_norm, DevPos pos0, int M, int Hq, int Hkv, int D, int rot, float theta,
                   float eps, float* q, float* gate, __nv_bfloat16* kcache, __nv_bfloat16* vcache,
                   cudaStream_t s);
 // Causal attention of M queries (positions pos0..) over the cache, on tensor cores over fixed 4096-key ranges at
 // fixed positions (combined afterwards), so each row's result is independent of M: decode, verify and prefill
 // (in slices of queries). `scratch` needs attention_rows_scratch_floats(M, Hq, D, ctx) floats.
+// fixed_ctx > 0 (a captured graph, pos0 read on the device): launch the ranges covering fixed_ctx keys
+// whatever the position; ranges past the last visible key write an empty partial that the combine skips,
+// so the result is bit for bit the eager launch's.
 size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx);
-void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, int pos0, int M, int Hq,
-                    int Hkv, int D, float* scratch, float* out, cudaStream_t s);
+void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, DevPos pos0, int M,
+                    int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s, int fixed_ctx = 0);
+// Sets the kernels' shared-memory attributes once, outside any graph capture.
+void prepare_kernels();
+// M3: attention_rows loads its key/value tiles with bulk copies (TMA, one 512-byte copy per key row) instead
+// of 16-byte cp.async. Same tiles, same arithmetic: the output is bit for bit the same. Off by default.
+void set_attention_bulk(bool on);
+// M3: attention_rows prefetches its KV tiles into L2 this many tiles past its shared-memory ring (head-major KV
+// only; 0 off). Moves data only: the output is bit for bit the same.
+void set_attention_prefetch(int tiles);
 // ---- The DFlash2 drafter (draft_kernels.cu). ----
 // dst[r][0..H) = bf16(src[r][0..H)), rows dst_stride apart (the target features the drafter conditions on).
 void copy_rows_bf16(const float* src, int rows, int H, __nv_bfloat16* dst, int dst_stride, cudaStream_t s);
 // Per-head RMSNorm (plain weight) and NeoX RoPE over the full 128-dim head at positions pos0 + row, in place.
-void draft_qk_rope(float* x, int rows, int heads, int row_stride, const __nv_bfloat16* norm, int pos0, float theta,
+void draft_qk_rope(float* x, int rows, int heads, int row_stride, const __nv_bfloat16* norm, DevPos pos0, float theta,
                    float eps, cudaStream_t s);
 // k/v rows [rows][kv_size] into the BF16 caches [position][kv_size] at positions pos0 ...
-void draft_store_kv(const float* k, const float* v, int rows, int kv_size, int pos0, __nv_bfloat16* kc,
+void draft_store_kv(const float* k, const float* v, int rows, int kv_size, DevPos pos0, __nv_bfloat16* kc,
                     __nv_bfloat16* vc, cudaStream_t s);
 // The block's B queries (positions L .. L + B - 1) over the cached context [L + j - window_left, L) and the
 // whole block (bidirectional within it). q [B][Hq][128], kb/vb [B][Hkv][128].
 void draft_attention(const float* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, const float* kb,
-                     const float* vb, int L, int B, int window_left, int Hq, int Hkv, float* out, cudaStream_t s);
+                     const float* vb, DevPos L, int B, int window_left, int Hq, int Hkv, float* out, cudaStream_t s);
 // DFlash2's two-tap grouped dynamic convolution over a block (side 0 wraps a sublayer's input, 1 its output).
 void grouped_conv(const float* h, const float* coef, const __nv_bfloat16* base, int side, float* out, int rows,
                   int C, int groups, int block, cudaStream_t s);
 // The candidate selector's 16 x 16 transition scores for E positions (hp: [E][256], cand/unary: [E][16]).
+// anchor_dev (a captured graph): read the anchor from device memory instead of `anchor`.
 void selector_lattice(const float* hp, const int* cand, const float* unary, const __nv_bfloat16* P,
-                      const __nv_bfloat16* S, int anchor, int E, float* scores, cudaStream_t s);
+                      const __nv_bfloat16* S, int anchor, int E, float* scores, cudaStream_t s,
+                      const int* anchor_dev = nullptr);
 
 }  // namespace ling::kernels

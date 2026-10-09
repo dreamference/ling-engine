@@ -20,6 +20,7 @@
 // contiguous values: logical k {2t, 2t+1, 2t+8, 2t+9} of step s are physical 32t + 4s + {0, 1, 2, 3},
 // for the weights (A) and the activations (B) alike.
 #include "core/kernels.cuh"
+#include "core/launch.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -150,6 +151,9 @@ __global__ void __launch_bounds__(kWarps * 32)
 #pragma unroll
   for (int p = 0; p < PF; ++p)
     if (cbeg + warp + p * kWarps < chunks) load_weights<TILES, FP4>(buf[p], w, row0, N, K, cbeg + warp + p * kWarps, g, t);
+  // PDL (launch.cuh): the first weight chunks above read only the weights, which never change, so they are
+  // in flight while this block waits for the kernel that wrote x and xinv. Nothing else happens before this.
+  pdl_begin();
   for (int c = cbeg + warp; c < chunks; c += kWarps) {
     if (c + PF * kWarps < chunks) load_weights<TILES, FP4>(buf[PF], w, row0, N, K, c + PF * kWarps, g, t);
     const WeightRegs<TILES, FP4>& cur = buf[0];
@@ -238,6 +242,7 @@ __global__ void __launch_bounds__(kWarps * 32)
 // The split-K partial sums, added in split order.
 __global__ void split_reduce_kernel(const float* __restrict__ part, int ksplit, int M, int N, float gscale,
                                     const float* __restrict__ xinv, float* __restrict__ y) {
+  pdl_begin();  // first statement: see launch.cuh
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= M * N) return;
   float sum = 0.f;
@@ -247,9 +252,11 @@ __global__ void split_reduce_kernel(const float* __restrict__ part, int ksplit, 
 
 // RMSNorm of each row, written in FP32 and as the scaled FP16 copy the streaming GEMM reads (the same
 // values to_half_rows would produce from the FP32 output).
-__global__ void rmsnorm_half_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+// 1024 threads: the bound keeps a Debug (-G) build within the register file.
+__global__ void __launch_bounds__(1024) rmsnorm_half_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w,
                                     float* __restrict__ out, __half* __restrict__ xh, float* __restrict__ xinv, int H,
                                     float eps, bool gemma) {
+  pdl_begin();  // first statement: see launch.cuh
   __shared__ float red[32];
   const size_t r = blockIdx.x;
   const float* row = x + r * H;
@@ -286,6 +293,7 @@ __global__ void rmsnorm_half_kernel(const float* __restrict__ x, const __nv_bflo
 // One block per row: a power-of-two scale that puts the row's largest magnitude in [2^14, 2^15).
 __global__ void to_half_rows_kernel(const float* __restrict__ x, int K, __half* __restrict__ out,
                                     float* __restrict__ xinv) {
+  pdl_begin();  // first statement: see launch.cuh
   __shared__ float red[32];
   const float* row = x + static_cast<size_t>(blockIdx.x) * K;
   float mx = 0.f;
@@ -345,9 +353,11 @@ void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, in
   float* part = ksplit > 1 ? split_buffer(size_t(ksplit) * M * t[0].N) : nullptr;
   const dim3 grid(blocks, ksplit);
   // One chunk in flight per warp ahead of the one it computes: 2 and 3 were measured no faster.
-  stream_gemm_kernel<NT, TILES, FP4, 1><<<grid, kWarps * 32, 0, s>>>(x, xinv, M, pr, K, ksplit, part);
+  launch_kernel("stream_gemm", stream_gemm_kernel<NT, TILES, FP4, 1>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K,
+                ksplit, part);
   if (ksplit > 1)
-    split_reduce_kernel<<<(M * t[0].N + 255) / 256, 256, 0, s>>>(part, ksplit, M, t[0].N, t[0].scale, xinv, t[0].y);
+    launch_kernel("stream_gemm split", split_reduce_kernel, dim3((M * t[0].N + 255) / 256), dim3(256), 0, s, part, ksplit,
+                  M, t[0].N, t[0].scale, xinv, t[0].y);
 }
 
 template <bool FP4>
@@ -485,15 +495,11 @@ void dequant_tiled_fp8(const uint8_t* tw, float wscale, __nv_bfloat16* out, int 
 
 void rmsnorm_half(const float* x, const __nv_bfloat16* w, float* out, __half* xh, float* xinv, int rows, int H, float eps,
                   bool gemma, cudaStream_t s) {
-  rmsnorm_half_kernel<<<rows, 1024, 0, s>>>(x, w, out, xh, xinv, H, eps, gemma);
-  const cudaError_t e = cudaGetLastError();
-  if (e != cudaSuccess) throw std::runtime_error(std::string("rmsnorm_half: ") + cudaGetErrorString(e));
+  launch_kernel("rmsnorm_half", rmsnorm_half_kernel, dim3(rows), dim3(1024), 0, s, x, w, out, xh, xinv, H, eps, gemma);
 }
 
 void to_half_rows(const float* x, int M, int K, __half* out, float* xinv, cudaStream_t s) {
-  to_half_rows_kernel<<<M, 256, 0, s>>>(x, K, out, xinv);
-  const cudaError_t e = cudaGetLastError();
-  if (e != cudaSuccess) throw std::runtime_error(std::string("to_half_rows: ") + cudaGetErrorString(e));
+  launch_kernel("to_half_rows", to_half_rows_kernel, dim3(M), dim3(256), 0, s, x, K, out, xinv);
 }
 
 void stream_gemm_nvfp4(const __half* x, const float* xinv, int M, const uint8_t* w, const uint8_t* wscale,

@@ -4,6 +4,17 @@
 //   ling-run --model DIR [--text "..." | --chat "..." | --ids 1,2,3] [--max-tokens N] [--temperature T]
 //            [--prompts-file F] [--ids-out] [--prompt-ids-out] [--max-context N]
 //            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N]]
+//            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--graph-check] [--seed N]
+//
+// --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
+// the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
+// tiles with bulk copies (M3); --attn-prefetch N sets how many KV tiles ahead its attention prefetches into L2
+// (default 2, 0 off; M3).
+//
+// --graph-check decodes each prompt speculatively twice from the same prefill, without and with step graphs,
+// greedily and then sampling (--temperature, default 1, top-k 20, top-p 0.95, seeded by --seed or 1), and
+// checks that the tokens, the recurrent state (bit for bit) and the steps and accepted drafts (which would show a
+// wrong drafter context KV) are the same both ways. --seed N seeds sampling.
 //
 // --spec decodes with the DFlash2 drafter. --spec-check (greedy) decodes each prompt plainly and then
 // speculatively, and checks that the tokens are identical and that the recurrent state after the
@@ -19,6 +30,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -31,6 +43,9 @@ int main(int argc, char** argv) {
   int max_tokens = 64, max_context = 32768;
   float temperature = 0.f;
   bool ids_out = false, prompt_ids_out = false, spec = false, spec_check = false, prefix_check = false;
+  bool graphs = false, pdl = false, attn_bulk = false, graph_check = false;
+  uint64_t seed = 0;
+  int attn_prefetch = 2;
   std::string draft;
   int block = 16, lookup = 1, lookup_min = 8;
   for (int i = 1; i < argc; ++i) {
@@ -59,6 +74,12 @@ int main(int argc, char** argv) {
     else if (a == "--lookup-min") lookup_min = std::stoi(next());
     else if (a == "--spec-check") spec_check = true;
     else if (a == "--prefix-check") prefix_check = true;
+    else if (a == "--graphs") graphs = true;
+    else if (a == "--graph-check") graph_check = true;
+    else if (a == "--seed") seed = std::stoull(next());
+    else if (a == "--pdl") pdl = true;
+    else if (a == "--attn-bulk") attn_bulk = true;
+    else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
@@ -99,6 +120,10 @@ int main(int argc, char** argv) {
     opts.lookup_mode = lookup;
     opts.lookup_min_match = lookup_min;
     opts.boundary_token = tok.token_id("<|im_end|>");
+    opts.step_graphs = graphs;
+    opts.pdl = pdl;
+    opts.attention_bulk = attn_bulk;
+    opts.attention_prefetch = attn_prefetch;
     ling::Engine engine(model, opts);
     auto t1 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "loaded %.1f GB of weights in %.1f s\n", engine.model().device_bytes() / 1e9,
@@ -167,6 +192,42 @@ int main(int argc, char** argv) {
     for (const std::vector<int>& prompt : prompts) {
       ling::SamplingParams sp;
       sp.temperature = temperature;
+      sp.seed = seed;
+      if (graph_check) {
+        for (int sampled = 0; sampled < 2; ++sampled) {
+          ling::SamplingParams gp;
+          gp.temperature = sampled ? (temperature > 0.f ? temperature : 1.f) : 0.f;
+          gp.seed = seed ? seed : 1;
+          double t_eager = 0, t_graph = 0;
+          // The steps and accepted drafts must match too: the commit also writes the drafter's context KV, which
+          // neither the tokens (the verify corrects every draft) nor the state hash would show if it were wrong.
+          engine.set_step_graphs(false);
+          engine.reset_spec_stats();
+          const std::vector<int> eager = generate(prompt, gp, true, true, &t_eager);
+          const uint64_t h_eager = engine.state_hash();
+          const long steps_eager = engine.spec_stats().steps, acc_eager = engine.spec_stats().accepted;
+          engine.set_step_graphs(true);
+          if (!engine.step_graphs()) throw std::runtime_error("--graph-check: step graphs are unavailable");
+          engine.reset_spec_stats();
+          const std::vector<int> graph = generate(prompt, gp, true, true, &t_graph);
+          const uint64_t h_graph = engine.state_hash();
+          const long steps_graph = engine.spec_stats().steps, acc_graph = engine.spec_stats().accepted;
+          const bool same = eager == graph, state = h_eager == h_graph;
+          const bool accept = steps_eager == steps_graph && acc_eager == acc_graph;
+          failures += !same + !state + !accept;
+          std::printf("prompt %zu tokens, %s: eager %zu tokens %.2f tok/s, %ld steps %ld accepted | graphs %zu tokens "
+                      "%.2f tok/s, %ld steps %ld accepted | tokens %s, state %s, acceptance %s\n",
+                      prompt.size(), sampled ? "sampled" : "greedy", eager.size(), eager.size() / t_eager, steps_eager,
+                      acc_eager, graph.size(), graph.size() / t_graph, steps_graph, acc_graph,
+                      same ? "identical" : "DIFFER", state ? "identical" : "DIFFERS", accept ? "identical" : "DIFFERS");
+          if (!same) {
+            size_t i = 0;
+            while (i < eager.size() && i < graph.size() && eager[i] == graph[i]) ++i;
+            std::printf("  first difference at output token %zu\n", i);
+          }
+        }
+        continue;
+      }
       if (spec_check) {
         sp.temperature = 0.f;
         double t_plain = 0, t_spec = 0;
@@ -228,6 +289,10 @@ int main(int argc, char** argv) {
                            double(st.shadow_dflash[b]) / st.shadow_steps[b]);
         }
       }
+    }
+    if (graph_check) {
+      std::printf(failures ? "GRAPH CHECK FAILED\n" : "graph check passed\n");
+      return failures ? 1 : 0;
     }
     if (spec_check) {
       std::printf(failures ? "SPEC CHECK FAILED\n" : "spec check passed\n");
