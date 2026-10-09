@@ -19,10 +19,36 @@ from types import SimpleNamespace
 
 from transformers import AutoTokenizer
 
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest, ResponsesRequest
-from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+import importlib
+import pkgutil
+
+import sglang.srt.entrypoints as entrypoints
 from sglang.srt.parser.template_manager import TemplateManager
+
+
+def _sglang_api():
+    """SGLang's HTTP API modules, found by what they define: the request models and the chat and
+    Responses serving classes (the ones the server itself runs)."""
+    found = {}
+    for info in pkgutil.walk_packages(entrypoints.__path__, entrypoints.__name__ + "."):
+        leaf = info.name.rsplit(".", 1)[-1]
+        if leaf not in ("protocol", "serving_chat", "serving_responses"):
+            continue
+        mod = importlib.import_module(info.name)
+        if leaf == "protocol" and hasattr(mod, "ResponsesRequest"):
+            found["ChatCompletionRequest"] = mod.ChatCompletionRequest
+            found["ResponsesRequest"] = mod.ResponsesRequest
+        for name, obj in vars(mod).items():
+            if isinstance(obj, type) and obj.__module__ == mod.__name__:
+                if name.endswith("ServingChat"):
+                    found["chat"] = obj
+                elif name.endswith("ServingResponses"):
+                    found["responses"] = obj
+    return found
+
+
+API = _sglang_api()
+ResponsesRequest = API["ResponsesRequest"]
 
 
 class StubModelConfig:
@@ -61,8 +87,8 @@ def main():
                          config_value=lambda k: getattr(server_args, k, None))
     templates = TemplateManager()
     templates.load_chat_template(tm, template, model_dir)
-    chat = OpenAIServingChat(tm, templates)
-    resp = OpenAIServingResponses.__new__(OpenAIServingResponses)
+    chat = API["chat"](tm, templates)
+    resp = API["responses"].__new__(API["responses"])
     resp.tokenizer_manager = tm
     resp.serving_chat = chat
     resp.msg_store = {}
