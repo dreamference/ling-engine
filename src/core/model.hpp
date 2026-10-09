@@ -11,6 +11,11 @@
 namespace ling {
 
 class Checkpoint;
+struct TensorView;
+
+// Uploads a checkpoint's NVFP4 (values and scales) or FP8 matrix and rewrites it on the GPU into the tiled
+// layout; returns the tiled device buffer (the caller frees it) and adds its size to *bytes.
+const uint8_t* upload_tiled(const TensorView& values, const TensorView* scales, int N, int K, size_t* bytes);
 
 struct ModelConfig {
   int hidden = 0;            // 5120
@@ -36,14 +41,16 @@ struct ModelConfig {
   static ModelConfig from_file(const std::string& config_json);
 };
 
-struct Fp4Weight {  // NVFP4: packed [N][K/2], E4M3 block scales [N][K/16], one FP32 global scale
+// NVFP4: E2M1 values with one E4M3 scale per 16 and one FP32 global scale. `w` is the tiled blob
+// (values and block scales together, kernels::retile_nvfp4), the order stream_gemm reads.
+struct Fp4Weight {
   const uint8_t* w = nullptr;
-  const uint8_t* scale = nullptr;
   float scale2 = 0.f;
   int N = 0, K = 0;
 };
 
-struct Fp8Weight {  // FP8 E4M3 [N][K], one FP32 per-tensor scale
+// FP8 E4M3 with one FP32 per-tensor scale; `w` is tiled (kernels::retile_fp8).
+struct Fp8Weight {
   const uint8_t* w = nullptr;
   float scale = 0.f;
   int N = 0, K = 0;

@@ -152,8 +152,7 @@ void Engine::draft_materialize(int rows, int pos0, int cap_row0) {
   kernels::rmsnorm(dctx_, draft_->hidden_norm(), dctx_, rows, d.hidden, d.eps, false, stream_);
   for (int l = 0; l < d.layers; ++l) {
     const DraftLayer& L = draft_->layers()[l];
-    linear_fp4(L.k, dctx_, rows, dk_);
-    linear_fp4(L.v, dctx_, rows, dv_, true);
+    linear_fp4_multi({{&L.k, dk_}, {&L.v, dv_}}, dctx_, rows);
     kernels::draft_qk_rope(dk_, rows, d.kv_heads, dkv, L.k_norm, pos0, d.rope_theta, d.eps, stream_);
     kernels::draft_store_kv(dk_, dv_, rows, dkv, pos0, dkc_[l], dvc_[l], stream_);
   }
@@ -176,9 +175,7 @@ void Engine::draft_propose(int anchor, int B) {
     // Attention wrapped in the grouped conv: input side 0, output side 1, one kernel projection.
     linear_bf16_cublas(L.attn_kproj, dh_, B, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.attn_base, 0, dh2_, B, H, d.conv_groups, B, stream_);
-    linear_fp4(L.q, dh2_, B, dq_);
-    linear_fp4(L.k, dh2_, B, dk_, true);
-    linear_fp4(L.v, dh2_, B, dv_, true);
+    linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, B);
     kernels::draft_qk_rope(dq_, B, d.heads, dq, L.q_norm, pos_, d.rope_theta, d.eps, stream_);
     kernels::draft_qk_rope(dk_, B, d.kv_heads, dkv, L.k_norm, pos_, d.rope_theta, d.eps, stream_);
     kernels::draft_attention(dq_, dkc_[l], dvc_[l], dk_, dv_, pos_, B, d.sliding_window - 1, d.heads, d.kv_heads,
@@ -190,8 +187,7 @@ void Engine::draft_propose(int anchor, int B) {
     // The MLP, wrapped the same way.
     linear_bf16_cublas(L.mlp_kproj, dh_, B, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.mlp_base, 0, dh2_, B, H, d.conv_groups, B, stream_);
-    linear_fp4(L.gate, dh2_, B, dg_);
-    linear_fp4(L.up, dh2_, B, du_, true);
+    linear_fp4_multi({{&L.gate, dg_}, {&L.up, du_}}, dh2_, B);
     kernels::silu_mul(dg_, du_, dg_, B * d.intermediate, stream_);
     linear_fp4(L.down, dg_, B, dh2_);
     kernels::grouped_conv(dh2_, dcoef_, L.mlp_base, 1, dout_, B, H, d.conv_groups, B, stream_);

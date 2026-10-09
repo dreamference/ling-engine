@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -672,6 +674,208 @@ __global__ void __launch_bounds__(256)
   }
 }
 
+// ---- Rows-path attention on tensor cores (decode and verify, M <= 32). ----
+// One block takes all query rows of one KV head (row r = position m * 6 + head g, up to 96 rows: 16
+// positions) and one fixed range of kMmaChunk keys, in tiles of 32 keys staged in shared memory.
+// S = Q K^T and O += P V run as BF16 m16n8k16 MMAs with FP32 accumulation, one warp per 16 rows, and
+// the online softmax lives in the accumulator fragments. Partial (max, sum, O) per row go to `scratch`
+// for attention_combine_kernel. A row's arithmetic depends only on its own query and keys: tiles past
+// its last key are fully masked and leave its state bit for bit unchanged, so results are row-invariant.
+constexpr int kMmaD = 256, kMmaChunk = 512;
+constexpr int kMmaKS = kMmaD + 8;  // padded row stride (bf16) of the K and V tiles: conflict-free fragments
+// One K tile and one V tile per stage, double-buffered.
+constexpr size_t mma_smem(int tk) { return 2 * size_t(2) * tk * kMmaKS * sizeof(__nv_bfloat16); }
+
+__device__ __forceinline__ void mma_bf16_16816(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                               uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+      "{%0, %1, %2, %3};"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
+  __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+  return *reinterpret_cast<uint32_t*>(&v);
+}
+
+__device__ __forceinline__ void cp_async16(void* smem_dst, const void* gmem_src, bool valid) {
+  const uint32_t d = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(d), "l"(gmem_src), "r"(valid ? 16 : 0));
+}
+
+// The keys [k0, k0 + TK) of one KV head into a stage (zero-filled past khi).
+template <int TK>
+__device__ __forceinline__ void attn_load_tile(__nv_bfloat16* stage, const __nv_bfloat16* __restrict__ kcache,
+                                               const __nv_bfloat16* __restrict__ vcache, int k0, int khi, int kvh,
+                                               int Hkv) {
+  constexpr int D = kMmaD, KS = kMmaKS;
+  __nv_bfloat16* ks = stage;
+  __nv_bfloat16* vs = stage + TK * KS;
+  for (int i = threadIdx.x; i < TK * (D / 8); i += blockDim.x) {
+    const int j = i / (D / 8), c = i % (D / 8), key = k0 + j;
+    const bool valid = key < khi;
+    const size_t off = (static_cast<size_t>(valid ? key : 0) * Hkv + kvh) * D + 8 * c;
+    cp_async16(ks + j * KS + 8 * c, kcache + off, valid);
+    cp_async16(vs + j * KS + 8 * c, vcache + off, valid);
+  }
+  asm volatile("cp.async.commit_group;");
+}
+
+template <int ROWS, int TK>  // query rows per block (16 per warp), keys per tile
+__global__ void __launch_bounds__(ROWS * 2)
+    attention_mma_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
+                         const __nv_bfloat16* __restrict__ vcache, int pos0, int M, int Hq, int Hkv, int splits,
+                         float* __restrict__ scratch) {
+  constexpr int D = kMmaD, G = 6, KS = kMmaKS;
+  extern __shared__ __align__(16) unsigned char smem[];
+  __nv_bfloat16* stages[2] = {reinterpret_cast<__nv_bfloat16*>(smem),
+                              reinterpret_cast<__nv_bfloat16*>(smem + mma_smem(TK) / 2)};
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
+  const int kvh = blockIdx.y, split = blockIdx.z;
+  const int R = M * G, r0 = blockIdx.x * ROWS, nrows = min(ROWS, R - r0);
+  const bool active = warp * 16 < nrows;
+  const int last_m = (r0 + nrows - 1) / G;
+  const int kend = pos0 + last_m + 1;  // keys [0, kend) are visible to some row of this block
+  const int klo = split * kMmaChunk, khi = min(kend, klo + kMmaChunk);
+  // This thread's two rows (g and g + 8 of the warp's 16), their positions, and their queries as MMA
+  // A fragments in BF16, scaled by 1 / sqrt(D) (a power of two: exact).
+  const int ra = r0 + warp * 16 + g, rb = ra + 8;
+  const int pa = pos0 + ra / G, pb = pos0 + rb / G;
+  const bool va = ra < r0 + nrows, vb = rb < r0 + nrows;
+  const float* qa = q + (static_cast<size_t>(ra / G) * Hq + kvh * G + ra % G) * D;
+  const float* qb = q + (static_cast<size_t>(rb / G) * Hq + kvh * G + rb % G) * D;
+  uint32_t qf[D / 16][4];
+#pragma unroll
+  for (int s = 0; s < D / 16; ++s) {
+    const int k = 16 * s + 2 * t;
+    const float2 a0 = va ? *reinterpret_cast<const float2*>(qa + k) : make_float2(0.f, 0.f);
+    const float2 a1 = vb ? *reinterpret_cast<const float2*>(qb + k) : make_float2(0.f, 0.f);
+    const float2 a2 = va ? *reinterpret_cast<const float2*>(qa + k + 8) : make_float2(0.f, 0.f);
+    const float2 a3 = vb ? *reinterpret_cast<const float2*>(qb + k + 8) : make_float2(0.f, 0.f);
+    qf[s][0] = pack_bf16(a0.x * 0.0625f, a0.y * 0.0625f);
+    qf[s][1] = pack_bf16(a1.x * 0.0625f, a1.y * 0.0625f);
+    qf[s][2] = pack_bf16(a2.x * 0.0625f, a2.y * 0.0625f);
+    qf[s][3] = pack_bf16(a3.x * 0.0625f, a3.y * 0.0625f);
+  }
+  float o[D / 8][4];
+#pragma unroll
+  for (int i = 0; i < D / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
+  float ma = -INFINITY, mb = -INFINITY, la = 0.f, lb = 0.f;
+  if (klo < khi) attn_load_tile<TK>(stages[0], kcache, vcache, klo, khi, kvh, Hkv);
+  int st = 0;
+  for (int k0 = klo; k0 < khi; k0 += TK, st ^= 1) {
+    // Prefetch the next tile into the other stage, then wait for this one.
+    if (k0 + TK < khi) {
+      attn_load_tile<TK>(stages[st ^ 1], kcache, vcache, k0 + TK, khi, kvh, Hkv);
+      asm volatile("cp.async.wait_group 1;");
+    } else {
+      asm volatile("cp.async.wait_group 0;");
+    }
+    __syncthreads();
+    const __nv_bfloat16* ks = stages[st];
+    const __nv_bfloat16* vs = ks + TK * KS;
+    if (active) {
+      // S = Q K^T for 16 rows x 32 keys: 4 key tiles of 8.
+      float sc[TK / 8][4];
+#pragma unroll
+      for (int n = 0; n < TK / 8; ++n) sc[n][0] = sc[n][1] = sc[n][2] = sc[n][3] = 0.f;
+#pragma unroll
+      for (int s = 0; s < D / 16; ++s) {
+#pragma unroll
+        for (int n = 0; n < TK / 8; ++n) {
+          const __nv_bfloat16* kr = ks + (n * 8 + g) * KS + 16 * s;
+          mma_bf16_16816(sc[n], qf[s][0], qf[s][1], qf[s][2], qf[s][3],
+                         *reinterpret_cast<const uint32_t*>(kr + 2 * t),
+                         *reinterpret_cast<const uint32_t*>(kr + 8 + 2 * t));
+        }
+      }
+      // Mask (causal, and the range end), then the online softmax for rows a and b.
+      float ta = -INFINITY, tb = -INFINITY;
+#pragma unroll
+      for (int n = 0; n < TK / 8; ++n)
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const int key = k0 + n * 8 + 2 * t + e;
+          if (key > pa || key >= khi) sc[n][e] = -INFINITY;
+          if (key > pb || key >= khi) sc[n][2 + e] = -INFINITY;
+          ta = fmaxf(ta, sc[n][e]);
+          tb = fmaxf(tb, sc[n][2 + e]);
+        }
+      ta = fmaxf(ta, __shfl_xor_sync(0xffffffffu, ta, 1));
+      ta = fmaxf(ta, __shfl_xor_sync(0xffffffffu, ta, 2));
+      tb = fmaxf(tb, __shfl_xor_sync(0xffffffffu, tb, 1));
+      tb = fmaxf(tb, __shfl_xor_sync(0xffffffffu, tb, 2));
+      const float na = fmaxf(ma, ta), nb = fmaxf(mb, tb);
+      const float alpha_a = na == -INFINITY ? 1.f : __expf(ma - na);
+      const float alpha_b = nb == -INFINITY ? 1.f : __expf(mb - nb);
+      float sa = 0.f, sb = 0.f;
+#pragma unroll
+      for (int n = 0; n < TK / 8; ++n)
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          sc[n][e] = sc[n][e] == -INFINITY ? 0.f : __expf(sc[n][e] - na);
+          sc[n][2 + e] = sc[n][2 + e] == -INFINITY ? 0.f : __expf(sc[n][2 + e] - nb);
+          sa += sc[n][e];
+          sb += sc[n][2 + e];
+        }
+      sa += __shfl_xor_sync(0xffffffffu, sa, 1);
+      sa += __shfl_xor_sync(0xffffffffu, sa, 2);
+      sb += __shfl_xor_sync(0xffffffffu, sb, 1);
+      sb += __shfl_xor_sync(0xffffffffu, sb, 2);
+      la = la * alpha_a + sa;
+      lb = lb * alpha_b + sb;
+      ma = na;
+      mb = nb;
+#pragma unroll
+      for (int i = 0; i < D / 8; ++i) {
+        o[i][0] *= alpha_a;
+        o[i][1] *= alpha_a;
+        o[i][2] *= alpha_b;
+        o[i][3] *= alpha_b;
+      }
+      // O += P V: P from the score fragments, V's B fragments by a transposing ldmatrix (two dim tiles each).
+#pragma unroll
+      for (int j = 0; j < TK / 16; ++j) {
+        const uint32_t a0 = pack_bf16(sc[2 * j][0], sc[2 * j][1]), a1 = pack_bf16(sc[2 * j][2], sc[2 * j][3]);
+        const uint32_t a2 = pack_bf16(sc[2 * j + 1][0], sc[2 * j + 1][1]);
+        const uint32_t a3 = pack_bf16(sc[2 * j + 1][2], sc[2 * j + 1][3]);
+        const int key = j * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+#pragma unroll
+        for (int i = 0; i < D / 8; i += 2) {
+          const uint32_t addr = static_cast<uint32_t>(
+              __cvta_generic_to_shared(vs + key * KS + i * 8 + (lane >> 4) * 8));
+          uint32_t b0, b1, b2, b3;
+          asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+                       : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3)
+                       : "r"(addr));
+          mma_bf16_16816(o[i], a0, a1, a2, a3, b0, b1);
+          mma_bf16_16816(o[i + 1], a0, a1, a2, a3, b2, b3);
+        }
+      }
+    }
+    __syncthreads();  // the stage is refilled two tiles later
+  }
+  if (!active) return;
+  // Partial state per row, in attention_combine_kernel's layout.
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const int row = h ? rb : ra;
+    if (!(h ? vb : va)) continue;
+    float* part = scratch + ((static_cast<size_t>(row / G) * Hq + kvh * G + row % G) * splits + split) * (D + 2);
+    if (t == 0) {
+      part[0] = h ? mb : ma;
+      part[1] = h ? lb : la;
+    }
+#pragma unroll
+    for (int i = 0; i < D / 8; ++i) {
+      part[2 + i * 8 + 2 * t] = o[i][2 * h];
+      part[2 + i * 8 + 2 * t + 1] = o[i][2 * h + 1];
+    }
+  }
+}
+
 __global__ void attention_combine_kernel(const float* __restrict__ scratch, int splits, int D,
                                          float* __restrict__ out) {
   const int mh = blockIdx.x, d = threadIdx.x;
@@ -831,11 +1035,7 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
   LING_LAUNCH_CHECK("attn_prepare");
 }
 
-// Rows path (M <= 32: decode and verify): key ranges of a fixed size at fixed positions, so a query's
-// partial sums, and their combination, do not depend on how many other rows are in the call.
-constexpr int kAttnRowsChunk = 1024;
-
-int attention_rows_splits(int ctx) { return (ctx + kAttnRowsChunk - 1) / kAttnRowsChunk; }
+int attention_rows_splits(int ctx) { return (ctx + kMmaChunk - 1) / kMmaChunk; }
 
 size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx) {
   return static_cast<size_t>(M) * Hq * attention_rows_splits(ctx) * (D + 2);
@@ -845,16 +1045,29 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
                     int Hkv, int D, float* scratch, float* out, cudaStream_t s) {
   if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
   const int splits = attention_rows_splits(pos0 + M);
-  // The tiled kernel: each key and value tile is read once for 8 positions x 6 query heads.
-  static bool configured = false;
-  if (!configured) {
-    check(cudaFuncSetAttribute(attention_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                               static_cast<int>(kPrefillSmem)),
-          "attention_rows smem");
-    configured = true;
+  // LING_ATTN=a,b: rows per block (48 or 96) and keys per tile (16 or 32); default 96,32.
+  static const int variant = [] {
+    const char* e = std::getenv("LING_ATTN");
+    return e ? std::atoi(e) * 100 + std::atoi(std::strchr(e, ',') ? std::strchr(e, ',') + 1 : "32") : 9632;
+  }();
+  const int R = M * 6;
+  auto run = [&](auto kernel, int rows, int tk) {
+    static bool configured[4] = {};
+    const int idx = (rows == 96) * 2 + (tk == 32);
+    if (!configured[idx]) {
+      check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(tk))),
+            "attention_rows smem");
+      configured[idx] = true;
+    }
+    kernel<<<dim3((R + rows - 1) / rows, Hkv, splits), rows * 2, mma_smem(tk), s>>>(q, kcache, vcache, pos0, M, Hq,
+                                                                                     Hkv, splits, scratch);
+  };
+  switch (variant) {
+    case 4816: run(attention_mma_kernel<48, 16>, 48, 16); break;
+    case 4832: run(attention_mma_kernel<48, 32>, 48, 32); break;
+    case 9616: run(attention_mma_kernel<96, 16>, 96, 16); break;
+    default: run(attention_mma_kernel<96, 32>, 96, 32); break;
   }
-  attention_prefill_kernel<<<dim3((M + kPrefillTQ - 1) / kPrefillTQ, Hkv, splits), 256, kPrefillSmem, s>>>(
-      q, kcache, vcache, pos0, M, Hq, Hkv, nullptr, kAttnRowsChunk, splits, scratch);
   LING_LAUNCH_CHECK("attention_rows");
   attention_combine_kernel<<<M * Hq, D, 0, s>>>(scratch, splits, D, out);
   LING_LAUNCH_CHECK("attention_rows_combine");

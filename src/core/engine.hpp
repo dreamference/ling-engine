@@ -10,6 +10,8 @@
 #pragma once
 
 #include <cstdint>
+#include <initializer_list>
+#include <utility>
 #include <map>
 #include <memory>
 #include <random>
@@ -126,6 +128,9 @@ class Engine {
   // (the same x feeding several matrices).
   void linear_fp4(const Fp4Weight& w, const float* x, int M, float* y, bool x_ready = false);
   void linear_fp8(const Fp8Weight& w, const float* x, int M, float* y, bool x_ready = false);
+  // Several matrices with the same input: one launch on the rows path, separate calls otherwise.
+  void linear_fp4_multi(std::initializer_list<std::pair<const Fp4Weight*, float*>> ws, const float* x, int M);
+  void linear_fp8_multi(std::initializer_list<std::pair<const Fp8Weight*, float*>> ws, const float* x, int M);
   void linear_bf16(const Bf16Weight& w, const float* x, int M, float* y);
   void linear_bf16_cublas(const Bf16Weight& w, const float* x, int M, float* y);  // drafter only: not row-invariant
   void take_snapshot();

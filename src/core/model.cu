@@ -1,5 +1,7 @@
 #include "core/model.hpp"
 
+#include "core/kernels.cuh"
+
 #include <cuda_runtime.h>
 
 #include <cstring>
@@ -121,13 +123,36 @@ float Model::scalar(const Checkpoint& ck, const std::string& name) {
   return v;
 }
 
+const uint8_t* upload_tiled(const TensorView& values, const TensorView* scales, int N, int K, size_t* bytes) {
+  auto to_device = [](const TensorView& t) {
+    void* d = nullptr;
+    check(cudaMalloc(&d, t.bytes), "cudaMalloc staging");
+    check(cudaMemcpy(d, t.data, t.bytes, cudaMemcpyHostToDevice), "upload staging");
+    return static_cast<uint8_t*>(d);
+  };
+  const size_t tiled = scales ? kernels::tiled_bytes_nvfp4(N, K) : kernels::tiled_bytes_fp8(N, K);
+  void* out = nullptr;
+  check(cudaMalloc(&out, tiled), "cudaMalloc tiled");
+  uint8_t* v = to_device(values);
+  uint8_t* sc = scales ? to_device(*scales) : nullptr;
+  if (scales) kernels::retile_nvfp4(v, sc, static_cast<uint8_t*>(out), N, K, nullptr);
+  else kernels::retile_fp8(v, static_cast<uint8_t*>(out), N, K, nullptr);
+  check(cudaDeviceSynchronize(), "retile");
+  cudaFree(v);
+  if (sc) cudaFree(sc);
+  *bytes += tiled;
+  return static_cast<const uint8_t*>(out);
+}
+
 Fp4Weight Model::fp4(const Checkpoint& ck, const std::string& prefix) {
   Fp4Weight w;
   const TensorView& t = ck.get(prefix + ".weight");
+  const TensorView& s = ck.get(prefix + ".weight_scale");
+  if (t.dtype != "U8" || s.dtype != "F8_E4M3") throw std::runtime_error(prefix + ": not NVFP4");
   w.N = static_cast<int>(t.shape[0]);
   w.K = static_cast<int>(t.shape[1] * 2);
-  w.w = static_cast<const uint8_t*>(upload(ck, prefix + ".weight", "U8"));
-  w.scale = static_cast<const uint8_t*>(upload(ck, prefix + ".weight_scale", "F8_E4M3"));
+  w.w = upload_tiled(t, &s, w.N, w.K, &bytes_);
+  allocations_.push_back(const_cast<uint8_t*>(w.w));
   w.scale2 = scalar(ck, prefix + ".weight_scale_2");
   return w;
 }
@@ -135,9 +160,11 @@ Fp4Weight Model::fp4(const Checkpoint& ck, const std::string& prefix) {
 Fp8Weight Model::fp8(const Checkpoint& ck, const std::string& prefix) {
   Fp8Weight w;
   const TensorView& t = ck.get(prefix + ".weight");
+  if (t.dtype != "F8_E4M3") throw std::runtime_error(prefix + ": not FP8");
   w.N = static_cast<int>(t.shape[0]);
   w.K = static_cast<int>(t.shape[1]);
-  w.w = static_cast<const uint8_t*>(upload(ck, prefix + ".weight", "F8_E4M3"));
+  w.w = upload_tiled(t, nullptr, w.N, w.K, &bytes_);
+  allocations_.push_back(const_cast<uint8_t*>(w.w));
   w.scale = scalar(ck, prefix + ".weight_scale");
   return w;
 }
