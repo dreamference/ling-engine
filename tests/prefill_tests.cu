@@ -196,17 +196,18 @@ bool test_gemm(std::mt19937& rng, bool fp4, int M, int N, int K, bool accumulate
   return ok;
 }
 
-// The prefill conv against the rows path's (then the same recurrence: close, the conv sums in another order),
-// and against itself over a split prompt (bit for bit).
+// The prefill conv and recurrence against the rows path's (same math, other summation orders: close), and
+// against themselves over a split prompt (bit for bit).
 bool test_deltanet(std::mt19937& rng) {
-  const int H = 16, HV = 48, C = 2 * H * 128 + HV * 128, M = 100, split = 37;
+  const int H = 16, HV = 48, C = 2 * H * 128 + HV * 128, M = 100, split = 64;  // splits fall on multiples of 32
   std::normal_distribution<float> nd(0.f, 1.f);
   std::uniform_real_distribution<float> ud(0.f, 1.f);
   std::vector<float> raw(size_t(M) * C), g(size_t(M) * HV), beta(size_t(M) * HV), conv0(size_t(C) * 3),
       state0(size_t(HV) * 128 * 128);
   std::vector<__nv_bfloat16> w(size_t(C) * 4);
   for (auto& v : raw) v = nd(rng);
-  for (auto& v : g) v = -0.5f * ud(rng);
+  for (size_t i = 0; i < g.size(); ++i)  // some heads forget fast (decay e^-30 per token), as real ones do
+    g[i] = (i % HV) % 7 == 0 ? -30.f * ud(rng) : -0.5f * ud(rng);
   for (auto& v : beta) v = ud(rng);
   for (auto& v : conv0) v = nd(rng);
   for (auto& v : state0) v = 0.1f * nd(rng);
@@ -232,36 +233,141 @@ bool test_deltanet(std::mt19937& rng) {
   // Prefill path, whole.
   restore();
   ling::kernels::gdn_conv_prefill(draw, mixed, conv, dw, M, C, nullptr);
-  ling::kernels::gdn_recurrent(mixed, dg, db, state, state, out, M, H, HV, nullptr);
+  ling::kernels::gdn_recurrent_prefill(mixed, dg, db, state, out, M, H, HV, 0, nullptr);
   const auto p_out = download(out, size_t(M) * HV * 128), p_state = download(state, state0.size()),
              p_conv = download(conv, conv0.size());
   // Prefill path, in two calls.
   restore();
   ling::kernels::gdn_conv_prefill(draw, mixed, conv, dw, split, C, nullptr);
   ling::kernels::gdn_conv_prefill(draw + size_t(split) * C, mixed + size_t(split) * C, conv, dw, M - split, C, nullptr);
-  ling::kernels::gdn_recurrent(mixed, dg, db, state, state, out, split, H, HV, nullptr);
-  ling::kernels::gdn_recurrent(mixed + size_t(split) * C, dg + split * HV, db + split * HV, state, state,
-                               out + size_t(split) * HV * 128, M - split, H, HV, nullptr);
+  ling::kernels::gdn_recurrent_prefill(mixed, dg, db, state, out, split, H, HV, 0, nullptr);
+  ling::kernels::gdn_recurrent_prefill(mixed + size_t(split) * C, dg + split * HV, db + split * HV, state,
+                                       out + size_t(split) * HV * 128, M - split, H, HV, split, nullptr);
   const cudaError_t e = cudaDeviceSynchronize();
   const bool same = download(out, size_t(M) * HV * 128) == p_out && download(state, state0.size()) == p_state &&
                     download(conv, conv0.size()) == p_conv;
-  double worst = 0, rms = 0;
+  // The chunked form multiplies in FP16 (FP32 accumulation): compare errors with each tensor's RMS.
+  double worst = 0, rms = 0, worst_s = 0, rms_s = 0;
   for (size_t i = 0; i < p_out.size(); ++i) {
     worst = std::max(worst, double(std::fabs(p_out[i] - ref_out[i])));
     rms += double(ref_out[i]) * ref_out[i];
   }
-  for (size_t i = 0; i < p_state.size(); ++i) worst = std::max(worst, double(std::fabs(p_state[i] - ref_state[i])));
+  for (size_t i = 0; i < p_state.size(); ++i) {
+    worst_s = std::max(worst_s, double(std::fabs(p_state[i] - ref_state[i])));
+    rms_s += double(ref_state[i]) * ref_state[i];
+  }
   rms = std::sqrt(rms / p_out.size());
+  rms_s = std::sqrt(rms_s / p_state.size());
   const bool conv_same = p_conv == ref_conv;  // the window is a copy of raw inputs
-  const bool ok = e == cudaSuccess && same && conv_same && worst < 1e-4 * std::max(rms, 1.0);
-  std::printf("deltanet prefill: max diff against the rows path %.2e (rms %.2e), window %s, split run %s %s\n", worst,
-              rms, conv_same ? "identical" : "DIFFERS", same ? "bit-identical" : "DIFFERS", ok ? "ok" : "FAIL");
+  const bool ok = e == cudaSuccess && same && conv_same && worst < 2e-2 * rms && worst_s < 2e-2 * rms_s;
+  std::printf("deltanet prefill: max diff against the rows path: output %.2e (rms %.2e), state %.2e (rms %.2e); "
+              "window %s, split run %s %s\n",
+              worst, rms, worst_s, rms_s, conv_same ? "identical" : "DIFFERS", same ? "bit-identical" : "DIFFERS",
+              ok ? "ok" : "FAIL");
   for (float* f : {draw, dg, db, mixed, conv, state, out}) cudaFree(f);
   cudaFree(dw);
   return ok;
 }
 
+// The fused gate/up GEMM equals the two GEMMs followed by silu_mul_quant_nvfp4, byte for byte.
+bool test_swiglu(std::mt19937& rng, int M, int N, int K) {
+  Weights G = make_weights(rng, true, N, K), U = make_weights(rng, true, N, K);
+  std::normal_distribution<float> nd(0.f, 1.f);
+  std::vector<float> x(size_t(M) * K);
+  for (auto& v : x) v = nd(rng);
+  float* dx = upload(x);
+  uint8_t *q, *sf, *q2, *sf2;
+  cudaMalloc(&q, size_t(M) * K / 2);
+  cudaMalloc(&sf, size_t(M) * K / 16);
+  cudaMalloc(&q2, size_t(M) * N / 2);
+  cudaMalloc(&sf2, size_t(M) * N / 16);
+  float *g, *u;
+  cudaMalloc(&g, size_t(M) * N * 4);
+  cudaMalloc(&u, size_t(M) * N * 4);
+  const float in = 0.05f, ag = 0.013f, au = 0.017f, out_in = 0.3f;
+  ling::kernels::quant_act_nvfp4(dx, M, K, in, q, sf, nullptr);
+  ling::kernels::prefill_gemm_nvfp4(q, sf, M, G.tiled, ag, g, N, N, K, false, nullptr);
+  ling::kernels::prefill_gemm_nvfp4(q, sf, M, U.tiled, au, u, N, N, K, false, nullptr);
+  ling::kernels::silu_mul_quant_nvfp4(g, u, M, N, out_in, q2, sf2, nullptr);
+  const auto rq = download(q2, size_t(M) * N / 2), rs = download(sf2, size_t(M) * N / 16);
+  cudaMemset(q2, 0, size_t(M) * N / 2);
+  cudaMemset(sf2, 0, size_t(M) * N / 16);
+  ling::kernels::prefill_swiglu_nvfp4(q, sf, M, G.tiled, ag, U.tiled, au, N, K, out_in, q2, sf2, nullptr);
+  const cudaError_t e = cudaDeviceSynchronize();
+  const bool ok = e == cudaSuccess && download(q2, size_t(M) * N / 2) == rq && download(sf2, size_t(M) * N / 16) == rs;
+  std::printf("prefill_swiglu M=%-4d N=%-5d K=%-5d: %s %s\n", M, N, K, ok ? "identical to the unfused path" : "DIFFERS",
+              ok ? "ok" : "FAIL");
+  for (void* f : {(void*)dx, (void*)q, (void*)sf, (void*)q2, (void*)sf2, (void*)g, (void*)u, (void*)G.tiled, (void*)U.tiled})
+    cudaFree(f);
+  return ok;
+}
+
+void bench_deltanet() {
+  const int H = 16, HV = 48, C = 2 * H * 128 + HV * 128, M = 2048;
+  float *mixed, *g, *beta, *state, *out;
+  cudaMalloc(&mixed, size_t(M) * C * 4);
+  cudaMalloc(&g, size_t(M) * HV * 4);
+  cudaMalloc(&beta, size_t(M) * HV * 4);
+  cudaMalloc(&state, size_t(HV) * 128 * 128 * 4);
+  cudaMalloc(&out, size_t(M) * HV * 128 * 4);
+  for (float* f : {mixed, g, beta, state}) cudaMemset(f, 0, 4);
+  for (int k = 0; k < 4; ++k) {
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    cudaEventRecord(e0);
+    if (k % 2 == 0) ling::kernels::gdn_recurrent(mixed, g, beta, state, state, out, M, H, HV, nullptr);
+    else ling::kernels::gdn_recurrent_prefill(mixed, g, beta, state, out, M, H, HV, 0, nullptr);
+    cudaEventRecord(e1);
+    cudaEventSynchronize(e1);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, e0, e1);
+    if (k >= 2) std::printf("bench deltanet recurrence M=%d: %s %.3f ms\n", M, k % 2 ? "prefill kernel" : "rows kernel", ms);
+  }
+  for (int hv : {1, 3, 12}) {  // fewer heads: does the time per token depend on how many heads run at once?
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    cudaEventRecord(e0);
+    ling::kernels::gdn_recurrent_prefill(mixed, g, beta, state, out, M, hv, hv, 0, nullptr);
+    cudaEventRecord(e1);
+    cudaEventSynchronize(e1);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, e0, e1);
+    std::printf("bench deltanet recurrence M=%d, %d heads: %.3f ms\n", M, hv, ms);
+  }
+  for (float* f : {mixed, g, beta, state, out}) cudaFree(f);
+}
+
 void bench(std::mt19937& rng) {
+  bench_deltanet();
+  for (int M : {512, 2048}) {
+    const int N = 17408, K = 5120;
+    Weights G = make_weights(rng, true, N, K), U = make_weights(rng, true, N, K);
+    uint8_t *q, *sf, *q2, *sf2;
+    cudaMalloc(&q, size_t(M) * K);
+    cudaMalloc(&sf, size_t(M) * K / 16);
+    cudaMalloc(&q2, size_t(M) * N / 2);
+    cudaMalloc(&sf2, size_t(M) * N / 16);
+    cudaMemset(q, 0x22, size_t(M) * K);
+    cudaMemset(sf, 0x38, size_t(M) * K / 16);
+    auto run = [&] { ling::kernels::prefill_swiglu_nvfp4(q, sf, M, G.tiled, 1.f, U.tiled, 1.f, N, K, 1.f, q2, sf2, nullptr); };
+    run();
+    cudaDeviceSynchronize();
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    cudaEventRecord(e0);
+    for (int r = 0; r < 10; ++r) run();
+    cudaEventRecord(e1);
+    cudaEventSynchronize(e1);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, e0, e1);
+    ms /= 10;
+    std::printf("bench M=%-4d ffn swiglu  nvfp4 N=2x%d K=%d %7.3f ms %6.1f TFLOPS (gate and up, NVFP4 output)\n", M, N, K,
+                ms, 4.0 * M * N * K / ms / 1e9);
+    for (void* f : {(void*)q, (void*)sf, (void*)q2, (void*)sf2, (void*)G.tiled, (void*)U.tiled}) cudaFree(f);
+  }
   struct Shape {
     const char* name;
     bool fp4;
@@ -328,6 +434,8 @@ int main(int argc, char** argv) {
   std::mt19937 rng(11);
   bool ok = test_quant(rng);
   ok &= test_deltanet(rng);
+  ok &= test_swiglu(rng, 200, 256, 512);
+  ok &= test_swiglu(rng, 700, 768, 1024);
   for (bool fp4 : {true, false}) {
     ok &= test_gemm(rng, fp4, 200, 256, 512, false);
     ok &= test_gemm(rng, fp4, 33, 128, 256, true);

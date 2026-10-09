@@ -79,6 +79,8 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   const size_t widest = std::max<size_t>(c.intermediate, std::max(c.hidden, std::max(C, 2 * qsize)));
   xq_ = alloc<uint8_t>(M * widest);         // FP8 activations, or NVFP4 in the first half
   xsf_ = alloc<uint8_t>(M * widest / 16);  // NVFP4 block scales
+  xq2_ = alloc<uint8_t>(M * c.intermediate / 2);  // the FFN's fused gate/up output (the down projection's input)
+  xsf2_ = alloc<uint8_t>(M * c.intermediate / 16);
   ids_dev_ = alloc<int>(M);
 
   // Head-major KV caches: one KV head's keys are one contiguous stream for the attention kernels.
@@ -399,8 +401,12 @@ void Engine::forward(const int* ids, int M, Pass pass) {
       else kernels::gdn_conv(mixed, conv_state, L.conv, M, C, stream_);
       kernels::gdn_gating(a_, b_, L.A_log, L.dt_bias, g, beta, M, c.lin_v_heads, stream_);
       mark("gdn_conv");
-      kernels::gdn_recurrent(mixed, g, beta, gdn_state_[slot], verify ? nullptr : gdn_state_[slot], core_, M,
-                             c.lin_k_heads, c.lin_v_heads, stream_);
+      if (quantized_)
+        kernels::gdn_recurrent_prefill(mixed, g, beta, gdn_state_[slot], core_, M, c.lin_k_heads, c.lin_v_heads, pos_,
+                                       stream_);
+      else
+        kernels::gdn_recurrent(mixed, g, beta, gdn_state_[slot], verify ? nullptr : gdn_state_[slot], core_, M,
+                               c.lin_k_heads, c.lin_v_heads, stream_);
       mark("gdn_recurrent");
       if (quantized_) {
         kernels::gated_rmsnorm_fp8(core_, z_, L.lin_norm, M * c.lin_v_heads, c.lin_v_dim, c.eps, L.out.in_scale, xq_,
@@ -415,12 +421,20 @@ void Engine::forward(const int* ids, int M, Pass pass) {
     {
       NvtxRange r("mlp");
       const bool post_half = norm_rows(h_, L.post_norm, xn_, M, L.gate.in_scale, true, L.up.in_scale != L.gate.in_scale);
-      linear_fp4_multi({{&L.gate, t1_}, {&L.up, t2_}}, xn_, M, post_half);
       if (!quantized_) {
+        linear_fp4_multi({{&L.gate, t1_}, {&L.up, t2_}}, xn_, M, post_half);
         kernels::silu_mul(t1_, t2_, t1_, M * I, stream_);
         linear_fp4(L.down, t1_, M, t2_);
         kernels::add_inplace(h_, t2_, M * H, stream_);
-      } else {  // silu(gate) * up straight into NVFP4, and the down projection adds into the residual
+      } else if (L.gate.in_scale == L.up.in_scale && xq_is(L.gate.in_scale, true)) {
+        // Gate and up in one GEMM whose epilogue writes the down projection's NVFP4 input; the down
+        // projection adds into the residual.
+        kernels::prefill_swiglu_nvfp4(xq_, xsf_, M, L.gate.w, L.gate.in_scale * L.gate.scale2, L.up.w,
+                                      L.up.in_scale * L.up.scale2, I, H, L.down.in_scale, xq2_, xsf2_, stream_);
+        kernels::prefill_gemm_nvfp4(xq2_, xsf2_, M, L.down.w, L.down.in_scale * L.down.scale2, h_, H, H, I, true,
+                                    stream_);
+      } else {  // gate and up quantize differently: separate GEMMs, then silu(gate) * up straight into NVFP4
+        linear_fp4_multi({{&L.gate, t1_}, {&L.up, t2_}}, xn_, M, post_half);
         kernels::silu_mul_quant_nvfp4(t1_, t2_, M, I, L.down.in_scale, xq_, xsf_, stream_);
         set_xq(0.f, true);  // not a plain quantization of any one input
         kernels::prefill_gemm_nvfp4(xq_, xsf_, M, L.down.w, L.down.in_scale * L.down.scale2, h_, H, H, I, true, stream_);
@@ -489,18 +503,22 @@ const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, Engine
 
   // Chunk ends: every prefill_chunk tokens, and the checkpoint positions (the end of each of the first
   // two messages, and chunk multiples up to checkpoint_limit), where the state is kept for later prompts.
+  // Every kept state sits at a multiple of kResumeAlign: the prefill DeltaNet runs in 32-token chunks at
+  // absolute positions, so a prompt resumed there computes exactly what a prefill from scratch does.
+  auto align = [](int p) { return p - p % kResumeAlign; };
   std::vector<int> bounds;
   if (!ckpt_slots_.empty()) {
     int messages = 0;
     for (int i = 0; i < L && i < opts_.checkpoint_limit && messages < 2; ++i)
       if (prompt[i] == opts_.boundary_token) {
-        bounds.push_back(i + 1);
+        if (align(i + 1) > 0) bounds.push_back(align(i + 1));
         ++messages;
       }
     for (int b = opts_.prefill_chunk; b < std::min(L, opts_.checkpoint_limit + 1); b += opts_.prefill_chunk)
       bounds.push_back(b);
     std::sort(bounds.begin(), bounds.end());
   }
+  const int snap_at = align(L);  // the end-of-prompt state is kept here (the tokens after it are re-prefilled)
   for (int i = reuse; i < L;) {
     int end = std::min(i + opts_.prefill_chunk, L);
     for (int b : bounds)
@@ -508,6 +526,7 @@ const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, Engine
         end = b;
         break;
       }
+    if (snap_at > i && snap_at < end) end = snap_at;
     const int n = end - i, pos0 = pos_;
     forward(prompt.data() + i, n, Pass::Prefill);
     if (draft_) {
@@ -516,10 +535,12 @@ const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, Engine
     }
     history_.insert(history_.end(), prompt.begin() + i, prompt.begin() + end);
     i = end;
+    if (end == snap_at) {
+      copy_state(snap_, true);
+      snap_pos_ = snap_at;
+    }
     if (end < L && std::binary_search(bounds.begin(), bounds.end(), end)) save_checkpoint(end);
   }
-  copy_state(snap_, true);
-  snap_pos_ = L;
   check(cudaStreamSynchronize(stream_), "prefill");
   if (stats) {
     stats->reused_tokens = reuse;

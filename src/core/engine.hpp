@@ -146,7 +146,8 @@ class Engine {
   // The prefill path (quantized activations, prefill_gemm.cu) or the rows path (stream_gemm.cu)?
   bool quantized(int M) const { return quantized_ || M > kRowsMax; }
   static constexpr int kRowsMax = 32;  // kernels::kMaxStreamRows
-  static constexpr int kAttnSlice = 256;  // prefill attention: queries per call (bounds the partials' scratch)
+  static constexpr int kAttnSlice = 256;
+  static constexpr int kResumeAlign = 32;  // kept states sit at multiples of this (the DeltaNet's chunk)  // prefill attention: queries per call (bounds the partials' scratch)
   bool quantized_ = false;                // set by forward(): the pass is a prefill
   // RMSNorm; on the rows path it also leaves the FP16 copy for the next linear call (x_ready).
   // On the prefill path it writes the quantized input of the next GEMMs instead (input scale `in_scale`,
@@ -195,6 +196,7 @@ class Engine {
   float *attn_scratch_ = nullptr, *logits_dev_ = nullptr;
   __nv_bfloat16* x_bf16_ = nullptr;
   uint8_t *xq_ = nullptr, *xsf_ = nullptr;  // the prefill path's quantized activations and their block scales
+  uint8_t *xq2_ = nullptr, *xsf2_ = nullptr;
   __half* xh_ = nullptr;     // the rows path's FP16 activations [32][max K]
   float* xinv_ = nullptr;    // and their per-row scales
   int* ids_dev_ = nullptr;
