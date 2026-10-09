@@ -4,11 +4,12 @@
 //   ling-run --model DIR [--text "..." | --chat "..." | --ids 1,2,3] [--max-tokens N] [--temperature T]
 //            [--prompts-file F] [--ids-out] [--prompt-ids-out] [--max-context N]
 //            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N]]
-//            [--graphs] [--pdl] [--attn-bulk] [--graph-check] [--seed N]
+//            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--graph-check] [--seed N]
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
-// tiles with bulk copies (M3).
+// tiles with bulk copies (M3); --attn-prefetch N sets how many KV tiles ahead its attention prefetches into L2
+// (default 2, 0 off; M3).
 //
 // --graph-check decodes each prompt speculatively twice from the same prefill, without and with step graphs,
 // greedily and then sampling (--temperature, default 1, top-k 20, top-p 0.95, seeded by --seed or 1), and
@@ -44,6 +45,7 @@ int main(int argc, char** argv) {
   bool ids_out = false, prompt_ids_out = false, spec = false, spec_check = false, prefix_check = false;
   bool graphs = false, pdl = false, attn_bulk = false, graph_check = false;
   uint64_t seed = 0;
+  int attn_prefetch = 2;
   std::string draft;
   int block = 16, lookup = 1, lookup_min = 8;
   for (int i = 1; i < argc; ++i) {
@@ -77,6 +79,7 @@ int main(int argc, char** argv) {
     else if (a == "--seed") seed = std::stoull(next());
     else if (a == "--pdl") pdl = true;
     else if (a == "--attn-bulk") attn_bulk = true;
+    else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
@@ -120,6 +123,7 @@ int main(int argc, char** argv) {
     opts.step_graphs = graphs;
     opts.pdl = pdl;
     opts.attention_bulk = attn_bulk;
+    opts.attention_prefetch = attn_prefetch;
     ling::Engine engine(model, opts);
     auto t1 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "loaded %.1f GB of weights in %.1f s\n", engine.model().device_bytes() / 1e9,

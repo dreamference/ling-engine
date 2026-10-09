@@ -302,8 +302,23 @@ bool test_attention_rows() {
     cudaMalloc(&bs, ling::kernels::attention_rows_scratch_floats(MMAX, Hq, D, big) * sizeof(float));
     cudaEvent_t a, b;
     cudaEventCreate(&a), cudaEventCreate(&b);
-    for (int layout = 0; layout < 2; ++layout) {
-      if (layout == 1) ling::kernels::set_kv_layout(size_t(big) * D, D);  // head-major, as the engine uses
+    // The L2 prefetch (head-major only) moves data, never arithmetic: bit for bit the same output.
+    {
+      ling::kernels::set_kv_layout(size_t(big) * D, D);
+      ling::kernels::attention_rows(dq, bk, bv, 24576, 16, Hq, Hkv, D, bs, out, nullptr);
+      const std::vector<float> plain = download(out, size_t(16) * Hq * D);
+      ling::kernels::set_attention_prefetch(2);
+      ling::kernels::attention_rows(dq, bk, bv, 24576, 16, Hq, Hkv, D, bs, out, nullptr);
+      const std::vector<float> pref = download(out, size_t(16) * Hq * D);
+      ling::kernels::set_attention_prefetch(0);
+      ling::kernels::set_kv_layout(0, 0);
+      const bool psame = std::memcmp(plain.data(), pref.data(), plain.size() * sizeof(float)) == 0;
+      ok &= psame;
+      std::printf("attention_rows with L2 prefetch identical (24K, head-major): %s\n", psame ? "yes ok" : "NO FAIL");
+    }
+    for (int layout = 0; layout < 3; ++layout) {
+      if (layout >= 1) ling::kernels::set_kv_layout(size_t(big) * D, D);  // head-major, as the engine uses
+      ling::kernels::set_attention_prefetch(layout == 2 ? 2 : 0);
       for (int bulk = 0; bulk < 2; ++bulk) {
         ling::kernels::set_attention_bulk(bulk == 1);
         for (int M : {1, 16}) {
@@ -314,12 +329,13 @@ bool test_attention_rows() {
           float ms = 0;
           cudaEventElapsedTime(&ms, a, b);
           std::printf("attention_rows 24K context, %s KV, %s, M=%-2d: %.3f ms per layer (%.0f GB/s of KV)\n",
-                      layout ? "head-major " : "interleaved", bulk ? "bulk   " : "cp.async", M, ms / 20,
+                      layout == 0 ? "interleaved " : layout == 1 ? "head-major  " : "head-major+L2 prefetch", bulk ? "bulk   " : "cp.async", M, ms / 20,
                       2.0 * 24576 * Hkv * D * 2 / (ms / 20 * 1e-3) / 1e9);
         }
       }
       ling::kernels::set_attention_bulk(false);
     }
+    ling::kernels::set_attention_prefetch(0);
     ling::kernels::set_kv_layout(0, 0);
     cudaFree(bk), cudaFree(bv), cudaFree(bs);
   }

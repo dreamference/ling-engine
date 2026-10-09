@@ -510,6 +510,27 @@ __device__ __forceinline__ void cp_async16(void* smem_dst, const void* gmem_src,
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(d), "l"(gmem_src), "r"(valid ? 16 : 0));
 }
 
+// L2 prefetch of the keys [k0, min(k0 + TK, khi)) of one KV head, for the head-major layout, where a tile's K
+// (and its V) are one contiguous run: one bulk-prefetch instruction each, by two threads. The ring of shared
+// memory holds only two 32-key stages (99 KB per block), so without this a block has one tile in flight while
+// it computes the other; the kernel is load-bound (removing its MMAs leaves its time unchanged at 24K) at ~181
+// GB/s, where a plain read of the same addresses reaches ~225. Prefetching `pf` tiles further ahead into L2
+// costs no shared memory and no registers. Measured at 24K, 16 rows: 0.557 -> 0.492 ms per layer at pf 2;
+// 3 and 4 no better. It moves data only: the arithmetic, and so every output bit, is unchanged.
+template <int TK>
+__device__ __forceinline__ void attn_prefetch_tile(const __nv_bfloat16* __restrict__ kcache,
+                                                   const __nv_bfloat16* __restrict__ vcache, int k0, int khi, int kvh,
+                                                   size_t hs, size_t ps) {
+  const int n = min(TK, khi - k0);
+  if (n <= 0) return;
+  const size_t off = kvh * hs + static_cast<size_t>(k0) * ps;
+  const uint32_t bytes = static_cast<uint32_t>(n) * kMmaD * 2;
+  if (threadIdx.x == 0)
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(kcache + off), "r"(bytes) : "memory");
+  else if (threadIdx.x == 32)
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(vcache + off), "r"(bytes) : "memory");
+}
+
 // The keys [k0, k0 + TK) of one KV head into a stage (zero-filled past khi).
 template <int TK>
 __device__ __forceinline__ void attn_load_tile(__nv_bfloat16* stage, const __nv_bfloat16* __restrict__ kcache,
@@ -594,7 +615,7 @@ template <int ROWS, int TK, int NS, bool BULK>
 __global__ void __launch_bounds__(ROWS * 2)
     attention_mma_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                          const __nv_bfloat16* __restrict__ vcache, DevPos pos0_arg, int M, int Hq, int Hkv,
-                         int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps) {
+                         int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf) {
   pdl_begin();  // first statement: see launch.cuh
   constexpr int D = kMmaD, G = 6, KS = kMmaKS;
   extern __shared__ __align__(16) unsigned char smem[];
@@ -678,6 +699,13 @@ __global__ void __launch_bounds__(ROWS * 2)
     } else {
       if (it + NS - 1 < ntiles) attn_load_tile<TK>(stage(it + NS - 1), kcache, vcache, k0 + (NS - 1) * TK, khi, kvh, hs, ps);
       else asm volatile("cp.async.commit_group;");
+      // Tiles it + NS .. it + NS + pf - 1 on their way into L2 (the first iteration starts the whole window).
+      if (pf > 0 && ps == static_cast<size_t>(D)) {
+        if (it == 0)
+          for (int p = NS; p < NS + pf - 1; ++p)
+            if (p < ntiles) attn_prefetch_tile<TK>(kcache, vcache, klo + p * TK, khi, kvh, hs, ps);
+        if (it + NS + pf - 1 < ntiles) attn_prefetch_tile<TK>(kcache, vcache, k0 + (NS + pf - 1) * TK, khi, kvh, hs, ps);
+      }
     }
     const __nv_bfloat16* ks = stage(it);
     const __nv_bfloat16* vs = ks + TK * KS;
@@ -810,11 +838,13 @@ size_t kv_ps(int Hkv, int D) { return g_kv_ps ? g_kv_ps : static_cast<size_t>(Hk
 
 bool g_pdl = false;
 bool g_attn_bulk = false;
+int g_attn_prefetch = 0;
 
 }  // namespace
 
 void set_pdl(bool on) { g_pdl = on; }
 void set_attention_bulk(bool on) { g_attn_bulk = on; }
+void set_attention_prefetch(int tiles) { g_attn_prefetch = tiles < 0 ? 0 : tiles; }
 bool pdl_enabled() { return g_pdl; }
 bool pdl_attention_enabled() {
   static const bool attn = [] {
@@ -1007,7 +1037,7 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows",
                     g_attn_bulk ? attention_mma_kernel<rows, tk, ns, true> : attention_mma_kernel<rows, tk, ns, false>,
                     dim3((R + rows - 1) / rows, Hkv, splits), dim3(rows * 2), mma_smem(tk, ns), s, q, kcache, vcache,
-                    pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D));
+                    pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel, dim3(M * Hq), dim3(D),
                     0, s, scratch, splits, D, out);
 }
