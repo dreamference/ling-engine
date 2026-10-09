@@ -111,6 +111,11 @@ void gdn_recurrent(const float* mixed, const float* g, const float* beta, const 
 void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float* out, int rows, int D,
                    float eps, cudaStream_t s);
 
+// The KV caches' layout (elements): head h, position p at h * head_stride + p * pos_stride. The default
+// is interleaved [pos][head][dim]; the engine sets head-major [head][pos][dim], so one head's keys are
+// one contiguous stream for the attention kernels.
+void set_kv_layout(size_t head_stride, size_t pos_stride);
+
 // Full attention: q_gate [M][Hq*2*D] (per head: q then gate), k/v [M][Hkv*D]. Applies the Gemma-style
 // q/k norms and NeoX RoPE on the first `rot` dims, writes q [M][Hq][D] and gate [M][Hq][D], and appends
 // k/v to the BF16 caches [pos][Hkv][D] at positions pos0 .. pos0+M-1.

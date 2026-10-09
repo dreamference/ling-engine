@@ -85,6 +85,8 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   w_bf16_ = alloc<__nv_bfloat16>(largest);
   ids_dev_ = alloc<int>(M);
 
+  // Head-major KV caches: one KV head's keys are one contiguous stream for the attention kernels.
+  kernels::set_kv_layout(size_t(opts_.max_context) * c.head_dim, c.head_dim);
   layer_slot_.resize(c.layers);
   for (int i = 0; i < c.layers; ++i) {
     if (c.full_attention[i]) {
