@@ -65,6 +65,9 @@ struct EngineOptions {
   // issue its first weight loads, while the one before it finishes. Off by default; LING_PDL=0/1 overrides.
   // Process-wide (the kernels' launch setting), like the KV layout.
   bool pdl = false;
+  // M3: the rows path's attention loads its KV tiles through the bulk-copy engine (kernels.cuh,
+  // set_attention_bulk); bit for bit the same output. Off by default; LING_ATTN_BULK=0/1 overrides.
+  bool attention_bulk = false;
 };
 
 struct EngineStats {

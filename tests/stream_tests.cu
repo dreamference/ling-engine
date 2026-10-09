@@ -264,6 +264,26 @@ bool test_attention_rows() {
     std::printf("attention_rows with a device position and fixed ranges identical: %s\n", gsame ? "yes ok" : "NO FAIL");
     cudaFree(gscratch), cudaFree(dpos);
   }
+  // The bulk-copy tiles (M3): every row bit for bit the cp.async kernel's, at M = 32, 16 and 1, with a
+  // range that ends inside a tile (the rows past it are not copied).
+  {
+    ling::kernels::set_attention_bulk(true);
+    bool bsame = true;
+    ling::kernels::attention_rows(dq, dk, dv, P, MMAX, Hq, Hkv, D, scratch, out, nullptr);
+    const std::vector<float> b32 = download(out, size_t(MMAX) * Hq * D);
+    bsame &= std::memcmp(b32.data(), full.data(), b32.size() * sizeof(float)) == 0;
+    ling::kernels::attention_rows(dq, dk, dv, P, 16, Hq, Hkv, D, scratch, out, nullptr);
+    const std::vector<float> b16 = download(out, size_t(16) * Hq * D);
+    bsame &= std::memcmp(b16.data(), full.data(), b16.size() * sizeof(float)) == 0;
+    for (int m : {0, 13, 31}) {
+      ling::kernels::attention_rows(dq + size_t(m) * Hq * D, dk, dv, P + m, 1, Hq, Hkv, D, scratch, out, nullptr);
+      const std::vector<float> one = download(out, size_t(Hq) * D);
+      bsame &= std::memcmp(one.data(), full.data() + size_t(m) * Hq * D, one.size() * sizeof(float)) == 0;
+    }
+    ling::kernels::set_attention_bulk(false);
+    ok &= bsame;
+    std::printf("attention_rows bulk-copy tiles identical to cp.async: %s\n", bsame ? "yes ok" : "NO FAIL");
+  }
   // Speed at the workload's median context, 16 rows (one layer).
   {
     const int big = 24576 + 32;
@@ -284,16 +304,21 @@ bool test_attention_rows() {
     cudaEventCreate(&a), cudaEventCreate(&b);
     for (int layout = 0; layout < 2; ++layout) {
       if (layout == 1) ling::kernels::set_kv_layout(size_t(big) * D, D);  // head-major, as the engine uses
-      for (int M : {1, 16}) {
-        cudaEventRecord(a);
-        for (int i = 0; i < 20; ++i) ling::kernels::attention_rows(dq, bk, bv, 24576, M, Hq, Hkv, D, bs, out, nullptr);
-        cudaEventRecord(b);
-        cudaEventSynchronize(b);
-        float ms = 0;
-        cudaEventElapsedTime(&ms, a, b);
-        std::printf("attention_rows 24K context, %s KV, M=%-2d: %.3f ms per layer (%.0f GB/s of KV)\n",
-                    layout ? "head-major " : "interleaved", M, ms / 20, 2.0 * 24576 * Hkv * D * 2 / (ms / 20 * 1e-3) / 1e9);
+      for (int bulk = 0; bulk < 2; ++bulk) {
+        ling::kernels::set_attention_bulk(bulk == 1);
+        for (int M : {1, 16}) {
+          cudaEventRecord(a);
+          for (int i = 0; i < 20; ++i) ling::kernels::attention_rows(dq, bk, bv, 24576, M, Hq, Hkv, D, bs, out, nullptr);
+          cudaEventRecord(b);
+          cudaEventSynchronize(b);
+          float ms = 0;
+          cudaEventElapsedTime(&ms, a, b);
+          std::printf("attention_rows 24K context, %s KV, %s, M=%-2d: %.3f ms per layer (%.0f GB/s of KV)\n",
+                      layout ? "head-major " : "interleaved", bulk ? "bulk   " : "cp.async", M, ms / 20,
+                      2.0 * 24576 * Hkv * D * 2 / (ms / 20 * 1e-3) / 1e9);
+        }
       }
+      ling::kernels::set_attention_bulk(false);
     }
     ling::kernels::set_kv_layout(0, 0);
     cudaFree(bk), cudaFree(bv), cudaFree(bs);
