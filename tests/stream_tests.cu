@@ -254,21 +254,31 @@ bool test_attention_rows() {
     float* bs;
     cudaMalloc(&bk, size_t(big) * Hkv * D * 2);
     cudaMalloc(&bv, size_t(big) * Hkv * D * 2);
-    cudaMemset(bk, 0, size_t(big) * Hkv * D * 2);
-    cudaMemset(bv, 0, size_t(big) * Hkv * D * 2);
+    // Random-looking data (zeros would let the memory system flatter the read).
+    {
+      std::vector<__nv_bfloat16> h(size_t(big) * Hkv * D);
+      for (size_t i = 0; i < h.size(); ++i) h[i] = __float2bfloat16(normal(rng));
+      cudaMemcpy(bk, h.data(), h.size() * 2, cudaMemcpyHostToDevice);
+      for (size_t i = 0; i < h.size(); ++i) h[i] = __float2bfloat16(normal(rng));
+      cudaMemcpy(bv, h.data(), h.size() * 2, cudaMemcpyHostToDevice);
+    }
     cudaMalloc(&bs, ling::kernels::attention_rows_scratch_floats(MMAX, Hq, D, big) * sizeof(float));
     cudaEvent_t a, b;
     cudaEventCreate(&a), cudaEventCreate(&b);
-    for (int M : {1, 16}) {
-      cudaEventRecord(a);
-      for (int i = 0; i < 20; ++i) ling::kernels::attention_rows(dq, bk, bv, 24576, M, Hq, Hkv, D, bs, out, nullptr);
-      cudaEventRecord(b);
-      cudaEventSynchronize(b);
-      float ms = 0;
-      cudaEventElapsedTime(&ms, a, b);
-      std::printf("attention_rows 24K context, M=%-2d: %.3f ms per layer (%.0f GB/s of KV)\n", M, ms / 20,
-                  2.0 * 24576 * Hkv * D * 2 / (ms / 20 * 1e-3) / 1e9);
+    for (int layout = 0; layout < 2; ++layout) {
+      if (layout == 1) ling::kernels::set_kv_layout(size_t(big) * D, D);  // head-major, as the engine uses
+      for (int M : {1, 16}) {
+        cudaEventRecord(a);
+        for (int i = 0; i < 20; ++i) ling::kernels::attention_rows(dq, bk, bv, 24576, M, Hq, Hkv, D, bs, out, nullptr);
+        cudaEventRecord(b);
+        cudaEventSynchronize(b);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, a, b);
+        std::printf("attention_rows 24K context, %s KV, M=%-2d: %.3f ms per layer (%.0f GB/s of KV)\n",
+                    layout ? "head-major " : "interleaved", M, ms / 20, 2.0 * 24576 * Hkv * D * 2 / (ms / 20 * 1e-3) / 1e9);
+      }
     }
+    ling::kernels::set_kv_layout(0, 0);
     cudaFree(bk), cudaFree(bv), cudaFree(bs);
   }
   cudaFree(dk), cudaFree(dv), cudaFree(dq), cudaFree(scratch), cudaFree(out);

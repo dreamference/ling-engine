@@ -351,12 +351,16 @@ __global__ void gdn_gating_kernel(const float* a, const float* b, const __nv_bfl
 
 constexpr int kGdnDk = 128, kGdnDv = 128;
 
-__global__ void __launch_bounds__(kGdnDv)
-    gdn_recurrent_kernel(const float* __restrict__ mixed, const float* __restrict__ g,
-                         const float* __restrict__ beta, const float* state_in, float* state_out,
-                         float* __restrict__ out, int M, int H, int HV) {
-  __shared__ float qs[kGdnDk], ks[kGdnDk], red[32];
-  const int hv = blockIdx.x, v = threadIdx.x, h = hv / (HV / H);
+// The gated delta rule, one warp per 32 value columns of a head (4 warps per head, each its own
+// block): the q and k norms by warp shuffles, no block-wide barriers, and four times the blocks to load
+// the state. Each column's arithmetic per token is the same sequence whatever M is.
+__global__ void __launch_bounds__(32)
+    gdn_recurrent_warp_kernel(const float* __restrict__ mixed, const float* __restrict__ g,
+                              const float* __restrict__ beta, const float* state_in, float* state_out,
+                              float* __restrict__ out, int M, int H, int HV) {
+  __shared__ float qs[kGdnDk], ks[kGdnDk];
+  const int hv = blockIdx.x / 4, part = blockIdx.x % 4, lane = threadIdx.x, v = part * 32 + lane;
+  const int h = hv / (HV / H);
   const int C = 2 * H * kGdnDk + HV * kGdnDv;
   const float* st = state_in + static_cast<size_t>(hv) * kGdnDk * kGdnDv;
   float S[kGdnDk];
@@ -365,13 +369,20 @@ __global__ void __launch_bounds__(kGdnDv)
   const float scale = rsqrtf(static_cast<float>(kGdnDk));
   for (int t = 0; t < M; ++t) {
     const float* row = mixed + static_cast<size_t>(t) * C;
-    const float qv = row[h * kGdnDk + v], kv_in = row[H * kGdnDk + h * kGdnDk + v];
-    const float qn = block_sum(qv * qv, red);
-    const float kn = block_sum(kv_in * kv_in, red);
-    __syncthreads();
-    qs[v] = qv * rsqrtf(qn + 1e-6f) * scale;
-    ks[v] = kv_in * rsqrtf(kn + 1e-6f);
-    __syncthreads();
+    const float4 q4 = *reinterpret_cast<const float4*>(row + h * kGdnDk + lane * 4);
+    const float4 k4 = *reinterpret_cast<const float4*>(row + H * kGdnDk + h * kGdnDk + lane * 4);
+    float qn = q4.x * q4.x + q4.y * q4.y + q4.z * q4.z + q4.w * q4.w;
+    float kn = k4.x * k4.x + k4.y * k4.y + k4.z * k4.z + k4.w * k4.w;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      qn += __shfl_xor_sync(0xffffffffu, qn, o);
+      kn += __shfl_xor_sync(0xffffffffu, kn, o);
+    }
+    const float qr = rsqrtf(qn + 1e-6f) * scale, kr = rsqrtf(kn + 1e-6f);
+    __syncwarp();
+    qs[lane * 4] = q4.x * qr, qs[lane * 4 + 1] = q4.y * qr, qs[lane * 4 + 2] = q4.z * qr, qs[lane * 4 + 3] = q4.w * qr;
+    ks[lane * 4] = k4.x * kr, ks[lane * 4 + 1] = k4.y * kr, ks[lane * 4 + 2] = k4.z * kr, ks[lane * 4 + 3] = k4.w * kr;
+    __syncwarp();
     const float decay = __expf(g[t * HV + hv]);
     const float b = beta[t * HV + hv];
     const float vv = row[2 * H * kGdnDk + hv * kGdnDv + v];
@@ -390,7 +401,7 @@ __global__ void __launch_bounds__(kGdnDv)
     }
     out[static_cast<size_t>(t) * HV * kGdnDv + hv * kGdnDv + v] = o;
   }
-  if (state_out == nullptr) return;  // a verify: the state is advanced later, over the accepted rows only
+  if (state_out == nullptr) return;
   float* so = state_out + static_cast<size_t>(hv) * kGdnDk * kGdnDv;
 #pragma unroll
   for (int k = 0; k < kGdnDk; ++k) so[k * kGdnDv + v] = S[k];
@@ -413,15 +424,14 @@ __global__ void attn_prepare_kernel(const float* __restrict__ q_gate, const floa
                                     const __nv_bfloat16* __restrict__ k_norm, int pos0, int Hq, int Hkv, int D,
                                     int rot, float theta, float eps, float* __restrict__ q,
                                     float* __restrict__ gate, __nv_bfloat16* __restrict__ kcache,
-                                    __nv_bfloat16* __restrict__ vcache) {
+                                    __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps) {
   extern __shared__ float xn[];
   __shared__ float red[32];
   const int m = blockIdx.x, slot = blockIdx.y, d = threadIdx.x;
   const int pos = pos0 + m;
   if (slot >= Hq + Hkv) {  // v: copy into the cache
     const int kh = slot - Hq - Hkv;
-    vcache[(static_cast<size_t>(pos) * Hkv + kh) * D + d] =
-        __float2bfloat16(v[(static_cast<size_t>(m) * Hkv + kh) * D + d]);
+    vcache[kh * hs + pos * ps + d] = __float2bfloat16(v[(static_cast<size_t>(m) * Hkv + kh) * D + d]);
     return;
   }
   const bool is_q = slot < Hq;
@@ -449,7 +459,7 @@ __global__ void attn_prepare_kernel(const float* __restrict__ q_gate, const floa
   if (is_q) {
     q[(static_cast<size_t>(m) * Hq + head) * D + d] = o;
   } else {
-    kcache[(static_cast<size_t>(pos) * Hkv + head) * D + d] = __float2bfloat16(o);
+    kcache[head * hs + pos * ps + d] = __float2bfloat16(o);
   }
 }
 
@@ -471,7 +481,7 @@ template <int G>
 __global__ void __launch_bounds__(256)
     attention_partial_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                              const __nv_bfloat16* __restrict__ vcache, int pos0, int Hq, int Hkv, int splits,
-                             int chunk, float* __restrict__ scratch) {
+                             int chunk, float* __restrict__ scratch, size_t hs, size_t ps) {
   constexpr int D = 256;
   __shared__ float wm[8][G], wl[8][G];
   __shared__ float wacc[8][D];
@@ -495,7 +505,7 @@ __global__ void __launch_bounds__(256)
     l[g] = 0.f;
   }
   for (int j = start + warp; j < end; j += 8) {
-    const size_t off = (static_cast<size_t>(j) * Hkv + kvh) * D + lane * 8;
+    const size_t off = kvh * hs + j * ps + lane * 8;
     uint4 kr = *reinterpret_cast<const uint4*>(kcache + off);
     uint4 vr = *reinterpret_cast<const uint4*>(vcache + off);
     const __nv_bfloat16* kb = reinterpret_cast<const __nv_bfloat16*>(&kr);
@@ -568,7 +578,8 @@ constexpr size_t kPrefillSmem = kPrefillRows * kPrefillD * sizeof(float) +
 __global__ void __launch_bounds__(256)
     attention_prefill_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                              const __nv_bfloat16* __restrict__ vcache, int pos0, int M, int Hq, int Hkv,
-                             float* __restrict__ out, int chunk, int splits, float* __restrict__ scratch) {
+                             float* __restrict__ out, int chunk, int splits, float* __restrict__ scratch,
+                             size_t kv_head_stride, size_t kv_pos_stride) {
   constexpr int D = kPrefillD, G = kPrefillG, TQ = kPrefillTQ, TK = kPrefillTK, R = kPrefillRows;
   constexpr int KS = kPrefillKStride;
   extern __shared__ __align__(16) unsigned char smem[];
@@ -604,7 +615,7 @@ __global__ void __launch_bounds__(256)
     __syncthreads();
     for (int i = t; i < TK * D; i += blockDim.x) {
       const int j = i / D, d = i % D, key = k0 + j;
-      const size_t off = (static_cast<size_t>(key) * Hkv + kvh) * D + d;
+      const size_t off = kvh * kv_head_stride + static_cast<size_t>(key) * kv_pos_stride + d;
       ks[j * KS + d] = key < khi ? kcache[off] : __float2bfloat16(0.f);
       vs[j * D + d] = key < khi ? vcache[off] : __float2bfloat16(0.f);
     }
@@ -698,8 +709,9 @@ __global__ void __launch_bounds__(256)
 // its last key are fully masked and leave its state bit for bit unchanged, so results are row-invariant.
 constexpr int kMmaD = 256;
 constexpr int kMmaKS = kMmaD + 8;  // padded row stride (bf16) of the K and V tiles: conflict-free fragments
-// One K tile and one V tile per stage, double-buffered.
-constexpr size_t mma_smem(int tk) { return 2 * size_t(2) * tk * kMmaKS * sizeof(__nv_bfloat16); }
+// One K tile and one V tile per stage; `ns` stages in a ring.
+constexpr size_t mma_stage(int tk) { return size_t(2) * tk * kMmaKS * sizeof(__nv_bfloat16); }
+constexpr size_t mma_smem(int tk, int ns) { return ns * mma_stage(tk); }
 
 __device__ __forceinline__ void mma_bf16_16816(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                                uint32_t b0, uint32_t b1) {
@@ -724,29 +736,28 @@ __device__ __forceinline__ void cp_async16(void* smem_dst, const void* gmem_src,
 template <int TK>
 __device__ __forceinline__ void attn_load_tile(__nv_bfloat16* stage, const __nv_bfloat16* __restrict__ kcache,
                                                const __nv_bfloat16* __restrict__ vcache, int k0, int khi, int kvh,
-                                               int Hkv) {
+                                               size_t hs, size_t ps) {
   constexpr int D = kMmaD, KS = kMmaKS;
   __nv_bfloat16* ks = stage;
   __nv_bfloat16* vs = stage + TK * KS;
   for (int i = threadIdx.x; i < TK * (D / 8); i += blockDim.x) {
     const int j = i / (D / 8), c = i % (D / 8), key = k0 + j;
     const bool valid = key < khi;
-    const size_t off = (static_cast<size_t>(valid ? key : 0) * Hkv + kvh) * D + 8 * c;
+    const size_t off = kvh * hs + static_cast<size_t>(valid ? key : 0) * ps + 8 * c;
     cp_async16(ks + j * KS + 8 * c, kcache + off, valid);
     cp_async16(vs + j * KS + 8 * c, vcache + off, valid);
   }
   asm volatile("cp.async.commit_group;");
 }
 
-template <int ROWS, int TK>  // query rows per block (16 per warp), keys per tile
+template <int ROWS, int TK, int NS>  // query rows per block (16 per warp), keys per tile, pipeline stages
 __global__ void __launch_bounds__(ROWS * 2)
     attention_mma_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                          const __nv_bfloat16* __restrict__ vcache, int pos0, int M, int Hq, int Hkv, int splits,
-                         int chunk, float* __restrict__ scratch) {
+                         int chunk, float* __restrict__ scratch, size_t hs, size_t ps) {
   constexpr int D = kMmaD, G = 6, KS = kMmaKS;
   extern __shared__ __align__(16) unsigned char smem[];
-  __nv_bfloat16* stages[2] = {reinterpret_cast<__nv_bfloat16*>(smem),
-                              reinterpret_cast<__nv_bfloat16*>(smem + mma_smem(TK) / 2)};
+  auto stage = [&](int i) { return reinterpret_cast<__nv_bfloat16*>(smem + (i % NS) * mma_stage(TK)); };
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
   const int kvh = blockIdx.y, split = blockIdx.z;
   const int R = M * G, r0 = blockIdx.x * ROWS, nrows = min(ROWS, R - r0);
@@ -778,18 +789,22 @@ __global__ void __launch_bounds__(ROWS * 2)
 #pragma unroll
   for (int i = 0; i < D / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
   float ma = -INFINITY, mb = -INFINITY, la = 0.f, lb = 0.f;
-  if (klo < khi) attn_load_tile<TK>(stages[0], kcache, vcache, klo, khi, kvh, Hkv);
-  int st = 0;
-  for (int k0 = klo; k0 < khi; k0 += TK, st ^= 1) {
-    // Prefetch the next tile into the other stage, then wait for this one.
-    if (k0 + TK < khi) {
-      attn_load_tile<TK>(stages[st ^ 1], kcache, vcache, k0 + TK, khi, kvh, Hkv);
-      asm volatile("cp.async.wait_group 1;");
-    } else {
-      asm volatile("cp.async.wait_group 0;");
-    }
-    __syncthreads();
-    const __nv_bfloat16* ks = stages[st];
+  // A ring of NS stages: tiles i + 1 .. i + NS - 1 are in flight while tile i is computed. Every
+  // iteration commits one cp.async group (empty past the range), so wait_group NS - 2 always means
+  // "tile i has landed".
+  const int ntiles = (khi - klo + TK - 1) / TK;
+#pragma unroll
+  for (int p = 0; p < NS - 1; ++p) {
+    if (p < ntiles) attn_load_tile<TK>(stage(p), kcache, vcache, klo + p * TK, khi, kvh, hs, ps);
+    else asm volatile("cp.async.commit_group;");
+  }
+  for (int it = 0; it < ntiles; ++it) {
+    const int k0 = klo + it * TK;
+    asm volatile("cp.async.wait_group %0;" ::"n"(NS - 2));
+    __syncthreads();  // tile it is visible to all, and stage (it - 1) % NS is free again
+    if (it + NS - 1 < ntiles) attn_load_tile<TK>(stage(it + NS - 1), kcache, vcache, k0 + (NS - 1) * TK, khi, kvh, hs, ps);
+    else asm volatile("cp.async.commit_group;");
+    const __nv_bfloat16* ks = stage(it);
     const __nv_bfloat16* vs = ks + TK * KS;
     if (active) {
       // S = Q K^T for 16 rows x 32 keys: 4 key tiles of 8.
@@ -870,7 +885,6 @@ __global__ void __launch_bounds__(ROWS * 2)
         }
       }
     }
-    __syncthreads();  // the stage is refilled two tiles later
   }
   if (!active) return;
   // Partial state per row, in attention_combine_kernel's layout.
@@ -912,7 +926,18 @@ int grid_for(size_t n, int threads) {
   return static_cast<int>(std::min<size_t>((n + threads - 1) / threads, 65535 * 4));
 }
 
+// The KV caches' layout, in elements: head h, position p, dim d at h * hs + p * ps + d. Interleaved
+// ([pos][head][dim], v0) unless set_kv_layout says otherwise.
+size_t g_kv_hs = 0, g_kv_ps = 0;
+size_t kv_hs(int D) { return g_kv_hs ? g_kv_hs : D; }
+size_t kv_ps(int Hkv, int D) { return g_kv_ps ? g_kv_ps : static_cast<size_t>(Hkv) * D; }
+
 }  // namespace
+
+void set_kv_layout(size_t head_stride, size_t pos_stride) {
+  g_kv_hs = head_stride;
+  g_kv_ps = pos_stride;
+}
 
 // Rows per warp: with one or two token rows each warp streams 2 weight rows (measured best of 1, 2, 4, 8:
 // 235 GB/s NVFP4 and 263 GB/s FP8 at M = 1, against 262 GB/s for a plain read); more rows need the registers.
@@ -1037,7 +1062,7 @@ void gdn_gating(const float* a, const float* b, const __nv_bfloat16* A_log, cons
 
 void gdn_recurrent(const float* mixed, const float* g, const float* beta, const float* state_in, float* state_out,
                    float* out, int M, int H, int HV, cudaStream_t s) {
-  gdn_recurrent_kernel<<<HV, kGdnDv, 0, s>>>(mixed, g, beta, state_in, state_out, out, M, H, HV);
+  gdn_recurrent_warp_kernel<<<HV * 4, 32, 0, s>>>(mixed, g, beta, state_in, state_out, out, M, H, HV);
   LING_LAUNCH_CHECK("gdn_recurrent");
 }
 
@@ -1053,7 +1078,7 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
                   cudaStream_t s) {
   dim3 grid(M, Hq + 2 * Hkv);
   attn_prepare_kernel<<<grid, D, D * sizeof(float), s>>>(q_gate, k, v, q_norm, k_norm, pos0, Hq, Hkv, D, rot,
-                                                         theta, eps, q, gate, kcache, vcache);
+                                                         theta, eps, q, gate, kcache, vcache, kv_hs(D), kv_ps(Hkv, D));
   LING_LAUNCH_CHECK("attn_prepare");
 }
 
@@ -1061,7 +1086,7 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
 int attention_chunk() {
   static const int c = [] {
     const char* e = std::getenv("LING_ATTN_CHUNK");
-    return e ? std::atoi(e) : 4096;  // measured at 24K, 16 rows: 512 keys 0.77 ms per layer, 1024 0.64, 2048 0.52, 4096 0.48
+    return e ? std::atoi(e) : 4096;  // measured at 24K, 16 rows, realistic data: 1024 keys 0.63 ms per layer, 2048 0.61, 4096 0.57, 8192 0.66
   }();
   return c;
 }
@@ -1076,30 +1101,19 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
                     int Hkv, int D, float* scratch, float* out, cudaStream_t s) {
   if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
   const int splits = attention_rows_splits(pos0 + M);
-  // LING_ATTN=a,b: rows per block (48 or 96) and keys per tile (16 or 32); default 96,32.
-  static const int variant = [] {
-    const char* e = std::getenv("LING_ATTN");
-    return e ? std::atoi(e) * 100 + std::atoi(std::strchr(e, ',') ? std::strchr(e, ',') + 1 : "32") : 9632;
-  }();
-  const int R = M * 6;
-  auto run = [&](auto kernel, int rows, int tk) {
-    static bool configured[4] = {};
-    const int idx = (rows == 96) * 2 + (tk == 32);
-    if (!configured[idx]) {
-      check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(tk))),
-            "attention_rows smem");
-      configured[idx] = true;
-    }
-    kernel<<<dim3((R + rows - 1) / rows, Hkv, splits), rows * 2, mma_smem(tk), s>>>(q, kcache, vcache, pos0, M, Hq,
-                                                                                     Hkv, splits, attention_chunk(),
-                                                                                     scratch);
-  };
-  switch (variant) {
-    case 4816: run(attention_mma_kernel<48, 16>, 48, 16); break;
-    case 4832: run(attention_mma_kernel<48, 32>, 48, 32); break;
-    case 9616: run(attention_mma_kernel<96, 16>, 96, 16); break;
-    default: run(attention_mma_kernel<96, 32>, 96, 32); break;
+  // 32-key tiles, double-buffered. Measured at 24K context, 16 rows, realistic data: 0.57 ms per layer;
+  // 16-key tiles with 3-5 stages were no faster.
+  constexpr int rows = 96, tk = 32, ns = 2;
+  static bool configured = false;
+  if (!configured) {
+    check(cudaFuncSetAttribute(attention_mma_kernel<rows, tk, ns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               static_cast<int>(mma_smem(tk, ns))),
+          "attention_rows smem");
+    configured = true;
   }
+  const int R = M * 6;
+  attention_mma_kernel<rows, tk, ns><<<dim3((R + rows - 1) / rows, Hkv, splits), rows * 2, mma_smem(tk, ns), s>>>(
+      q, kcache, vcache, pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D));
   LING_LAUNCH_CHECK("attention_rows");
   attention_combine_kernel<<<M * Hq, D, 0, s>>>(scratch, splits, D, out);
   LING_LAUNCH_CHECK("attention_rows_combine");
@@ -1122,13 +1136,13 @@ void attention(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16*
       configured = true;
     }
     attention_prefill_kernel<<<dim3((M + kPrefillTQ - 1) / kPrefillTQ, Hkv), 256, kPrefillSmem, s>>>(
-        q, kcache, vcache, pos0, M, Hq, Hkv, out, 0, 1, nullptr);
+        q, kcache, vcache, pos0, M, Hq, Hkv, out, 0, 1, nullptr, kv_hs(D), kv_ps(Hkv, D));
     LING_LAUNCH_CHECK("attention_prefill");
     return;
   }
   const int splits = attention_splits(M * Hkv, pos0 + M);
   attention_partial_kernel<6><<<dim3(M * Hkv, splits), 256, 0, s>>>(q, kcache, vcache, pos0, Hq, Hkv, splits, 0,
-                                                                   scratch);
+                                                                   scratch, kv_hs(D), kv_ps(Hkv, D));
   LING_LAUNCH_CHECK("attention_partial");
   attention_combine_kernel<<<M * Hq, D, 0, s>>>(scratch, splits, D, out);
   LING_LAUNCH_CHECK("attention_combine");
