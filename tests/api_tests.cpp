@@ -33,6 +33,18 @@ static int known_gaps = 0;
     }                                                                                      \
   } while (0)
 
+static bool valid_utf8(const std::string& s) {
+  for (size_t i = 0; i < s.size();) {
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    const size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
+    if (n == 0 || i + n > s.size()) return false;
+    for (size_t k = 1; k < n; ++k)
+      if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) return false;
+    i += n;
+  }
+  return true;
+}
+
 static int count_of(const std::string& s, const std::string& sub) {
   int n = 0;
   for (size_t p = s.find(sub); p != std::string::npos; p = s.find(sub, p + sub.size())) ++n;
@@ -306,6 +318,49 @@ int main() {
       ok = false;
     }
     KNOWN(ok && thinking_off);
+  }
+  {
+    // Stop strings while streaming multi-byte text (the sglang#40529 family): the hold-back used to count
+    // bytes, split a character, and the chunk's JSON dump then threw and ended the stream. Fed one byte
+    // at a time (harsher than the decoder, which hands over whole characters): every piece is valid
+    // UTF-8, the pieces add up to the text before the stop string, and the stop string never appears.
+    const std::string text = "用中文写三句话。长城很长，很古老。完毕之后再写一句。";
+    for (const std::string stop : {"完毕", "END", "很古老", "。"}) {
+      ling::serve::StopScanner s({stop});
+      std::string out;
+      bool pieces_valid = true;
+      for (char c : text) {
+        const std::string piece = s.push(std::string(1, c));
+        pieces_valid = pieces_valid && valid_utf8(piece);
+        out += piece;
+        if (s.stopped()) break;
+      }
+      out += s.finish();
+      const size_t at = text.find(stop);
+      EXPECT(pieces_valid);
+      EXPECT(out == (at == std::string::npos ? text : text.substr(0, at)));
+      EXPECT(s.stopped() == (at != std::string::npos));
+    }
+  }
+  {
+    // The earliest of several stop strings wins; an empty stop string is ignored; no stops: all text.
+    ling::serve::StopScanner s({"", "</function", "STOP"});
+    std::string out;
+    for (const std::string piece : {"call <", "/funct", "ion> and STOP"}) out += s.push(piece);
+    EXPECT(s.stopped() && out == "call ");
+    ling::serve::StopScanner none({});
+    EXPECT(none.push("é") == "é" && none.push("\xE9\x95") == "" && none.push("\xBF") == "\xE9\x95\xBF");
+  }
+  {
+    // A dump never throws on bytes that are not UTF-8 (half a character): they become U+FFFD.
+    bool ok = true;
+    std::string out;
+    try {
+      out = ling::serve::dump_json(json{{"delta", std::string("ok \xE9\x95")}});
+    } catch (const std::exception&) {
+      ok = false;
+    }
+    EXPECT(ok && valid_utf8(out) && out.find("\xEF\xBF\xBD") != std::string::npos);
   }
   if (known_gaps) std::printf("%d known gaps (not failures; see reports/engine-issues-2026-10-09.md)\n", known_gaps);
   std::printf(failures ? "%d API TEST FAILURES\n" : "all api tests passed\n", failures);

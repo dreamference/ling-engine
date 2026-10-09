@@ -93,6 +93,56 @@ std::string new_id(const std::string& prefix) {
   return id;
 }
 
+std::string dump_json(const json& j) { return j.dump(-1, ' ', false, json::error_handler_t::replace); }
+
+namespace {
+
+// The largest b <= end such that s[0, b) does not end inside a UTF-8 character (s starts on a boundary).
+// An invalid sequence is left as it is; dump_json replaces it.
+size_t utf8_cut(const std::string& s, size_t end) {
+  size_t lead = end;  // back over continuation bytes to the first byte of the last character
+  while (lead > 0 && end - lead < 4 && (static_cast<unsigned char>(s[lead - 1]) & 0xC0) == 0x80) --lead;
+  if (lead == 0) return end;
+  const unsigned char c = static_cast<unsigned char>(s[lead - 1]);
+  const size_t need = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 1;
+  return end - (lead - 1) >= need ? end : lead - 1;
+}
+
+}  // namespace
+
+StopScanner::StopScanner(const std::vector<std::string>& stops) {
+  for (const std::string& s : stops) {
+    if (s.empty()) continue;  // "" would match at once and end every answer before it starts
+    stops_.push_back(s);
+    hold_ = std::max(hold_, s.size() - 1);
+  }
+}
+
+std::string StopScanner::push(const std::string& text) {
+  if (stopped_) return {};
+  pending_ += text;
+  // A stop string never starts in text already emitted: it would have to end in the held-back bytes,
+  // and they are fewer than its length. So the search covers pending_ alone.
+  size_t stop_at = std::string::npos;
+  for (const std::string& s : stops_) stop_at = std::min(stop_at, pending_.find(s));
+  if (stop_at != std::string::npos) {
+    stopped_ = true;
+    std::string out = pending_.substr(0, stop_at);
+    pending_.clear();
+    return out;
+  }
+  const size_t safe = utf8_cut(pending_, pending_.size() - std::min(pending_.size(), hold_));
+  std::string out = pending_.substr(0, safe);
+  pending_.erase(0, safe);
+  return out;
+}
+
+std::string StopScanner::finish() {
+  std::string out;
+  if (!stopped_) out.swap(pending_);
+  return out;
+}
+
 Request parse_request(const json& body, bool chat) {
   if (!body.is_object()) throw std::invalid_argument("the request body must be a JSON object");
   Request r;
