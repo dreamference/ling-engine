@@ -352,6 +352,25 @@ int main() {
     EXPECT(none.push("é") == "é" && none.push("\xE9\x95") == "" && none.push("\xBF") == "\xE9\x95\xBF");
   }
   {
+    // vllm#27572 class: a chat stream that fails after its headers still ends with a finish chunk and
+    // [DONE] after the error (it used to stop at the error object), and its finish_reason is not "stop".
+    const json finish = {{"id", "chatcmpl-1"}, {"object", "chat.completion.chunk"},
+                         {"choices", json::array({json{{"index", 0}, {"delta", json::object()},
+                                                       {"finish_reason", ling::serve::kStreamErrorFinish}}})}};
+    const std::string tail = ling::serve::stream_error_tail(
+        json{{"error", {{"message", "bad \xE9"}, {"type", "server_error"}}}}, finish);
+    std::vector<std::string> events;
+    for (size_t at = 0, end; (end = tail.find("\n\n", at)) != std::string::npos; at = end + 2)
+      events.push_back(tail.substr(at, end - at));
+    EXPECT(events.size() == 3);
+    if (events.size() == 3) {
+      EXPECT(events[0].rfind("data: ", 0) == 0 && json::parse(events[0].substr(6)).contains("error"));
+      const json chunk = json::parse(events[1].substr(6));
+      EXPECT(chunk["choices"][0]["finish_reason"] == "error");
+      EXPECT(events[2] == "data: [DONE]");
+    }
+  }
+  {
     // A dump never throws on bytes that are not UTF-8 (half a character): they become U+FFFD.
     bool ok = true;
     std::string out;
