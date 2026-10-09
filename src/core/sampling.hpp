@@ -36,9 +36,10 @@ void require_finite(std::span<const float> logits);
 void require_finite_topk(std::span<const float> vals, std::span<const int> ids, int vocab);
 
 // Picks the next token from one row of logits. Presence and repetition penalties apply once to each
-// distinct token of `penalized`; then greedy (temperature <= 0, ties to the lower id), or temperature,
+// distinct token of `output`, the tokens the request has generated so far: like production, they never
+// count the prompt (sglang#41124). Then greedy (temperature <= 0, ties to the lower id), or temperature,
 // top-k, top-p and min-p and a draw from `rng`. Throws NonFiniteLogits if any logit is NaN or inf.
-int sample_logits(std::span<const float> logits, const SamplingParams& p, std::span<const int> penalized,
+int sample_logits(std::span<const float> logits, const SamplingParams& p, std::span<const int> output,
                   std::mt19937_64& rng);
 
 }  // namespace ling

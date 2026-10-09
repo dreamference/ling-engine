@@ -223,8 +223,6 @@ def test_seed_reproduces(server, path):
     assert others != {a}
 
 
-@pytest.mark.xfail(reason="Engine::sample applies presence/repetition penalties over prompt + output; "
-                          "production SGLang counts output tokens only", strict=False)
 @pytest.mark.parametrize("penalty", [{"presence_penalty": 2.0}, {"repetition_penalty": 1.5}])
 def test_penalties_ignore_prompt_tokens(server, penalty):
     """sglang#41124 (penalty history), with SGLang's semantics: presence, frequency and repetition

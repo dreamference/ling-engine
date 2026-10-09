@@ -87,7 +87,10 @@ class Engine {
   const std::vector<float>& prefill(const std::vector<int>& prompt, EngineStats* stats = nullptr);
   // Appends one token and returns the logits after it.
   const std::vector<float>& step(int token);
-  // Picks the next token from logits (sample_logits). Throws NonFiniteLogits if any logit is NaN or inf.
+  // Picks the next token from logits (sample_logits). `history` is history(): a seed is offset by its
+  // length, and presence and repetition penalties count only its tokens after the last prefill's prompt,
+  // i.e. the request's output, as production does (never the prompt's own tokens). Throws
+  // NonFiniteLogits if any logit is NaN or inf.
   int sample(const std::vector<float>& logits, const SamplingParams& p, const std::vector<int>& history);
 
   // Speculation. `anchor` is the next token, chosen but not yet processed (what step() would take).
@@ -200,6 +203,7 @@ class Engine {
   std::vector<float*> gdn_state_, conv_state_;    // per linear layer
   std::vector<int> layer_slot_;                   // layer -> index into the vectors above
   std::vector<int> history_;
+  size_t prompt_len_ = 0;  // the last prefill's prompt: history_ past it is the current request's output
   // Kept states. Each is the state after history_[0, pos), valid while those tokens stay in history_.
   StateSlot snap_;     // the end of the last prompt
   int snap_pos_ = -1;

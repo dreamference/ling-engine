@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <limits>
 #include <random>
+#include <utility>
 #include <vector>
 
 #include "core/sampling.hpp"
@@ -107,6 +108,40 @@ int main() {
     SamplingParams one = sampled;
     one.top_k = 1;
     EXPECT(ling::sample_logits(row, one, {}, rng) == ling::sample_logits(row, greedy, {}, rng));
+  }
+  {
+    // sglang#41124, with production's semantics: presence and repetition penalties count the request's
+    // output only. Engine::sample hands sample_logits history() past the last prompt, so a token that
+    // is the prompt's own and not yet generated keeps its logit: at the first output position (no output
+    // yet) a penalty never changes the greedy choice.
+    std::vector<float> l(V, 0.f);
+    l[42] = 4.f;  // say, the secret word the prompt asks the model to repeat
+    l[17] = 3.f;
+    std::mt19937_64 rng(5);
+    for (const auto& [presence, repetition] : {std::pair{2.f, 1.f}, std::pair{0.f, 2.f}}) {
+      SamplingParams pen = greedy;
+      pen.presence_penalty = presence;
+      pen.repetition_penalty = repetition;
+      EXPECT(ling::sample_logits(l, pen, {}, rng) == 42);                         // no output yet
+      const std::vector<int> once = {42}, three_times = {42, 42, 42};
+      EXPECT(ling::sample_logits(l, pen, once, rng) == 17);                       // generated once: penalized
+      EXPECT(ling::sample_logits(l, pen, three_times, rng) == 17);                // once per distinct token
+    }
+    // A repetition penalty divides a positive logit and multiplies a negative one; presence subtracts,
+    // once however often the token was generated: 42 at 4 -> 4 - 1.5 = 2.5 against 17 at 3.
+    SamplingParams pres = greedy;
+    pres.presence_penalty = 1.5f;
+    const std::vector<int> repeated = {42, 42, 42, 42};
+    EXPECT(ling::sample_logits(l, pres, repeated, rng) == 17);
+    pres.presence_penalty = 0.5f;  // 3.5 still beats 3
+    EXPECT(ling::sample_logits(l, pres, repeated, rng) == 42);
+    std::vector<float> neg(V, -10.f);
+    neg[3] = -1.f;
+    neg[4] = -1.5f;
+    SamplingParams rep = greedy;
+    rep.repetition_penalty = 2.f;  // -1 * 2 = -2 falls below -1.5
+    const std::vector<int> three = {3};
+    EXPECT(ling::sample_logits(neg, rep, three, rng) == 4);
   }
   std::printf(failures ? "%d SAMPLING TEST FAILURES\n" : "all sampling tests passed\n", failures);
   return failures ? 1 : 0;

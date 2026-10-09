@@ -22,13 +22,13 @@ void require_finite_topk(std::span<const float> vals, std::span<const int> ids, 
     if (!std::isfinite(vals[i]) || vals[i] == -FLT_MAX || ids[i] < 0 || ids[i] >= vocab) throw NonFiniteLogits();
 }
 
-int sample_logits(std::span<const float> logits, const SamplingParams& p, std::span<const int> penalized,
+int sample_logits(std::span<const float> logits, const SamplingParams& p, std::span<const int> output,
                   std::mt19937_64& rng) {
   require_finite(logits);
   const int V = static_cast<int>(logits.size());
   std::vector<float> l(logits.begin(), logits.end());
   if (p.presence_penalty != 0.f || p.repetition_penalty != 1.f) {
-    std::unordered_set<int> seen(penalized.begin(), penalized.end());
+    std::unordered_set<int> seen(output.begin(), output.end());
     for (int t : seen) {
       if (t < 0 || t >= V) continue;
       if (p.repetition_penalty != 1.f) l[t] = l[t] > 0 ? l[t] / p.repetition_penalty : l[t] * p.repetition_penalty;

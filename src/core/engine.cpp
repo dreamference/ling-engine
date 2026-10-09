@@ -554,6 +554,7 @@ const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, Engine
     if (end < L && std::binary_search(bounds.begin(), bounds.end(), end)) save_checkpoint(end);
   }
   check(cudaStreamSynchronize(stream_), "prefill");
+  prompt_len_ = L;
   if (stats) {
     stats->reused_tokens = reuse;
     stats->prefill_tokens = L - reuse;
@@ -572,7 +573,8 @@ const std::vector<float>& Engine::step(int token) {
 
 int Engine::sample(const std::vector<float>& logits, const SamplingParams& p, const std::vector<int>& history) {
   if (p.seed != 0 && p.temperature > 0.f) rng_.seed(p.seed + history.size());
-  return sample_logits(logits, p, history, rng_);
+  const size_t output = std::min(history.size(), prompt_len_);  // where the request's output starts
+  return sample_logits(logits, p, std::span<const int>(history).subspan(output), rng_);
 }
 
 }  // namespace ling
