@@ -99,6 +99,16 @@ std::string new_id(const std::string& prefix);
 // U+FFFD instead of making the dump throw: a dump error must never end a stream.
 std::string dump_json(const json& j);
 
+// The finish_reason of a chat-completions or completions stream that failed after its headers were sent.
+// Not "stop": a client must not take a broken answer for a complete one. Clients that do not know the
+// value treat it as an unknown reason, and the error object before it says what happened.
+inline constexpr const char* kStreamErrorFinish = "error";
+
+// The end of a chat-completions or completions stream that failed after its headers were sent: the error
+// object, then `finish_chunk` (a chunk whose finish_reason is kStreamErrorFinish), then [DONE], so the
+// stream still ends the way the clients expect (Cline, through its SDK, and LiteLLM wait for them).
+std::string stream_error_tail(const json& error, const json& finish_chunk);
+
 // Stop strings over streamed text. Text is emitted once no stop string can still start in it, and only up
 // to a UTF-8 character boundary: holding back a number of bytes could split a character, and the
 // chunk's JSON dump then failed and ended the stream.

@@ -95,6 +95,10 @@ std::string new_id(const std::string& prefix) {
 
 std::string dump_json(const json& j) { return j.dump(-1, ' ', false, json::error_handler_t::replace); }
 
+std::string stream_error_tail(const json& error, const json& finish_chunk) {
+  return "data: " + dump_json(error) + "\n\ndata: " + dump_json(finish_chunk) + "\n\ndata: [DONE]\n\n";
+}
+
 namespace {
 
 // The largest b <= end such that s[0, b) does not end inside a UTF-8 character (s starts on a boundary).

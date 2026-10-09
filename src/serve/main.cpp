@@ -418,13 +418,13 @@ class Handler : public proxygen::RequestHandler {
 
     job.sink.text = [=](const std::string& piece) { deliver(chat ? st->parser.push(piece) : OutputParser::Delta{{}, piece, {}}); };
     job.sink.error = [=](const std::string& msg) {
-      post(ex, [msg, stream = req.stream](proxygen::ResponseHandler* d) {
-        if (stream) {
-          ResponseBuilder(d).body("data: " + dump_json(error_body(msg, "server_error")) + "\n\n").sendWithEOM();
-        } else {
-          send_json(d, 500, error_body(msg, "server_error"));
-        }
-      });
+      if (req.stream) {  // the headers are out: end the stream properly after the error
+        const std::string tail =
+            stream_error_tail(error_body(msg, "server_error"), chunk_of(json::object(), kStreamErrorFinish));
+        post(ex, [tail](proxygen::ResponseHandler* d) { ResponseBuilder(d).body(tail).sendWithEOM(); });
+      } else {
+        post(ex, [msg](proxygen::ResponseHandler* d) { send_json(d, 500, error_body(msg, "server_error")); });
+      }
     };
     job.sink.done = [=](const std::string& finish_in, int prompt_tokens, int completion_tokens, int cached) {
       if (chat) deliver(st->parser.finish());
