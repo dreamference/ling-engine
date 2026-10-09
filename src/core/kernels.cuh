@@ -71,6 +71,12 @@ void prefill_gemm_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8
                         int N, int K, bool accumulate, cudaStream_t s);
 void prefill_gemm_fp8(const uint8_t* xq, int M, const uint8_t* w, float alpha, float* y, int ldy, int N, int K,
                       bool accumulate, cudaStream_t s);
+// The FFN's gate and up projections in one GEMM, straight into the down projection's input:
+// NVFP4(silu(alpha_gate * xq . G^T) * (alpha_up * xq . U^T)) with global scale 1 / out_input_scale, into q_out
+// [M][N/2] and sf_out [M][N/16]; the FP32 products are never written. N % 128 == 0, K % 128 == 0.
+void prefill_swiglu_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8_t* gate, float alpha_gate,
+                          const uint8_t* up, float alpha_up, int N, int K, float out_input_scale, uint8_t* q_out,
+                          uint8_t* sf_out, cudaStream_t s);
 
 // ya = x . Wa^T, yb = x . Wb^T for two BF16 [48][K] matrices and any M, row-invariant (the prefill path's
 // DeltaNet a and b projections).
@@ -141,6 +147,11 @@ void gdn_recurrent(const float* mixed, const float* g, const float* beta, const 
 // out: after the conv and SiLU), and the window updated. Each token is computed the same way whatever M is.
 void gdn_conv_prefill(const float* in, float* out, float* conv_state, const __nv_bfloat16* w, int M, int C,
                       cudaStream_t s);
+// The prefill path's recurrence: the same math as gdn_recurrent in its chunked form (32-token chunks at absolute
+// positions: pos0 is the first token's position) on tensor cores, the state updated in place. Its result for a
+// prompt does not depend on how the prompt was split, as long as every split falls on a multiple of 32.
+void gdn_recurrent_prefill(const float* mixed, const float* g, const float* beta, float* state, float* out, int M, int H,
+                           int HV, int pos0, cudaStream_t s);
 // out = rmsnorm(x) * w * silu(z), rows of length D.
 void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float* out, int rows, int D,
                    float eps, cudaStream_t s);

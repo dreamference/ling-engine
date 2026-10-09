@@ -6,29 +6,43 @@
 // the FP8 projections multiply FP8 E4M3 activations (static per-tensor input_scale) with kind::f8f6f4.
 // Accumulation is FP32; y = alpha * acc with alpha = input_scale * weight scale, as SGLang computes it.
 //
-// Tiling: a block computes 128 tokens x 128 weight rows with 8 warps (2 x 4, 64 x 32 each). One pipeline
-// stage holds 64 bytes of K per row (128 NVFP4 values, one tiled block's width; or 64 FP8 values, half of
-// one): activations and weights in shared memory with their 16-byte units XOR-swizzled by row pair, so
-// every ldmatrix phase is free of bank conflicts, plus the rows' E4M3 block scales. cp.async fills four
-// stages ahead of the MMAs.
+// Tiling: a block computes 128 tokens x 256 weight rows (3 stages) or, when that leaves under two waves,
+// 128 x 128 (4 stages), with 8 warps (2 x 4). One pipeline stage holds 64 bytes of K per row (128 NVFP4
+// values, one tiled block's width; or 64 FP8 values, half of one): activations and weights in shared
+// memory with their 16-byte units XOR-swizzled by row pair, so every ldmatrix phase is free of bank
+// conflicts, plus the rows' E4M3 block scales; cp.async fills the stages ahead of the MMAs. The FFN's gate
+// and up run as one GEMM whose epilogue applies SwiGLU and writes the down projection's NVFP4 input.
+//
+// Measured at 2,048 rows: NVFP4 230-290 TFLOPS (CUTLASS 4.5.1's SM120 example: 325 on the gate shape, 262
+// on the down shape), FP8 ~133. A warp-specialized variant (one producer warp issuing every cp.async of a
+// stage, mbarriers between it and 8 consumer warps) ran FP8 ~8% faster and NVFP4 3-4x slower: one warp
+// cannot issue a stage's ~1,800 copies in the time the MMAs take. TMA would issue them in a few
+// instructions, but the FP8 tiled layout (decode's) has no 64-byte row runs for a swizzled box.
 #include "core/kernels.cuh"
 
 #include <cuda_fp8.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
 namespace ling::kernels {
 namespace {
 
-constexpr int kBM = 128, kBN = 128, kStages = 4, kThreads = 256;
+constexpr int kBM = 128, kThreads = 256;
 constexpr int kRowBytes = 64;  // per row per stage
 constexpr int kTileBytesFp4 = 16 * 64 + 16 * 8, kTileBytesFp8 = 16 * 128;
-constexpr int kStageA = kBM * kRowBytes, kStageB = kBN * kRowBytes, kStageSA = kBM * 8, kStageSB = kBN * 8;
-constexpr int kStageBytes = kStageA + kStageB + kStageSA + kStageSB;
-constexpr int kSmemBytes = kStages * kStageBytes;
-static_assert(kBM * 4 == 2 * kThreads && kBN * 4 == 2 * kThreads, "each thread copies two pieces of A and of B");
+
+// A block computes kBM tokens x BN weight rows; 8 warps, 2 along M x 4 along N, each 64 x BN / 4.
+template <int BN, int STAGES>
+struct Shape {
+  static constexpr int kStageA = kBM * kRowBytes, kStageB = BN * kRowBytes, kStageSA = kBM * 8, kStageSB = BN * 8;
+  static constexpr int kStageBytes = kStageA + kStageB + kStageSA + kStageSB;
+  static constexpr int kSmemBytes = STAGES * kStageBytes;
+  static constexpr int kNF = BN / 4 / 8;  // n8 fragments per warp
+  static_assert(kBM * 4 == 2 * kThreads && (BN * 4) % kThreads == 0 && kBM + BN / 2 <= kThreads, "copy split");
+};
 
 __device__ __forceinline__ uint32_t smem_addr(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -81,20 +95,45 @@ struct GemmArgs {
   float alpha;
   float* y;           // [M][ldy]
   int ldy;
-  int M, N, K;
+  int M, N, K;        // N: output columns
   bool accumulate;    // y += alpha * acc
+  // SwiGLU mode: w is the gate, w2 the up projection (alpha2 its scale), and the output is
+  // NVFP4(silu(gate) * up) with global scale gscale_out into q_out [M][N/2] and sf_out [M][N/16].
+  const uint8_t* w2 = nullptr;
+  float alpha2 = 0.f, gscale_out = 0.f;
+  uint8_t* q_out = nullptr;
+  uint8_t* sf_out = nullptr;
 };
+
+// The weight row behind row r of a block's B tile (block n0 = blockIdx.y * BN). Plain: row n0 + r. SwiGLU:
+// each warp's WN rows are WN / 2 gate rows then the up rows of the same outputs, so a thread holds both
+// products of its output columns.
+template <int BN, bool SWIGLU>
+__device__ __forceinline__ const uint8_t* weight_row(const GemmArgs& p, int n0, int r, int& row) {
+  if constexpr (!SWIGLU) {
+    row = n0 + r;
+    return p.w;
+  } else {
+    constexpr int WN = BN / 4, HALF = WN / 2;
+    static_assert(HALF % 16 == 0, "whole 16-row weight tiles");
+    const int wn = r / WN, within = r % WN;
+    row = n0 / 2 + wn * HALF + within % HALF;
+    return within < HALF ? p.w : p.w2;
+  }
+}
 
 // Each thread's share of a stage's copies, with the global addresses of stage 0 and the shared-memory
 // offsets computed once: a stage then costs a few additions per copy. Thread i copies 16-byte pieces
 // i and i + 256 of the activations and of the weights, and the block scales of one row (activations,
 // threads 0-127) or of two rows (weights, threads 128-191).
-template <bool FP4>
+template <bool FP4, int BN, int STAGES, bool SWIGLU = false>
 struct Loader {
+  using S = Shape<BN, STAGES>;
+  static constexpr int kBPieces = BN * 4 / kThreads;
   const uint8_t* a[2];
-  const uint8_t* b[2];
+  const uint8_t* b[kBPieces];
   const uint8_t* sf = nullptr;
-  uint32_t sa[2], sb[2], ssf = 0;
+  uint32_t sa[2], sb[kBPieces], ssf = 0;
   int sf_kind = 0;  // 0 none, 1 activation scales (8 bytes), 2 weight scales (16 bytes)
 
   __device__ Loader(const GemmArgs& p, int m0, int n0) {
@@ -105,41 +144,49 @@ struct Loader {
       const int i = tid + j * kThreads, r = i >> 2, u = i & 3;
       a[j] = p.xq + static_cast<size_t>(min(m0 + r, p.M - 1)) * xrow + u * 16;
       sa[j] = swz(r, u);
-      const int tile = (n0 + r) >> 4, rr = r & 15;
+    }
+#pragma unroll
+    for (int j = 0; j < kBPieces; ++j) {
+      const int i = tid + j * kThreads, r = i >> 2, u = i & 3;
+      int row;
+      const uint8_t* w = weight_row<BN, SWIGLU>(p, n0, r, row);
+      const int tile = row >> 4, rr = row & 15;
       if constexpr (FP4) {
-        b[j] = p.w + static_cast<size_t>(tile) * chunks * kTileBytesFp4 + (rr * 4 + u) * 16;
+        b[j] = w + static_cast<size_t>(tile) * chunks * kTileBytesFp4 + (rr * 4 + u) * 16;
       } else {
         // FP8 tiled block: piece ((h * 2 + q) * 8 + g) * 4 + t holds row g + 8h, values [32t + 16q, +16).
         // Stage kt covers half kt & 1 of chunk kt >> 1: units 4 (kt & 1) + u, i.e. t + 2 (kt & 1), 32 bytes on.
         const int t = u >> 1, q = u & 1, g = rr & 7, h = rr >> 3;
-        b[j] = p.w + static_cast<size_t>(tile) * chunks * kTileBytesFp8 + (((h * 2 + q) * 8 + g) * 4 + t) * 16;
+        b[j] = w + static_cast<size_t>(tile) * chunks * kTileBytesFp8 + (((h * 2 + q) * 8 + g) * 4 + t) * 16;
       }
-      sb[j] = kStageA + swz(r, u);
+      sb[j] = S::kStageA + swz(r, u);
     }
     if constexpr (FP4) {
       if (tid < kBM) {
         sf_kind = 1;
         sf = p.xs + static_cast<size_t>(min(m0 + tid, p.M - 1)) * (p.K / 16);
-        ssf = kStageA + kStageB + tid * 8;
-      } else if (tid < kBM + kBN / 2) {
+        ssf = S::kStageA + S::kStageB + tid * 8;
+      } else if (tid < kBM + BN / 2) {
         sf_kind = 2;
-        const int r = (tid - kBM) * 2, tile = (n0 + r) >> 4, rr = r & 15;
-        sf = p.w + static_cast<size_t>(tile) * chunks * kTileBytesFp4 + 1024 + rr * 8;
-        ssf = kStageA + kStageB + kStageSA + r * 8;
+        const int r = (tid - kBM) * 2;
+        int row;
+        const uint8_t* w = weight_row<BN, SWIGLU>(p, n0, r, row);
+        const int tile = row >> 4, rr = row & 15;
+        sf = w + static_cast<size_t>(tile) * chunks * kTileBytesFp4 + 1024 + rr * 8;
+        ssf = S::kStageA + S::kStageB + S::kStageSA + r * 8;
       }
     }
   }
 
   // Issues the copies of K stage `kt` (64 bytes per row) into shared-memory stage `slot`.
   __device__ __forceinline__ void load(uint8_t* smem, int slot, int kt) const {
-    const uint32_t st = smem_addr(smem) + slot * kStageBytes;
+    const uint32_t st = smem_addr(smem) + slot * S::kStageBytes;
     const size_t boff = FP4 ? static_cast<size_t>(kt) * kTileBytesFp4
                             : static_cast<size_t>(kt >> 1) * kTileBytesFp8 + (kt & 1) * 32;
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-      cp16(st + sa[j], a[j] + kt * kRowBytes);
-      cp16(st + sb[j], b[j] + boff);
-    }
+    for (int j = 0; j < 2; ++j) cp16(st + sa[j], a[j] + kt * kRowBytes);
+#pragma unroll
+    for (int j = 0; j < kBPieces; ++j) cp16(st + sb[j], b[j] + boff);
     if constexpr (FP4) {
       if (sf_kind == 1) cp8(st + ssf, sf + kt * 8);
       else if (sf_kind == 2) cp16(st + ssf, sf + boff);
@@ -147,108 +194,161 @@ struct Loader {
   }
 };
 
-template <bool FP4>
-__global__ void __launch_bounds__(kThreads) prefill_gemm_kernel(GemmArgs p) {
-  extern __shared__ __align__(128) uint8_t smem[];
-  const int m0 = blockIdx.x * kBM, n0 = blockIdx.y * kBN;
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int wm = warp & 1, wn = warp >> 1;
-  const int KT = p.K / kRowBytes / (FP4 ? 2 : 1);  // stages along K
-
-  float acc[4][4][4];
-#pragma unroll
-  for (int i = 0; i < 4; ++i)
-#pragma unroll
-    for (int j = 0; j < 4; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
-
-  const Loader<FP4> loader(p, m0, n0);
-#pragma unroll
-  for (int s = 0; s < kStages - 1; ++s) {
-    if (s < KT) loader.load(smem, s, s);
-    cp_commit();
-  }
-  const int lr = lane & 7, mat = lane >> 3;
-  for (int kt = 0; kt < KT; ++kt) {
-    cp_wait<kStages - 2>();
-    __syncthreads();
-    const int nk = kt + kStages - 1;
-    if (nk < KT) loader.load(smem, nk % kStages, nk);
-    cp_commit();
-
-    const uint8_t* st = smem + (kt % kStages) * kStageBytes;
-    const uint32_t sA = smem_addr(st), sB = sA + kStageA;
-    const uint8_t* sSA = st + kStageA + kStageB;
-    const uint8_t* sSB = sSA + kStageSA;
-    // Both MMA steps' fragments (32 bytes of K per row each) are loaded before the first MMA, so the
-    // shared-memory loads of the second overlap the first's MMAs.
-    uint32_t a[2][4][4], b[2][4][2], sfa[2][4] = {}, sfb[2][4] = {};
-#pragma unroll
-    for (int s = 0; s < 2; ++s) {
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        const int r = wm * 64 + 16 * i + lr + 8 * (mat & 1);
-        ldsm_x4(a[s][i], sA + swz(r, 2 * s + (mat >> 1)));
-        if constexpr (FP4)
-          sfa[s][i] = *reinterpret_cast<const uint32_t*>(sSA + (wm * 64 + 16 * i + (lane >> 2) + 8 * (lane & 1)) * 8 + 4 * s);
-      }
-#pragma unroll
-      for (int jp = 0; jp < 2; ++jp) {
-        const int r = wn * 32 + 16 * jp + 8 * (mat >> 1) + lr;
-        uint32_t t[4];
-        ldsm_x4(t, sB + swz(r, 2 * s + (mat & 1)));
-        b[s][2 * jp][0] = t[0];
-        b[s][2 * jp][1] = t[1];
-        b[s][2 * jp + 1][0] = t[2];
-        b[s][2 * jp + 1][1] = t[3];
-      }
-      if constexpr (FP4) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-          sfb[s][j] = *reinterpret_cast<const uint32_t*>(sSB + (wn * 32 + 8 * j + (lane >> 2)) * 8 + 4 * s);
-      }
-    }
-#pragma unroll
-    for (int s = 0; s < 2; ++s)
-#pragma unroll
-      for (int i = 0; i < 4; ++i)
-#pragma unroll
-        for (int j = 0; j < 4; ++j) mma<FP4>(acc[i][j], a[s][i], b[s][j][0], b[s][j][1], sfa[s][i], sfb[s][j]);
-  }
-  cp_wait<0>();
-
-  const int g = lane >> 2, t = lane & 3;
-#pragma unroll
-  for (int i = 0; i < 4; ++i)
-#pragma unroll
-    for (int h = 0; h < 2; ++h) {
-      const int row = m0 + wm * 64 + 16 * i + g + 8 * h;
-      if (row >= p.M) continue;
-      float* yr = p.y + static_cast<size_t>(row) * p.ldy + n0 + wn * 32 + 2 * t;
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        float2 v = make_float2(acc[i][j][2 * h] * p.alpha, acc[i][j][2 * h + 1] * p.alpha);
-        float2* dst = reinterpret_cast<float2*>(yr + 8 * j);
-        if (p.accumulate) {
-          const float2 o = *dst;
-          v.x += o.x;
-          v.y += o.y;
-        }
-        *dst = v;
-      }
-    }
-}
-
-// ---- Activation quantization, as production's kernels do it (activations are BF16 there, so each value is
-// rounded to BF16 first). ----
-
 __device__ __forceinline__ float bf16_round(float x) { return __bfloat162float(__float2bfloat16(x)); }
-
+__device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }
 // Two values to one byte: the first in the low nibble (the order the MMA reads and the checkpoint stores).
 __device__ __forceinline__ uint32_t e2m1x2(float lo, float hi) {
   uint16_t out;
   asm("{\n .reg .b8 b;\n cvt.rn.satfinite.e2m1x2.f32 b, %1, %2;\n mov.b16 %0, {b, b};\n}" : "=h"(out) : "f"(hi), "f"(lo));
   return out & 0xffu;
 }
+
+// One pipeline stage's MMAs: the fragments of both 32-byte K steps, then 2 x 4 x NF MMAs.
+template <bool FP4, int BN, int STAGES>
+__device__ __forceinline__ void compute_stage(const uint8_t* st, float (&acc)[4][Shape<BN, STAGES>::kNF][4], int lane,
+                                              int wm, int wn) {
+  using S = Shape<BN, STAGES>;
+  constexpr int NF = S::kNF, WN = BN / 4;
+  const int lr = lane & 7, mat = lane >> 3;
+  const uint32_t sA = smem_addr(st), sB = sA + S::kStageA;
+  const uint8_t* sSA = st + S::kStageA + S::kStageB;
+  const uint8_t* sSB = sSA + S::kStageSA;
+  // Both MMA steps' fragments (32 bytes of K per row each) are loaded before the first MMA, so the
+  // shared-memory loads of the second overlap the first's MMAs.
+  uint32_t a[2][4][4], b[2][NF][2], sfa[2][4] = {}, sfb[2][NF] = {};
+#pragma unroll
+  for (int s = 0; s < 2; ++s) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int r = wm * 64 + 16 * i + lr + 8 * (mat & 1);
+      ldsm_x4(a[s][i], sA + swz(r, 2 * s + (mat >> 1)));
+      if constexpr (FP4)
+        sfa[s][i] = *reinterpret_cast<const uint32_t*>(sSA + (wm * 64 + 16 * i + (lane >> 2) + 8 * (lane & 1)) * 8 + 4 * s);
+    }
+#pragma unroll
+    for (int jp = 0; jp < NF / 2; ++jp) {
+      const int r = wn * WN + 16 * jp + 8 * (mat >> 1) + lr;
+      uint32_t t[4];
+      ldsm_x4(t, sB + swz(r, 2 * s + (mat & 1)));
+      b[s][2 * jp][0] = t[0];
+      b[s][2 * jp][1] = t[1];
+      b[s][2 * jp + 1][0] = t[2];
+      b[s][2 * jp + 1][1] = t[3];
+    }
+    if constexpr (FP4) {
+#pragma unroll
+      for (int j = 0; j < NF; ++j)
+        sfb[s][j] = *reinterpret_cast<const uint32_t*>(sSB + (wn * WN + 8 * j + (lane >> 2)) * 8 + 4 * s);
+    }
+  }
+#pragma unroll
+  for (int s = 0; s < 2; ++s)
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+      for (int j = 0; j < NF; ++j) mma<FP4>(acc[i][j], a[s][i], b[s][j][0], b[s][j][1], sfa[s][i], sfb[s][j]);
+}
+
+// The epilogue: alpha * acc into y (or added to it), or SwiGLU straight into NVFP4.
+template <int BN, int STAGES, bool SWIGLU>
+__device__ __forceinline__ void epilogue(const GemmArgs& p, const float (&acc)[4][Shape<BN, STAGES>::kNF][4], int m0, int n0,
+                                         int lane, int wm, int wn) {
+  constexpr int NF = Shape<BN, STAGES>::kNF, WN = BN / 4;
+  const int g = lane >> 2, t = lane & 3;
+  if constexpr (SWIGLU) {
+    // Fragments j and j + NF / 2 are the gate and up products of the same columns. Columns 16b .. 16b + 15 of
+    // the warp's outputs are fragments 2b and 2b + 1: each lane holds four of them (2t, 2t + 1, 8 + 2t,
+    // 9 + 2t), and the lanes t = 0 .. 3 of a row form one NVFP4 block.
+    const int oc = n0 / 2 + wn * (WN / 2);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int row = m0 + wm * 64 + 16 * i + g + 8 * h;
+#pragma unroll
+        for (int bb = 0; bb < NF / 4; ++bb) {
+          float v[4];
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            const int j = 2 * bb + (e >> 1);
+            const float gv = acc[i][j][2 * h + (e & 1)] * p.alpha, uv = acc[i][j + NF / 2][2 * h + (e & 1)] * p.alpha2;
+            v[e] = bf16_round(silu(gv) * uv);
+          }
+          float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+          amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+          amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+          const __nv_fp8_e4m3 sc(p.gscale_out * (amax * (1.f / 6.f)));
+          const float sv = static_cast<float>(sc);
+          const float os = sv != 0.f ? 1.f / (sv * (1.f / p.gscale_out)) : 0.f;
+          if (row < p.M) {
+            const int col = oc + 16 * bb;  // the block's first column
+            uint8_t* qr = p.q_out + static_cast<size_t>(row) * (p.N / 2) + col / 2;
+            qr[t] = static_cast<uint8_t>(e2m1x2(v[0] * os, v[1] * os));
+            qr[4 + t] = static_cast<uint8_t>(e2m1x2(v[2] * os, v[3] * os));
+            if (t == 0) p.sf_out[static_cast<size_t>(row) * (p.N / 16) + col / 16] = sc.__x;
+          }
+        }
+      }
+  } else {
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int row = m0 + wm * 64 + 16 * i + g + 8 * h;
+        if (row >= p.M) continue;
+        float* yr = p.y + static_cast<size_t>(row) * p.ldy + n0 + wn * WN + 2 * t;
+#pragma unroll
+        for (int j = 0; j < NF; ++j) {
+          float2 v = make_float2(acc[i][j][2 * h] * p.alpha, acc[i][j][2 * h + 1] * p.alpha);
+          float2* dst = reinterpret_cast<float2*>(yr + 8 * j);
+          if (p.accumulate) {
+            const float2 o = *dst;
+            v.x += o.x;
+            v.y += o.y;
+          }
+          *dst = v;
+        }
+      }
+  }
+}
+
+template <bool FP4, int BN, int STAGES, bool SWIGLU = false>
+__global__ void __launch_bounds__(kThreads) prefill_gemm_kernel(GemmArgs p) {
+  using S = Shape<BN, STAGES>;
+  constexpr int NF = S::kNF;
+  extern __shared__ __align__(128) uint8_t smem[];
+  const int m0 = blockIdx.x * kBM, n0 = blockIdx.y * BN;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int wm = warp & 1, wn = warp >> 1;
+  const int KT = p.K / kRowBytes / (FP4 ? 2 : 1);  // stages along K
+
+  float acc[4][NF][4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+#pragma unroll
+    for (int j = 0; j < NF; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+
+  const Loader<FP4, BN, STAGES, SWIGLU> loader(p, m0, n0);
+#pragma unroll
+  for (int s = 0; s < STAGES - 1; ++s) {
+    if (s < KT) loader.load(smem, s, s);
+    cp_commit();
+  }
+  for (int kt = 0; kt < KT; ++kt) {
+    cp_wait<STAGES - 2>();
+    __syncthreads();
+    const int nk = kt + STAGES - 1;
+    if (nk < KT) loader.load(smem, nk % STAGES, nk);
+    cp_commit();
+    compute_stage<FP4, BN, STAGES>(smem + (kt % STAGES) * S::kStageBytes, acc, lane, wm, wn);
+  }
+  cp_wait<0>();
+  epilogue<BN, STAGES, SWIGLU>(p, acc, m0, n0, lane, wm, wn);
+}
+
+// ---- Activation quantization, as production's kernels do it (activations are BF16 there, so each value is
+// rounded to BF16 first). ----
+
 
 // The NVFP4 encoding of four values held by each of four adjacent lanes (one block of 16).
 __device__ __forceinline__ void put_nvfp4(const float (&v)[4], float gscale, size_t quad, uint8_t* __restrict__ q,
@@ -275,8 +375,6 @@ __device__ __forceinline__ uint32_t put_fp8x4(const float (&v)[4], float inv_sca
 // Four lanes per block of 16 values (each loads one float4, coalesced): scale = E4M3(gscale * amax / 6),
 // values = E2M1(x * gscale / scale). With `up`, the value quantized is silu(x) * up (the FFN's gate and up
 // products, fused so the 17,408-wide activation is never written in FP32).
-__device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }
-
 template <bool SILU>
 __global__ void quant_nvfp4_kernel(const float* __restrict__ x, const float* __restrict__ up, size_t quads, float gscale,
                                    uint8_t* __restrict__ q, uint8_t* __restrict__ sf) {
@@ -438,17 +536,37 @@ void check_launch(const char* what) {
   if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
 
-template <bool FP4>
-void launch_gemm(const GemmArgs& p, cudaStream_t s) {
-  if (p.N % kBN != 0 || p.K % 128 != 0) throw std::runtime_error("prefill_gemm: N % 128 and K % 128 must be 0");
-  if (p.M < 1) return;
+template <bool FP4, int BN, int STAGES, bool SWIGLU = false>
+void launch_shape(const GemmArgs& p, cudaStream_t s) {
+  using S = Shape<BN, STAGES>;
   static bool configured = false;
   if (!configured) {
-    cudaFuncSetAttribute(prefill_gemm_kernel<FP4>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
+    cudaFuncSetAttribute(prefill_gemm_kernel<FP4, BN, STAGES, SWIGLU>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         S::kSmemBytes);
     configured = true;
   }
-  const dim3 grid((p.M + kBM - 1) / kBM, p.N / kBN);
-  prefill_gemm_kernel<FP4><<<grid, kThreads, kSmemBytes, s>>>(p);
+  const dim3 grid((p.M + kBM - 1) / kBM, (SWIGLU ? 2 * p.N : p.N) / BN);
+  prefill_gemm_kernel<FP4, BN, STAGES, SWIGLU><<<grid, kThreads, S::kSmemBytes, s>>>(p);
+}
+
+// LING_GEMM_SHAPE (experiments): 0 automatic, 1: 128 x 128 x 4 stages, 2: 128 x 256 x 3 stages.
+int gemm_shape() {
+  static const int v = [] {
+    const char* e = std::getenv("LING_GEMM_SHAPE");
+    return e ? std::atoi(e) : 0;
+  }();
+  return v;
+}
+
+template <bool FP4>
+void launch_gemm(const GemmArgs& p, cudaStream_t s) {
+  if (p.N % 128 != 0 || p.K % 128 != 0) throw std::runtime_error("prefill_gemm: N % 128 and K % 128 must be 0");
+  if (p.M < 1) return;
+  int shape = gemm_shape();
+  // 128 x 256 tiles (measured +12-25% on the NVFP4 matrices at 512-2,048 rows) when they still give two waves.
+  if (shape == 0) shape = (p.M + kBM - 1) / kBM * (p.N / 256) >= 96 ? 2 : 1;
+  if (shape == 2 && p.N % 256 == 0) launch_shape<FP4, 256, 3>(p, s);
+  else launch_shape<FP4, 128, 4>(p, s);
   check_launch(FP4 ? "prefill_gemm_nvfp4" : "prefill_gemm_fp8");
 }
 
@@ -503,6 +621,22 @@ void narrow_bf16(const float* x, int M, const __nv_bfloat16* wa, const __nv_bflo
   if (2 * N != 96 || K % 16 != 0) throw std::runtime_error("narrow_bf16: built for two 48-row matrices, K % 16 == 0");
   narrow_bf16_kernel<<<(M + 15) / 16, 128, 0, s>>>(x, M, wa, wb, ya, yb, N, K);
   check_launch("narrow_bf16");
+}
+
+void prefill_swiglu_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8_t* gate, float alpha_gate,
+                          const uint8_t* up, float alpha_up, int N, int K, float out_input_scale, uint8_t* q_out,
+                          uint8_t* sf_out, cudaStream_t s) {
+  if (N % 128 != 0 || K % 128 != 0) throw std::runtime_error("prefill_swiglu_nvfp4: N % 128 and K % 128 must be 0");
+  if (M < 1) return;
+  GemmArgs p{xq, xs, gate, alpha_gate, nullptr, 0, M, N, K, false};
+  p.w2 = up;
+  p.alpha2 = alpha_up;
+  p.gscale_out = 1.f / out_input_scale;
+  p.q_out = q_out;
+  p.sf_out = sf_out;
+  if ((M + kBM - 1) / kBM * (2 * N / 256) >= 96) launch_shape<true, 256, 3, true>(p, s);
+  else launch_shape<true, 128, 4, true>(p, s);
+  check_launch("prefill_swiglu_nvfp4");
 }
 
 void prefill_gemm_fp8(const uint8_t* xq, int M, const uint8_t* w, float alpha, float* y, int ldy, int N, int K,
