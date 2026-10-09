@@ -21,6 +21,8 @@
 #include <cstdio>
 #include <stdexcept>
 
+#include <nvtx3/nvToolsExt.h>
+
 #include "core/engine.hpp"
 #include "core/kernels.cuh"
 #include "core/accept.hpp"
@@ -28,6 +30,11 @@
 
 namespace ling {
 namespace {
+
+struct NvtxRange {
+  explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
+  ~NvtxRange() { nvtxRangePop(); }
+};
 
 void check(cudaError_t e, const char* what) {
   if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
@@ -163,6 +170,7 @@ void Engine::draft_materialize(int rows, int pos0, int cap_row0) {
 }
 
 void Engine::draft_propose(int anchor, int B) {
+  NvtxRange range("draft");
   const ModelConfig& c = model_->config();
   const DraftConfig& d = draft_->config();
   const int H = d.hidden, E = B - 1, dq = d.heads * d.head_dim, dkv = d.kv_heads * d.head_dim;
@@ -326,8 +334,11 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p) {
 
   // 4. Commit the anchor and the accepted drafts.
   const int n = accepted + 1;
-  commit(n);
-  draft_materialize(n, pos_, 0);
+  {
+    NvtxRange range("commit");
+    commit(n);
+    draft_materialize(n, pos_, 0);
+  }
   history_.insert(history_.end(), rows.begin(), rows.begin() + n);
   pos_ += n;
   check(cudaStreamSynchronize(stream_), "commit");
