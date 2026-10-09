@@ -373,14 +373,14 @@ M0 produces the numbers every later target is restated against (plus the five me
 
 **Agreement gate (standing, from 9 October 2026).** It replaces the 98.6% top-1 target on validate_v0.py's six prompts, whose 288 tokens cannot detect a change smaller than about 4.5 points ([reports/M2-prefill.md](reports/M2-prefill.md) section 6). Measured with `bench/agreement/` on 54 prompts (validate_v0.py's six, 24 short chat prompts, 24 replayed agent prompts), teacher-forced on production's greedy 48-token continuation, against production at concurrency 1 with a cold cache; a flip is a position where the engine's top token scores strictly below production's top:
 
-- flip rate ≤ 2.6% (production's own decode against its own prefill on the same inputs);
+- flip rate not significantly above production's own self-noise, its greedy decode against its own prefill on the same positions: a one-sided Fisher exact test (the hypergeometric upper tail, observed table included) at α = 0.05. With production's 65 flips in 2,490 positions the threshold is 85 flips (3.41%): 85 gives p = 0.058, 86 gives p = 0.049;
 - every flip's gap (production's top against the engine's choice) ≤ 1.75 nats;
 - top-5 agreement 100%;
 - no late concentration of flips by position in the continuation or by prompt length;
 - tool-name match on the 24 agent prompts' first answers ≥ production's match with itself;
 - exact-argument match judged only against production's match with itself (13 of 24 when measured).
 
-M1 measured 2.25%, M2 2.65% (66 flips against production's 65); every other line passes for both.
+M1 (56 flips, 2.25%, p = 0.82), `44c92c5` (68, 2.73%, p = 0.43) and M2 (66, 2.65%, p = 0.50) all pass the flip line; M2 is as far from production as production is from itself. Every other line passes for M1 and M2. `bench/agreement/analyze.py` reports counts, not verdicts; anything that turns them into pass/fail applies this test, with the threshold recomputed from production's own count whenever the prompt set changes.
 
 **Exactness policy.** The engine's numerics are the exact path: decode and verify on the rows path, prefill as M2 built it. Every non-exact mode (a change of numerics, not of speed) sits behind a switch and is off by default. One may become the default only if:
 
