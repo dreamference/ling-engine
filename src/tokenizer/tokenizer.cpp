@@ -59,7 +59,7 @@ std::string nfc(std::string_view text) {
 
 }  // namespace
 
-Tokenizer::Tokenizer(const std::string& path) {
+Tokenizer::Tokenizer(const std::string& path, const std::string& pattern_override) {
   std::ifstream f(path);
   if (!f) throw std::runtime_error("cannot read " + path);
   nlohmann::json j = nlohmann::json::parse(f);
@@ -112,6 +112,7 @@ Tokenizer::Tokenizer(const std::string& path) {
   } else if (pre["type"] == "Split") {
     pattern = pre["pattern"]["Regex"];
   }
+  if (!pattern_override.empty()) pattern = pattern_override;
   if (pattern.empty()) throw std::runtime_error("no Split pattern in tokenizer.json");
   int errcode = 0;
   PCRE2_SIZE erroff = 0;

@@ -31,6 +31,57 @@ T get_or(const json& body, const char* key, T dflt) {
   return body[key].get<T>();
 }
 
+// The messages as production's chat endpoint hands them to the template: a tool message whose content is
+// a list of text parts becomes their text joined by spaces, and a final assistant message with string
+// content is sent as a user message (SGLang's handling when continue_final_message is off).
+json production_messages(const json& messages) {
+  if (!messages.is_array()) return messages;
+  json out = messages;
+  for (json& m : out) {
+    if (!m.is_object() || m.value("role", "") != "tool" || !m.contains("content") || !m["content"].is_array()) continue;
+    bool text_only = true;
+    for (const json& p : m["content"]) text_only = text_only && (p.is_string() || (p.is_object() && p.value("type", "") == "text"));
+    if (!text_only) continue;
+    std::string joined;
+    bool first = true;
+    for (const json& p : m["content"]) {
+      joined += (first ? "" : " ") + (p.is_string() ? p.get<std::string>() : p.contains("text") && p["text"].is_string() ? p["text"].get<std::string>() : "");
+      first = false;
+    }
+    m["content"] = joined;
+  }
+  if (!out.empty() && out.back().is_object() && out.back().value("role", "") == "assistant" &&
+      out.back().contains("content") && out.back()["content"].is_string())
+    out.back() = json{{"role", "user"}, {"content", out.back()["content"]}};
+  return out;
+}
+
+// The tools as production's server hands them to the chat template: each one validated into its
+// `Tool`/`Function` models and dumped again, which fixes the keys and their order:
+// {"type", "function": {"description", "name", "parameters", "strict"}, "defer_loading"}. A named
+// tool_choice keeps only that tool.
+json canonical_tools(const json& tools, const json& tool_choice) {
+  std::string only;
+  if (tool_choice.is_object() && tool_choice.contains("function") && tool_choice["function"].is_object())
+    only = tool_choice["function"].value("name", "");
+  json out = json::array();
+  for (const json& t : tools) {
+    if (!t.is_object()) continue;
+    const json& f = t.contains("function") && t["function"].is_object() ? t["function"] : t;
+    json fn = json::object();
+    fn["description"] = f.contains("description") && f["description"].is_string() ? f["description"] : json();
+    fn["name"] = f.value("name", "");
+    fn["parameters"] = f.contains("parameters") ? f["parameters"] : json();
+    fn["strict"] = f.contains("strict") && f["strict"].is_boolean() ? f["strict"].get<bool>() : false;
+    const json defer = t.contains("defer_loading") && t["defer_loading"].is_boolean() ? t["defer_loading"] : json();
+    if (!defer.is_null() || (f.contains("defer_loading") && f["defer_loading"].is_boolean()))
+      fn["defer_loading"] = defer.is_null() ? f["defer_loading"] : defer;
+    if (!only.empty() && fn["name"] != only) continue;
+    out.push_back(json{{"type", t.value("type", "function")}, {"function", fn}, {"defer_loading", defer}});
+  }
+  return out;
+}
+
 }  // namespace
 
 std::string new_id(const std::string& prefix) {
@@ -77,8 +128,8 @@ Request parse_request(const json& body, bool chat) {
     if (body.contains("reasoning_effort") && body["reasoning_effort"].is_string())
       opts.reasoning_effort = body["reasoning_effort"].get<std::string>();
     if (body.contains("tools") && body["tools"].is_array() && body.value("tool_choice", json("auto")) != "none")
-      r.tools = body["tools"];
-    r.prompt_text = render_chat(body["messages"], r.tools, opts);
+      r.tools = canonical_tools(body["tools"], body.contains("tool_choice") ? body["tool_choice"] : json("auto"));
+    r.prompt_text = render_chat(production_messages(body["messages"]), r.tools, opts);
     r.reasoning = !opts.enable_thinking.has_value() || *opts.enable_thinking;
   } else {
     if (!body.contains("prompt")) throw std::invalid_argument("prompt is required");
@@ -236,8 +287,9 @@ json normalize_item(const json& item) {
         args = raw.dump();
       }
     }
-    const std::string id = item.contains("call_id") && item["call_id"].is_string() ? item["call_id"].get<std::string>()
-                                                                                    : item.value("id", "");
+    const std::string id = item.contains("call_id") && item["call_id"].is_string() && !item["call_id"].get<std::string>().empty()
+                               ? item["call_id"].get<std::string>()
+                               : item.value("id", "");
     return json{{"role", "assistant"},
                 {"tool_calls", json::array({json{{"id", id},
                                                  {"type", "function"},
@@ -267,8 +319,35 @@ json normalize_item(const json& item) {
   std::string role = item.value("role", "user");
   if (role == "developer") role = "system";
   json msg = {{"role", role}};
-  if (item.contains("content")) msg["content"] = item["content"].is_string() ? item["content"] : json(text_of_parts(item["content"]));
+  // Content stays a list of parts when it is one (the template concatenates their text): input_text and
+  // output_text parts become text parts, anything else is kept for the template to accept or refuse.
+  if (item.contains("content") && !item["content"].is_null()) {
+    const json& c = item["content"];
+    if (!c.is_array()) {
+      msg["content"] = c;
+    } else {
+      json parts = json::array();
+      for (const json& p : c) {
+        const std::string pt = p.is_object() ? p.value("type", "") : "";
+        if (pt == "input_text" || pt == "output_text")
+          parts.push_back({{"type", "text"}, {"text", p.contains("text") && p["text"].is_string() ? p["text"] : json("")}});
+        else
+          parts.push_back(p);
+      }
+      msg["content"] = parts;
+    }
+  }
   return msg;
+}
+
+bool empty_content(const json& m) {
+  return !m.contains("content") || m["content"].is_null() || (m["content"].is_string() && m["content"].get<std::string>().empty());
+}
+
+json as_parts(const json& c) {
+  if (c.is_array()) return c;
+  if (c.is_string() && !c.get<std::string>().empty()) return json::array({json{{"type", "text"}, {"text", c}}});
+  return json::array();
 }
 
 }  // namespace
@@ -294,10 +373,17 @@ Request parse_responses_request(const json& body) {
   for (json& m : messages) {
     if (m["role"] == "assistant" && !merged.empty() && merged.back()["role"] == "assistant") {
       json& prev = merged.back();
-      const std::string nc = m.contains("content") && m["content"].is_string() ? m["content"].get<std::string>() : "";
-      if (!nc.empty()) {
-        const std::string pc = prev.contains("content") && prev["content"].is_string() ? prev["content"].get<std::string>() : "";
-        prev["content"] = pc.empty() ? nc : pc + "\n\n" + nc;
+      // As production merges them: two strings join with a blank line, anything else as parts.
+      if (!empty_content(m)) {
+        if (empty_content(prev)) {
+          prev["content"] = m["content"];
+        } else if (prev["content"].is_string() && m["content"].is_string()) {
+          prev["content"] = prev["content"].get<std::string>() + "\n\n" + m["content"].get<std::string>();
+        } else {
+          json parts = as_parts(prev["content"]);
+          for (const json& p : as_parts(m["content"])) parts.push_back(p);
+          prev["content"] = parts;
+        }
       }
       if (m.contains("tool_calls")) {
         if (!prev.contains("tool_calls")) prev["tool_calls"] = json::array();
@@ -313,19 +399,27 @@ Request parse_responses_request(const json& body) {
     }
     merged.push_back(std::move(m));
   }
-  // Every system chunk goes into one leading system message.
-  std::string system;
+  // Every system chunk goes into one leading system message, joined by blank lines: a string content is
+  // one chunk (even an empty one), a list contributes each part's text as a chunk of its own.
+  std::vector<std::string> chunks;
   json others = json::array();
   for (json& m : merged) {
     if (m["role"] == "system") {
-      const std::string c = m.contains("content") && m["content"].is_string() ? m["content"].get<std::string>() : "";
-      if (!c.empty()) system += (system.empty() ? "" : "\n\n") + c;
+      const json c = m.contains("content") ? m["content"] : json();
+      if (c.is_string()) chunks.push_back(c.get<std::string>());
+      else if (c.is_array())
+        for (const json& p : c)
+          if (p.is_object() && p.contains("text") && p["text"].is_string()) chunks.push_back(p["text"].get<std::string>());
     } else {
       others.push_back(std::move(m));
     }
   }
   json final_messages = json::array();
-  if (!system.empty()) final_messages.push_back({{"role", "system"}, {"content", system}});
+  if (!chunks.empty()) {
+    std::string system;
+    for (size_t i = 0; i < chunks.size(); ++i) system += (i ? "\n\n" : "") + chunks[i];
+    final_messages.push_back({{"role", "system"}, {"content", system}});
+  }
   for (json& m : others) final_messages.push_back(std::move(m));
 
   json chat = json::object();

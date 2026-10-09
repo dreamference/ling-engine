@@ -77,6 +77,26 @@ int main() {
            std::string::npos);
     EXPECT(out.find("{\"type\": \"function\", \"function\": {\"name\": \"shell\"") != std::string::npos);
   }
+  {
+    // The Responses conversion as production does it (bench/render/render_test.py checks it on replayed
+    // requests): tools dumped in production's key order, system parts as chunks of their own, assistant
+    // list contents merged without a separator.
+    json body = json::parse(R"({"instructions":"Base.","tools":[{"type":"function","name":"shell","description":"Run",
+      "parameters":{"type":"object"},"strict":false}],"reasoning":{"effort":"none"},
+      "input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"A"},{"type":"input_text","text":"B"}]},
+               {"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
+               {"type":"message","role":"assistant","content":[{"type":"output_text","text":"one"}]},
+               {"type":"message","role":"assistant","content":[{"type":"output_text","text":"two"}]},
+               {"type":"message","role":"user","content":"next"}]})");
+    const ling::serve::Request r = ling::serve::parse_responses_request(body);
+    const std::string& t = r.prompt_text;
+    EXPECT(t.find("{\"type\": \"function\", \"function\": {\"description\": \"Run\", \"name\": \"shell\", "
+                  "\"parameters\": {\"type\": \"object\"}, \"strict\": false}, \"defer_loading\": null}") != std::string::npos);
+    EXPECT(t.find("</IMPORTANT>\n\nBase.\n\nA\n\nB<|im_end|>") != std::string::npos);
+    EXPECT(t.find("<think>\n\n</think>\n\nonetwo<|im_end|>") != std::string::npos);
+    const std::string tail = "<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    EXPECT(t.size() >= tail.size() && t.compare(t.size() - tail.size(), tail.size(), tail) == 0);
+  }
   std::printf(failures ? "%d API TEST FAILURES\n" : "all api tests passed\n", failures);
   return failures ? 1 : 0;
 }

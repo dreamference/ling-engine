@@ -64,12 +64,14 @@ target_link_libraries(ling-run PRIVATE ling_core ling_tokenizer)
 # ling-tokenize: prints token ids for each input line (tested against the reference tokenizer).
 add_executable(ling-tokenize tools/ling_tokenize.cpp)
 target_link_libraries(ling-tokenize PRIVATE ling_tokenizer)
-add_executable(ling-template tools/ling_template.cpp)
-target_link_libraries(ling-template PRIVATE ling_tokenizer)
 
 # The API layer without the HTTP library, so it is testable on its own.
 add_library(ling_api STATIC src/serve/api.cpp)
 target_link_libraries(ling_api PUBLIC ling_core ling_tokenizer)
+
+# ling-template: the chat template, and the Responses-to-prompt conversion, without a model.
+add_executable(ling-template tools/ling_template.cpp)
+target_link_libraries(ling-template PRIVATE ling_api)
 
 # ling-serve: the HTTP server (proxygen), built when proxygen is found.
 set(LING_PROXYGEN_PREFIX "$ENV{HOME}/ling-deps/proxygen" CACHE PATH "Where proxygen and its dependencies are installed")

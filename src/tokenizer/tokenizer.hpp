@@ -11,9 +11,19 @@
 
 namespace ling {
 
+// The pre-tokenizer pattern production's server tokenizes with. Its tokenizer class (transformers 5's
+// Qwen2Tokenizer) replaces the checkpoint's Split pattern with this older Qwen2 one, which has no \p{M}:
+// combining marks (Devanagari vowel signs, for example) split from the letters before them. For text
+// without combining marks the two patterns give the same tokens.
+inline constexpr const char* kProductionPretokenizer =
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|"
+    "\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
 class Tokenizer {
  public:
-  explicit Tokenizer(const std::string& tokenizer_json_path);
+  // `pattern` replaces tokenizer.json's Split pattern when it is not empty (kProductionPretokenizer
+  // tokenizes as production does).
+  explicit Tokenizer(const std::string& tokenizer_json_path, const std::string& pattern = "");
   ~Tokenizer();
   Tokenizer(const Tokenizer&) = delete;
   Tokenizer& operator=(const Tokenizer&) = delete;
