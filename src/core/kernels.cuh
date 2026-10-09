@@ -203,6 +203,9 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
                     int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s, int fixed_ctx = 0);
 // Sets the kernels' shared-memory attributes once, outside any graph capture.
 void prepare_kernels();
+// M3: attention_rows loads its key/value tiles with bulk copies (TMA, one 512-byte copy per key row) instead
+// of 16-byte cp.async. Same tiles, same arithmetic: the output is bit for bit the same. Off by default.
+void set_attention_bulk(bool on);
 // ---- The DFlash2 drafter (draft_kernels.cu). ----
 // dst[r][0..H) = bf16(src[r][0..H)), rows dst_stride apart (the target features the drafter conditions on).
 void copy_rows_bf16(const float* src, int rows, int H, __nv_bfloat16* dst, int dst_stride, cudaStream_t s);

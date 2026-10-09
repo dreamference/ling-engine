@@ -528,7 +528,69 @@ __device__ __forceinline__ void attn_load_tile(__nv_bfloat16* stage, const __nv_
   asm volatile("cp.async.commit_group;");
 }
 
-template <int ROWS, int TK, int NS>  // query rows per block (16 per warp), keys per tile, pipeline stages
+// ---- The same tiles through the bulk-copy (TMA) engine (M3, set_attention_bulk). ----
+// One key's 256 values of one KV head are 512 contiguous bytes in both KV layouts, so a tile is TK bulk
+// copies for K and TK for V, one per lane of one warp, each into its padded shared-memory row: the layout
+// the MMAs read is unchanged. Completion is counted in bytes on one mbarrier per stage instead of
+// cp.async groups. The copies run without the SM issuing a 16-byte request per thread, and each is one
+// 512-byte request to memory.
+__device__ __forceinline__ uint32_t smem_addr(const void* p) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+__device__ __forceinline__ void mbar_init(uint64_t* bar, uint32_t count) {
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_addr(bar)), "r"(count) : "memory");
+}
+
+// Waits until phase `parity` of the barrier has completed (every expected byte has landed).
+__device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t parity) {
+  asm volatile(
+      "{\n"
+      " .reg .pred done;\n"
+      "WAIT:\n"
+      " mbarrier.try_wait.parity.shared::cta.b64 done, [%0], %1;\n"
+      " @!done bra WAIT;\n"
+      "}\n" ::"r"(smem_addr(bar)),
+      "r"(parity)
+      : "memory");
+}
+
+// The keys [k0, min(k0 + TK, khi)) of one KV head into a stage; called by every lane of one warp. Rows past
+// khi are not copied: they keep finite values from an earlier tile (or the zeros the kernel starts with),
+// their scores are masked to -inf and their probabilities are exactly 0, so they add nothing, as the zero
+// rows of attn_load_tile add nothing.
+template <int TK>
+__device__ __forceinline__ void attn_bulk_tile(__nv_bfloat16* stage, const __nv_bfloat16* __restrict__ kcache,
+                                               const __nv_bfloat16* __restrict__ vcache, int k0, int khi, int kvh,
+                                               size_t hs, size_t ps, uint64_t* bar) {
+  static_assert(TK <= 32, "one key per lane");
+  constexpr int D = kMmaD, KS = kMmaKS, kRowBytes = D * 2;
+  const int lane = threadIdx.x & 31, valid = max(0, min(TK, khi - k0));
+  // The barrier's transaction count first (lane 0's arrival), so the phase cannot complete before every
+  // copy of this tile has been counted.
+  if (lane == 0)
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_addr(bar)),
+                 "r"(2 * valid * kRowBytes)
+                 : "memory");
+  __syncwarp();
+  if (lane < valid) {
+    const size_t off = kvh * hs + static_cast<size_t>(k0 + lane) * ps;
+    asm volatile(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+            smem_addr(stage + lane * KS)),
+        "l"(kcache + off), "r"(kRowBytes), "r"(smem_addr(bar))
+        : "memory");
+    asm volatile(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+            smem_addr(stage + (TK + lane) * KS)),
+        "l"(vcache + off), "r"(kRowBytes), "r"(smem_addr(bar))
+        : "memory");
+  }
+}
+
+// query rows per block (16 per warp), keys per tile, pipeline stages; BULK: tiles through the bulk-copy
+// engine (attn_bulk_tile) instead of cp.async. The arithmetic is the same either way, bit for bit.
+template <int ROWS, int TK, int NS, bool BULK>
 __global__ void __launch_bounds__(ROWS * 2)
     attention_mma_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                          const __nv_bfloat16* __restrict__ vcache, DevPos pos0_arg, int M, int Hq, int Hkv,
@@ -580,19 +642,43 @@ __global__ void __launch_bounds__(ROWS * 2)
   float ma = -INFINITY, mb = -INFINITY, la = 0.f, lb = 0.f;
   // A ring of NS stages: tiles i + 1 .. i + NS - 1 are in flight while tile i is computed. Every
   // iteration commits one cp.async group (empty past the range), so wait_group NS - 2 always means
-  // "tile i has landed".
+  // "tile i has landed". With BULK, stage s's tiles complete phases 0, 1, 0, ... of bar[s] instead.
   const int ntiles = (khi - klo + TK - 1) / TK;
+  __shared__ __align__(8) uint64_t bar[BULK ? NS : 1];
+  if constexpr (BULK) {
+    // Zero the stages once (rows past the range are never copied), make those generic-proxy writes
+    // visible to the bulk copies about to overwrite them, and set up one barrier per stage (one arrival:
+    // warp 0's lane 0, with the tile's byte count).
+    for (size_t i = tid; i < mma_smem(TK, NS) / 16; i += blockDim.x) reinterpret_cast<uint4*>(smem)[i] = make_uint4(0, 0, 0, 0);
+    if (tid == 0) {
+      for (int i = 0; i < NS; ++i) mbar_init(&bar[i], 1);
+      asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    __syncthreads();
+  }
 #pragma unroll
   for (int p = 0; p < NS - 1; ++p) {
-    if (p < ntiles) attn_load_tile<TK>(stage(p), kcache, vcache, klo + p * TK, khi, kvh, hs, ps);
-    else asm volatile("cp.async.commit_group;");
+    if constexpr (BULK) {
+      if (warp == 0 && p < ntiles) attn_bulk_tile<TK>(stage(p), kcache, vcache, klo + p * TK, khi, kvh, hs, ps, &bar[p]);
+    } else {
+      if (p < ntiles) attn_load_tile<TK>(stage(p), kcache, vcache, klo + p * TK, khi, kvh, hs, ps);
+      else asm volatile("cp.async.commit_group;");
+    }
   }
   for (int it = 0; it < ntiles; ++it) {
     const int k0 = klo + it * TK;
-    asm volatile("cp.async.wait_group %0;" ::"n"(NS - 2));
+    if constexpr (BULK) mbar_wait(&bar[it % NS], (it / NS) & 1);
+    else asm volatile("cp.async.wait_group %0;" ::"n"(NS - 2));
     __syncthreads();  // tile it is visible to all, and stage (it - 1) % NS is free again
-    if (it + NS - 1 < ntiles) attn_load_tile<TK>(stage(it + NS - 1), kcache, vcache, k0 + (NS - 1) * TK, khi, kvh, hs, ps);
-    else asm volatile("cp.async.commit_group;");
+    if constexpr (BULK) {
+      if (warp == 0 && it + NS - 1 < ntiles)
+        attn_bulk_tile<TK>(stage(it + NS - 1), kcache, vcache, k0 + (NS - 1) * TK, khi, kvh, hs, ps,
+                           &bar[(it + NS - 1) % NS]);
+    } else {
+      if (it + NS - 1 < ntiles) attn_load_tile<TK>(stage(it + NS - 1), kcache, vcache, k0 + (NS - 1) * TK, khi, kvh, hs, ps);
+      else asm volatile("cp.async.commit_group;");
+    }
     const __nv_bfloat16* ks = stage(it);
     const __nv_bfloat16* vs = ks + TK * KS;
     if (active) {
@@ -723,10 +809,12 @@ size_t kv_hs(int D) { return g_kv_hs ? g_kv_hs : D; }
 size_t kv_ps(int Hkv, int D) { return g_kv_ps ? g_kv_ps : static_cast<size_t>(Hkv) * D; }
 
 bool g_pdl = false;
+bool g_attn_bulk = false;
 
 }  // namespace
 
 void set_pdl(bool on) { g_pdl = on; }
+void set_attention_bulk(bool on) { g_attn_bulk = on; }
 bool pdl_enabled() { return g_pdl; }
 bool pdl_attention_enabled() {
   static const bool attn = [] {
@@ -898,7 +986,10 @@ constexpr int kAttnRows = 96, kAttnTk = 32, kAttnNs = 2;
 void prepare_kernels() {
   static bool configured = false;
   if (configured) return;
-  check(cudaFuncSetAttribute(attention_mma_kernel<kAttnRows, kAttnTk, kAttnNs>,
+  check(cudaFuncSetAttribute(attention_mma_kernel<kAttnRows, kAttnTk, kAttnNs, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
+        "attention_rows smem");
+  check(cudaFuncSetAttribute(attention_mma_kernel<kAttnRows, kAttnTk, kAttnNs, true>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
         "attention_rows smem");
   configured = true;
@@ -913,7 +1004,8 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
   constexpr int rows = kAttnRows, tk = kAttnTk, ns = kAttnNs;
   prepare_kernels();
   const int R = M * 6;
-  launch_kernel_pdl(pdl_attention_enabled(), "attention_rows", attention_mma_kernel<rows, tk, ns>,
+  launch_kernel_pdl(pdl_attention_enabled(), "attention_rows",
+                    g_attn_bulk ? attention_mma_kernel<rows, tk, ns, true> : attention_mma_kernel<rows, tk, ns, false>,
                     dim3((R + rows - 1) / rows, Hkv, splits), dim3(rows * 2), mma_smem(tk, ns), s, q, kcache, vcache,
                     pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D));
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel, dim3(M * Hq), dim3(D),

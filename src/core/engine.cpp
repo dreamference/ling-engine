@@ -125,6 +125,10 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   if (const char* e = std::getenv("LING_PDL")) pdl = std::atoi(e) != 0;
   kernels::set_pdl(pdl);
   if (pdl) std::fprintf(stderr, "programmatic dependent launch on\n");
+  bool bulk = opts_.attention_bulk;
+  if (const char* e = std::getenv("LING_ATTN_BULK")) bulk = std::atoi(e) != 0;
+  kernels::set_attention_bulk(bulk);
+  if (bulk) std::fprintf(stderr, "attention: bulk-copy tiles\n");
 }
 
 Engine::~Engine() {
