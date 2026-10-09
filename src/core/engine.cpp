@@ -115,11 +115,9 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   bool graphs = opts_.step_graphs;
   if (const char* e = std::getenv("LING_STEP_GRAPHS")) graphs = std::atoi(e) != 0;
   const char* ksplit = std::getenv("LING_KSPLIT");
-  if (graphs && (profile_ || (ksplit && std::atoi(ksplit) != 0))) {
-    std::fprintf(stderr, "step graphs off: LING_PROFILE or LING_KSPLIT is set\n");
-    graphs = false;
-  }
-  graphs_ = graphs && draft_ != nullptr;
+  graphs_allowed_ = draft_ != nullptr && !profile_ && !(ksplit && std::atoi(ksplit) != 0);
+  if (graphs && !graphs_allowed_) std::fprintf(stderr, "step graphs off: no drafter, or LING_PROFILE or LING_KSPLIT is set\n");
+  graphs_ = graphs && graphs_allowed_;
   if (graphs_) std::fprintf(stderr, "step graphs on\n");
   bool pdl = opts_.pdl;
   if (const char* e = std::getenv("LING_PDL")) pdl = std::atoi(e) != 0;

@@ -151,6 +151,11 @@ bool Engine::can_speculate(const SamplingParams& p) const {
   return p.temperature <= 0.f || (p.top_k > 0 && p.top_k <= 64);
 }
 
+void Engine::set_step_graphs(bool on) {
+  if (!on) clear_graphs();
+  graphs_ = on && graphs_allowed_;
+}
+
 void Engine::clear_graphs() {
   if (draft_graph_) cudaGraphExecDestroy(draft_graph_);
   draft_graph_ = nullptr;
