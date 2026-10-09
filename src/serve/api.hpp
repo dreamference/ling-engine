@@ -95,4 +95,28 @@ class OutputParser {
 
 std::string new_id(const std::string& prefix);
 
+// JSON for the wire. Bytes that are not valid UTF-8 (a model can emit part of a character) become
+// U+FFFD instead of making the dump throw: a dump error must never end a stream.
+std::string dump_json(const json& j);
+
+// Stop strings over streamed text. Text is emitted once no stop string can still start in it, and only up
+// to a UTF-8 character boundary: holding back a number of bytes could split a character, and the
+// chunk's JSON dump then failed and ended the stream.
+class StopScanner {
+ public:
+  explicit StopScanner(const std::vector<std::string>& stops);  // empty strings are ignored
+  // Appends generated text and returns what can be emitted now. Once a stop string appears, returns the
+  // text before it and sets stopped(); nothing after it is ever returned.
+  std::string push(const std::string& text);
+  // The text still held back, at the end of generation (empty once stopped).
+  std::string finish();
+  bool stopped() const { return stopped_; }
+
+ private:
+  std::vector<std::string> stops_;
+  size_t hold_ = 0;      // the longest stop string's length - 1: the bytes that may still start one
+  std::string pending_;  // generated, not yet emitted; it starts on a character boundary
+  bool stopped_ = false;
+};
+
 }  // namespace ling::serve

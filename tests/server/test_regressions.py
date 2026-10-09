@@ -331,8 +331,6 @@ def test_stream_chunk_shape(server):
                 json.loads(tc["function"]["arguments"])
 
 
-@pytest.mark.xfail(reason="Worker::generate holds back (longest stop - 1) BYTES while streaming, which can split "
-                          "a UTF-8 character; the JSON dump of that chunk then throws", strict=False)
 @pytest.mark.parametrize("stop", ["END", "完毕"])
 def test_streaming_with_stop_and_multibyte_text(server, stop):
     """Bug class: streaming detokenization and stop strings with multi-byte text (sglang#40529 family;

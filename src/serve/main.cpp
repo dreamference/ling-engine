@@ -158,9 +158,7 @@ class Worker {
     const long steps0 = eng.spec_stats().steps, drafted0 = eng.spec_stats().drafted, accepted0 = eng.spec_stats().accepted;
     const auto t_decode = std::chrono::steady_clock::now();
     StreamDecoder dec(*ctx_.tok);
-    std::string all;
-    size_t emitted = 0, max_stop = 0;
-    for (const auto& s : job.req.stop) max_stop = std::max(max_stop, s.size());
+    StopScanner stops(job.req.stop);
     std::string finish = "length";
     int produced = 0, passes = 0;
     bool ended_by_eos = false;
@@ -184,23 +182,12 @@ class Worker {
           break;
         }
         ++produced;
-        all += dec.push(t);
-        size_t stop_at = std::string::npos;
-        for (const auto& s : job.req.stop) {
-          size_t p = all.find(s, emitted > s.size() ? emitted - s.size() : 0);
-          if (p != std::string::npos) stop_at = std::min(stop_at, p);
-        }
-        if (stop_at != std::string::npos) {
-          if (stop_at > emitted) job.sink.text(all.substr(emitted, stop_at - emitted));
-          emitted = all.size();
+        const std::string ready = stops.push(dec.push(t));
+        if (!ready.empty()) job.sink.text(ready);
+        if (stops.stopped()) {
           finish = "stop";
           done = true;
           break;
-        }
-        const size_t safe = max_stop > 0 && all.size() >= max_stop - 1 ? all.size() - (max_stop - 1) : (max_stop ? 0 : all.size());
-        if (safe > emitted) {
-          job.sink.text(all.substr(emitted, safe - emitted));
-          emitted = safe;
         }
         if (produced >= limit) {
           done = true;
@@ -216,9 +203,10 @@ class Worker {
         pending = {eng.sample(logits, job.req.sampling, eng.history())};
       }
     }
-    if (finish != "stop" || emitted < all.size()) {
-      all += dec.flush();
-      if (all.size() > emitted) job.sink.text(all.substr(emitted));
+    if (!stops.stopped()) {  // what the decoder and the stop scanner still hold back
+      std::string rest = stops.push(dec.flush());
+      if (!stops.stopped()) rest += stops.finish();
+      if (!rest.empty()) job.sink.text(rest);
     }
     const auto now = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(now - t_decode).count();
@@ -277,7 +265,7 @@ void send_json(proxygen::ResponseHandler* d, int status, const json& body) {
   ResponseBuilder(d)
       .status(status, status == 200 ? "OK" : status == 400 ? "Bad Request" : status == 404 ? "Not Found" : "Error")
       .header("Content-Type", "application/json")
-      .body(body.dump())
+      .body(dump_json(body))
       .sendWithEOM();
 }
 
@@ -383,7 +371,7 @@ class Handler : public proxygen::RequestHandler {
     auto st = std::make_shared<State>(chat && req.reasoning, req.tools);
 
     auto sse = [ex](const json& chunk) {
-      std::string data = "data: " + chunk.dump() + "\n\n";
+      std::string data = "data: " + dump_json(chunk) + "\n\n";
       post(ex, [data](proxygen::ResponseHandler* d) { ResponseBuilder(d).body(data).send(); });
     };
     auto chunk_of = [=](json delta, json finish) {
@@ -432,7 +420,7 @@ class Handler : public proxygen::RequestHandler {
     job.sink.error = [=](const std::string& msg) {
       post(ex, [msg, stream = req.stream](proxygen::ResponseHandler* d) {
         if (stream) {
-          ResponseBuilder(d).body("data: " + error_body(msg, "server_error").dump() + "\n\n").sendWithEOM();
+          ResponseBuilder(d).body("data: " + dump_json(error_body(msg, "server_error")) + "\n\n").sendWithEOM();
         } else {
           send_json(d, 500, error_body(msg, "server_error"));
         }
@@ -520,7 +508,7 @@ class Handler : public proxygen::RequestHandler {
       payload["type"] = type;
       payload["sequence_number"] = st->seq++;
       if (!req.stream) return;
-      std::string data = "event: " + type + "\ndata: " + payload.dump() + "\n\n";
+      std::string data = "event: " + type + "\ndata: " + dump_json(payload) + "\n\n";
       post(ex, [data](proxygen::ResponseHandler* d) { ResponseBuilder(d).body(data).send(); });
     };
     auto close_reasoning = [=]() {
