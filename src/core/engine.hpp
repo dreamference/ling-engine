@@ -134,6 +134,9 @@ class Engine {
   void set_draft_block(int b);
   // Whether speculative steps run as CUDA graphs (false when asked for but unavailable: see step_graphs).
   bool step_graphs() const { return graphs_; }
+  // Turns step graphs on or off between steps (ling-run --graph-check compares the two); `on` has no effect
+  // where graphs are unavailable.
+  void set_step_graphs(bool on);
 
   const std::vector<int>& history() const { return history_; }
   void reset();
@@ -207,7 +210,8 @@ class Engine {
   // depends on, so there is one commit graph per count; the draft and verify graphs have fixed shapes
   // (block B; the verify's attention launches the key ranges of the whole max_context, empty ones exiting at
   // once). Positions are read on the device from pos_dev_, written before every graph step.
-  bool graphs_ = false;       // step graphs in use (opts_.step_graphs and nothing preventing them)
+  bool graphs_ = false;          // step graphs in use (opts_.step_graphs and nothing preventing them)
+  bool graphs_allowed_ = false;  // nothing prevents them (a drafter, no LING_PROFILE or LING_KSPLIT)
   bool use_dev_pos_ = false;  // set while capturing: dpos() points the kernels at pos_dev_
   int* pos_dev_ = nullptr;
   kernels::DevPos dpos(int off = 0) const {
