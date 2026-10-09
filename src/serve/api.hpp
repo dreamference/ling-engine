@@ -3,6 +3,7 @@
 #pragma once
 
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -98,6 +99,23 @@ std::string new_id(const std::string& prefix);
 // JSON for the wire. Bytes that are not valid UTF-8 (a model can emit part of a character) become
 // U+FFFD instead of making the dump throw: a dump error must never end a stream.
 std::string dump_json(const json& j);
+
+// A prompt that leaves no room for a single output token, in the shape each client recognises as a
+// context overflow (reports/api-compat-checklist.md §5): code context_length_exceeded, and a message
+// starting "This model's maximum context length is", which LiteLLM (OpenHands) and Cline match. Chat
+// completions and completions answer it as HTTP 400 before any header; the streamed Responses API sends
+// it as response.failed, the only shape on which Codex compacts the conversation instead of retrying.
+inline constexpr const char* kContextLengthExceeded = "context_length_exceeded";
+bool exceeds_context(size_t prompt_tokens, int max_context);
+std::string context_overflow_message(size_t prompt_tokens, int max_context);
+json context_overflow_error(size_t prompt_tokens, int max_context);  // {"error": {message, type, code}}
+
+// Thrown by the engine worker for a prompt that is too long (behind the HTTP handler's own check).
+class ContextOverflow : public std::invalid_argument {
+ public:
+  ContextOverflow(size_t prompt_tokens, int max_context)
+      : std::invalid_argument(context_overflow_message(prompt_tokens, max_context)) {}
+};
 
 // The finish_reason of a chat-completions or completions stream that failed after its headers were sent.
 // Not "stop": a client must not take a broken answer for a complete one. Clients that do not know the

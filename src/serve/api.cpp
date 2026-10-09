@@ -1,5 +1,6 @@
 #include "serve/api.hpp"
 
+#include <algorithm>
 #include <random>
 #include <stdexcept>
 
@@ -94,6 +95,22 @@ std::string new_id(const std::string& prefix) {
 }
 
 std::string dump_json(const json& j) { return j.dump(-1, ' ', false, json::error_handler_t::replace); }
+
+bool exceeds_context(size_t prompt_tokens, int max_context) {
+  return prompt_tokens >= static_cast<size_t>(std::max(max_context, 0));
+}
+
+std::string context_overflow_message(size_t prompt_tokens, int max_context) {
+  return "This model's maximum context length is " + std::to_string(max_context) + " tokens. However, your request has " +
+         std::to_string(prompt_tokens) + " input tokens. Please reduce the length of the messages.";
+}
+
+json context_overflow_error(size_t prompt_tokens, int max_context) {
+  return json{{"error",
+               {{"message", context_overflow_message(prompt_tokens, max_context)},
+                {"type", "invalid_request_error"},
+                {"code", kContextLengthExceeded}}}};
+}
 
 std::string stream_error_tail(const json& error, const json& finish_chunk) {
   return "data: " + dump_json(error) + "\n\ndata: " + dump_json(finish_chunk) + "\n\ndata: [DONE]\n\n";

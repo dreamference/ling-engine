@@ -371,6 +371,20 @@ int main() {
     }
   }
   {
+    // Context overflow in the shape the clients recognise (reports/api-compat-checklist.md §5): code
+    // context_length_exceeded, type invalid_request_error, and a message LiteLLM ("maximum context length
+    // is") and Cline ("context length", "maximum context") match. A prompt that fills the context leaves
+    // no room for one output token, so it overflows too.
+    using ling::serve::exceeds_context;
+    EXPECT(!exceeds_context(65535, 65536) && exceeds_context(65536, 65536) && exceeds_context(70000, 65536));
+    const json e = ling::serve::context_overflow_error(70000, 65536)["error"];
+    EXPECT(e["code"] == "context_length_exceeded" && e["type"] == "invalid_request_error");
+    const std::string m = e["message"];
+    EXPECT(m.rfind("This model's maximum context length is 65536 tokens.", 0) == 0);
+    EXPECT(m.find("70000 input tokens") != std::string::npos && m.find("context length") != std::string::npos);
+    EXPECT(std::string(ling::serve::ContextOverflow(70000, 65536).what()) == m);
+  }
+  {
     // A dump never throws on bytes that are not UTF-8 (half a character): they become U+FFFD.
     bool ok = true;
     std::string out;
