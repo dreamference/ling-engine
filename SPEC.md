@@ -371,6 +371,8 @@ M0 produces the numbers every later target is restated against (plus the five me
 
 **Status (9 October 2026).** M0 is done ([reports/M0.md](reports/M0.md)). M1 is done ([reports/M1.md](reports/M1.md)): exact speculation with the DFlash2 drafter, 45.5 tokens/s on the replay, 97% of production's decode. Prefill came next, ahead of M2's tree speculation, by the maintainer's choice ([reports/M2-prefill.md](reports/M2-prefill.md)): from M4, the prompt template of section 12 (ling-serve's prompts are now token-identical to production's on 396 replayed requests), FP4 prefill (section 11's numerics: NVFP4 activations for the FFN, FP8 for the projections, on block-scaled tensor cores; 2,640 / 2,580 / 2,110 tokens/s at 1K / 8K / 35K tokens against production's 2,140-2,460 / 1,930 / 1,680) and shared-prefix checkpoints (a new session resumes after the shared system message). The DeltaNet prefill runs the chunked form in 32-token chunks rather than 64, the KV cache stays BF16, and prefill attention is the rows path's tensor-core kernel. Open: M2's tree speculation, M3, the rest of M4 (paged FP8 KV, images, batches of 2-4) and M5.
 
+**Backlog (9 October 2026).** The surveys of 9 October are merged and ranked in [reports/backlog-2026-10-09.md](reports/backlog-2026-10-09.md); only measured wins move from it into this spec.
+
 ## 15. Risks and open questions
 
 The two risks that can sink the targets are the bus and the toolchain; the third is that the gap closes from the other side.
