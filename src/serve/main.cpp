@@ -44,6 +44,7 @@ struct Metrics {
   double prompt_tokens = 0, cached_tokens = 0, generation_tokens = 0, verify_calls = 0;
   double e2e_sum = 0, e2e_count = 0, ttft_sum = 0, ttft_count = 0;
   double accepted_drafts = 0, drafted = 0;
+  double nonfinite = 0;  // requests ended because the logits were not finite
   SpecStats spec;  // the engine's speculation counters after the last request
 
   json spec_json() {
@@ -82,6 +83,7 @@ struct Metrics {
     counter("sglang:time_to_first_token_seconds_count", ttft_count, "Time to first token, count.");
     counter("ling:spec_drafted_tokens_total", drafted, "Drafted tokens offered to the verify.");
     counter("ling:spec_accepted_tokens_total", accepted_drafts, "Drafted tokens accepted.");
+    counter("ling:nonfinite_logits_total", nonfinite, "Requests ended because the logits were NaN or inf.");
     return out;
   }
 };
@@ -144,6 +146,13 @@ class Worker {
         generate(job);
       } catch (const ContextOverflow& e) {
         job.sink.error(e.what(), kContextLengthExceeded);
+      } catch (const NonFiniteLogits& e) {
+        {
+          std::lock_guard<std::mutex> l(ctx_.metrics.mu);
+          ctx_.metrics.nonfinite += 1;
+        }
+        std::fprintf(stderr, "request failed: %s (%zu prompt tokens)\n", e.what(), job.prompt.size());
+        job.sink.error(e.what(), "server_error");
       } catch (const std::exception& e) {
         job.sink.error(e.what(), "server_error");
       }

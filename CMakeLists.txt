@@ -47,6 +47,7 @@ add_library(ling_core STATIC
   src/core/speculate.cpp
   src/core/lookup.cpp
   src/core/accept.cpp
+  src/core/sampling.cpp
   src/core/model.cu
   src/core/engine.cpp
 )
@@ -105,6 +106,9 @@ add_test(NAME prefill COMMAND ling-prefill-tests)
 add_executable(ling-spec-tests tests/spec_tests.cpp)
 target_link_libraries(ling-spec-tests PRIVATE ling_core)
 add_test(NAME spec COMMAND ling-spec-tests)
+add_executable(ling-sampling-tests tests/sampling_tests.cpp)
+target_link_libraries(ling-sampling-tests PRIVATE ling_core)
+add_test(NAME sampling COMMAND ling-sampling-tests)
 add_executable(ling-api-tests tests/api_tests.cpp)
 target_link_libraries(ling-api-tests PRIVATE ling_api)
 add_test(NAME api COMMAND ling-api-tests)

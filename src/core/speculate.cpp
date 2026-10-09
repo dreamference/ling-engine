@@ -302,9 +302,12 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p) {
   int accepted = 0, next = 0;
   if (greedy) {
     std::vector<int> am(V);
+    std::vector<float> top(V);
     kernels::topk_rows(logits_dev_, V, c.vocab, 1, topk_scratch_, vals_dev_, ids_out_dev_, stream_);
     check(cudaMemcpyAsync(am.data(), ids_out_dev_, V * sizeof(int), cudaMemcpyDeviceToHost, stream_), "argmax");
+    check(cudaMemcpyAsync(top.data(), vals_dev_, V * sizeof(float), cudaMemcpyDeviceToHost, stream_), "argmax");
     check(cudaStreamSynchronize(stream_), "verify");
+    require_finite_topk(top, am, c.vocab);
     while (accepted < E && rows[accepted + 1] == am[accepted]) ++accepted;
     next = am[accepted];
   } else {
@@ -315,6 +318,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p) {
     check(cudaMemcpyAsync(vals.data(), vals_dev_, vals.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_), "topk");
     check(cudaMemcpyAsync(ids.data(), ids_out_dev_, ids.size() * sizeof(int), cudaMemcpyDeviceToHost, stream_), "topk");
     check(cudaStreamSynchronize(stream_), "verify");
+    require_finite_topk(vals, ids, c.vocab);
     auto q_of = [&](int e, int token) {  // the draft's probability of `token` at drafted position e
       if (use_lookup) return token == rows[e + 1] ? 1.0 : 0.0;  // a deterministic proposal
       double qt = 0;
