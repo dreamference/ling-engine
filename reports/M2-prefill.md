@@ -221,7 +221,7 @@ The argument differences are the content of `exec_command`'s command (`sed -n '5
 | P4: M2 matches production at least as often as M1 | **Fails as written** on exact arguments by one prompt (6 against 7, 9 against 10); passes on tool names (23 against 22). The criterion had no noise reference: production matches itself exactly on 13 of 24 |
 | P5: statistics | No difference on any set; the six-prompt set cannot detect a change smaller than about 4.5 points |
 
-The maintainer accepted M2 on these results and replaced the six-prompt 98.6% target with a standing gate measured this way (SPEC section 14). Against that gate M2 measures 66 flips in 2,490 positions, 2.65%, one flip above production's own 65 (2.61%); M1 measures 56 (2.25%).
+The maintainer accepted M2 on these results and replaced the six-prompt 98.6% target with a standing gate measured this way (SPEC section 14). Against that gate M2 measures 66 flips in 2,490 positions, 2.65%, against production's own 65 (2.61%); M1 measures 56 (2.25%) and `44c92c5` 68 (2.73%). The gate's flip line is a one-sided Fisher exact test against production's own decode-against-prefill count on the same positions (α = 0.05), whose threshold at this sample size is 85 flips (3.41%; 86 gives p = 0.049). All three builds pass it: M1 with p = 0.82, `44c92c5` 0.43, M2 0.50, as far from production as production is from itself. `bench/agreement/analyze.py` reports counts only; a pass/fail added to it applies this test.
 
 ## 7. Exactness
 
