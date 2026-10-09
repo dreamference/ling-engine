@@ -43,8 +43,8 @@ __global__ void conv_prefill_kernel(const float* __restrict__ in, float* __restr
   }
 }
 
-// The window after the last token: the three most recent raw inputs.
-__global__ void conv_window_kernel(const float* __restrict__ in, float* __restrict__ state, int M, int C) {
+// The window after the first M tokens: the three most recent raw inputs (into `out`, which may be `state`).
+__global__ void conv_window_kernel(const float* __restrict__ in, const float* state, float* out, int M, int C) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= C) return;
   float s[3];
@@ -54,7 +54,7 @@ __global__ void conv_window_kernel(const float* __restrict__ in, float* __restri
     s[j] = tt >= 0 ? in[static_cast<size_t>(tt) * C + c] : state[c * 3 + 3 + tt];
   }
 #pragma unroll
-  for (int j = 0; j < 3; ++j) state[c * 3 + j] = s[j];
+  for (int j = 0; j < 3; ++j) out[c * 3 + j] = s[j];
 }
 
 // ---- The chunked (WY) form of the gated delta rule on tensor cores ----
@@ -125,7 +125,8 @@ __device__ __forceinline__ void frag_b_nk(uint32_t (&b)[2], const __half* base, 
 
 __global__ void __launch_bounds__(kChunkThreads)
     chunk_gdn_kernel(const float* __restrict__ mixed, const float* __restrict__ g, const float* __restrict__ beta,
-                     float* __restrict__ state, float* __restrict__ out, int M, int H, int HV, int phase) {
+                     float* __restrict__ state, float* __restrict__ out, int M, int H, int HV, int phase,
+                     float* __restrict__ state_at, int at) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
   ChunkSmem& sm = *reinterpret_cast<ChunkSmem*>(smem_raw);
   const int hv = blockIdx.x, h = hv / (HV / H), tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -343,6 +344,14 @@ __global__ void __launch_bounds__(kChunkThreads)
         const int r = sm0 + gq + 8 * hh, c = sn0 + 8 * j + 2 * tq;
         *reinterpret_cast<__half2*>(sm.s16 + r * kPad + c) = __floats2half2_rn(S[j][2 * hh], S[j][2 * hh + 1]);
       }
+    if (t1 == at) {  // the state after token `at` (a chunk end), kept for a later prompt
+      float* sa = state_at + static_cast<size_t>(hv) * kDk * kDv;
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+          sa[(sm0 + gq + 8 * (e >> 1)) * kDv + sn0 + 8 * j + 2 * tq + (e & 1)] = S[j][e];
+    }
     __syncthreads();
   }
 #pragma unroll
@@ -362,24 +371,30 @@ void check_launch(const char* what) {
 }  // namespace
 
 void gdn_conv_prefill(const float* in, float* out, float* conv_state, const __nv_bfloat16* w, int M, int C,
-                      cudaStream_t s) {
+                      cudaStream_t s, float* window_at, int at) {
   const size_t n = static_cast<size_t>(M) * C;
   conv_prefill_kernel<<<static_cast<int>(std::min<size_t>((n + 255) / 256, 48 * 64)), 256, 0, s>>>(in, out, conv_state,
                                                                                                      w, M, C);
   check_launch("gdn_conv_prefill");
-  conv_window_kernel<<<(C + 255) / 256, 256, 0, s>>>(in, conv_state, M, C);
+  if (window_at && at > 0 && at <= M) {
+    conv_window_kernel<<<(C + 255) / 256, 256, 0, s>>>(in, conv_state, window_at, at, C);
+    check_launch("gdn_conv_window_at");
+  }
+  conv_window_kernel<<<(C + 255) / 256, 256, 0, s>>>(in, conv_state, conv_state, M, C);
   check_launch("gdn_conv_window");
 }
 
 void gdn_recurrent_prefill(const float* mixed, const float* g, const float* beta, float* state, float* out, int M, int H,
-                           int HV, int pos0, cudaStream_t s) {
+                           int HV, int pos0, cudaStream_t s, float* state_at, int at) {
   if (M < 1) return;
   static bool configured = false;
   if (!configured) {
     cudaFuncSetAttribute(chunk_gdn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(ChunkSmem)));
     configured = true;
   }
-  chunk_gdn_kernel<<<HV, kChunkThreads, sizeof(ChunkSmem), s>>>(mixed, g, beta, state, out, M, H, HV, pos0 % kT);
+  if ((pos0 + at) % kT != 0 && state_at) throw std::runtime_error("gdn_recurrent_prefill: state_at must be at a chunk end");
+  chunk_gdn_kernel<<<HV, kChunkThreads, sizeof(ChunkSmem), s>>>(mixed, g, beta, state, out, M, H, HV, pos0 % kT,
+                                                                 state_at, state_at ? at : -1);
   check_launch("gdn_recurrent_prefill");
 }
 

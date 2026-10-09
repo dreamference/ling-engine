@@ -476,14 +476,14 @@ __global__ void quant_fp8_kernel(const float* __restrict__ x, size_t quads, floa
   }
 }
 
-// Narrow BF16 matrices (the DeltaNet a and b projections, 48 rows each) on tensor cores: a block takes 16
-// rows of x, each of its 4 warps a quarter of the 2N output columns, m16n8k16 MMAs over K in order. x is
+// Narrow BF16 matrices (the DeltaNet a and b projections, 48 rows each) on tensor cores: a one-warp block
+// takes 16 rows of x and a quarter of the 2N output columns (blockIdx.y), m16n8k16 MMAs over K in order. x is
 // rounded to BF16 (production's activations). A row's result does not depend on M.
-__global__ void __launch_bounds__(128)
+__global__ void __launch_bounds__(32)
     narrow_bf16_kernel(const float* __restrict__ x, int M, const __nv_bfloat16* __restrict__ wa,
                        const __nv_bfloat16* __restrict__ wb, float* __restrict__ ya, float* __restrict__ yb, int N, int K) {
-  constexpr int NF = 3;  // n8 fragments per warp: 4 warps x 3 x 8 = 96 = 2 x 48 columns
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+  constexpr int NF = 3;  // n8 fragments per block: 4 column groups x 3 x 8 = 96 = 2 x 48 columns
+  const int lane = threadIdx.x & 31, warp = blockIdx.y, g = lane >> 2, t = lane & 3;
   const int r0 = blockIdx.x * 16;
   const float* xa = x + static_cast<size_t>(min(r0 + g, M - 1)) * K;
   const float* xb = x + static_cast<size_t>(min(r0 + g + 8, M - 1)) * K;
@@ -619,7 +619,7 @@ void prefill_gemm_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8
 void narrow_bf16(const float* x, int M, const __nv_bfloat16* wa, const __nv_bfloat16* wb, float* ya, float* yb, int N,
                  int K, cudaStream_t s) {
   if (2 * N != 96 || K % 16 != 0) throw std::runtime_error("narrow_bf16: built for two 48-row matrices, K % 16 == 0");
-  narrow_bf16_kernel<<<(M + 15) / 16, 128, 0, s>>>(x, M, wa, wb, ya, yb, N, K);
+  narrow_bf16_kernel<<<dim3((M + 15) / 16, 4), 32, 0, s>>>(x, M, wa, wb, ya, yb, N, K);
   check_launch("narrow_bf16");
 }
 

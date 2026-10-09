@@ -145,13 +145,15 @@ void gdn_recurrent(const float* mixed, const float* g, const float* beta, const 
                    float* out, int M, int H, int HV, cudaStream_t s);
 // The prefill path's conv (prefill_gdn.cu), parallel over tokens: out of place (in: the raw projections,
 // out: after the conv and SiLU), and the window updated. Each token is computed the same way whatever M is.
+// window_at (optional): also the window after the first `at` tokens (a state kept for a later prompt).
 void gdn_conv_prefill(const float* in, float* out, float* conv_state, const __nv_bfloat16* w, int M, int C,
-                      cudaStream_t s);
+                      cudaStream_t s, float* window_at = nullptr, int at = -1);
 // The prefill path's recurrence: the same math as gdn_recurrent in its chunked form (32-token chunks at absolute
 // positions: pos0 is the first token's position) on tensor cores, the state updated in place. Its result for a
 // prompt does not depend on how the prompt was split, as long as every split falls on a multiple of 32.
+// state_at (optional): also the state after the first `at` tokens, which must end a chunk (pos0 + at % 32 == 0).
 void gdn_recurrent_prefill(const float* mixed, const float* g, const float* beta, float* state, float* out, int M, int H,
-                           int HV, int pos0, cudaStream_t s);
+                           int HV, int pos0, cudaStream_t s, float* state_at = nullptr, int at = -1);
 // out = rmsnorm(x) * w * silu(z), rows of length D.
 void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float* out, int rows, int D,
                    float eps, cudaStream_t s);
