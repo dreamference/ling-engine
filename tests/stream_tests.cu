@@ -5,6 +5,7 @@
 //   ling-stream-tests            correctness only
 //   ling-stream-tests --bench    plus timings
 //   LING_PDL=1 ling-stream-tests  the same with programmatic dependent launch (launch.cuh)
+//   LING_NO_TIMING=1 ling-stream-tests  skips the attention timings (under compute-sanitizer)
 #include <cuda_fp8.h>
 
 #include <algorithm>
@@ -316,7 +317,7 @@ bool test_attention_rows() {
       ok &= psame;
       std::printf("attention_rows with L2 prefetch identical (24K, head-major): %s\n", psame ? "yes ok" : "NO FAIL");
     }
-    for (int layout = 0; layout < 3; ++layout) {
+    for (int layout = 0; layout < (std::getenv("LING_NO_TIMING") ? 0 : 3); ++layout) {
       if (layout >= 1) ling::kernels::set_kv_layout(size_t(big) * D, D);  // head-major, as the engine uses
       ling::kernels::set_attention_prefetch(layout == 2 ? 2 : 0);
       for (int bulk = 0; bulk < 2; ++bulk) {
