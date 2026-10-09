@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <utility>
 #include <map>
@@ -26,6 +27,7 @@
 #include <cuda_runtime.h>
 
 #include "core/drafter.hpp"
+#include "core/kernels.cuh"
 #include "core/model.hpp"
 
 namespace ling {
@@ -56,6 +58,9 @@ struct EngineOptions {
   int prefix_checkpoints = 8;
   int boundary_token = -1;  // <|im_end|>
   int checkpoint_limit = 32768;
+  // M3: run each part of a speculative step (draft, verify, commit) as a captured CUDA graph instead of
+  // ~1,400 separate launches (speculate.cpp). Off by default until measured; LING_STEP_GRAPHS=0/1 overrides.
+  bool step_graphs = false;
 };
 
 struct EngineStats {
@@ -120,6 +125,8 @@ class Engine {
   }
   int draft_block() const { return opts_.draft_block; }
   void set_draft_block(int b);
+  // Whether speculative steps run as CUDA graphs (false when asked for but unavailable: see step_graphs).
+  bool step_graphs() const { return graphs_; }
 
   const std::vector<int>& history() const { return history_; }
   void reset();
@@ -178,9 +185,47 @@ class Engine {
 
   // Speculation (speculate.cpp).
   void commit(int n);                                 // advance the recurrent state over a verify's first n rows
-  void draft_materialize(int rows, int pos0, int cap_row0);  // target features -> the drafter's context KV
-  void draft_propose(int anchor, int B);              // the drafter's block, top-16 candidates and lattice
+  // Target features -> the drafter's context KV at positions pos0 .. pos0 + rows - 1.
+  void draft_materialize(int rows, kernels::DevPos pos0, int cap_row0);
+  void draft_propose(int anchor, int B, bool graph);  // the drafter's block, top-16 candidates and lattice
   void alloc_drafter();
+
+  // The three parts of a speculative step as launch sequences with no host synchronization inside, so
+  // each can be captured into a CUDA graph. Their inputs and outputs on the host side are pin_'s buffers.
+  void draft_launch(int B);         // pin_->draft_ids -> pin_->cand, pin_->scores
+  void verify_launch(int V, int K);  // pin_->rows -> each row's top K in pin_->topk_vals / topk_ids
+  void commit_launch(int n);        // the anchor and n - 1 accepted drafts into the recurrent state and drafter KV
+
+  // CUDA graphs of the step (M3). The variable part of a step is the accepted count, which only the commit
+  // depends on, so there is one commit graph per count; the draft and verify graphs have fixed shapes
+  // (block B; the verify's attention launches the key ranges of the whole max_context, empty ones exiting at
+  // once). Positions are read on the device from pos_dev_, written before every graph step.
+  bool graphs_ = false;       // step graphs in use (opts_.step_graphs and nothing preventing them)
+  bool use_dev_pos_ = false;  // set while capturing: dpos() points the kernels at pos_dev_
+  int* pos_dev_ = nullptr;
+  kernels::DevPos dpos(int off = 0) const {
+    return use_dev_pos_ ? kernels::DevPos(pos_ + off, pos_dev_, off) : kernels::DevPos(pos_ + off);
+  }
+  cudaGraphExec_t draft_graph_ = nullptr;
+  std::map<int, cudaGraphExec_t> verify_graphs_;  // by top-K (1 when greedy)
+  std::vector<cudaGraphExec_t> commit_graphs_;    // by accepted count + 1
+  // Runs `body` as the graph in `slot` (captured on first use), or eagerly when graphs are off. A failed
+  // capture turns graphs off for the engine's lifetime, says why, and runs `body` eagerly.
+  void run_graph(cudaGraphExec_t& slot, const char* what, const std::function<void()>& body);
+  cudaGraphExec_t capture(const std::function<void()>& body);
+  void clear_graphs();
+  // Page-locked host buffers for every copy inside a step: a graph's memcpy nodes read and write fixed
+  // host addresses when they run, so these must stay put and must not be pageable.
+  struct StepPinned {
+    int pos;
+    int draft_ids[kernels::kMaxStreamRows];  // the drafter's block: the anchor, then mask tokens
+    int rows[kernels::kMaxStreamRows];       // the verified rows: the anchor, then the drafted tokens
+    int cand[kernels::kMaxStreamRows * 16];
+    float scores[kernels::kMaxStreamRows * 16 * 16];
+    float topk_vals[kernels::kMaxStreamRows * 64];
+    int topk_ids[kernels::kMaxStreamRows * 64];
+  };
+  StepPinned* pin_ = nullptr;
 
   EngineOptions opts_;
   std::unique_ptr<Model> model_;
@@ -236,8 +281,6 @@ class Engine {
   int* dcand_ = nullptr;
   float *topk_scratch_ = nullptr, *vals_dev_ = nullptr;
   int* ids_out_dev_ = nullptr;
-  std::vector<int> cand_host_;
-  std::vector<float> scores_host_;
   struct ShadowRecord {
     int pos;                  // the anchor's position
     std::vector<int> tokens;  // the lookup's proposal for the positions after it

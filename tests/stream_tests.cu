@@ -247,6 +247,21 @@ bool test_attention_rows() {
   same &= std::memcmp(sixteen.data(), full.data(), sixteen.size() * sizeof(float)) == 0;
   ok &= same;
   std::printf("attention_rows rows identical across M = 1, 16, 32: %s\n", same ? "yes ok" : "NO FAIL");
+  // As a step graph launches it: the position read on the device (the host's value deliberately wrong),
+  // every key range up to a fixed context. Must be bit for bit the eager launch.
+  {
+    const int fixed = 3 * 4096;
+    float* gscratch;
+    cudaMalloc(&gscratch, ling::kernels::attention_rows_scratch_floats(MMAX, Hq, D, fixed) * sizeof(float));
+    int* dpos = upload(std::vector<int>{P});
+    ling::kernels::attention_rows(dq, dk, dv, ling::kernels::DevPos(-1, dpos, 0), 16, Hq, Hkv, D, gscratch, out, nullptr,
+                                  fixed);
+    const std::vector<float> g = download(out, size_t(16) * Hq * D);
+    const bool gsame = std::memcmp(g.data(), full.data(), g.size() * sizeof(float)) == 0;
+    ok &= gsame;
+    std::printf("attention_rows with a device position and fixed ranges identical: %s\n", gsame ? "yes ok" : "NO FAIL");
+    cudaFree(gscratch), cudaFree(dpos);
+  }
   // Speed at the workload's median context, 16 rows (one layer).
   {
     const int big = 24576 + 32;

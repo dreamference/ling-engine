@@ -421,14 +421,14 @@ __global__ void gated_rmsnorm_kernel(const float* __restrict__ x, const float* _
 
 __global__ void attn_prepare_kernel(const float* __restrict__ q_gate, const float* __restrict__ k,
                                     const float* __restrict__ v, const __nv_bfloat16* __restrict__ q_norm,
-                                    const __nv_bfloat16* __restrict__ k_norm, int pos0, int Hq, int Hkv, int D,
+                                    const __nv_bfloat16* __restrict__ k_norm, DevPos pos0, int Hq, int Hkv, int D,
                                     int rot, float theta, float eps, float* __restrict__ q,
                                     float* __restrict__ gate, __nv_bfloat16* __restrict__ kcache,
                                     __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps) {
   extern __shared__ float xn[];
   __shared__ float red[32];
   const int m = blockIdx.x, slot = blockIdx.y, d = threadIdx.x;
-  const int pos = pos0 + m;
+  const int pos = pos_value(pos0) + m;
   if (slot >= Hq + Hkv) {  // v: copy into the cache
     const int kh = slot - Hq - Hkv;
     vcache[kh * hs + pos * ps + d] = __float2bfloat16(v[(static_cast<size_t>(m) * Hkv + kh) * D + d]);
@@ -516,18 +516,28 @@ __device__ __forceinline__ void attn_load_tile(__nv_bfloat16* stage, const __nv_
 template <int ROWS, int TK, int NS>  // query rows per block (16 per warp), keys per tile, pipeline stages
 __global__ void __launch_bounds__(ROWS * 2)
     attention_mma_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
-                         const __nv_bfloat16* __restrict__ vcache, int pos0, int M, int Hq, int Hkv, int splits,
-                         int chunk, float* __restrict__ scratch, size_t hs, size_t ps) {
+                         const __nv_bfloat16* __restrict__ vcache, DevPos pos0_arg, int M, int Hq, int Hkv,
+                         int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps) {
   constexpr int D = kMmaD, G = 6, KS = kMmaKS;
   extern __shared__ __align__(16) unsigned char smem[];
   auto stage = [&](int i) { return reinterpret_cast<__nv_bfloat16*>(smem + (i % NS) * mma_stage(TK)); };
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
   const int kvh = blockIdx.y, split = blockIdx.z;
+  const int pos0 = pos_value(pos0_arg);
   const int R = M * G, r0 = blockIdx.x * ROWS, nrows = min(ROWS, R - r0);
   const bool active = warp * 16 < nrows;
   const int last_m = (r0 + nrows - 1) / G;
   const int kend = pos0 + last_m + 1;  // keys [0, kend) are visible to some row of this block
   const int klo = split * chunk, khi = min(kend, klo + chunk);
+  if (klo >= kend) {
+    // A range no row of this block sees (a graph launches ranges up to a fixed context): an empty partial,
+    // max = -inf, which attention_combine_kernel skips without reading its sum or values.
+    for (int r = tid; r < nrows; r += blockDim.x) {
+      const int row = r0 + r;
+      scratch[((static_cast<size_t>(row / G) * Hq + kvh * G + row % G) * splits + split) * (D + 2)] = -INFINITY;
+    }
+    return;
+  }
   // This thread's two rows (g and g + 8 of the warp's 16), their positions, and their queries as MMA
   // A fragments in BF16, scaled by 1 / sqrt(D) (a power of two: exact).
   const int ra = r0 + warp * 16 + g, rb = ra + 8;
@@ -836,7 +846,7 @@ void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float
 }
 
 void attn_prepare(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
-                  const __nv_bfloat16* k_norm, int pos0, int M, int Hq, int Hkv, int D, int rot, float theta,
+                  const __nv_bfloat16* k_norm, DevPos pos0, int M, int Hq, int Hkv, int D, int rot, float theta,
                   float eps, float* q, float* gate, __nv_bfloat16* kcache, __nv_bfloat16* vcache,
                   cudaStream_t s) {
   dim3 grid(M, Hq + 2 * Hkv);
@@ -860,20 +870,27 @@ size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx) {
   return static_cast<size_t>(M) * Hq * attention_rows_splits(ctx) * (D + 2);
 }
 
-void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, int pos0, int M, int Hq,
-                    int Hkv, int D, float* scratch, float* out, cudaStream_t s) {
-  if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
-  const int splits = attention_rows_splits(pos0 + M);
-  // 32-key tiles, double-buffered. Measured at 24K context, 16 rows, realistic data: 0.57 ms per layer;
-  // 16-key tiles with 3-5 stages were no faster.
-  constexpr int rows = 96, tk = 32, ns = 2;
+// 32-key tiles, double-buffered. Measured at 24K context, 16 rows, realistic data: 0.57 ms per layer;
+// 16-key tiles with 3-5 stages were no faster.
+constexpr int kAttnRows = 96, kAttnTk = 32, kAttnNs = 2;
+
+void prepare_kernels() {
   static bool configured = false;
-  if (!configured) {
-    check(cudaFuncSetAttribute(attention_mma_kernel<rows, tk, ns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                               static_cast<int>(mma_smem(tk, ns))),
-          "attention_rows smem");
-    configured = true;
-  }
+  if (configured) return;
+  check(cudaFuncSetAttribute(attention_mma_kernel<kAttnRows, kAttnTk, kAttnNs>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
+        "attention_rows smem");
+  configured = true;
+}
+
+void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, DevPos pos0, int M,
+                    int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s, int fixed_ctx) {
+  if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
+  if (pos0.dev && fixed_ctx <= 0) throw std::runtime_error("attention_rows: a device position needs a fixed context");
+  // The grid: the ranges covering the rows' keys, or (in a graph) every range up to fixed_ctx.
+  const int splits = attention_rows_splits(fixed_ctx > 0 ? fixed_ctx : pos0.host + M);
+  constexpr int rows = kAttnRows, tk = kAttnTk, ns = kAttnNs;
+  prepare_kernels();
   const int R = M * 6;
   attention_mma_kernel<rows, tk, ns><<<dim3((R + rows - 1) / rows, Hkv, splits), rows * 2, mma_smem(tk, ns), s>>>(
       q, kcache, vcache, pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D));
