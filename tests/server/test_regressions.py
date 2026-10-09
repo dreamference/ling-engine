@@ -509,8 +509,6 @@ def test_responses_reasoning_tokens_counted(server):
 # --- Errors, limits, cancellation ---------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="a prompt over the context limit is refused on the engine thread: HTTP 500, or "
-                          "response.failed with code server_error after a 200", strict=False)
 def test_context_overflow_is_recognisable(server):
     """The agents decide whether to compact the conversation from this error, and each recognises a
     different shape (reports/api-compat-checklist.md, section B):
@@ -520,7 +518,7 @@ def test_context_overflow_is_recognisable(server):
     - OpenHands (through LiteLLM) matches message substrings such as "maximum context length is".
     Check: completions and chat answer HTTP 400 with code context_length_exceeded and a message LiteLLM
     recognises, before any stream starts; the streamed Responses API ends with response.failed carrying
-    that code."""
+    that code, and the non-streamed one answers HTTP 400 with it."""
     n = server.max_model_len + 64
     status, out = server.request("/v1/completions", {"prompt": [785] * n, "max_tokens": 4})
     assert status == 400 and out["error"].get("code") == "context_length_exceeded", out
@@ -534,6 +532,9 @@ def test_context_overflow_is_recognisable(server):
     assert status == 200
     failed = [e["data"] for e in events if e["event"] == "response.failed"]
     assert failed and failed[0]["response"]["error"]["code"] == "context_length_exceeded", events[-1:]
+    assert "maximum context length is" in failed[0]["response"]["error"]["message"]
+    status, out = server.request("/v1/responses", {"input": text, "max_output_tokens": 4})
+    assert status == 400 and out["error"].get("code") == "context_length_exceeded", out
 
 
 def test_absurd_values_leave_the_server_healthy(server):

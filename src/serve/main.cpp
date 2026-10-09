@@ -98,7 +98,8 @@ struct ServerContext {
 struct JobSink {
   std::function<void(const std::string&)> text;
   std::function<void(const std::string& finish, int prompt_tokens, int completion_tokens, int cached_tokens)> done;
-  std::function<void(const std::string&)> error;
+  // The message, and the code the client sees (server_error, or context_length_exceeded).
+  std::function<void(const std::string& message, const std::string& code)> error;
 };
 
 struct Job {
@@ -141,16 +142,18 @@ class Worker {
       }
       try {
         generate(job);
+      } catch (const ContextOverflow& e) {
+        job.sink.error(e.what(), kContextLengthExceeded);
       } catch (const std::exception& e) {
-        job.sink.error(e.what());
+        job.sink.error(e.what(), "server_error");
       }
     }
   }
 
   void generate(Job& job) {
     Engine& eng = *ctx_.engine;
+    if (exceeds_context(job.prompt.size(), eng.max_context())) throw ContextOverflow(job.prompt.size(), eng.max_context());
     const int ctx_left = eng.max_context() - static_cast<int>(job.prompt.size());
-    if (ctx_left <= 0) throw std::invalid_argument("the prompt is longer than the context limit");
     const int limit = job.req.max_tokens > 0 ? std::min(job.req.max_tokens, ctx_left) : ctx_left;
     EngineStats stats;
     std::vector<float> logits = eng.prefill(job.prompt, &stats);
@@ -269,8 +272,15 @@ void send_json(proxygen::ResponseHandler* d, int status, const json& body) {
       .sendWithEOM();
 }
 
-json error_body(const std::string& msg, const std::string& type) {
-  return json{{"error", {{"message", msg}, {"type", type}}}};
+json error_body(const std::string& msg, const std::string& type, const std::string& code = "") {
+  json e = {{"message", msg}, {"type", type}};
+  if (!code.empty()) e["code"] = code;
+  return json{{"error", e}};
+}
+
+// The type that goes with an error code.
+std::string error_type(const std::string& code) {
+  return code == kContextLengthExceeded ? "invalid_request_error" : "server_error";
 }
 
 class Handler : public proxygen::RequestHandler {
@@ -346,6 +356,10 @@ class Handler : public proxygen::RequestHandler {
       return;
     }
     job.prompt = job.req.prompt_ids.empty() ? ctx_.tok->encode(job.req.prompt_text) : job.req.prompt_ids;
+    if (exceeds_context(job.prompt.size(), ctx_.engine->max_context())) {  // refused before any header
+      send_json(downstream_, 400, context_overflow_error(job.prompt.size(), ctx_.engine->max_context()));
+      return;
+    }
     job.cancelled = ex_->cancelled;
     const std::string id = new_id(chat ? "chatcmpl-" : "cmpl-");
     const long created = std::time(nullptr);
@@ -417,13 +431,14 @@ class Handler : public proxygen::RequestHandler {
     };
 
     job.sink.text = [=](const std::string& piece) { deliver(chat ? st->parser.push(piece) : OutputParser::Delta{{}, piece, {}}); };
-    job.sink.error = [=](const std::string& msg) {
+    job.sink.error = [=](const std::string& msg, const std::string& code) {
+      const json error = error_body(msg, error_type(code), code);
       if (req.stream) {  // the headers are out: end the stream properly after the error
-        const std::string tail =
-            stream_error_tail(error_body(msg, "server_error"), chunk_of(json::object(), kStreamErrorFinish));
+        const std::string tail = stream_error_tail(error, chunk_of(json::object(), kStreamErrorFinish));
         post(ex, [tail](proxygen::ResponseHandler* d) { ResponseBuilder(d).body(tail).sendWithEOM(); });
       } else {
-        post(ex, [msg](proxygen::ResponseHandler* d) { send_json(d, 500, error_body(msg, "server_error")); });
+        const int status = code == kContextLengthExceeded ? 400 : 500;
+        post(ex, [error, status](proxygen::ResponseHandler* d) { send_json(d, status, error); });
       }
     };
     job.sink.done = [=](const std::string& finish_in, int prompt_tokens, int completion_tokens, int cached) {
@@ -576,17 +591,27 @@ class Handler : public proxygen::RequestHandler {
     }
     event("response.created", {{"response", response_obj("in_progress")}});
 
-    job.sink.text = [=](const std::string& piece) { deliver(st->parser.push(piece)); };
-    job.sink.error = [=](const std::string& msg) {
+    // Streamed, an error is response.failed carrying its code (context_length_exceeded is what makes
+    // Codex compact; server_error is retried); not streamed, an HTTP error with the same code.
+    auto fail = [=](const std::string& msg, const std::string& code) {
       if (req.stream) {
         json failed = response_obj("failed");
-        failed["error"] = {{"code", "server_error"}, {"message", msg}};
+        failed["error"] = {{"code", code}, {"message", msg}};
         event("response.failed", {{"response", failed}});
         post(ex, [](proxygen::ResponseHandler* d) { ResponseBuilder(d).sendWithEOM(); });
       } else {
-        post(ex, [msg](proxygen::ResponseHandler* d) { send_json(d, 500, error_body(msg, "server_error")); });
+        const json error = error_body(msg, error_type(code), code);
+        const int status = code == kContextLengthExceeded ? 400 : 500;
+        post(ex, [error, status](proxygen::ResponseHandler* d) { send_json(d, status, error); });
       }
     };
+    if (exceeds_context(job.prompt.size(), ctx_.engine->max_context())) {
+      fail(context_overflow_message(job.prompt.size(), ctx_.engine->max_context()), kContextLengthExceeded);
+      return;
+    }
+
+    job.sink.text = [=](const std::string& piece) { deliver(st->parser.push(piece)); };
+    job.sink.error = fail;
     job.sink.done = [=](const std::string& finish, int prompt_tokens, int completion_tokens, int cached) {
       deliver(st->parser.finish());
       close_reasoning();
