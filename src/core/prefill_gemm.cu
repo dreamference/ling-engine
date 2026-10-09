@@ -1,7 +1,7 @@
 // Prefill GEMMs (M > 32 rows) on block-scaled tensor cores, reading the weights in the tiled layout the
 // decode kernels read (stream_gemm.cu), so no second copy of any weight exists.
 //
-// Numerics are production's (SPEC.md §11): the NVFP4 FFN multiplies NVFP4 activations (E2M1 values, one
+// Numerics are production's (specs/DREAMFERENCE_LING_ENGINE_SESSIONS.md §11): the NVFP4 FFN multiplies NVFP4 activations (E2M1 values, one
 // E4M3 scale per 16, the checkpoint's input_scale as the global scale) with mma.sync kind::mxf4nvf4, and
 // the FP8 projections multiply FP8 E4M3 activations (static per-tensor input_scale) with kind::f8f6f4.
 // Accumulation is FP32; y = alpha * acc with alpha = input_scale * weight scale, as SGLang computes it.
