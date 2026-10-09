@@ -39,6 +39,7 @@ template float* Engine::alloc<float>(size_t);
 template int* Engine::alloc<int>(size_t);
 template __half* Engine::alloc<__half>(size_t);
 template __nv_bfloat16* Engine::alloc<__nv_bfloat16>(size_t);
+template uint8_t* Engine::alloc<uint8_t>(size_t);
 
 Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   model_ = std::make_unique<Model>(model_dir);
@@ -69,20 +70,15 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   q_ = alloc<float>(M * qsize);
   gate_ = alloc<float>(M * qsize);
   attn_ = alloc<float>(M * qsize);
-  attn_scratch_ = alloc<float>(std::max(
-      kernels::attention_scratch_floats(M, c.heads, c.kv_heads, c.head_dim, opts_.max_context),
-      kernels::attention_rows_scratch_floats(kernels::kMaxStreamRows, c.heads, c.head_dim, opts_.max_context)));
+  attn_scratch_ = alloc<float>(kernels::attention_rows_scratch_floats(std::max(kAttnSlice, kernels::kMaxStreamRows),
+                                                                      c.heads, c.head_dim, opts_.max_context));
   logits_dev_ = alloc<float>(size_t(kernels::kMaxStreamRows) * c.vocab);
   xh_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * std::max(c.intermediate, std::max(c.hidden, std::max(C, qsize))));
   xinv_ = alloc<float>(kernels::kMaxStreamRows);
   x_bf16_ = alloc<__nv_bfloat16>(M * std::max(c.intermediate, std::max(c.hidden, C)));
-  size_t largest = 0;
-  for (const LayerWeights& L : model_->layers()) {
-    for (const Fp4Weight* w : {&L.gate, &L.up, &L.down}) largest = std::max(largest, size_t(w->N) * w->K);
-    for (const Fp8Weight* w : {&L.in_qkv, &L.in_z, &L.out, &L.q, &L.k, &L.v, &L.o})
-      largest = std::max(largest, size_t(w->N) * w->K);
-  }
-  w_bf16_ = alloc<__nv_bfloat16>(largest);
+  const size_t widest = std::max<size_t>(c.intermediate, std::max(c.hidden, std::max(C, 2 * qsize)));
+  xq_ = alloc<uint8_t>(M * widest);         // FP8 activations, or NVFP4 in the first half
+  xsf_ = alloc<uint8_t>(M * widest / 16);  // NVFP4 block scales
   ids_dev_ = alloc<int>(M);
 
   // Head-major KV caches: one KV head's keys are one contiguous stream for the attention kernels.
@@ -97,10 +93,10 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
       layer_slot_[i] = static_cast<int>(gdn_state_.size());
       gdn_state_.push_back(alloc<float>(size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim));
       conv_state_.push_back(alloc<float>(size_t(C) * (c.conv_kernel - 1)));
-      snap_gdn_.push_back(alloc<float>(size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim));
-      snap_conv_.push_back(alloc<float>(size_t(C) * (c.conv_kernel - 1)));
     }
   }
+  snap_ = alloc_slot();
+  for (int i = 0; i < opts_.prefix_checkpoints; ++i) ckpt_slots_.push_back(alloc_slot());
   if (!opts_.draft_dir.empty()) {
     draft_ = std::make_unique<DraftModel>(opts_.draft_dir);
     alloc_drafter();
@@ -121,15 +117,22 @@ Engine::~Engine() {
 }
 
 void Engine::reset() {
+  reset_state();
+  check(cudaStreamSynchronize(stream_), "reset");
+  history_.clear();
+  ckpts_.clear();
+  snap_pos_ = -1;
+  dkv_lo_ = 0;
+  pos_ = 0;
+}
+
+void Engine::reset_state() {
   const ModelConfig& c = model_->config();
   for (float* s : gdn_state_)
     check(cudaMemsetAsync(s, 0, size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim * sizeof(float), stream_), "reset");
   for (float* s : conv_state_)
     check(cudaMemsetAsync(s, 0, size_t(c.lin_conv_channels()) * (c.conv_kernel - 1) * sizeof(float), stream_),
           "reset");
-  check(cudaStreamSynchronize(stream_), "reset");
-  history_.clear();
-  pos_ = 0;
 }
 
 uint64_t Engine::state_hash() {
@@ -155,46 +158,75 @@ void Engine::set_draft_block(int b) {
   opts_.draft_block = b;
 }
 
-void Engine::take_snapshot() {
+Engine::StateSlot Engine::alloc_slot() {
   const ModelConfig& c = model_->config();
-  const size_t gdn_bytes = size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim * sizeof(float);
-  const size_t conv_bytes = size_t(c.lin_conv_channels()) * (c.conv_kernel - 1) * sizeof(float);
+  StateSlot s;
   for (size_t i = 0; i < gdn_state_.size(); ++i) {
-    check(cudaMemcpyAsync(snap_gdn_[i], gdn_state_[i], gdn_bytes, cudaMemcpyDeviceToDevice, stream_), "snapshot");
-    check(cudaMemcpyAsync(snap_conv_[i], conv_state_[i], conv_bytes, cudaMemcpyDeviceToDevice, stream_), "snapshot");
+    s.gdn.push_back(alloc<float>(size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim));
+    s.conv.push_back(alloc<float>(size_t(c.lin_conv_channels()) * (c.conv_kernel - 1)));
   }
-  check(cudaStreamSynchronize(stream_), "snapshot");
-  snapshot_tokens_ = history_;
+  return s;
 }
 
-void Engine::restore_snapshot() {
+void Engine::copy_state(const StateSlot& slot, bool save) {
   const ModelConfig& c = model_->config();
   const size_t gdn_bytes = size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim * sizeof(float);
   const size_t conv_bytes = size_t(c.lin_conv_channels()) * (c.conv_kernel - 1) * sizeof(float);
   for (size_t i = 0; i < gdn_state_.size(); ++i) {
-    check(cudaMemcpyAsync(gdn_state_[i], snap_gdn_[i], gdn_bytes, cudaMemcpyDeviceToDevice, stream_), "restore");
-    check(cudaMemcpyAsync(conv_state_[i], snap_conv_[i], conv_bytes, cudaMemcpyDeviceToDevice, stream_), "restore");
+    check(cudaMemcpyAsync(save ? slot.gdn[i] : gdn_state_[i], save ? gdn_state_[i] : slot.gdn[i], gdn_bytes,
+                          cudaMemcpyDeviceToDevice, stream_),
+          "state copy");
+    check(cudaMemcpyAsync(save ? slot.conv[i] : conv_state_[i], save ? conv_state_[i] : slot.conv[i], conv_bytes,
+                          cudaMemcpyDeviceToDevice, stream_),
+          "state copy");
   }
-  check(cudaStreamSynchronize(stream_), "restore");
-  history_ = snapshot_tokens_;
-  pos_ = static_cast<int>(history_.size());
+}
+
+void Engine::truncate_history(int n) {
+  if (n < static_cast<int>(history_.size())) history_.resize(n);
+  ckpts_.erase(std::remove_if(ckpts_.begin(), ckpts_.end(), [&](const Checkpoint& k) { return k.pos > n; }), ckpts_.end());
+  if (snap_pos_ > n) snap_pos_ = -1;
+  dkv_lo_ = std::min(dkv_lo_, n);
+}
+
+void Engine::save_checkpoint(int pos) {
+  for (const Checkpoint& k : ckpts_)
+    if (k.pos == pos) return;
+  int slot = -1;
+  std::vector<bool> used(ckpt_slots_.size(), false);
+  for (const Checkpoint& k : ckpts_) used[k.slot] = true;
+  for (size_t i = 0; i < used.size(); ++i)
+    if (!used[i]) slot = static_cast<int>(i);
+  if (slot < 0) {  // full: the earliest positions are the ones other sessions share, so the latest gives way
+    if (ckpts_.empty() || ckpts_.back().pos < pos) return;
+    slot = ckpts_.back().slot;
+    ckpts_.pop_back();
+  }
+  copy_state(ckpt_slots_[slot], true);
+  ckpts_.push_back({pos, slot});
+  std::sort(ckpts_.begin(), ckpts_.end(), [](const Checkpoint& a, const Checkpoint& b) { return a.pos < b.pos; });
 }
 
 void Engine::linear_fp4(const Fp4Weight& w, const float* x, int M, float* y, bool x_ready) {
-  if (M <= kernels::kMaxStreamRows) {  // the rows path: stream the weights once for every row
+  if (!quantized(M)) {  // the rows path: stream the weights once for every row
     if (!x_ready) kernels::to_half_rows(x, M, w.K, xh_, xinv_, stream_);
     kernels::stream_gemm_nvfp4(xh_, xinv_, M, w.w, nullptr, w.scale2, y, w.N, w.K, stream_);
     return;
   }
-  kernels::dequant_tiled_nvfp4(w.w, w.scale2, w_bf16_, w.N, w.K, stream_);
-  kernels::to_bf16(x, x_bf16_, M * w.K, stream_);
-  kernels::gemm_bf16_cublas(cublas_, x_bf16_, M, w_bf16_, y, w.N, w.K);
+  kernels::quant_act_nvfp4(x, M, w.K, w.in_scale, xq_, xsf_, stream_);
+  set_xq(w.in_scale, true);
+  kernels::prefill_gemm_nvfp4(xq_, xsf_, M, w.w, w.in_scale * w.scale2, y, w.N, w.N, w.K, false, stream_);
 }
 
 void Engine::linear_fp4_multi(std::initializer_list<std::pair<const Fp4Weight*, float*>> ws, const float* x, int M,
                               bool x_ready) {
-  if (M > kernels::kMaxStreamRows) {
-    for (const auto& [w, y] : ws) linear_fp4(*w, x, M, y);
+  if (quantized(M)) {  // one quantization of x for every matrix that shares its input scale
+    for (const auto& [w, y] : ws) {
+      if (!(x_ready && xq_is(w->in_scale, true))) kernels::quant_act_nvfp4(x, M, w->K, w->in_scale, xq_, xsf_, stream_);
+      set_xq(w->in_scale, true);
+      x_ready = true;
+      kernels::prefill_gemm_nvfp4(xq_, xsf_, M, w->w, w->in_scale * w->scale2, y, w->N, w->N, w->K, false, stream_);
+    }
     return;
   }
   kernels::StreamTarget t[4];
@@ -209,8 +241,13 @@ void Engine::linear_fp4_multi(std::initializer_list<std::pair<const Fp4Weight*, 
 
 void Engine::linear_fp8_multi(std::initializer_list<std::pair<const Fp8Weight*, float*>> ws, const float* x, int M,
                               bool x_ready) {
-  if (M > kernels::kMaxStreamRows) {
-    for (const auto& [w, y] : ws) linear_fp8(*w, x, M, y);
+  if (quantized(M)) {
+    for (const auto& [w, y] : ws) {
+      if (!(x_ready && xq_is(w->in_scale, false))) kernels::quant_act_fp8(x, M, w->K, w->in_scale, xq_, stream_);
+      set_xq(w->in_scale, false);
+      x_ready = true;
+      kernels::prefill_gemm_fp8(xq_, M, w->w, w->in_scale * w->scale, y, w->N, w->N, w->K, false, stream_);
+    }
     return;
   }
   kernels::StreamTarget t[4];
@@ -223,14 +260,27 @@ void Engine::linear_fp8_multi(std::initializer_list<std::pair<const Fp8Weight*, 
   kernels::stream_gemm_multi(false, xh_, xinv_, M, t, n, K, stream_);
 }
 
-bool Engine::norm_rows(const float* x, const __nv_bfloat16* w, float* out, int M) {
+void Engine::linear_fp8_residual(const Fp8Weight& w, const float* x, int M, bool x_ready) {
+  const int H = model_->config().hidden;
+  if (!quantized(M)) {
+    linear_fp8(w, x, M, t1_);
+    kernels::add_inplace(h_, t1_, M * H, stream_);
+    return;
+  }
+  if (!(x_ready && xq_is(w.in_scale, false))) kernels::quant_act_fp8(x, M, w.K, w.in_scale, xq_, stream_);
+  set_xq(w.in_scale, false);
+  kernels::prefill_gemm_fp8(xq_, M, w.w, w.in_scale * w.scale, h_, H, w.N, w.K, true, stream_);
+}
+
+bool Engine::norm_rows(const float* x, const __nv_bfloat16* w, float* out, int M, float in_scale, bool nvfp4, bool f32) {
   const ModelConfig& c = model_->config();
-  if (M <= kernels::kMaxStreamRows) {
+  if (!quantized(M)) {
     kernels::rmsnorm_half(x, w, out, xh_, xinv_, M, c.hidden, c.eps, true, stream_);
     return true;
   }
-  kernels::rmsnorm(x, w, out, M, c.hidden, c.eps, true, stream_);
-  return false;
+  kernels::rmsnorm_quant(x, w, f32 ? out : nullptr, M, c.hidden, c.eps, nvfp4, in_scale, xq_, xsf_, stream_);
+  set_xq(in_scale, nvfp4);
+  return true;
 }
 
 void Engine::linear_bf16(const Bf16Weight& w, const float* x, int M, float* y) {
@@ -252,20 +302,23 @@ void Engine::linear_bf16_cublas(const Bf16Weight& w, const float* x, int M, floa
 }
 
 void Engine::linear_fp8(const Fp8Weight& w, const float* x, int M, float* y, bool x_ready) {
-  if (M <= kernels::kMaxStreamRows) {
+  if (!quantized(M)) {
     if (!x_ready) kernels::to_half_rows(x, M, w.K, xh_, xinv_, stream_);
     kernels::stream_gemm_fp8(xh_, xinv_, M, w.w, w.scale, y, w.N, w.K, stream_);
     return;
   }
-  kernels::dequant_tiled_fp8(w.w, w.scale, w_bf16_, w.N, w.K, stream_);
-  kernels::to_bf16(x, x_bf16_, M * w.K, stream_);
-  kernels::gemm_bf16_cublas(cublas_, x_bf16_, M, w_bf16_, y, w.N, w.K);
+  kernels::quant_act_fp8(x, M, w.K, w.in_scale, xq_, stream_);
+  set_xq(w.in_scale, false);
+  kernels::prefill_gemm_fp8(xq_, M, w.w, w.in_scale * w.scale, y, w.N, w.N, w.K, false, stream_);
 }
 
 void Engine::forward(const int* ids, int M, Pass pass) {
   const ModelConfig& c = model_->config();
   if (pos_ + M > opts_.max_context) throw std::runtime_error("context is longer than max_context");
   const bool rows = M <= kernels::kMaxStreamRows, verify = pass == Pass::Verify;
+  // A prompt's tokens take the prefill path whatever the chunk's size, so the state a prompt leaves does
+  // not depend on how its prefill was split or where it resumed (the prefix checkpoints rely on it).
+  quantized_ = pass == Pass::Prefill;
   if (verify && !rows) throw std::runtime_error("verify: at most 32 rows");
   NvtxRange range(verify ? "verify" : M == 1 ? "decode" : "prefill_chunk");
   const int H = c.hidden, I = c.intermediate, C = c.lin_conv_channels(), Vs = c.lin_value_size();
@@ -286,22 +339,34 @@ void Engine::forward(const int* ids, int M, Pass pass) {
   for (int li = 0; li < c.layers; ++li) {
     const LayerWeights& L = model_->layers()[li];
     const int slot = layer_slot_[li];
-    const bool xn_half = norm_rows(h_, L.input_norm, xn_, M);
+    // The prefill path quantizes the norm's output for the projections that follow; the DeltaNet's a and b
+    // projections (BF16) also read it in FP32.
+    // (FP32 too wherever the projections' input scales differ, so the others can quantize it themselves.)
+    const bool xn_half =
+        L.full ? norm_rows(h_, L.input_norm, xn_, M, L.q.in_scale, false,
+                           L.k.in_scale != L.q.in_scale || L.v.in_scale != L.q.in_scale)
+               : norm_rows(h_, L.input_norm, xn_, M, L.in_qkv.in_scale, false, true);
     if (L.full) {
       NvtxRange r("attention");
       linear_fp8_multi({{&L.q, q_gate_}, {&L.k, k_}, {&L.v, v_}}, xn_, M, xn_half);
       mark("attn_proj");
       kernels::attn_prepare(q_gate_, k_, v_, L.q_norm, L.k_norm, pos_, M, c.heads, c.kv_heads, c.head_dim,
                             c.rotary_dim, c.rope_theta, c.eps, q_, gate_, kcache_[slot], vcache_[slot], stream_);
-      if (rows)
-        kernels::attention_rows(q_, kcache_[slot], vcache_[slot], pos_, M, c.heads, c.kv_heads, c.head_dim,
-                                attn_scratch_, attn_, stream_);
-      else
-        kernels::attention(q_, kcache_[slot], vcache_[slot], pos_, M, c.heads, c.kv_heads, c.head_dim,
-                           attn_scratch_, attn_, stream_);
-      kernels::sigmoid_mul(attn_, gate_, M * qsize, stream_);
+      // Fixed key ranges at fixed positions for every pass (row-invariant), in slices of queries that
+      // bound the partial results' scratch.
+      for (int q0 = 0; q0 < M; q0 += kAttnSlice) {
+        const int n = std::min(kAttnSlice, M - q0);
+        kernels::attention_rows(q_ + size_t(q0) * qsize, kcache_[slot], vcache_[slot], pos_ + q0, n, c.heads,
+                                c.kv_heads, c.head_dim, attn_scratch_, attn_ + size_t(q0) * qsize, stream_);
+      }
+      if (quantized_) {
+        kernels::sigmoid_mul_fp8(attn_, gate_, size_t(M) * qsize, L.o.in_scale, xq_, stream_);
+        set_xq(L.o.in_scale, false);
+      } else {
+        kernels::sigmoid_mul(attn_, gate_, M * qsize, stream_);
+      }
       mark("attn_core");
-      linear_fp8(L.o, attn_, M, t1_);
+      linear_fp8_residual(L.o, attn_, M, quantized_);
       mark("attn_proj");
     } else {
       NvtxRange r("deltanet");
@@ -310,8 +375,11 @@ void Engine::forward(const int* ids, int M, Pass pass) {
       float* mixed = verify ? v_post_[slot] : mixed_;
       float* g = verify ? v_g_[slot] : g_;
       float* beta = verify ? v_beta_[slot] : beta_;
-      linear_fp8_multi({{&L.in_qkv, verify ? v_pre_[slot] : mixed}, {&L.in_z, z_}}, xn_, M, xn_half);
-      if (M <= kernels::kMaxStreamRows && L.in_a.N == L.in_b.N) {  // both in one launch
+      // The prefill path convolves out of place: the projection goes to t2_ (free until the MLP).
+      linear_fp8_multi({{&L.in_qkv, verify ? v_pre_[slot] : quantized_ ? t2_ : mixed}, {&L.in_z, z_}}, xn_, M, xn_half);
+      if (quantized_) {  // tensor cores, row-invariant for any M
+        kernels::narrow_bf16(xn_, M, L.in_a.w, L.in_b.w, a_, b_, L.in_a.N, L.in_a.K, stream_);
+      } else if (L.in_a.N == L.in_b.N) {  // both in one launch
         kernels::bf16_rows(xn_, M, L.in_a.w, a_, L.in_a.N, L.in_a.K, stream_, L.in_b.w, b_);
       } else {
         linear_bf16(L.in_a, xn_, M, a_);
@@ -327,24 +395,36 @@ void Engine::forward(const int* ids, int M, Pass pass) {
               "verify conv");
         conv_state = conv_tmp_;
       }
-      kernels::gdn_conv(mixed, conv_state, L.conv, M, C, stream_);
+      if (quantized_) kernels::gdn_conv_prefill(t2_, mixed, conv_state, L.conv, M, C, stream_);
+      else kernels::gdn_conv(mixed, conv_state, L.conv, M, C, stream_);
       kernels::gdn_gating(a_, b_, L.A_log, L.dt_bias, g, beta, M, c.lin_v_heads, stream_);
       mark("gdn_conv");
       kernels::gdn_recurrent(mixed, g, beta, gdn_state_[slot], verify ? nullptr : gdn_state_[slot], core_, M,
                              c.lin_k_heads, c.lin_v_heads, stream_);
       mark("gdn_recurrent");
-      kernels::gated_rmsnorm(core_, z_, L.lin_norm, normed_, M * c.lin_v_heads, c.lin_v_dim, c.eps, stream_);
-      linear_fp8(L.out, normed_, M, t1_);
+      if (quantized_) {
+        kernels::gated_rmsnorm_fp8(core_, z_, L.lin_norm, M * c.lin_v_heads, c.lin_v_dim, c.eps, L.out.in_scale, xq_,
+                                   stream_);
+        set_xq(L.out.in_scale, false);
+      } else {
+        kernels::gated_rmsnorm(core_, z_, L.lin_norm, normed_, M * c.lin_v_heads, c.lin_v_dim, c.eps, stream_);
+      }
+      linear_fp8_residual(L.out, normed_, M, quantized_);
       mark("gdn_proj");
     }
-    kernels::add_inplace(h_, t1_, M * H, stream_);
     {
       NvtxRange r("mlp");
-      const bool post_half = norm_rows(h_, L.post_norm, xn_, M);
+      const bool post_half = norm_rows(h_, L.post_norm, xn_, M, L.gate.in_scale, true, L.up.in_scale != L.gate.in_scale);
       linear_fp4_multi({{&L.gate, t1_}, {&L.up, t2_}}, xn_, M, post_half);
-      kernels::silu_mul(t1_, t2_, t1_, M * I, stream_);
-      linear_fp4(L.down, t1_, M, t2_);
-      kernels::add_inplace(h_, t2_, M * H, stream_);
+      if (!quantized_) {
+        kernels::silu_mul(t1_, t2_, t1_, M * I, stream_);
+        linear_fp4(L.down, t1_, M, t2_);
+        kernels::add_inplace(h_, t2_, M * H, stream_);
+      } else {  // silu(gate) * up straight into NVFP4, and the down projection adds into the residual
+        kernels::silu_mul_quant_nvfp4(t1_, t2_, M, I, L.down.in_scale, xq_, xsf_, stream_);
+        set_xq(0.f, true);  // not a plain quantization of any one input
+        kernels::prefill_gemm_nvfp4(xq_, xsf_, M, L.down.w, L.down.in_scale * L.down.scale2, h_, H, H, I, true, stream_);
+      }
       mark("mlp");
     }
     // The drafter conditions on the residual stream after these layers (SGLang captures it at the input
@@ -376,43 +456,74 @@ void Engine::forward(const int* ids, int M, Pass pass) {
 const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, EngineStats* stats) {
   if (prompt.empty()) throw std::runtime_error("empty prompt");
   auto t0 = std::chrono::steady_clock::now();
-  size_t reuse = 0;
-  auto extends = [&](const std::vector<int>& prefix) {
-    return !prefix.empty() && prefix.size() < prompt.size() && std::equal(prefix.begin(), prefix.end(), prompt.begin());
-  };
-  // Two states can be resumed: the current one (when the prompt extends everything processed so far)
-  // and the snapshot taken at the end of the previous prompt. An agent's next turn re-renders the
-  // model's output, so it rarely extends the current state, but it always extends the previous prompt.
-  // The current state counts only if it exactly matches history_ (a failed request can leave it
-  // half-advanced). Full-attention KV beyond the resumed position is simply overwritten.
-  const bool current_ok = pos_ == static_cast<int>(history_.size()) && extends(history_);
-  const bool snapshot_ok = extends(snapshot_tokens_);
-  if (current_ok && (!snapshot_ok || history_.size() >= snapshot_tokens_.size())) {
-    reuse = history_.size();
-  } else if (snapshot_ok) {
-    restore_snapshot();
-    reuse = snapshot_tokens_.size();
-  } else {
-    snapshot_tokens_.clear();  // the prefill below overwrites the KV cache the snapshot relies on
-    reset();
+  const int L = static_cast<int>(prompt.size()), H = static_cast<int>(history_.size());
+  // The caches hold the KV of history_; DeltaNet and conv state exist only where a state was kept: the
+  // end of the last prompt (snap_) and the prefix checkpoints. The
+  // prompt resumes from the furthest of these inside its common prefix with history_, so an agent's next
+  // turn (which extends its previous prompt) prefills only its new tokens, and a new session whose
+  // system message (instructions and tool schemas) another session already processed starts after it.
+  int lcp = 0;
+  while (lcp < std::min(H, L) && history_[lcp] == prompt[lcp]) ++lcp;
+  // The drafter attends to the last `window` positions: resuming at p > window start needs its context
+  // KV from the window start up to p, which is valid only from dkv_lo_ on.
+  const int window = draft_ ? std::max(0, L - draft_->config().sliding_window) : 0;
+  auto usable = [&](int p) { return p <= lcp && p < L && (!draft_ || p <= window || dkv_lo_ <= window); };
+  // Only states a prefill left count, never the current one after decoding: a decoded token went through
+  // the rows path, and a prompt's state must be the same however it was reached.
+  int reuse = 0;
+  const StateSlot* from = nullptr;
+  if (snap_pos_ > 0 && usable(snap_pos_)) {
+    reuse = snap_pos_;
+    from = &snap_;
   }
-  // The drafter attends to a sliding window of 2048 positions: only the prompt's last ones need its KV.
-  if (draft_) window_start_ = std::max(0, static_cast<int>(prompt.size()) - draft_->config().sliding_window);
-  for (size_t i = reuse; i < prompt.size();) {
-    const int n = static_cast<int>(std::min<size_t>(opts_.prefill_chunk, prompt.size() - i));
-    const int pos0 = pos_;
+  for (const Checkpoint& k : ckpts_)
+    if (usable(k.pos) && k.pos > reuse) {
+      reuse = k.pos;
+      from = &ckpt_slots_[k.slot];
+    }
+  if (from) copy_state(*from, false);
+  else reset_state();
+  pos_ = reuse;
+  truncate_history(reuse);
+  if (draft_ && window > reuse) dkv_lo_ = window;
+
+  // Chunk ends: every prefill_chunk tokens, and the checkpoint positions (the end of each of the first
+  // two messages, and chunk multiples up to checkpoint_limit), where the state is kept for later prompts.
+  std::vector<int> bounds;
+  if (!ckpt_slots_.empty()) {
+    int messages = 0;
+    for (int i = 0; i < L && i < opts_.checkpoint_limit && messages < 2; ++i)
+      if (prompt[i] == opts_.boundary_token) {
+        bounds.push_back(i + 1);
+        ++messages;
+      }
+    for (int b = opts_.prefill_chunk; b < std::min(L, opts_.checkpoint_limit + 1); b += opts_.prefill_chunk)
+      bounds.push_back(b);
+    std::sort(bounds.begin(), bounds.end());
+  }
+  for (int i = reuse; i < L;) {
+    int end = std::min(i + opts_.prefill_chunk, L);
+    for (int b : bounds)
+      if (b > i && b < end) {
+        end = b;
+        break;
+      }
+    const int n = end - i, pos0 = pos_;
     forward(prompt.data() + i, n, Pass::Prefill);
     if (draft_) {
-      const int first = std::max(pos0, window_start_);
-      if (first < pos0 + n) draft_materialize(pos0 + n - first, first, first - pos0);
+      const int first = std::max(pos0, window);
+      if (first < pos0 + n) draft_materialize(pos0 + n - first, first, first - pos0);  // still quantized_
     }
-    i += n;
+    history_.insert(history_.end(), prompt.begin() + i, prompt.begin() + end);
+    i = end;
+    if (end < L && std::binary_search(bounds.begin(), bounds.end(), end)) save_checkpoint(end);
   }
-  history_ = prompt;
-  take_snapshot();
+  copy_state(snap_, true);
+  snap_pos_ = L;
+  check(cudaStreamSynchronize(stream_), "prefill");
   if (stats) {
-    stats->reused_tokens = static_cast<int>(reuse);
-    stats->prefill_tokens = static_cast<int>(prompt.size() - reuse);
+    stats->reused_tokens = reuse;
+    stats->prefill_tokens = L - reuse;
     stats->prefill_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   }
   return logits_;

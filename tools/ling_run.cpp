@@ -8,6 +8,11 @@
 // --spec decodes with the DFlash2 drafter. --spec-check (greedy) decodes each prompt plainly and then
 // speculatively, and checks that the tokens are identical and that the recurrent state after the
 // speculative run equals the state of a plain run over the same tokens, bit for bit.
+//
+// --prefix-check prefills each prompt after the one before it (so it resumes from a kept state: the end of
+// the previous prompt or a prefix checkpoint), then again from scratch, and checks that the DeltaNet and
+// conv state and the next token are the same both ways (M2: prefix checkpoints).
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -25,7 +30,7 @@ int main(int argc, char** argv) {
   std::string model, text, chat, ids_arg, prompts_file;
   int max_tokens = 64, max_context = 32768;
   float temperature = 0.f;
-  bool ids_out = false, prompt_ids_out = false, spec = false, spec_check = false;
+  bool ids_out = false, prompt_ids_out = false, spec = false, spec_check = false, prefix_check = false;
   std::string draft;
   int block = 16, lookup = 1, lookup_min = 8;
   for (int i = 1; i < argc; ++i) {
@@ -53,6 +58,7 @@ int main(int argc, char** argv) {
     else if (a == "--lookup") lookup = std::stoi(next());
     else if (a == "--lookup-min") lookup_min = std::stoi(next());
     else if (a == "--spec-check") spec_check = true;
+    else if (a == "--prefix-check") prefix_check = true;
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
@@ -92,6 +98,7 @@ int main(int argc, char** argv) {
     opts.draft_block = block;
     opts.lookup_mode = lookup;
     opts.lookup_min_match = lookup_min;
+    opts.boundary_token = tok.token_id("<|im_end|>");
     ling::Engine engine(model, opts);
     auto t1 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "loaded %.1f GB of weights in %.1f s\n", engine.model().device_bytes() / 1e9,
@@ -136,6 +143,27 @@ int main(int argc, char** argv) {
     };
 
     int failures = 0;
+    if (prefix_check) {
+      auto argmax = [](const std::vector<float>& l) { return int(std::max_element(l.begin(), l.end()) - l.begin()); };
+      engine.reset();
+      for (size_t i = 0; i < prompts.size(); ++i) {
+        ling::EngineStats st;
+        const int resumed = argmax(engine.prefill(prompts[i], &st));
+        const uint64_t h_resumed = engine.state_hash();
+        engine.reset();
+        ling::EngineStats fresh_st;
+        const int fresh = argmax(engine.prefill(prompts[i], &fresh_st));
+        const uint64_t h_fresh = engine.state_hash();
+        const bool same = resumed == fresh && h_resumed == h_fresh;
+        failures += !same;
+        std::printf("prompt %zu: %zu tokens, resumed at %d (%.2f s) against %.2f s from scratch: state %s, next token %s\n",
+                    i, prompts[i].size(), st.reused_tokens, st.prefill_seconds, fresh_st.prefill_seconds,
+                    h_resumed == h_fresh ? "identical" : "DIFFERS", resumed == fresh ? "identical" : "DIFFERS");
+        // Leave the engine as a server would be after prompt i, with the checkpoints of its prefill.
+      }
+      std::printf(failures ? "PREFIX CHECK FAILED\n" : "prefix check passed\n");
+      return failures ? 1 : 0;
+    }
     for (const std::vector<int>& prompt : prompts) {
       ling::SamplingParams sp;
       sp.temperature = temperature;

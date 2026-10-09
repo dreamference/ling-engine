@@ -46,6 +46,7 @@ struct ModelConfig {
 struct Fp4Weight {
   const uint8_t* w = nullptr;
   float scale2 = 0.f;
+  float in_scale = 1.f;  // the activations' global scale (input_scale), for the prefill GEMM
   int N = 0, K = 0;
 };
 
@@ -53,6 +54,7 @@ struct Fp4Weight {
 struct Fp8Weight {
   const uint8_t* w = nullptr;
   float scale = 0.f;
+  float in_scale = 1.f;  // the activations' static per-tensor scale (input_scale), for the prefill GEMM
   int N = 0, K = 0;
 };
 

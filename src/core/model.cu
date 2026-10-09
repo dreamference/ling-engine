@@ -154,6 +154,7 @@ Fp4Weight Model::fp4(const Checkpoint& ck, const std::string& prefix) {
   w.w = upload_tiled(t, &s, w.N, w.K, &bytes_);
   allocations_.push_back(const_cast<uint8_t*>(w.w));
   w.scale2 = scalar(ck, prefix + ".weight_scale_2");
+  w.in_scale = scalar(ck, prefix + ".input_scale");
   return w;
 }
 
@@ -166,6 +167,7 @@ Fp8Weight Model::fp8(const Checkpoint& ck, const std::string& prefix) {
   w.w = upload_tiled(t, nullptr, w.N, w.K, &bytes_);
   allocations_.push_back(const_cast<uint8_t*>(w.w));
   w.scale = scalar(ck, prefix + ".weight_scale");
+  w.in_scale = scalar(ck, prefix + ".input_scale");
   return w;
 }
 

@@ -6,7 +6,9 @@
 //   - the rows path, M <= 32 tokens (decode, verify, short prompts): tensor-core weight streaming
 //     (stream_gemm.cu) and fixed-range attention, every kernel row-invariant, so a token verified in a
 //     block of 16 gets bit-for-bit the numbers it gets when decoded alone;
-//   - the prefill path, longer chunks: weights dequantized to BF16 for cuBLAS, tiled prefill attention.
+//   - the prefill path, longer chunks: activations quantized as production quantizes them (NVFP4 for the
+//     NVFP4 matrices, FP8 for the FP8 ones) and block-scaled tensor-core GEMMs over the same tiled
+//     weights (prefill_gemm.cu); tiled prefill attention.
 #pragma once
 
 #include <cstdint>
@@ -48,6 +50,12 @@ struct EngineOptions {
   // least lookup_min_match tokens long, and the drafter's pass is skipped).
   int lookup_mode = 1;
   int lookup_min_match = 8;
+  // Prefix checkpoints: DeltaNet and conv states kept at chosen prompt positions (the end of the first two
+  // messages, i.e. after `boundary_token`, and multiples of prefill_chunk up to checkpoint_limit), so a later
+  // prompt that shares the prefix resumes there. Each costs ~157 MB; 0 turns them off.
+  int prefix_checkpoints = 8;
+  int boundary_token = -1;  // <|im_end|>
+  int checkpoint_limit = 32768;
 };
 
 struct EngineStats {
@@ -133,12 +141,37 @@ class Engine {
                         bool x_ready = false);
   void linear_fp8_multi(std::initializer_list<std::pair<const Fp8Weight*, float*>> ws, const float* x, int M,
                         bool x_ready = false);
+  // h_ += x . W^T (the out-projections into the residual stream; the prefill GEMM adds in its epilogue).
+  void linear_fp8_residual(const Fp8Weight& w, const float* x, int M, bool x_ready = false);
+  // The prefill path (quantized activations, prefill_gemm.cu) or the rows path (stream_gemm.cu)?
+  bool quantized(int M) const { return quantized_ || M > kRowsMax; }
+  static constexpr int kRowsMax = 32;  // kernels::kMaxStreamRows
+  static constexpr int kAttnSlice = 256;  // prefill attention: queries per call (bounds the partials' scratch)
+  bool quantized_ = false;                // set by forward(): the pass is a prefill
   // RMSNorm; on the rows path it also leaves the FP16 copy for the next linear call (x_ready).
-  bool norm_rows(const float* x, const __nv_bfloat16* w, float* out, int M);
+  // On the prefill path it writes the quantized input of the next GEMMs instead (input scale `in_scale`,
+  // NVFP4 or FP8), and `out` only when `f32`.
+  bool norm_rows(const float* x, const __nv_bfloat16* w, float* out, int M, float in_scale, bool nvfp4, bool f32);
+  // What xq_ holds: the quantization of the current input with this input scale and encoding (0: nothing
+  // reusable). x_ready on the prefill path means "xq_ holds it".
+  float xq_scale_ = 0.f;
+  bool xq_nvfp4_ = false;
+  void set_xq(float scale, bool nvfp4) {
+    xq_scale_ = scale;
+    xq_nvfp4_ = nvfp4;
+  }
+  bool xq_is(float scale, bool nvfp4) const { return scale != 0.f && xq_scale_ == scale && xq_nvfp4_ == nvfp4; }
   void linear_bf16(const Bf16Weight& w, const float* x, int M, float* y);
   void linear_bf16_cublas(const Bf16Weight& w, const float* x, int M, float* y);  // the drafter's BF16 matrices
-  void take_snapshot();
-  void restore_snapshot();
+  // DeltaNet and conv state, saved or restored as a whole.
+  struct StateSlot {
+    std::vector<float*> gdn, conv;
+  };
+  StateSlot alloc_slot();
+  void copy_state(const StateSlot& slot, bool save);  // save: state -> slot; else slot -> state
+  void reset_state();                                 // the zero state of an empty sequence
+  void save_checkpoint(int pos);
+  void truncate_history(int n);  // forget the tokens from position n on, and every state past them
 
   // Speculation (speculate.cpp).
   void commit(int n);                                 // advance the recurrent state over a verify's first n rows
@@ -160,7 +193,8 @@ class Engine {
   float *a_ = nullptr, *b_ = nullptr, *g_ = nullptr, *beta_ = nullptr, *core_ = nullptr, *normed_ = nullptr;
   float *q_gate_ = nullptr, *k_ = nullptr, *v_ = nullptr, *q_ = nullptr, *gate_ = nullptr, *attn_ = nullptr;
   float *attn_scratch_ = nullptr, *logits_dev_ = nullptr;
-  __nv_bfloat16 *x_bf16_ = nullptr, *w_bf16_ = nullptr;
+  __nv_bfloat16* x_bf16_ = nullptr;
+  uint8_t *xq_ = nullptr, *xsf_ = nullptr;  // the prefill path's quantized activations and their block scales
   __half* xh_ = nullptr;     // the rows path's FP16 activations [32][max K]
   float* xinv_ = nullptr;    // and their per-row scales
   int* ids_dev_ = nullptr;
@@ -170,9 +204,15 @@ class Engine {
   std::vector<float*> gdn_state_, conv_state_;    // per linear layer
   std::vector<int> layer_slot_;                   // layer -> index into the vectors above
   std::vector<int> history_;
-  // DeltaNet and conv state at the end of the last prompt, and that prompt.
-  std::vector<float*> snap_gdn_, snap_conv_;
-  std::vector<int> snapshot_tokens_;
+  // Kept states. Each is the state after history_[0, pos), valid while those tokens stay in history_.
+  StateSlot snap_;     // the end of the last prompt
+  int snap_pos_ = -1;
+  struct Checkpoint {
+    int pos, slot;
+  };
+  std::vector<StateSlot> ckpt_slots_;
+  std::vector<Checkpoint> ckpts_;  // sorted by position
+  int dkv_lo_ = 0;  // the drafter's context KV is valid for positions [dkv_lo_, history_.size())
   int pos_ = 0;
 
   // A verify's per-layer DeltaNet inputs, kept for commit(): the in-projection before and after the conv,
@@ -194,7 +234,6 @@ class Engine {
   int* ids_out_dev_ = nullptr;
   std::vector<int> cand_host_;
   std::vector<float> scores_host_;
-  int window_start_ = 0;
   struct ShadowRecord {
     int pos;                  // the anchor's position
     std::vector<int> tokens;  // the lookup's proposal for the positions after it
