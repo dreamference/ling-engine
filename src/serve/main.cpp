@@ -2,7 +2,9 @@
 // time; the HTTP threads parse requests and stream server-sent events back.
 //
 //   ling-serve --model DIR [--host 0.0.0.0] [--port 8000] [--served-model-name NAME] [--max-context N]
-//              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]]
+//              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs]
+//
+// --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3).
 //
 // With --draft, requests decode speculatively with the DFlash2 drafter (requests that set penalties
 // decode plainly). GET /metrics exports SGLang's counter names, so M0's replay harness reads them as is.
@@ -651,6 +653,7 @@ int main(int argc, char** argv) {
   std::string model_dir, host = "0.0.0.0", name;
   int port = 8000, max_context = 65536, draft_block = 16, lookup = 1, lookup_min = 8, checkpoints = 8;
   std::string draft_dir, pretokenizer = "production";
+  bool graphs = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -671,6 +674,7 @@ int main(int argc, char** argv) {
     else if (a == "--lookup-min") lookup_min = std::stoi(next());
     else if (a == "--pretokenizer") pretokenizer = next();
     else if (a == "--prefix-checkpoints") checkpoints = std::stoi(next());
+    else if (a == "--graphs") graphs = true;
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
@@ -699,6 +703,7 @@ int main(int argc, char** argv) {
   opts.lookup_min_match = lookup_min;
   opts.prefix_checkpoints = checkpoints;
   opts.boundary_token = tok.token_id("<|im_end|>");
+  opts.step_graphs = graphs;
   std::cerr << "loading " << model_dir << " ...\n";
   ling::Engine engine(model_dir, opts);
   std::cerr << "loaded " << engine.model().device_bytes() / 1e9 << " GB of weights\n";

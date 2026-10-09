@@ -25,7 +25,7 @@ constexpr int kDD = 128;  // drafter head dim
 // Per-head RMSNorm (plain weight) and NeoX RoPE over the whole head, in place. One block per (row, head),
 // one thread per dim.
 __global__ void draft_qk_rope_kernel(float* __restrict__ x, int row_stride, const __nv_bfloat16* __restrict__ w,
-                                     int pos0, float theta, float eps) {
+                                     DevPos pos0, float theta, float eps) {
   __shared__ float red[4], xs[kDD];
   const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
   float* p = x + static_cast<size_t>(r) * row_stride + h * kDD;
@@ -39,13 +39,13 @@ __global__ void draft_qk_rope_kernel(float* __restrict__ x, int row_stride, cons
   const int half = kDD / 2, i = d % half;
   const float inv_freq = powf(theta, -2.f * i / kDD);
   float sn, cs;
-  sincosf(static_cast<float>(pos0 + r) * inv_freq, &sn, &cs);
+  sincosf(static_cast<float>(pos_value(pos0) + r) * inv_freq, &sn, &cs);
   p[d] = d < half ? xs[d] * cs - xs[d + half] * sn : xs[d] * cs + xs[d - half] * sn;
 }
 
 __global__ void draft_store_kv_kernel(const float* __restrict__ k, const float* __restrict__ v, int kv_size,
-                                      int pos0, __nv_bfloat16* __restrict__ kc, __nv_bfloat16* __restrict__ vc) {
-  const int r = blockIdx.x;
+                                      DevPos pos0_arg, __nv_bfloat16* __restrict__ kc, __nv_bfloat16* __restrict__ vc) {
+  const int r = blockIdx.x, pos0 = pos_value(pos0_arg);
   for (int i = threadIdx.x; i < kv_size; i += blockDim.x) {
     const size_t dst = static_cast<size_t>(pos0 + r) * kv_size + i;
     kc[dst] = __float2bfloat16(k[static_cast<size_t>(r) * kv_size + i]);
@@ -60,9 +60,9 @@ template <int G>
 __global__ void __launch_bounds__(256)
     draft_attention_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
                            const __nv_bfloat16* __restrict__ vc, const float* __restrict__ kb,
-                           const float* __restrict__ vb, int L, int window_left, int Hkv, float* __restrict__ out) {
+                           const float* __restrict__ vb, DevPos L_arg, int window_left, int Hkv, float* __restrict__ out) {
   __shared__ float wm[8][G], wl[8][G], wacc[8][kDD];
-  const int j = blockIdx.x, kvh = blockIdx.y, B = gridDim.x;
+  const int j = blockIdx.x, kvh = blockIdx.y, B = gridDim.x, L = pos_value(L_arg);
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int Hq = Hkv * G;
   const int lo = max(0, L + j - window_left);
@@ -171,9 +171,11 @@ constexpr int kSelK = 16, kSelR = 256;
 __global__ void __launch_bounds__(256)
     selector_lattice_kernel(const float* __restrict__ hp, const int* __restrict__ cand,
                             const float* __restrict__ unary, const __nv_bfloat16* __restrict__ P,
-                            const __nv_bfloat16* __restrict__ S, int anchor, float* __restrict__ scores) {
+                            const __nv_bfloat16* __restrict__ S, int anchor_arg, const int* __restrict__ anchor_dev,
+                            float* __restrict__ scores) {
   __shared__ float Ps[kSelK][kSelR + 1], Ss[kSelK][kSelR + 1], hs[kSelR];
   const int e = blockIdx.x, t = threadIdx.x;
+  const int anchor = anchor_dev ? *anchor_dev : anchor_arg;
   hs[t] = hp[static_cast<size_t>(e) * kSelR + t];
   for (int i = 0; i < kSelK; ++i) {
     const int pid = e == 0 ? anchor : cand[(e - 1) * kSelK + i];
@@ -203,20 +205,20 @@ void copy_rows_bf16(const float* src, int rows, int H, __nv_bfloat16* dst, int d
   check_launch("copy_rows_bf16");
 }
 
-void draft_qk_rope(float* x, int rows, int heads, int row_stride, const __nv_bfloat16* norm, int pos0, float theta,
+void draft_qk_rope(float* x, int rows, int heads, int row_stride, const __nv_bfloat16* norm, DevPos pos0, float theta,
                    float eps, cudaStream_t s) {
   draft_qk_rope_kernel<<<dim3(rows, heads), kDD, 0, s>>>(x, row_stride, norm, pos0, theta, eps);
   check_launch("draft_qk_rope");
 }
 
-void draft_store_kv(const float* k, const float* v, int rows, int kv_size, int pos0, __nv_bfloat16* kc,
+void draft_store_kv(const float* k, const float* v, int rows, int kv_size, DevPos pos0, __nv_bfloat16* kc,
                     __nv_bfloat16* vc, cudaStream_t s) {
   draft_store_kv_kernel<<<rows, 256, 0, s>>>(k, v, kv_size, pos0, kc, vc);
   check_launch("draft_store_kv");
 }
 
 void draft_attention(const float* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, const float* kb,
-                     const float* vb, int L, int B, int window_left, int Hq, int Hkv, float* out, cudaStream_t s) {
+                     const float* vb, DevPos L, int B, int window_left, int Hq, int Hkv, float* out, cudaStream_t s) {
   if (Hq != 4 * Hkv) throw std::runtime_error("draft_attention: built for 4 query heads per KV head");
   draft_attention_kernel<4><<<dim3(B, Hkv), 256, 0, s>>>(q, kc, vc, kb, vb, L, window_left, Hkv, out);
   check_launch("draft_attention");
@@ -229,8 +231,8 @@ void grouped_conv(const float* h, const float* coef, const __nv_bfloat16* base, 
 }
 
 void selector_lattice(const float* hp, const int* cand, const float* unary, const __nv_bfloat16* P,
-                      const __nv_bfloat16* S, int anchor, int E, float* scores, cudaStream_t s) {
-  selector_lattice_kernel<<<E, 256, 0, s>>>(hp, cand, unary, P, S, anchor, scores);
+                      const __nv_bfloat16* S, int anchor, int E, float* scores, cudaStream_t s, const int* anchor_dev) {
+  selector_lattice_kernel<<<E, 256, 0, s>>>(hp, cand, unary, P, S, anchor, anchor_dev, scores);
   check_launch("selector_lattice");
 }
 

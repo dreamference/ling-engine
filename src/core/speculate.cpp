@@ -15,6 +15,21 @@
 //      replaying those rows' saved inputs through the same kernels, and their target features become
 //      the drafter's context KV.
 // The rows path is row-invariant, so greedy speculation reproduces plain greedy decoding token for token.
+//
+// CUDA graphs (M3, EngineOptions::step_graphs). Each of the three GPU parts of a step (draft, verify with
+// its top-K, commit) is a fixed launch sequence with no host synchronization inside, captured once into a
+// graph and replayed every step; the host keeps the two decisions between them (the lattice walk and the
+// accept rule, exactly as without graphs), which cost a few microseconds each. What changes from step to step
+// is handled so that a graph stays valid:
+//   - the position: the kernels that depend on it read it from pos_dev_ (kernels::DevPos), which the host
+//     writes before each step's graphs run;
+//   - the anchor and the drafted tokens: page-locked host buffers (pin_) copied by the graphs' memcpy nodes;
+//   - the accepted count, which only the commit depends on: one commit graph per count (at most 32);
+//   - the attention's key ranges (its grid): the verify graph launches every range up to max_context, and a
+//     range past the rows' last key exits at once with an empty partial the combine skips;
+//   - sampling parameters: the verify graph is keyed by top-K, everything else is on the host.
+// Every kernel computes exactly what its eager launch computes, so graphs change no output bit
+// (--spec-check compares the tokens and the recurrent state with plain decoding).
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -116,6 +131,7 @@ void Engine::alloc_drafter() {
   topk_scratch_ = alloc<float>(kernels::topk_scratch_floats(B, 64));
   vals_dev_ = alloc<float>(size_t(B) * 64);
   ids_out_dev_ = alloc<int>(size_t(B) * 64);
+  if (d.selector_top_k > 16) throw std::runtime_error("drafter selector_top_k > 16");
   const int C = c.lin_conv_channels();
   for (size_t i = 0; i < gdn_state_.size(); ++i) {
     v_pre_.push_back(alloc<float>(size_t(B) * C));
@@ -135,6 +151,56 @@ bool Engine::can_speculate(const SamplingParams& p) const {
   return p.temperature <= 0.f || (p.top_k > 0 && p.top_k <= 64);
 }
 
+void Engine::clear_graphs() {
+  if (draft_graph_) cudaGraphExecDestroy(draft_graph_);
+  draft_graph_ = nullptr;
+  for (auto& [k, g] : verify_graphs_) cudaGraphExecDestroy(g);
+  verify_graphs_.clear();
+  for (cudaGraphExec_t g : commit_graphs_)
+    if (g) cudaGraphExecDestroy(g);
+  commit_graphs_.clear();
+}
+
+cudaGraphExec_t Engine::capture(const std::function<void()>& body) {
+  cudaGraph_t graph = nullptr;
+  // Thread-local: ling-serve's other threads may make CUDA calls while the worker captures.
+  check(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "begin capture");
+  use_dev_pos_ = true;
+  try {
+    body();
+  } catch (...) {
+    use_dev_pos_ = false;
+    cudaStreamEndCapture(stream_, &graph);  // ends the invalidated capture
+    if (graph) cudaGraphDestroy(graph);
+    cudaGetLastError();
+    throw;
+  }
+  use_dev_pos_ = false;
+  check(cudaStreamEndCapture(stream_, &graph), "end capture");
+  cudaGraphExec_t exec = nullptr;
+  const cudaError_t e = cudaGraphInstantiate(&exec, graph, 0);
+  cudaGraphDestroy(graph);
+  check(e, "graph instantiate");
+  return exec;
+}
+
+void Engine::run_graph(cudaGraphExec_t& slot, const char* what, const std::function<void()>& body) {
+  if (graphs_ && !slot) {
+    try {
+      slot = capture(body);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "step graphs off: capturing the %s failed: %s\n", what, e.what());
+      clear_graphs();
+      graphs_ = false;
+    }
+  }
+  if (graphs_ && slot) {
+    check(cudaGraphLaunch(slot, stream_), what);
+    return;
+  }
+  body();
+}
+
 void Engine::commit(int n) {
   const ModelConfig& c = model_->config();
   for (int li = 0; li < c.layers; ++li) {
@@ -148,7 +214,7 @@ void Engine::commit(int n) {
   }
 }
 
-void Engine::draft_materialize(int rows, int pos0, int cap_row0) {
+void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
   if (rows <= 0) return;
   const DraftConfig& d = draft_->config();
   const int dkv = d.kv_heads * d.head_dim;
@@ -169,15 +235,13 @@ void Engine::draft_materialize(int rows, int pos0, int cap_row0) {
   }
 }
 
-void Engine::draft_propose(int anchor, int B) {
+void Engine::draft_launch(int B) {
   NvtxRange range("draft");
   const ModelConfig& c = model_->config();
   const DraftConfig& d = draft_->config();
   const int H = d.hidden, E = B - 1, dq = d.heads * d.head_dim, dkv = d.kv_heads * d.head_dim;
   const int K16 = d.selector_top_k;
-  std::vector<int> ids(B, d.mask_token);
-  ids[0] = anchor;
-  check(cudaMemcpyAsync(ids_dev_, ids.data(), B * sizeof(int), cudaMemcpyHostToDevice, stream_), "draft ids");
+  check(cudaMemcpyAsync(ids_dev_, pin_->draft_ids, B * sizeof(int), cudaMemcpyHostToDevice, stream_), "draft ids");
   kernels::embed(model_->embed(), ids_dev_, B, H, dres_, stream_);
   for (int l = 0; l < d.layers; ++l) {
     const DraftLayer& L = draft_->layers()[l];
@@ -188,9 +252,9 @@ void Engine::draft_propose(int anchor, int B) {
     linear_bf16_cublas(L.attn_kproj, dh_, B, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.attn_base, 0, dh2_, B, H, d.conv_groups, B, stream_);
     linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, B);
-    kernels::draft_qk_rope(dq_, B, d.heads, dq, L.q_norm, pos_, d.rope_theta, d.eps, stream_);
-    kernels::draft_qk_rope(dk_, B, d.kv_heads, dkv, L.k_norm, pos_, d.rope_theta, d.eps, stream_);
-    kernels::draft_attention(dq_, dkc_[l], dvc_[l], dk_, dv_, pos_, B, d.sliding_window - 1, d.heads, d.kv_heads,
+    kernels::draft_qk_rope(dq_, B, d.heads, dq, L.q_norm, dpos(), d.rope_theta, d.eps, stream_);
+    kernels::draft_qk_rope(dk_, B, d.kv_heads, dkv, L.k_norm, dpos(), d.rope_theta, d.eps, stream_);
+    kernels::draft_attention(dq_, dkc_[l], dvc_[l], dk_, dv_, dpos(), B, d.sliding_window - 1, d.heads, d.kv_heads,
                              dattn_, stream_);
     linear_fp4(L.o, dattn_, B, dh2_);
     kernels::grouped_conv(dh2_, dcoef_, L.attn_base, 1, dout_, B, H, d.conv_groups, B, stream_);
@@ -206,26 +270,47 @@ void Engine::draft_propose(int anchor, int B) {
   }
   kernels::add_inplace(dres_, dout_, B * H, stream_);
   // Drafted positions 1 .. B - 1: the final norm, the target's LM head (no target final norm), the top 16,
-  // the selector's projection and lattice.
+  // the selector's projection and lattice (its first predecessor, the anchor, read from ids_dev_[0]).
   kernels::rmsnorm(dres_ + H, draft_->norm(), dh_, E, H, d.eps, false, stream_);
   linear_fp4(model_->lm_head(), dh_, E, dlogits_);
   kernels::topk_rows(dlogits_, E, c.vocab, K16, topk_scratch_, dunary_, dcand_, stream_);
   linear_bf16_cublas(draft_->selector_projection(), dh_, E, dhp_);
   kernels::selector_lattice(dhp_, dcand_, dunary_, draft_->predecessor_codebook(), draft_->successor_codebook(),
-                            anchor, E, dscores_, stream_);
-  cand_host_.resize(size_t(E) * K16);
-  scores_host_.resize(size_t(E) * K16 * K16);
-  check(cudaMemcpyAsync(cand_host_.data(), dcand_, cand_host_.size() * sizeof(int), cudaMemcpyDeviceToHost, stream_),
+                            pin_->draft_ids[0], E, dscores_, stream_, ids_dev_);
+  check(cudaMemcpyAsync(pin_->cand, dcand_, size_t(E) * K16 * sizeof(int), cudaMemcpyDeviceToHost, stream_),
         "draft candidates");
-  check(cudaMemcpyAsync(scores_host_.data(), dscores_, scores_host_.size() * sizeof(float), cudaMemcpyDeviceToHost,
+  check(cudaMemcpyAsync(pin_->scores, dscores_, size_t(E) * K16 * K16 * sizeof(float), cudaMemcpyDeviceToHost,
                         stream_),
         "draft scores");
+}
+
+void Engine::draft_propose(int anchor, int B, bool graph) {
+  pin_->draft_ids[0] = anchor;
+  for (int i = 1; i < B; ++i) pin_->draft_ids[i] = draft_->config().mask_token;
+  if (graph) run_graph(draft_graph_, "draft", [&] { draft_launch(B); });
+  else draft_launch(B);
   check(cudaStreamSynchronize(stream_), "draft");
+}
+
+void Engine::verify_launch(int V, int K) {
+  const ModelConfig& c = model_->config();
+  forward(pin_->rows, V, Pass::Verify);
+  kernels::topk_rows(logits_dev_, V, c.vocab, K, topk_scratch_, vals_dev_, ids_out_dev_, stream_);
+  if (K > 1)
+    check(cudaMemcpyAsync(pin_->topk_vals, vals_dev_, size_t(V) * K * sizeof(float), cudaMemcpyDeviceToHost, stream_),
+          "topk");
+  check(cudaMemcpyAsync(pin_->topk_ids, ids_out_dev_, size_t(V) * K * sizeof(int), cudaMemcpyDeviceToHost, stream_),
+        "topk");
+}
+
+void Engine::commit_launch(int n) {
+  NvtxRange range("commit");
+  commit(n);
+  draft_materialize(n, dpos(), 0);
 }
 
 std::vector<int> Engine::speculate(int anchor, const SamplingParams& p) {
   if (!can_speculate(p)) throw std::runtime_error("speculate: unsupported sampling parameters or no drafter");
-  const ModelConfig& c = model_->config();
   const int room = opts_.max_context - pos_;
   if (room < 1) throw std::runtime_error("context is longer than max_context");
   const int B = std::min(opts_.draft_block, room);
@@ -234,6 +319,9 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p) {
     step(anchor);
     return {sample(logits_, p, history_)};
   }
+  // Graphs have the block's shape and the drafter's chain; a short block at the context's end or a lookup
+  // chain runs eagerly. Either way the same kernels run, so the result is the same.
+  const bool graph = graphs_ && B == opts_.draft_block && !(opts_.lookup_mode == 2);
   const int K16 = draft_->config().selector_top_k;
   int E = B - 1;
   if (p.seed != 0) rng_.seed(p.seed + history_.size());
@@ -255,15 +343,21 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p) {
     rows.insert(rows.end(), lp.tokens.begin(), lp.tokens.end());
     E = static_cast<int>(lp.tokens.size());
   }
+  if (graph) {  // the position every graph of this step reads
+    pin_->pos = pos_;
+    check(cudaMemcpyAsync(pos_dev_, &pin_->pos, sizeof(int), cudaMemcpyHostToDevice, stream_), "position");
+  }
 
   // 1. Draft, and walk the selector's lattice (SGLang's sample_path).
   if (!use_lookup) {
-  draft_propose(anchor, B);
+  draft_propose(anchor, B, graph);
+  const int* cand_host = pin_->cand;
+  const float* scores_host = pin_->scores;
   rows.resize(B);
   q.assign(E, std::vector<double>(K16, 0.0));
   int prev = 0;
   for (int e = 0; e < E; ++e) {
-    const float* s = scores_host_.data() + (size_t(e) * K16 + (e == 0 ? 0 : prev)) * K16;
+    const float* s = scores_host + (size_t(e) * K16 + (e == 0 ? 0 : prev)) * K16;
     int pick = 0;
     if (greedy) {
       for (int k = 1; k < K16; ++k)
@@ -287,7 +381,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p) {
         }
       }
     }
-    rows[e + 1] = cand_host_[size_t(e) * K16 + pick];
+    rows[e + 1] = cand_host[size_t(e) * K16 + pick];
     prev = pick;
   }
   }
@@ -295,36 +389,36 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p) {
   auto t1 = std::chrono::steady_clock::now();
   spec_stats_.draft_seconds += std::chrono::duration<double>(t1 - t0).count();
 
-  // 2. Verify.
-  forward(rows.data(), V, Pass::Verify);
+  // 2. Verify, with each row's top K (the argmax when greedy) on the GPU.
+  const int K = greedy ? 1 : p.top_k;
+  std::copy(rows.begin(), rows.end(), pin_->rows);
+  if (graph) {
+    cudaGraphExec_t& g = verify_graphs_[K];
+    run_graph(g, "verify", [&] { verify_launch(V, K); });
+  } else {
+    verify_launch(V, K);
+  }
+  check(cudaStreamSynchronize(stream_), "verify");
 
   // 3. Accept.
   int accepted = 0, next = 0;
   if (greedy) {
-    std::vector<int> am(V);
-    kernels::topk_rows(logits_dev_, V, c.vocab, 1, topk_scratch_, vals_dev_, ids_out_dev_, stream_);
-    check(cudaMemcpyAsync(am.data(), ids_out_dev_, V * sizeof(int), cudaMemcpyDeviceToHost, stream_), "argmax");
-    check(cudaStreamSynchronize(stream_), "verify");
+    const int* am = pin_->topk_ids;
     while (accepted < E && rows[accepted + 1] == am[accepted]) ++accepted;
     next = am[accepted];
   } else {
-    const int K = p.top_k;
-    std::vector<float> vals(size_t(V) * K);
-    std::vector<int> ids(size_t(V) * K);
-    kernels::topk_rows(logits_dev_, V, c.vocab, K, topk_scratch_, vals_dev_, ids_out_dev_, stream_);
-    check(cudaMemcpyAsync(vals.data(), vals_dev_, vals.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_), "topk");
-    check(cudaMemcpyAsync(ids.data(), ids_out_dev_, ids.size() * sizeof(int), cudaMemcpyDeviceToHost, stream_), "topk");
-    check(cudaStreamSynchronize(stream_), "verify");
+    const float* vals = pin_->topk_vals;
+    const int* ids = pin_->topk_ids;
     auto q_of = [&](int e, int token) {  // the draft's probability of `token` at drafted position e
       if (use_lookup) return token == rows[e + 1] ? 1.0 : 0.0;  // a deterministic proposal
       double qt = 0;
-      const int* cand = cand_host_.data() + size_t(e) * K16;
+      const int* cand = pin_->cand + size_t(e) * K16;
       for (int k = 0; k < K16; ++k)
         if (cand[k] == token) qt += q[e][k];
       return qt;
     };
     std::vector<Dist> P(V);
-    for (int i = 0; i < V; ++i) P[i] = target_dist(vals.data() + size_t(i) * K, ids.data() + size_t(i) * K, K, p);
+    for (int i = 0; i < V; ++i) P[i] = target_dist(vals + size_t(i) * K, ids + size_t(i) * K, K, p);
     const auto [acc, tok] = accept_sampled(P, std::vector<int>(rows.begin() + 1, rows.end()), q_of, rng_);
     accepted = acc;
     next = tok;
@@ -334,10 +428,11 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p) {
 
   // 4. Commit the anchor and the accepted drafts.
   const int n = accepted + 1;
-  {
-    NvtxRange range("commit");
-    commit(n);
-    draft_materialize(n, pos_, 0);
+  if (graph) {
+    if (commit_graphs_.size() < size_t(V) + 1) commit_graphs_.resize(size_t(V) + 1, nullptr);
+    run_graph(commit_graphs_[n], "commit", [&] { commit_launch(n); });
+  } else {
+    commit_launch(n);
   }
   history_.insert(history_.end(), rows.begin(), rows.begin() + n);
   pos_ += n;

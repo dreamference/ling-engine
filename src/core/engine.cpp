@@ -82,6 +82,9 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   xq2_ = alloc<uint8_t>(M * c.intermediate / 2);  // the FFN's fused gate/up output (the down projection's input)
   xsf2_ = alloc<uint8_t>(M * c.intermediate / 16);
   ids_dev_ = alloc<int>(M);
+  pos_dev_ = alloc<int>(1);
+  check(cudaHostAlloc(reinterpret_cast<void**>(&pin_), sizeof(StepPinned), cudaHostAllocDefault), "pinned step buffers");
+  kernels::prepare_kernels();  // attributes are set here, never inside a graph capture
 
   // Head-major KV caches: one KV head's keys are one contiguous stream for the attention kernels.
   kernels::set_kv_layout(size_t(opts_.max_context) * c.head_dim, c.head_dim);
@@ -107,9 +110,22 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   logits_.resize(c.vocab);
   profile_ = std::getenv("LING_PROFILE") != nullptr;
   rng_.seed(std::random_device{}());
+  // Step graphs: asked for by the options or LING_STEP_GRAPHS, and only where nothing inside a step would
+  // synchronize (LING_PROFILE's per-phase timing) or allocate (LING_KSPLIT's split-K buffer) while capturing.
+  bool graphs = opts_.step_graphs;
+  if (const char* e = std::getenv("LING_STEP_GRAPHS")) graphs = std::atoi(e) != 0;
+  const char* ksplit = std::getenv("LING_KSPLIT");
+  if (graphs && (profile_ || (ksplit && std::atoi(ksplit) != 0))) {
+    std::fprintf(stderr, "step graphs off: LING_PROFILE or LING_KSPLIT is set\n");
+    graphs = false;
+  }
+  graphs_ = graphs && draft_ != nullptr;
+  if (graphs_) std::fprintf(stderr, "step graphs on\n");
 }
 
 Engine::~Engine() {
+  clear_graphs();
+  if (pin_) cudaFreeHost(pin_);
   if (profile_) {
     for (const auto& [phase, sec] : phase_seconds_) std::fprintf(stderr, "profile %-24s %8.3f s\n", phase.c_str(), sec);
   }
@@ -157,6 +173,7 @@ uint64_t Engine::state_hash() {
 
 void Engine::set_draft_block(int b) {
   if (b < 2 || b > kernels::kMaxStreamRows) throw std::runtime_error("draft block must be in [2, 32]");
+  if (b != opts_.draft_block) clear_graphs();  // they were captured for the old block
   opts_.draft_block = b;
 }
 
@@ -290,6 +307,8 @@ void Engine::linear_bf16(const Bf16Weight& w, const float* x, int M, float* y) {
     kernels::bf16_rows(x, M, w.w, y, w.N, w.K, stream_);
     return;
   }
+  // cuBLAS would need a preset workspace inside a graph capture; no step matrix takes this path.
+  if (use_dev_pos_) throw std::runtime_error("cuBLAS inside a step graph");
   kernels::to_bf16(x, x_bf16_, M * w.K, stream_);
   kernels::gemm_bf16_cublas(cublas_, x_bf16_, M, w.w, y, w.N, w.K);
 }
@@ -299,6 +318,8 @@ void Engine::linear_bf16_cublas(const Bf16Weight& w, const float* x, int M, floa
     kernels::bf16_rows(x, M, w.w, y, w.N, w.K, stream_);
     return;
   }
+  // cuBLAS would need a preset workspace inside a graph capture; no step matrix takes this path.
+  if (use_dev_pos_) throw std::runtime_error("cuBLAS inside a step graph");
   kernels::to_bf16(x, x_bf16_, M * w.K, stream_);
   kernels::gemm_bf16_cublas(cublas_, x_bf16_, M, w.w, y, w.N, w.K);
 }
@@ -352,14 +373,15 @@ void Engine::forward(const int* ids, int M, Pass pass, int keep_at) {
       NvtxRange r("attention");
       linear_fp8_multi({{&L.q, q_gate_}, {&L.k, k_}, {&L.v, v_}}, xn_, M, xn_half);
       mark("attn_proj");
-      kernels::attn_prepare(q_gate_, k_, v_, L.q_norm, L.k_norm, pos_, M, c.heads, c.kv_heads, c.head_dim,
+      kernels::attn_prepare(q_gate_, k_, v_, L.q_norm, L.k_norm, dpos(), M, c.heads, c.kv_heads, c.head_dim,
                             c.rotary_dim, c.rope_theta, c.eps, q_, gate_, kcache_[slot], vcache_[slot], stream_);
       // Fixed key ranges at fixed positions for every pass (row-invariant), in slices of queries that
-      // bound the partial results' scratch.
+      // bound the partial results' scratch. A captured graph launches the ranges of the whole context.
       for (int q0 = 0; q0 < M; q0 += kAttnSlice) {
         const int n = std::min(kAttnSlice, M - q0);
-        kernels::attention_rows(q_ + size_t(q0) * qsize, kcache_[slot], vcache_[slot], pos_ + q0, n, c.heads,
-                                c.kv_heads, c.head_dim, attn_scratch_, attn_ + size_t(q0) * qsize, stream_);
+        kernels::attention_rows(q_ + size_t(q0) * qsize, kcache_[slot], vcache_[slot], dpos(q0), n, c.heads,
+                                c.kv_heads, c.head_dim, attn_scratch_, attn_ + size_t(q0) * qsize, stream_,
+                                use_dev_pos_ ? opts_.max_context : 0);
       }
       if (quantized_) {
         kernels::sigmoid_mul_fp8(attn_, gate_, size_t(M) * qsize, L.o.in_scale, xq_, stream_);
