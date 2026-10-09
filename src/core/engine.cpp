@@ -181,12 +181,42 @@ void Engine::restore_snapshot() {
 void Engine::linear_fp4(const Fp4Weight& w, const float* x, int M, float* y, bool x_ready) {
   if (M <= kernels::kMaxStreamRows) {  // the rows path: stream the weights once for every row
     if (!x_ready) kernels::to_half_rows(x, M, w.K, xh_, xinv_, stream_);
-    kernels::stream_gemm_nvfp4(xh_, xinv_, M, w.w, w.scale, w.scale2, y, w.N, w.K, stream_);
+    kernels::stream_gemm_nvfp4(xh_, xinv_, M, w.w, nullptr, w.scale2, y, w.N, w.K, stream_);
     return;
   }
-  kernels::dequant_nvfp4(w.w, w.scale, w.scale2, w_bf16_, w.N, w.K, stream_);
+  kernels::dequant_tiled_nvfp4(w.w, w.scale2, w_bf16_, w.N, w.K, stream_);
   kernels::to_bf16(x, x_bf16_, M * w.K, stream_);
   kernels::gemm_bf16_cublas(cublas_, x_bf16_, M, w_bf16_, y, w.N, w.K);
+}
+
+void Engine::linear_fp4_multi(std::initializer_list<std::pair<const Fp4Weight*, float*>> ws, const float* x, int M) {
+  if (M > kernels::kMaxStreamRows) {
+    for (const auto& [w, y] : ws) linear_fp4(*w, x, M, y);
+    return;
+  }
+  kernels::StreamTarget t[4];
+  int n = 0, K = 0;
+  for (const auto& [w, y] : ws) {
+    t[n++] = {w->w, nullptr, w->scale2, y, w->N};
+    K = w->K;
+  }
+  kernels::to_half_rows(x, M, K, xh_, xinv_, stream_);
+  kernels::stream_gemm_multi(true, xh_, xinv_, M, t, n, K, stream_);
+}
+
+void Engine::linear_fp8_multi(std::initializer_list<std::pair<const Fp8Weight*, float*>> ws, const float* x, int M) {
+  if (M > kernels::kMaxStreamRows) {
+    for (const auto& [w, y] : ws) linear_fp8(*w, x, M, y);
+    return;
+  }
+  kernels::StreamTarget t[4];
+  int n = 0, K = 0;
+  for (const auto& [w, y] : ws) {
+    t[n++] = {w->w, nullptr, w->scale, y, w->N};
+    K = w->K;
+  }
+  kernels::to_half_rows(x, M, K, xh_, xinv_, stream_);
+  kernels::stream_gemm_multi(false, xh_, xinv_, M, t, n, K, stream_);
 }
 
 void Engine::linear_bf16(const Bf16Weight& w, const float* x, int M, float* y) {
@@ -209,7 +239,7 @@ void Engine::linear_fp8(const Fp8Weight& w, const float* x, int M, float* y, boo
     kernels::stream_gemm_fp8(xh_, xinv_, M, w.w, w.scale, y, w.N, w.K, stream_);
     return;
   }
-  kernels::dequant_fp8(w.w, w.scale, w_bf16_, w.N, w.K, stream_);
+  kernels::dequant_tiled_fp8(w.w, w.scale, w_bf16_, w.N, w.K, stream_);
   kernels::to_bf16(x, x_bf16_, M * w.K, stream_);
   kernels::gemm_bf16_cublas(cublas_, x_bf16_, M, w_bf16_, y, w.N, w.K);
 }
@@ -241,9 +271,7 @@ void Engine::forward(const int* ids, int M, Pass pass) {
     kernels::rmsnorm(h_, L.input_norm, xn_, M, H, c.eps, true, stream_);
     if (L.full) {
       NvtxRange r("attention");
-      linear_fp8(L.q, xn_, M, q_gate_);
-      linear_fp8(L.k, xn_, M, k_, true);
-      linear_fp8(L.v, xn_, M, v_, true);
+      linear_fp8_multi({{&L.q, q_gate_}, {&L.k, k_}, {&L.v, v_}}, xn_, M);
       mark("attn_proj");
       kernels::attn_prepare(q_gate_, k_, v_, L.q_norm, L.k_norm, pos_, M, c.heads, c.kv_heads, c.head_dim,
                             c.rotary_dim, c.rope_theta, c.eps, q_, gate_, kcache_[slot], vcache_[slot], stream_);
@@ -264,8 +292,7 @@ void Engine::forward(const int* ids, int M, Pass pass) {
       float* mixed = verify ? v_post_[slot] : mixed_;
       float* g = verify ? v_g_[slot] : g_;
       float* beta = verify ? v_beta_[slot] : beta_;
-      linear_fp8(L.in_qkv, xn_, M, verify ? v_pre_[slot] : mixed);
-      linear_fp8(L.in_z, xn_, M, z_, true);
+      linear_fp8_multi({{&L.in_qkv, verify ? v_pre_[slot] : mixed}, {&L.in_z, z_}}, xn_, M);
       linear_bf16(L.in_a, xn_, M, a_);
       linear_bf16(L.in_b, xn_, M, b_);
       mark("gdn_proj");
@@ -292,8 +319,7 @@ void Engine::forward(const int* ids, int M, Pass pass) {
     {
       NvtxRange r("mlp");
       kernels::rmsnorm(h_, L.post_norm, xn_, M, H, c.eps, true, stream_);
-      linear_fp4(L.gate, xn_, M, t1_);
-      linear_fp4(L.up, xn_, M, t2_, true);
+      linear_fp4_multi({{&L.gate, t1_}, {&L.up, t2_}}, xn_, M);
       kernels::silu_mul(t1_, t2_, t1_, M * I, stream_);
       linear_fp4(L.down, t1_, M, t2_);
       kernels::add_inplace(h_, t2_, M * H, stream_);

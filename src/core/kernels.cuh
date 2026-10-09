@@ -31,14 +31,38 @@ void gemv_bf16(const float* x, int M, const __nv_bfloat16* w, float* y, int N, i
 // Row-invariant: a row's result is bit-for-bit the same whatever M is, so a token verified in a block of
 // 16 gets exactly the numbers it would get decoded alone.
 constexpr int kMaxStreamRows = 32;
+// The weights stream_gemm reads are tiled (SPEC.md §8, stage 4): each (16-row tile, 128-value chunk) is
+// one contiguous block in the order the warp's lanes read it, so every load covers 512 contiguous bytes
+// (measured: the row-major pattern reads at 215 GB/s, contiguous blocks at 232). NVFP4 blocks carry
+// their E4M3 scales after the values. N % 16 == 0 and K % 128 == 0.
+size_t tiled_bytes_nvfp4(int N, int K);
+size_t tiled_bytes_fp8(int N, int K);
+void retile_nvfp4(const uint8_t* w, const uint8_t* wscale, uint8_t* out, int N, int K, cudaStream_t s);
+void retile_fp8(const uint8_t* w, uint8_t* out, int N, int K, cudaStream_t s);
+// Tiled weights -> BF16 row-major [N][K] (the prefill path's cuBLAS input).
+void dequant_tiled_nvfp4(const uint8_t* tw, float scale2, __nv_bfloat16* out, int N, int K, cudaStream_t s);
+void dequant_tiled_fp8(const uint8_t* tw, float wscale, __nv_bfloat16* out, int N, int K, cudaStream_t s);
+
 // x [M][K] FP32 -> FP16 with a power-of-two scale per row (xinv[m] undoes it).
 void to_half_rows(const float* x, int M, int K, __half* out, float* xinv, cudaStream_t s);
-// y[M][N] = scale2 * x . W^T, W NVFP4 as for gemv_nvfp4. K must be a multiple of 128.
+// y[M][N] = scale2 * x . W^T, W NVFP4 in the tiled layout (wscale is unused: the scales are in the blob).
 void stream_gemm_nvfp4(const __half* x, const float* xinv, int M, const uint8_t* w, const uint8_t* wscale,
                        float scale2, float* y, int N, int K, cudaStream_t s);
-// y[M][N] = wscale * x . W^T, W FP8 E4M3 [N][K]. K must be a multiple of 128.
+// y[M][N] = wscale * x . W^T, W FP8 E4M3 in the tiled layout.
 void stream_gemm_fp8(const __half* x, const float* xinv, int M, const uint8_t* w, float wscale, float* y, int N,
                      int K, cudaStream_t s);
+
+// Several matrices that share the input x, in one launch (fewer launch ramps and tails): each target
+// gets y = scale * x . W^T. Row-invariant like the single-matrix calls, and bit-identical to them.
+struct StreamTarget {
+  const uint8_t* w;
+  const uint8_t* wscale;  // NVFP4 block scales (nullptr for FP8)
+  float scale;            // NVFP4 global scale, or the FP8 per-tensor scale
+  float* y;
+  int N;
+};
+void stream_gemm_multi(bool nvfp4, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K,
+                       cudaStream_t s);
 
 // Top-K (K <= 64) of each row of x [rows][V]: values descending, ties to the lower index (so entry 0 is
 // what std::max_element returns). `scratch` needs topk_scratch_floats(rows, K) floats.

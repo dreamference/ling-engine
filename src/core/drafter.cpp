@@ -75,10 +75,12 @@ DraftModel::DraftModel(const std::string& dir) {
   auto fp4 = [&](const std::string& prefix) {
     Fp4Weight w;
     const TensorView& t = ck.get(prefix + ".weight");
+    const TensorView& sc = ck.get(prefix + ".weight_scale");
+    if (t.dtype != "U8" || sc.dtype != "F8_E4M3") throw std::runtime_error(prefix + ": not NVFP4");
     w.N = static_cast<int>(t.shape[0]);
     w.K = static_cast<int>(t.shape[1] * 2);
-    w.w = static_cast<const uint8_t*>(upload(prefix + ".weight", "U8"));
-    w.scale = static_cast<const uint8_t*>(upload(prefix + ".weight_scale", "F8_E4M3"));
+    w.w = upload_tiled(t, &sc, w.N, w.K, &bytes_);
+    allocations_.push_back(const_cast<uint8_t*>(w.w));
     const TensorView& s2 = ck.get(prefix + ".weight_scale_2");
     if (s2.dtype != "F32" || s2.bytes != 4) throw std::runtime_error(prefix + ".weight_scale_2 is not an F32 scalar");
     std::memcpy(&w.scale2, s2.data, 4);
