@@ -371,6 +371,28 @@ M0 produces the numbers every later target is restated against (plus the five me
 
 **Status (9 October 2026).** M0 is done ([reports/M0.md](reports/M0.md)). M1 is done ([reports/M1.md](reports/M1.md)): exact speculation with the DFlash2 drafter, 45.5 tokens/s on the replay, 97% of production's decode. Prefill came next, ahead of M2's tree speculation, by the maintainer's choice ([reports/M2-prefill.md](reports/M2-prefill.md)): from M4, the prompt template of section 12 (ling-serve's prompts are now token-identical to production's on 396 replayed requests), FP4 prefill (section 11's numerics: NVFP4 activations for the FFN, FP8 for the projections, on block-scaled tensor cores; 2,640 / 2,580 / 2,110 tokens/s at 1K / 8K / 35K tokens against production's 2,140-2,460 / 1,930 / 1,680) and shared-prefix checkpoints (a new session resumes after the shared system message). The DeltaNet prefill runs the chunked form in 32-token chunks rather than 64, the KV cache stays BF16, and prefill attention is the rows path's tensor-core kernel. Open: M2's tree speculation, M3, the rest of M4 (paged FP8 KV, images, batches of 2-4) and M5.
 
+**Agreement gate (standing, from 9 October 2026).** It replaces the 98.6% top-1 target on validate_v0.py's six prompts, whose 288 tokens cannot detect a change smaller than about 4.5 points ([reports/M2-prefill.md](reports/M2-prefill.md) section 6). Measured with `bench/agreement/` on 54 prompts (validate_v0.py's six, 24 short chat prompts, 24 replayed agent prompts), teacher-forced on production's greedy 48-token continuation, against production at concurrency 1 with a cold cache; a flip is a position where the engine's top token scores strictly below production's top:
+
+- flip rate ≤ 2.6% (production's own decode against its own prefill on the same inputs);
+- every flip's gap (production's top against the engine's choice) ≤ 1.75 nats;
+- top-5 agreement 100%;
+- no late concentration of flips by position in the continuation or by prompt length;
+- tool-name match on the 24 agent prompts' first answers ≥ production's match with itself;
+- exact-argument match judged only against production's match with itself (13 of 24 when measured).
+
+M1 measured 2.25%, M2 2.65% (66 flips against production's 65); every other line passes for both.
+
+**Exactness policy.** The engine's numerics are the exact path: decode and verify on the rows path, prefill as M2 built it. Every non-exact mode (a change of numerics, not of speed) sits behind a switch and is off by default. One may become the default only if:
+
+- mean KL(exact engine ‖ mode) ≤ 0.0008 nats (twice production's own warm-against-cold spread at concurrency 1);
+- the KL shows no growth with position at 25K and at 64K tokens of context;
+- top-5 agreement with the exact engine is 100%;
+- tool calls on the 24 replayed agent prompts are no worse;
+- `--spec-check` and `--prefix-check` are bit-exact within the mode;
+- a SWE-bench night is no worse.
+
+BF16 prefill intermediates may be built behind a switch now. FP8 KV (§16.10) and the all-NVFP4 projections (§16.2) wait until the exact engine has beaten SGLang in a night.
+
 **Backlog (9 October 2026).** The surveys of 9 October are merged and ranked in [reports/backlog-2026-10-09.md](reports/backlog-2026-10-09.md); only measured wins move from it into this spec.
 
 ## 15. Risks and open questions
