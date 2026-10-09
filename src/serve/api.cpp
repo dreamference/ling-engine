@@ -11,6 +11,7 @@ namespace {
 const std::string kThinkEnd = "</think>";
 const std::string kCallOpen = "<tool_call>";
 const std::string kCallClose = "</tool_call>";
+const std::string kFunctionOpen = "<function=";
 
 // Longest suffix of `s` that is a proper prefix of `tag` (text that might still become the tag).
 size_t partial_tag(const std::string& s, const std::string& tag) {
@@ -150,6 +151,63 @@ OutputParser::Delta OutputParser::push(const std::string& text) {
 
 OutputParser::Delta OutputParser::finish() { return drain(true); }
 
+void OutputParser::FenceTracker::feed(const std::string& text) {
+  for (char c : text) {
+    if (c == '\n') {
+      end_line();
+      continue;
+    }
+    if (indent_ && (c == ' ' || c == '\t')) continue;
+    if (indent_) {
+      indent_ = false;
+      if (c == '`' || c == '~') {
+        run_char_ = c;
+        run_len_ = 1;
+        in_run_ = true;
+      } else {
+        tail_ = true;
+      }
+      continue;
+    }
+    if (in_run_ && c == run_char_) {
+      ++run_len_;
+      continue;
+    }
+    in_run_ = false;
+    if (c != ' ' && c != '\t' && c != '\r') tail_ = true;
+  }
+}
+
+void OutputParser::FenceTracker::end_line() {
+  if (run_len_ >= 3) {
+    if (!open_) {  // an opening fence may carry an info string ("```xml")
+      open_ = true;
+      fence_char_ = run_char_;
+      fence_len_ = run_len_;
+    } else if (run_char_ == fence_char_ && run_len_ >= fence_len_ && !tail_) {
+      open_ = false;
+    }
+  }
+  indent_ = true;
+  run_char_ = 0;
+  run_len_ = 0;
+  in_run_ = tail_ = false;
+}
+
+void OutputParser::emit_content(Delta& d, const std::string& text) {
+  d.content += text;
+  fence_.feed(text);
+}
+
+bool OutputParser::offered(const std::string& function) const {
+  for (const json& t : tools_) {
+    if (!t.is_object()) continue;
+    const json& fn = t.contains("function") && t["function"].is_object() ? t["function"] : t;
+    if (fn.value("name", "") == function) return true;
+  }
+  return false;
+}
+
 OutputParser::Delta OutputParser::drain(bool final) {
   Delta d;
   while (!buf_.empty()) {
@@ -174,28 +232,43 @@ OutputParser::Delta OutputParser::drain(bool final) {
     if (!buf_.empty()) skip_newlines_ = 0;
     if (buf_.empty()) break;
     if (tools_.is_array() && !tools_.empty()) {
-      size_t open = buf_.find(kCallOpen);
-      if (open != std::string::npos) {
-        d.content += buf_.substr(0, open);
-        size_t close = buf_.find(kCallClose, open);
-        if (close == std::string::npos) {
-          buf_.erase(0, open);
-          if (final) {  // an unterminated call: hand it back as text
-            d.content += buf_;
-            buf_.clear();
-          }
-          break;
-        }
-        const std::string block = buf_.substr(open + kCallOpen.size(), close - open - kCallOpen.size());
-        buf_.erase(0, close + kCallClose.size());
-        if (auto call = parse_call(block)) d.tool_calls.push_back(*call);
-        else d.content += kCallOpen + block + kCallClose;
+      const size_t open = buf_.find(kCallOpen);
+      if (open == std::string::npos) {
+        const size_t hold = final ? 0 : partial_tag(buf_, kCallOpen);
+        emit_content(d, buf_.substr(0, buf_.size() - hold));
+        buf_.erase(0, buf_.size() - hold);
+        break;
+      }
+      emit_content(d, buf_.substr(0, open));
+      buf_.erase(0, open);
+      // buf_ starts with the marker. It opens a call only outside a code fence and when `<function=`
+      // follows it (after whitespace); otherwise it is quoted text, released at once rather than held
+      // until the end of the answer.
+      const size_t after = buf_.find_first_not_of(" \t\r\n", kCallOpen.size());
+      const std::string next = after == std::string::npos ? std::string() : buf_.substr(after, kFunctionOpen.size());
+      const bool call_follows = next == kFunctionOpen;
+      const bool may_follow = !call_follows && next.size() < kFunctionOpen.size() &&
+                              kFunctionOpen.compare(0, next.size(), next) == 0;
+      if (fence_.open() || (!call_follows && !(may_follow && !final))) {
+        emit_content(d, kCallOpen);
+        buf_.erase(0, kCallOpen.size());
         continue;
       }
-      const size_t hold = final ? 0 : partial_tag(buf_, kCallOpen);
-      d.content += buf_.substr(0, buf_.size() - hold);
-      buf_.erase(0, buf_.size() - hold);
-      break;
+      if (!call_follows) break;  // too little text yet to tell
+      const size_t close = buf_.find(kCallClose);
+      if (close == std::string::npos) {
+        if (final) {  // an unterminated call: hand it back as text
+          emit_content(d, buf_);
+          buf_.clear();
+        }
+        break;
+      }
+      const std::string block = buf_.substr(kCallOpen.size(), close - kCallOpen.size());
+      buf_.erase(0, close + kCallClose.size());
+      auto call = parse_call(block);
+      if (call && offered(call->name)) d.tool_calls.push_back(*call);
+      else emit_content(d, kCallOpen + block + kCallClose);  // not a call to anything the request offered
+      continue;
     }
     d.content += buf_;
     buf_.clear();
@@ -224,7 +297,13 @@ std::optional<ToolCall> OutputParser::parse_call(const std::string& block) const
     size_t pend = block.find('>', p);
     if (pend == std::string::npos) break;
     const std::string name = strip(block.substr(p + popen.size(), pend - p - popen.size()));
-    size_t vend = block.find(pclose, pend);
+    // A value ends at its </parameter>. One the model left open ends where the next parameter starts on
+    // a line of its own, as the template writes them (vllm#57699), so it cannot swallow its neighbour;
+    // markup inside a value that is not at a line start stays part of the value. A last value left open
+    // ends at </function>.
+    const size_t close = block.find(pclose, pend);
+    const size_t next = block.find("\n" + popen, pend);
+    size_t vend = std::min(close, next);
     if (vend == std::string::npos) vend = block.find("</function>", pend);
     if (vend == std::string::npos) vend = block.size();
     std::string value = block.substr(pend + 1, vend - pend - 1);
@@ -233,7 +312,7 @@ std::optional<ToolCall> OutputParser::parse_call(const std::string& block) const
     const std::string converted = convert_value(call.name, name, value);
     json parsed = json::parse(converted, nullptr, false);
     args[name] = parsed.is_discarded() ? json(value) : parsed;
-    pos = vend + pclose.size();
+    pos = vend == close ? close + pclose.size() : vend;
   }
   call.arguments = args.dump();
   return call;

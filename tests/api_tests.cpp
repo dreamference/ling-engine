@@ -160,7 +160,19 @@ int main() {
     EXPECT(d.tool_calls.size() == 1);
     if (d.tool_calls.size() == 1) {
       json args = json::parse(d.tool_calls[0].arguments);
-      KNOWN(args["workdir"] == "/tmp" && args.contains("timeout_ms") && args["timeout_ms"] == 5);
+      EXPECT(args["workdir"] == "/tmp" && args.contains("timeout_ms") && args["timeout_ms"] == 5);
+    }
+  }
+  {
+    // ... while parameter markup inside a closed value, not at a line start, stays part of the value.
+    OutputParser p(false, edit_tools);
+    auto d = feed(p,
+                  "<tool_call>\n<function=edit>\n<parameter=path>\na.md\n</parameter>\n<parameter=new_string>\n"
+                  "write <parameter=x> to name one\n</parameter>\n</function>\n</tool_call>");
+    EXPECT(d.tool_calls.size() == 1);
+    if (d.tool_calls.size() == 1) {
+      json args = json::parse(d.tool_calls[0].arguments);
+      EXPECT(args["path"] == "a.md" && args["new_string"] == "write <parameter=x> to name one");
     }
   }
   {
@@ -185,7 +197,15 @@ int main() {
                   "Wrap calls in `<tool_call>` tags.\n<tool_call>\n<function=shell>\n<parameter=command>\n[\"pwd\"]\n"
                   "</parameter>\n</function>\n</tool_call>");
     EXPECT(d.tool_calls.size() == 1);
-    KNOWN(d.content == "Wrap calls in `<tool_call>` tags.\n");
+    EXPECT(d.content == "Wrap calls in `<tool_call>` tags.\n");
+  }
+  {
+    // vllm#56658, streaming: the text after a literal marker is released as it arrives, not held back
+    // until the end of the answer.
+    OutputParser p(false, tools);
+    std::string seen;
+    for (char c : std::string("Use `<tool_call>` here, then more text")) seen += p.push(std::string(1, c)).content;
+    EXPECT(seen.find("`<tool_call>` here, then more") != std::string::npos);
   }
   {
     // vllm#57541: an example inside a markdown code fence is text, not a call.
@@ -194,16 +214,27 @@ int main() {
         "</tool_call>\n```\nThat is the format.";
     OutputParser p(false, tools);
     auto d = feed(p, text);
-    KNOWN(d.tool_calls.empty() && d.content == text);
+    EXPECT(d.tool_calls.empty() && d.content == text);
+  }
+  {
+    // A tilde fence counts too, and a real call after the fence has closed is still a call.
+    OutputParser p(false, tools);
+    auto d = feed(p,
+                  "~~~\n<tool_call>\n<function=shell>\n</function>\n</tool_call>\n~~~\nNow for real:\n<tool_call>\n"
+                  "<function=shell>\n<parameter=command>\n[\"ls\"]\n</parameter>\n</function>\n</tool_call>");
+    EXPECT(d.tool_calls.size() == 1);
+    EXPECT(d.content.find("~~~\n<tool_call>\n<function=shell>\n</function>\n</tool_call>\n~~~\nNow for real:") == 0);
   }
   {
     // vllm#58147: a call to a function the request did not offer (here the template's own placeholder)
     // is not executed as a tool call.
     OutputParser p(false, tools);
-    auto d = feed(p,
-                  "<tool_call>\n<function=function_name>\n<parameter=parameter_name>\nvalue\n</parameter>\n</function>\n"
-                  "</tool_call>");
-    KNOWN(d.tool_calls.empty());
+    const std::string text =
+        "<tool_call>\n<function=function_name>\n<parameter=parameter_name>\nvalue\n</parameter>\n</function>\n"
+        "</tool_call>";
+    auto d = feed(p, text);
+    EXPECT(d.tool_calls.empty());
+    EXPECT(d.content == text);  // handed back as text, nothing lost
   }
   {
     // vllm#58147: tool-call markup quoted inside the reasoning never becomes a call. (The opposite
