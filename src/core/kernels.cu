@@ -298,7 +298,8 @@ __global__ void embed_kernel(const __nv_bfloat16* __restrict__ table, const int*
   for (int h = threadIdx.x; h < H; h += blockDim.x) out[static_cast<size_t>(m) * H + h] = __bfloat162float(row[h]);
 }
 
-__global__ void rmsnorm_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+// Up to 1024 threads: the bound keeps a Debug (-G) build within the register file at that size.
+__global__ void __launch_bounds__(1024) rmsnorm_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w,
                                float* __restrict__ out, int H, float eps, bool gemma) {
   pdl_begin();  // first statement: see launch.cuh
   __shared__ float red[32];
