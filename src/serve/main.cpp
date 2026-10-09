@@ -650,7 +650,7 @@ class Factory : public proxygen::RequestHandlerFactory {
 int main(int argc, char** argv) {
   std::string model_dir, host = "0.0.0.0", name;
   int port = 8000, max_context = 65536, draft_block = 16, lookup = 1, lookup_min = 8;
-  std::string draft_dir;
+  std::string draft_dir, pretokenizer = "production";
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -669,20 +669,27 @@ int main(int argc, char** argv) {
     else if (a == "--draft-block") draft_block = std::stoi(next());
     else if (a == "--lookup") lookup = std::stoi(next());
     else if (a == "--lookup-min") lookup_min = std::stoi(next());
+    else if (a == "--pretokenizer") pretokenizer = next();
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]] [--pretokenizer production|checkpoint]\n";
     return 2;
   }
   int fake_argc = 1;
   char** fake_argv = argv;
   folly::Init init(&fake_argc, &fake_argv, false);
 
-  ling::Tokenizer tok(model_dir + "/tokenizer.json");
+  // Prompts are tokenized as production tokenizes them (tokenizer.hpp, kProductionPretokenizer) unless
+  // --pretokenizer checkpoint asks for the checkpoint's own pattern.
+  if (pretokenizer != "production" && pretokenizer != "checkpoint") {
+    std::cerr << "--pretokenizer is production or checkpoint\n";
+    return 2;
+  }
+  ling::Tokenizer tok(model_dir + "/tokenizer.json", pretokenizer == "production" ? ling::kProductionPretokenizer : "");
   ling::EngineOptions opts;
   opts.max_context = max_context;
   opts.draft_dir = draft_dir;

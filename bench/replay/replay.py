@@ -10,7 +10,10 @@ each session; the window's first request is reported separately as a cold reques
 Usage:
   replay.py --url http://127.0.0.1:8000 --tools tools.json --out run.jsonl \
             [--sessions-file sel.txt | rollouts...] [--window 12] [--concurrency 1]
-            [--greedy] [--max-requests N]
+            [--greedy] [--max-requests N] [--dump-bodies FILE]
+
+--dump-bodies writes every request body (one JSON object per line) instead of sending it, so the
+prompt-rendering test (bench/render/) sees exactly the requests a replay sends.
 
 Per request it records: input and cached tokens, output tokens, time to first token, total time
 and decode tokens/s. Around the run it reads /metrics, so accepted tokens per verify step come
@@ -145,6 +148,7 @@ def main():
     ap.add_argument("--effort", default="none", help="reasoning effort; puffin sends none")
     ap.add_argument("--max-out", type=int, default=0, help="override the recorded output cap")
     ap.add_argument("--label", default="")
+    ap.add_argument("--dump-bodies", help="write the request bodies to this file and send nothing")
     a = ap.parse_args()
 
     tools_plain = json.load(open(a.tools))
@@ -167,6 +171,29 @@ def main():
             s = min(int(a.start), len(reqs) - w)
         jobs.append((p, instr, reqs, list(range(s, s + w))))
 
+    def body_of(p, instr, rq):
+        rec_out = int(rq["usage"].get("output_tokens") or 0)
+        body = {
+            "model": a.model, "instructions": instr,
+            "input": [clean_item(x) for x in rq["input"]],
+            "tools": tools_plain if "index-off" in p else tools_index, "tool_choice": "auto", "parallel_tool_calls": True,
+            "reasoning": {"effort": a.effort, "summary": "auto"},
+            "store": False, "stream": True,
+            "max_output_tokens": a.max_out or max(rec_out, 1),
+        }
+        if a.greedy:
+            body["temperature"] = 0.0
+        return body
+
+    if a.dump_bodies:
+        with open(a.dump_bodies, "w") as f:
+            for p, instr, reqs, idxs in jobs:
+                for k, i in enumerate(idxs):
+                    f.write(json.dumps({"session": p.split("/")[-1], "req": i, "cold": k == 0,
+                                        "rec_in": reqs[i]["usage"].get("input_tokens"),
+                                        "body": body_of(p, instr, reqs[i])}) + "\n")
+        return 0
+
     out = open(a.out, "w")
     lock = threading.Lock()
     queue = list(jobs)
@@ -182,17 +209,7 @@ def main():
             for k, i in enumerate(idxs):
                 rq = reqs[i]
                 rec_out = int(rq["usage"].get("output_tokens") or 0)
-                body = {
-                    "model": a.model, "instructions": instr,
-                    "input": [clean_item(x) for x in rq["input"]],
-                    "tools": tools_plain if "index-off" in p else tools_index, "tool_choice": "auto", "parallel_tool_calls": True,
-                    "reasoning": {"effort": a.effort, "summary": "auto"},
-                    "store": False, "stream": True,
-                    "max_output_tokens": a.max_out or max(rec_out, 1),
-                }
-                if a.greedy:
-                    body["temperature"] = 0.0
-                res = send(a.url, body)
+                res = send(a.url, body_of(p, instr, rq))
                 rec = {"label": a.label, "worker": wid, "session": p.split("/")[-1], "req": i,
                        "cold": k == 0, "t_wall": time.time(),
                        "rec_in": rq["usage"].get("input_tokens"),
