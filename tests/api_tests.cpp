@@ -130,7 +130,7 @@ int main() {
     const std::string tail = "<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
     EXPECT(t.size() >= tail.size() && t.compare(t.size() - tail.size(), tail.size(), tail) == 0);
   }
-  // Bug classes from SGLang's and vLLM's trackers (reports/engine-issues-2026-10-09.md, SPEC "Known
+  // Bug classes from SGLang's and vLLM's trackers (reports/engine-issues-2026-10-09.md, specs/DREAMFERENCE_LING_ENGINE_VALIDATION.md §18 "Known
   // pitfalls"). Each block names the upstream issue it guards against.
   const json edit_tools = json::parse(R"([{"type":"function","function":{"name":"edit","parameters":{"type":"object",
     "properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}}}}}])");

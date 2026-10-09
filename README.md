@@ -6,7 +6,7 @@ Decoding Qwen3.8-27B on a DGX Spark is bound by its 273 GB/s memory bus, not by 
 
 The spec is built on Mightling's measured workload, not a chat benchmark: in 168 recorded agent sessions, 92% of the wall time is the model, a request writes 177 tokens on average (mostly tool-call arguments), and 46% of what the agent writes is copied from its own context. On that workload today's production server (SGLang with the DFlash2 drafter) decodes about 30 tokens/s at ~160 ms per speculative step, against a weight pass that should take about 90 ms.
 
-**Spec:** [SPEC.md](SPEC.md) (8 October 2026) · analysis scripts in [`bench/`](bench/)
+**Spec:** [specs/](specs/README.md) (8 October 2026, split into documents on 9 October) · analysis scripts in [`bench/`](bench/)
 
 ## The plan in brief
 

@@ -1,4 +1,4 @@
-// The context-lookup draft source (SPEC.md §10): agents copy (file contents into patches, names into
+// The context-lookup draft source (specs/DREAMFERENCE_LING_ENGINE_SPECULATION.md §10): agents copy (file contents into patches, names into
 // commands, earlier tool calls into new ones), so the continuation of the most recent earlier occurrence
 // of the last few tokens is often what comes next. Costs microseconds on the host.
 #pragma once

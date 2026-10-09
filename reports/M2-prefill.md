@@ -2,7 +2,7 @@
 
 October 9, 2026 · measured on the development GB10 (`second-puffin`) against production's SGLang on the same machine (M0's reference container, production flags). Recorded sessions are replayed locally and never leave it; only aggregates are reported.
 
-SPEC §14 puts FP4 prefill and shared-prefix checkpoints in M4 and tree speculation in M2. M1 left decode at 97% of production and a whole request at twice production's time because of v0's prefill, so prefill came first; tree speculation (the spec's M2) is still open, and M1 §6 already measured its lookup half at +4% at best.
+../specs/DREAMFERENCE_LING_ENGINE_MILESTONES.md §14 puts FP4 prefill and shared-prefix checkpoints in M4 and tree speculation in M2. M1 left decode at 97% of production and a whole request at twice production's time because of v0's prefill, so prefill came first; tree speculation (the spec's M2) is still open, and M1 §6 already measured its lookup half at +4% at best.
 
 ## Summary
 
@@ -41,7 +41,7 @@ v0's prefill dequantized every weight matrix to BF16 for each 2,048-token chunk 
 
 ### Numerics: production's quantization
 
-SPEC §11 prescribes it and the checkpoint carries what it needs: every NVFP4 and FP8 matrix has an `input_scale`. The prefill path now quantizes activations exactly as production's SGLang does (`modelopt_quant.py`):
+../specs/DREAMFERENCE_LING_ENGINE_SESSIONS.md §11 prescribes it and the checkpoint carries what it needs: every NVFP4 and FP8 matrix has an `input_scale`. The prefill path now quantizes activations exactly as production's SGLang does (`modelopt_quant.py`):
 
 - **NVFP4 matrices (the FFN):** activations rounded to BF16, then NVFP4 with one E4M3 scale per 16 values, `scale = E4M3(gscale * amax / 6)`, global scale `1 / input_scale`; `alpha = input_scale * weight_scale_2`.
 - **FP8 matrices (the projections):** static per-tensor `x / input_scale`, saturated E4M3; `alpha = input_scale * weight_scale`.
@@ -59,7 +59,7 @@ Decode and verify keep M1's rows path (FP16 activations, exact weights), so spec
 | FFN gate (N 17,408, K 5,120) | 325 TFLOPS | 230 TFLOPS (262 with up fused, below) |
 | FFN down (N 5,120, K 17,408) | 262 TFLOPS | 287 TFLOPS |
 
-But CUTLASS reads B K-major with its own blocked scale-factor layout, and the weights exist once, in M1's tiled layout (each 16-row x 128-value block contiguous, scales beside the values), which the decode kernels read and which measured +5-6% end to end. Using CUTLASS means a second copy of the FFN weights in its layout: ~10.7 GB on a ~57 GB budget (SPEC §12), for a gain on the gate that the fused SwiGLU GEMM below mostly recovers. Our kernel reads the tiled blocks directly.
+But CUTLASS reads B K-major with its own blocked scale-factor layout, and the weights exist once, in M1's tiled layout (each 16-row x 128-value block contiguous, scales beside the values), which the decode kernels read and which measured +5-6% end to end. Using CUTLASS means a second copy of the FFN weights in its layout: ~10.7 GB on a ~57 GB budget (../specs/DREAMFERENCE_LING_ENGINE_INTEGRATION.md §12), for a gain on the gate that the fused SwiGLU GEMM below mostly recovers. Our kernel reads the tiled blocks directly.
 
 **Fusions.** The FFN's gate and up run as one GEMM whose epilogue applies SwiGLU and writes the down projection's NVFP4 input (2.8 ms at 2,048 tokens, against 4.5 ms for two GEMMs writing FP32 and a separate SwiGLU-and-quantize pass; byte-identical output). RMSNorm, the DeltaNet's gated norm and the attention's sigmoid gate write the next GEMM's quantized input directly; the out-projections add into the residual stream in the GEMM epilogue.
 
@@ -90,7 +90,7 @@ M1 resumed only from the end of the previous prompt: right for a session's next 
 ling-serve runs one sequence; its KV cache holds the tokens of the last request. Prefill now keeps states besides the end of the last prompt: the DeltaNet and conv state at the end of the first two messages (the system message, then the first user message) and at multiples of 2,048 tokens up to 32K, in 8 slots of ~157 MB, the earliest positions kept when they run out. A new prompt resumes from the furthest kept state inside its common prefix with the cache. Three details:
 
 - **Positions are multiples of 32,** the DeltaNet chunk: the end-of-prompt state is kept at the last multiple of 32, and up to 31 tokens are prefilled again. Resuming there computes exactly what a prefill from scratch does.
-- **Memory.** The eight slots and the end-of-prompt state take 1.4 GB; the prefill path's quantized-activation buffers ~60 MB and the attention partials ~0.1 GB at 64K context. That is ~1.5 GB over M1's footprint, inside SPEC §12's 2 GB shared-prefix store.
+- **Memory.** The eight slots and the end-of-prompt state take 1.4 GB; the prefill path's quantized-activation buffers ~60 MB and the attention partials ~0.1 GB at 64K context. That is ~1.5 GB over M1's footprint, inside ../specs/DREAMFERENCE_LING_ENGINE_INTEGRATION.md §12's 2 GB shared-prefix store.
 - **The drafter's context.** It attends to the last 2,048 positions; resuming at a position inside that window needs its context KV from the window's start, which the engine now tracks (`dkv_lo_`), and otherwise resumes further back.
 
 `ling-run --prefix-check` prefills a sequence of replayed prompts (three turns of one session, two of another, a third session, back to the first), each after the previous one and again from scratch, and compares the states: all identical, bit for bit, along with the next token. The cross-session prompts resume at 11,360-11,488 tokens (the system message's end); the next turn of a session resumes at the previous prompt's end.

@@ -1,4 +1,4 @@
-// Speculative decoding with the DFlash2 drafter (SPEC.md §10, lever 2), as SGLang's DFLASH path runs it
+// Speculative decoding with the DFlash2 drafter (specs/DREAMFERENCE_LING_ENGINE_SPECULATION.md §10, lever 2), as SGLang's DFLASH path runs it
 // (models/dflash.py, speculative/dflash_worker_v2.py).
 //
 // One step from an anchor (the token chosen from the last logits, not yet processed by the target):

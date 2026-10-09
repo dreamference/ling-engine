@@ -2,7 +2,7 @@
 
 Each test names the upstream issue(s) it guards against, the input that triggered their bug, and the
 check that would have caught it. The survey and the table of issues are in
-reports/engine-issues-2026-10-09.md; SPEC.md's "Known pitfalls" maps each class to its test.
+reports/engine-issues-2026-10-09.md; specs/DREAMFERENCE_LING_ENGINE_VALIDATION.md §18 ("Known pitfalls") maps each class to its test.
 
 They need a running ling-serve (see conftest.py: LING_SERVE_URL, and the server must say it is
 ling-engine); without one every test skips. Tests marked xfail are known gaps: ling-serve does not do
@@ -238,7 +238,7 @@ def test_penalties_ignore_prompt_tokens(server, penalty):
 
 @pytest.mark.parametrize("top_k", [-1, 0])
 def test_untruncated_sampling_is_not_degenerate(server, top_k):
-    """sglang#36537 and production's own FlashInfer bug (SPEC section 12: the completions canary).
+    """sglang#36537 and production's own FlashInfer bug (specs/DREAMFERENCE_LING_ENGINE_INTEGRATION.md §12: the completions canary).
 
     Their bug: sampling with top_p 1 and no top_k (the completions default) returned token 0, '!', for
     every step; elsewhere a kernel picked on SM12x looped on token 0 with thinking + tools. Check: an

@@ -34,7 +34,7 @@ October 9, 2026 · a survey of 12 months of SGLang's and vLLM's GitHub issues (O
    - `tests/server/`: 49 HTTP test cases in 29 functions, following `bench/serve_smoke.py`'s way of reaching the server. 13 of the 49 are expected failures that state the right behaviour. Without a reachable ling-serve that names itself `ling-engine`, all of them skip. Checked here: they collect, and they skip with no server and against a stub that claims to be another engine.
    - `tests/api_tests.cpp`: 13 CPU cases. Six of them are `KNOWN(...)` gaps, which print but do not fail. **These were not compiled**: no builds run on this machine.
 
-5. **SPEC.md** gains section 18, *Known pitfalls*, and section 19, *Backlog from user requests*.
+5. **The specification** gains section 18, *Known pitfalls*, and section 19, *Backlog from user requests* (since the split of 2026-10-09: `specs/DREAMFERENCE_LING_ENGINE_VALIDATION.md` and `specs/DREAMFERENCE_LING_ENGINE_BACKLOG.md`).
 
 ## 1. Method and counts
 
@@ -110,7 +110,7 @@ Production's FlashInfer bug was the same symptom.
 - `Engine::sample` has no finiteness check. `max_element` over NaN is unordered, and `std::discrete_distribution` with NaN weights is undefined.
 - Nothing stops a NaN state from being saved as a prefix checkpoint and then reused by every later session.
 
-**What is needed:** a guard that ends the request with an error and a counter, and never saves a non-finite checkpoint (SPEC §18).
+**What is needed:** a guard that ends the request with an error and a counter, and never saves a non-finite checkpoint (../specs/DREAMFERENCE_LING_ENGINE_VALIDATION.md §18).
 
 **Tests:**
 - `degenerate()` checks in the boundary, conversation, long non-English and untruncated-sampling tests;
