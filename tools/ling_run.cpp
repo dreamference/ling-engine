@@ -12,7 +12,8 @@
 //
 // --graph-check decodes each prompt speculatively twice from the same prefill, without and with step graphs,
 // greedily and then sampling (--temperature, default 1, top-k 20, top-p 0.95, seeded by --seed or 1), and
-// checks that the tokens and the recurrent state are the same both ways, bit for bit. --seed N seeds sampling.
+// checks that the tokens, the recurrent state (bit for bit) and the steps and accepted drafts (which would show a
+// wrong drafter context KV) are the same both ways. --seed N seeds sampling.
 //
 // --spec decodes with the DFlash2 drafter. --spec-check (greedy) decodes each prompt plainly and then
 // speculatively, and checks that the tokens are identical and that the recurrent state after the
@@ -194,19 +195,27 @@ int main(int argc, char** argv) {
           gp.temperature = sampled ? (temperature > 0.f ? temperature : 1.f) : 0.f;
           gp.seed = seed ? seed : 1;
           double t_eager = 0, t_graph = 0;
+          // The steps and accepted drafts must match too: the commit also writes the drafter's context KV, which
+          // neither the tokens (the verify corrects every draft) nor the state hash would show if it were wrong.
           engine.set_step_graphs(false);
+          engine.reset_spec_stats();
           const std::vector<int> eager = generate(prompt, gp, true, true, &t_eager);
           const uint64_t h_eager = engine.state_hash();
+          const long steps_eager = engine.spec_stats().steps, acc_eager = engine.spec_stats().accepted;
           engine.set_step_graphs(true);
           if (!engine.step_graphs()) throw std::runtime_error("--graph-check: step graphs are unavailable");
+          engine.reset_spec_stats();
           const std::vector<int> graph = generate(prompt, gp, true, true, &t_graph);
           const uint64_t h_graph = engine.state_hash();
+          const long steps_graph = engine.spec_stats().steps, acc_graph = engine.spec_stats().accepted;
           const bool same = eager == graph, state = h_eager == h_graph;
-          failures += !same + !state;
-          std::printf("prompt %zu tokens, %s: eager %zu tokens %.2f tok/s | graphs %zu tokens %.2f tok/s | tokens %s, "
-                      "state %s\n",
-                      prompt.size(), sampled ? "sampled" : "greedy", eager.size(), eager.size() / t_eager, graph.size(),
-                      graph.size() / t_graph, same ? "identical" : "DIFFER", state ? "identical" : "DIFFERS");
+          const bool accept = steps_eager == steps_graph && acc_eager == acc_graph;
+          failures += !same + !state + !accept;
+          std::printf("prompt %zu tokens, %s: eager %zu tokens %.2f tok/s, %ld steps %ld accepted | graphs %zu tokens "
+                      "%.2f tok/s, %ld steps %ld accepted | tokens %s, state %s, acceptance %s\n",
+                      prompt.size(), sampled ? "sampled" : "greedy", eager.size(), eager.size() / t_eager, steps_eager,
+                      acc_eager, graph.size(), graph.size() / t_graph, steps_graph, acc_graph,
+                      same ? "identical" : "DIFFER", state ? "identical" : "DIFFERS", accept ? "identical" : "DIFFERS");
           if (!same) {
             size_t i = 0;
             while (i < eager.size() && i < graph.size() && eager[i] == graph[i]) ++i;
