@@ -53,6 +53,10 @@ struct Metrics {
   double accepted_drafts = 0, drafted = 0;
   double nonfinite = 0;  // requests ended because the logits were not finite
   SpecStats spec;  // the engine's speculation counters after the last request
+  // Gauges the benchmark harness reads (its admission and its parallelism): requests running and
+  // queued (one runs at a time, the rest wait), and the token pool a night's tasks are budgeted
+  // against (one resident history today, so the context size; several sessions later, SESSIONS §11).
+  int running = 0, queued = 0, max_total_tokens = 0;
 
   json spec_json() {
     std::lock_guard<std::mutex> l(mu);
@@ -91,6 +95,15 @@ struct Metrics {
     counter("ling:spec_drafted_tokens_total", drafted, "Drafted tokens offered to the verify.");
     counter("ling:spec_accepted_tokens_total", accepted_drafts, "Drafted tokens accepted.");
     counter("ling:nonfinite_logits_total", nonfinite, "Requests ended because the logits were NaN or inf.");
+    auto gauge = [&](const char* name, double v, const char* help) {
+      out += std::string("# HELP ") + name + " " + help + "\n# TYPE " + name + " gauge\n";
+      char buf[64];
+      std::snprintf(buf, sizeof buf, "%.6f", v);
+      out += std::string(name) + lab + " " + buf + "\n";
+    };
+    gauge("sglang:num_running_reqs", running, "Requests being generated (at most one).");
+    gauge("sglang:num_queue_reqs", queued, "Requests waiting for the engine.");
+    gauge("sglang:max_total_num_tokens", max_total_tokens, "Tokens the resident history can hold (the context size).");
     return out;
   }
 };
@@ -144,6 +157,10 @@ class Worker {
       std::lock_guard<std::mutex> l(mu_);
       queue_.push_back(std::move(job));
     }
+    {
+      std::lock_guard<std::mutex> l(ctx_.metrics.mu);
+      ctx_.metrics.queued += 1;
+    }
     cv_.notify_one();
   }
 
@@ -158,6 +175,18 @@ class Worker {
         job = std::move(queue_.front());
         queue_.pop_front();
       }
+      {
+        std::lock_guard<std::mutex> l(ctx_.metrics.mu);
+        ctx_.metrics.queued -= 1;
+        ctx_.metrics.running = 1;
+      }
+      struct Done {  // the gauge drops however generate() ends
+        ServerContext& ctx;
+        ~Done() {
+          std::lock_guard<std::mutex> l(ctx.metrics.mu);
+          ctx.metrics.running = 0;
+        }
+      } done_guard{ctx_};
       try {
         generate(job);
       } catch (const ContextOverflow& e) {
@@ -799,6 +828,7 @@ int main(int argc, char** argv) {
   ctx.engine = &engine;
   ctx.tok = &tok;
   ctx.im_end = tok.token_id("<|im_end|>");
+  ctx.metrics.max_total_tokens = max_context;
   ctx.think_end = tok.token_id("</think>");
   {
     const std::vector<int> one = tok.encode("\n"), two = tok.encode("\n\n");

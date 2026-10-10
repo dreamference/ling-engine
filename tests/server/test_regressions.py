@@ -612,6 +612,37 @@ def test_responses_reasoning_tokens_counted(server):
     assert off["usage"]["output_tokens_details"]["reasoning_tokens"] == 0
 
 
+def test_metrics_has_the_harness_gauges(server):
+    """The benchmark harness's admission reads sglang:num_running_reqs and sglang:num_queue_reqs from
+    /metrics and refuses to start while another client's request runs; its parallelism divides
+    sglang:max_total_num_tokens by its per-task budget (API §6). Check: the three gauges are there,
+    running is 1 while a request streams and 0 after, and the pool equals max_model_len."""
+    def gauges():
+        status, text = server.request("/metrics")
+        assert status == 200
+        out = {}
+        for line in text.splitlines():
+            if line.startswith("sglang:num_running_reqs") or line.startswith("sglang:num_queue_reqs") or \
+                    line.startswith("sglang:max_total_num_tokens"):
+                name, value = line.split(" ")[0].split("{")[0], float(line.rsplit(" ", 1)[1])
+                out[name] = value
+        return out
+    idle = gauges()
+    assert set(idle) == {"sglang:num_running_reqs", "sglang:num_queue_reqs", "sglang:max_total_num_tokens"}, idle
+    assert idle["sglang:num_running_reqs"] == 0 and idle["sglang:num_queue_reqs"] == 0
+    assert idle["sglang:max_total_num_tokens"] == server.max_model_len
+    r = server.open_stream("/v1/completions", {"prompt": "Count from one to two hundred, separated by commas: 1, 2, 3,",
+                                               "max_tokens": 300, "temperature": 0, "stream": True})
+    try:
+        r.readline()  # the first chunk: the request is running
+        busy = gauges()
+        assert busy["sglang:num_running_reqs"] == 1, busy
+    finally:
+        r.close()
+    time.sleep(1)
+    assert gauges()["sglang:num_running_reqs"] == 0
+
+
 # --- Errors, limits, cancellation ---------------------------------------------------------------------
 
 
