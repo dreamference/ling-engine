@@ -38,7 +38,7 @@ M1 (56 flips, 2.25%, p = 0.82), `44c92c5` (68, 2.73%, p = 0.43) and M2 (66, 2.65
 - `--spec-check` and `--prefix-check` are bit-exact within the mode;
 - a SWE-bench night is no worse.
 
-BF16 prefill intermediates may be built behind a switch now. FP8 KV (§16.10) and the all-NVFP4 projections (§16.2) wait until the exact engine has beaten SGLang in a night.
+BF16 prefill intermediates may be built behind a switch now. They are: `--prefill-bf16` on `ling-serve` and `ling-run` (`LING_PREFILL_BF16=1`; [CLI §1, §2 and §4](./DREAMFERENCE_LING_ENGINE_CLI.md)) keeps the prefill's DeltaNet intermediates in BF16 (B34), off by default, with `bench/prefill_bf16_check.sh` as the timing and the checks above; its numbers are not yet measured. FP8 KV (§16.10) and the all-NVFP4 projections (§16.2) wait until the exact engine has beaten SGLang in a night.
 
 **Backlog (9 October 2026).** The surveys of 9 October are merged and ranked in [reports/backlog-2026-10-09.md](../reports/backlog-2026-10-09.md); only measured wins move from it into this spec.
 

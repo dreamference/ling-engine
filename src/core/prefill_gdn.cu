@@ -11,6 +11,11 @@
 //     is bound by the per-token dependency chain, not by arithmetic.
 // Each token's conv is computed the same way whatever M is; the recurrence is the same for any split that
 // falls on a multiple of 32 tokens.
+//
+// The kernels are templates over the element type of the tensors they read and write between each other
+// (elem.cuh): float on the exact path, and __nv_bfloat16 behind --prefill-bf16 for the conv's input (the
+// in_qkv projection), the conv's output (the recurrence's input) and the recurrence's output. The conv and
+// recurrent state, g and beta are FP32 in both. The float instantiations are the kernels as they were.
 #include "core/kernels.cuh"
 
 #include <cuda_fp16.h>
@@ -18,6 +23,9 @@
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
+
+#include "core/elem.cuh"
 
 namespace ling::kernels {
 namespace {
@@ -25,33 +33,40 @@ namespace {
 __device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }
 
 // out[t][c] = silu(w0 x[t-3] + w1 x[t-2] + w2 x[t-1] + w3 x[t]), x[-3..-1] from the state window.
-__global__ void conv_prefill_kernel(const float* __restrict__ in, float* __restrict__ out, const float* __restrict__ state,
+template <typename InT, typename OutT>
+__global__ void conv_prefill_kernel(const InT* __restrict__ in, OutT* __restrict__ out, const float* __restrict__ state,
                                     const __nv_bfloat16* __restrict__ w, int M, int C) {
   const size_t n = static_cast<size_t>(M) * C;
   for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n;
        i += static_cast<size_t>(gridDim.x) * blockDim.x) {
     const int t = static_cast<int>(i / C), c = static_cast<int>(i % C);
     float x[4];
+    // The restrict-qualified pointers are indexed here, not through elem.cuh, so the float instantiation keeps
+    // the original kernel's alias information and schedule (its SASS is unchanged).
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       const int tt = t - 3 + j;
-      x[j] = tt >= 0 ? in[static_cast<size_t>(tt) * C + c] : state[c * 3 + 3 + tt];
+      if constexpr (std::is_same_v<InT, float>) x[j] = tt >= 0 ? in[static_cast<size_t>(tt) * C + c] : state[c * 3 + 3 + tt];
+      else x[j] = tt >= 0 ? __bfloat162float(in[static_cast<size_t>(tt) * C + c]) : state[c * 3 + 3 + tt];
     }
     const float o = __bfloat162float(w[c * 4]) * x[0] + __bfloat162float(w[c * 4 + 1]) * x[1] +
                     __bfloat162float(w[c * 4 + 2]) * x[2] + __bfloat162float(w[c * 4 + 3]) * x[3];
-    out[i] = silu(o);
+    if constexpr (std::is_same_v<OutT, float>) out[i] = silu(o);
+    else out[i] = __float2bfloat16(silu(o));
   }
 }
 
 // The window after the first M tokens: the three most recent raw inputs (into `out`, which may be `state`).
-__global__ void conv_window_kernel(const float* __restrict__ in, const float* state, float* out, int M, int C) {
+// With a BF16 input the window holds BF16 values (production's conv state is BF16) in the FP32 state.
+template <typename InT>
+__global__ void conv_window_kernel(const InT* __restrict__ in, const float* state, float* out, int M, int C) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= C) return;
   float s[3];
 #pragma unroll
   for (int j = 0; j < 3; ++j) {
     const int tt = M - 3 + j;
-    s[j] = tt >= 0 ? in[static_cast<size_t>(tt) * C + c] : state[c * 3 + 3 + tt];
+    s[j] = tt >= 0 ? elem::load(in + static_cast<size_t>(tt) * C + c) : state[c * 3 + 3 + tt];
   }
 #pragma unroll
   for (int j = 0; j < 3; ++j) out[c * 3 + j] = s[j];
@@ -123,9 +138,10 @@ __device__ __forceinline__ void frag_b_nk(uint32_t (&b)[2], const __half* base, 
   ldsm2(b, base + (n0 + (lane & 7)) * ld + k0 + 8 * ((lane >> 3) & 1));
 }
 
+template <typename InT, typename OutT>
 __global__ void __launch_bounds__(kChunkThreads)
-    chunk_gdn_kernel(const float* __restrict__ mixed, const float* __restrict__ g, const float* __restrict__ beta,
-                     float* __restrict__ state, float* __restrict__ out, int M, int H, int HV, int phase,
+    chunk_gdn_kernel(const InT* __restrict__ mixed, const float* __restrict__ g, const float* __restrict__ beta,
+                     float* __restrict__ state, OutT* __restrict__ out, int M, int H, int HV, int phase,
                      float* __restrict__ state_at, int at) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
   ChunkSmem& sm = *reinterpret_cast<ChunkSmem*>(smem_raw);
@@ -156,10 +172,10 @@ __global__ void __launch_bounds__(kChunkThreads)
       float4 q4 = make_float4(0.f, 0.f, 0.f, 0.f), k4 = q4, v4 = q4;
       float gv = 0.f, bv = 0.f;
       if (i < n) {
-        const float* row = mixed + static_cast<size_t>(t0 + i) * C;
-        q4 = reinterpret_cast<const float4*>(row + h * kDk)[lane];
-        k4 = reinterpret_cast<const float4*>(row + H * kDk + h * kDk)[lane];
-        v4 = reinterpret_cast<const float4*>(row + 2 * H * kDk + hv * kDv)[lane];
+        const InT* row = mixed + static_cast<size_t>(t0 + i) * C;
+        q4 = elem::load4(row + h * kDk, lane);
+        k4 = elem::load4(row + H * kDk + h * kDk, lane);
+        v4 = elem::load4(row + 2 * H * kDk + hv * kDv, lane);
         gv = g[static_cast<size_t>(t0 + i) * HV + hv];
         bv = beta[static_cast<size_t>(t0 + i) * HV + hv];
       }
@@ -318,8 +334,7 @@ __global__ void __launch_bounds__(kChunkThreads)
       for (int hh = 0; hh < 2; ++hh) {
         const int i = 16 * mf + gq + 8 * hh, c = nf0 + 8 * f + 2 * tq;
         if (i < n)
-          *reinterpret_cast<float2*>(out + static_cast<size_t>(t0 + i) * HV * kDv + hv * kDv + c) =
-              make_float2(O[f][2 * hh], O[f][2 * hh + 1]);
+          elem::store2(out + static_cast<size_t>(t0 + i) * HV * kDv + hv * kDv + c, O[f][2 * hh], O[f][2 * hh + 1]);
       }
 #pragma unroll
     for (int j = 0; j < 8; ++j)
@@ -368,34 +383,58 @@ void check_launch(const char* what) {
   if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
 
+template <typename InT, typename OutT>
+void conv_prefill(const InT* in, OutT* out, float* conv_state, const __nv_bfloat16* w, int M, int C, cudaStream_t s,
+                  float* window_at, int at) {
+  const size_t n = static_cast<size_t>(M) * C;
+  conv_prefill_kernel<InT, OutT><<<static_cast<int>(std::min<size_t>((n + 255) / 256, 48 * 64)), 256, 0, s>>>(
+      in, out, conv_state, w, M, C);
+  check_launch("gdn_conv_prefill");
+  if (window_at && at > 0 && at <= M) {
+    conv_window_kernel<InT><<<(C + 255) / 256, 256, 0, s>>>(in, conv_state, window_at, at, C);
+    check_launch("gdn_conv_window_at");
+  }
+  conv_window_kernel<InT><<<(C + 255) / 256, 256, 0, s>>>(in, conv_state, conv_state, M, C);
+  check_launch("gdn_conv_window");
+}
+
+template <typename InT, typename OutT>
+void recurrent_prefill(const InT* mixed, const float* g, const float* beta, float* state, OutT* out, int M, int H, int HV,
+                       int pos0, cudaStream_t s, float* state_at, int at) {
+  if (M < 1) return;
+  static bool configured = false;  // per instantiation
+  if (!configured) {
+    cudaFuncSetAttribute(chunk_gdn_kernel<InT, OutT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         int(sizeof(ChunkSmem)));
+    configured = true;
+  }
+  if ((pos0 + at) % kT != 0 && state_at) throw std::runtime_error("gdn_recurrent_prefill: state_at must be at a chunk end");
+  chunk_gdn_kernel<InT, OutT><<<HV, kChunkThreads, sizeof(ChunkSmem), s>>>(mixed, g, beta, state, out, M, H, HV,
+                                                                            pos0 % kT, state_at, state_at ? at : -1);
+  check_launch("gdn_recurrent_prefill");
+}
+
 }  // namespace
 
 void gdn_conv_prefill(const float* in, float* out, float* conv_state, const __nv_bfloat16* w, int M, int C,
                       cudaStream_t s, float* window_at, int at) {
-  const size_t n = static_cast<size_t>(M) * C;
-  conv_prefill_kernel<<<static_cast<int>(std::min<size_t>((n + 255) / 256, 48 * 64)), 256, 0, s>>>(in, out, conv_state,
-                                                                                                     w, M, C);
-  check_launch("gdn_conv_prefill");
-  if (window_at && at > 0 && at <= M) {
-    conv_window_kernel<<<(C + 255) / 256, 256, 0, s>>>(in, conv_state, window_at, at, C);
-    check_launch("gdn_conv_window_at");
-  }
-  conv_window_kernel<<<(C + 255) / 256, 256, 0, s>>>(in, conv_state, conv_state, M, C);
-  check_launch("gdn_conv_window");
+  conv_prefill<float, float>(in, out, conv_state, w, M, C, s, window_at, at);
+}
+
+void gdn_conv_prefill_bf16(const __nv_bfloat16* in, __nv_bfloat16* out, float* conv_state, const __nv_bfloat16* w, int M,
+                           int C, cudaStream_t s, float* window_at, int at) {
+  conv_prefill<__nv_bfloat16, __nv_bfloat16>(in, out, conv_state, w, M, C, s, window_at, at);
 }
 
 void gdn_recurrent_prefill(const float* mixed, const float* g, const float* beta, float* state, float* out, int M, int H,
                            int HV, int pos0, cudaStream_t s, float* state_at, int at) {
-  if (M < 1) return;
-  static bool configured = false;
-  if (!configured) {
-    cudaFuncSetAttribute(chunk_gdn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(ChunkSmem)));
-    configured = true;
-  }
-  if ((pos0 + at) % kT != 0 && state_at) throw std::runtime_error("gdn_recurrent_prefill: state_at must be at a chunk end");
-  chunk_gdn_kernel<<<HV, kChunkThreads, sizeof(ChunkSmem), s>>>(mixed, g, beta, state, out, M, H, HV, pos0 % kT,
-                                                                 state_at, state_at ? at : -1);
-  check_launch("gdn_recurrent_prefill");
+  recurrent_prefill<float, float>(mixed, g, beta, state, out, M, H, HV, pos0, s, state_at, at);
+}
+
+void gdn_recurrent_prefill_bf16(const __nv_bfloat16* mixed, const float* g, const float* beta, float* state,
+                                __nv_bfloat16* out, int M, int H, int HV, int pos0, cudaStream_t s, float* state_at,
+                                int at) {
+  recurrent_prefill<__nv_bfloat16, __nv_bfloat16>(mixed, g, beta, state, out, M, H, HV, pos0, s, state_at, at);
 }
 
 }  // namespace ling::kernels

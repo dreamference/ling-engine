@@ -27,6 +27,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "core/elem.cuh"
+
 namespace ling::kernels {
 namespace {
 
@@ -103,6 +105,9 @@ struct GemmArgs {
   float alpha2 = 0.f, gscale_out = 0.f;
   uint8_t* q_out = nullptr;
   uint8_t* sf_out = nullptr;
+  // BF16 output (the OUT_BF16 instantiations, --prefill-bf16): y_bf16 [M][ldy] instead of y, never accumulated.
+  // Last, so the fields above keep their offsets (the FP32 kernels' SASS is unchanged).
+  __nv_bfloat16* y_bf16 = nullptr;
 };
 
 // The weight row behind row r of a block's B tile (block n0 = blockIdx.y * BN). Plain: row n0 + r. SwiGLU:
@@ -249,8 +254,10 @@ __device__ __forceinline__ void compute_stage(const uint8_t* st, float (&acc)[4]
       for (int j = 0; j < NF; ++j) mma<FP4>(acc[i][j], a[s][i], b[s][j][0], b[s][j][1], sfa[s][i], sfb[s][j]);
 }
 
-// The epilogue: alpha * acc into y (or added to it), or SwiGLU straight into NVFP4.
-template <int BN, int STAGES, bool SWIGLU>
+// The epilogue: alpha * acc into y (or added to it), or SwiGLU straight into NVFP4, or (OUT_BF16, the
+// --prefill-bf16 instantiations) alpha * acc rounded to BF16 into y_bf16, as production's FP8 GEMMs write their
+// BF16 output.
+template <int BN, int STAGES, bool SWIGLU, bool OUT_BF16 = false>
 __device__ __forceinline__ void epilogue(const GemmArgs& p, const float (&acc)[4][Shape<BN, STAGES>::kNF][4], int m0, int n0,
                                          int lane, int wm, int wn) {
   constexpr int NF = Shape<BN, STAGES>::kNF, WN = BN / 4;
@@ -289,6 +296,19 @@ __device__ __forceinline__ void epilogue(const GemmArgs& p, const float (&acc)[4
           }
         }
       }
+  } else if constexpr (OUT_BF16) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int row = m0 + wm * 64 + 16 * i + g + 8 * h;
+        if (row >= p.M) continue;
+        __nv_bfloat16* yr = p.y_bf16 + static_cast<size_t>(row) * p.ldy + n0 + wn * WN + 2 * t;
+#pragma unroll
+        for (int j = 0; j < NF; ++j)
+          *reinterpret_cast<__nv_bfloat162*>(yr + 8 * j) =
+              __floats2bfloat162_rn(acc[i][j][2 * h] * p.alpha, acc[i][j][2 * h + 1] * p.alpha);
+      }
   } else {
 #pragma unroll
     for (int i = 0; i < 4; ++i)
@@ -312,7 +332,7 @@ __device__ __forceinline__ void epilogue(const GemmArgs& p, const float (&acc)[4
   }
 }
 
-template <bool FP4, int BN, int STAGES, bool SWIGLU = false>
+template <bool FP4, int BN, int STAGES, bool SWIGLU = false, bool OUT_BF16 = false>
 __global__ void __launch_bounds__(kThreads) prefill_gemm_kernel(GemmArgs p) {
   using S = Shape<BN, STAGES>;
   constexpr int NF = S::kNF;
@@ -343,7 +363,7 @@ __global__ void __launch_bounds__(kThreads) prefill_gemm_kernel(GemmArgs p) {
     compute_stage<FP4, BN, STAGES>(smem + (kt % STAGES) * S::kStageBytes, acc, lane, wm, wn);
   }
   cp_wait<0>();
-  epilogue<BN, STAGES, SWIGLU>(p, acc, m0, n0, lane, wm, wn);
+  epilogue<BN, STAGES, SWIGLU, OUT_BF16>(p, acc, m0, n0, lane, wm, wn);
 }
 
 // ---- Activation quantization, as production's kernels do it (activations are BF16 there, so each value is
@@ -391,11 +411,12 @@ __global__ void quant_nvfp4_kernel(const float* __restrict__ x, const float* __r
 }
 
 // RMSNorm of each row (Gemma's x * rstd * (1 + w)) straight into the next GEMM's encoding, and into FP32 too
-// when `out` is given. One block per row; each thread takes whole groups of four values, so four adjacent
-// lanes hold one NVFP4 block. H % 1024 == 0.
-template <bool FP4>
+// when `out` is given (or into BF16, OutT = __nv_bfloat16: the --prefill-bf16 copy, rounded as the quantizer
+// rounds). One block per row; each thread takes whole groups of four values, so four adjacent lanes hold one
+// NVFP4 block. H % 1024 == 0.
+template <bool FP4, typename OutT = float>
 __global__ void __launch_bounds__(256)
-    norm_quant_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w, float* __restrict__ out, int H,
+    norm_quant_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w, OutT* __restrict__ out, int H,
                       float eps, float scale, uint8_t* __restrict__ q, uint8_t* __restrict__ sf) {
   __shared__ float red[8];
   const size_t r = blockIdx.x;
@@ -419,7 +440,7 @@ __global__ void __launch_bounds__(256)
     float v[4];
 #pragma unroll
     for (int k = 0; k < 4; ++k) v[k] = xs[k] * rstd * (1.f + __bfloat162float(w[4 * i + k]));
-    if (out) reinterpret_cast<float4*>(out + r * H)[i] = make_float4(v[0], v[1], v[2], v[3]);
+    if (out) elem::store4(out + r * H, i, make_float4(v[0], v[1], v[2], v[3]));
 #pragma unroll
     for (int k = 0; k < 4; ++k) v[k] = bf16_round(v[k]);
     const size_t quad = r * (H / 4) + i;
@@ -429,15 +450,17 @@ __global__ void __launch_bounds__(256)
 }
 
 // The DeltaNet output norm (rmsnorm(x) * w * silu(z) per head of D = 128) straight into FP8 for the
-// out-projection: one warp per head row, four values per lane.
-__global__ void gated_norm_fp8_kernel(const float* __restrict__ x, const float* __restrict__ z,
+// out-projection: one warp per head row, four values per lane. InT: the recurrence's output and the z
+// projection, float or (--prefill-bf16) __nv_bfloat16.
+template <typename InT>
+__global__ void gated_norm_fp8_kernel(const InT* __restrict__ x, const InT* __restrict__ z,
                                       const __nv_bfloat16* __restrict__ w, size_t rows, float eps, float inv_scale,
                                       uint8_t* __restrict__ q) {
   const size_t r = blockIdx.x * static_cast<size_t>(blockDim.x / 32) + threadIdx.x / 32;
   if (r >= rows) return;
   const int lane = threadIdx.x & 31;
-  const float4 f = reinterpret_cast<const float4*>(x + r * 128)[lane];
-  const float4 g = reinterpret_cast<const float4*>(z + r * 128)[lane];
+  const float4 f = elem::load4(x + r * 128, lane);
+  const float4 g = elem::load4(z + r * 128, lane);
   float ss = f.x * f.x + f.y * f.y + f.z * f.z + f.w * f.w;
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
@@ -461,11 +484,13 @@ __global__ void sigmoid_mul_fp8_kernel(const float* __restrict__ x, const float*
   }
 }
 
-// Four values per thread: E4M3(x / input_scale), saturated to +-448.
-__global__ void quant_fp8_kernel(const float* __restrict__ x, size_t quads, float inv_scale, uint8_t* __restrict__ q) {
+// Four values per thread: E4M3(x / input_scale), saturated to +-448. InT = __nv_bfloat16 (--prefill-bf16)
+// reads the BF16 copy of the norm, which the BF16 rounding below leaves as it is.
+template <typename InT>
+__global__ void quant_fp8_kernel(const InT* __restrict__ x, size_t quads, float inv_scale, uint8_t* __restrict__ q) {
   for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < quads;
        i += static_cast<size_t>(gridDim.x) * blockDim.x) {
-    const float4 f = reinterpret_cast<const float4*>(x)[i];
+    const float4 f = elem::load4(x, i);
     const float v[4] = {bf16_round(f.x) * inv_scale, bf16_round(f.y) * inv_scale, bf16_round(f.z) * inv_scale,
                         bf16_round(f.w) * inv_scale};
     uint32_t w = 0;
@@ -478,15 +503,17 @@ __global__ void quant_fp8_kernel(const float* __restrict__ x, size_t quads, floa
 
 // Narrow BF16 matrices (the DeltaNet a and b projections, 48 rows each) on tensor cores: a one-warp block
 // takes 16 rows of x and a quarter of the 2N output columns (blockIdx.y), m16n8k16 MMAs over K in order. x is
-// rounded to BF16 (production's activations). A row's result does not depend on M.
+// rounded to BF16 (production's activations), or (InT = __nv_bfloat16, --prefill-bf16) is BF16 already: the
+// same fragments either way. A row's result does not depend on M.
+template <typename InT>
 __global__ void __launch_bounds__(32)
-    narrow_bf16_kernel(const float* __restrict__ x, int M, const __nv_bfloat16* __restrict__ wa,
+    narrow_bf16_kernel(const InT* __restrict__ x, int M, const __nv_bfloat16* __restrict__ wa,
                        const __nv_bfloat16* __restrict__ wb, float* __restrict__ ya, float* __restrict__ yb, int N, int K) {
   constexpr int NF = 3;  // n8 fragments per block: 4 column groups x 3 x 8 = 96 = 2 x 48 columns
   const int lane = threadIdx.x & 31, warp = blockIdx.y, g = lane >> 2, t = lane & 3;
   const int r0 = blockIdx.x * 16;
-  const float* xa = x + static_cast<size_t>(min(r0 + g, M - 1)) * K;
-  const float* xb = x + static_cast<size_t>(min(r0 + g + 8, M - 1)) * K;
+  const InT* xa = x + static_cast<size_t>(min(r0 + g, M - 1)) * K;
+  const InT* xb = x + static_cast<size_t>(min(r0 + g + 8, M - 1)) * K;
   const __nv_bfloat16* wrow[NF];
 #pragma unroll
   for (int j = 0; j < NF; ++j) {
@@ -495,14 +522,10 @@ __global__ void __launch_bounds__(32)
   }
   float acc[NF][4] = {};
   for (int k = 0; k < K; k += 16) {
-    auto pack = [](float2 v) {
-      const __nv_bfloat162 h = __floats2bfloat162_rn(v.x, v.y);
-      return *reinterpret_cast<const uint32_t*>(&h);
-    };
-    const uint32_t a0 = pack(*reinterpret_cast<const float2*>(xa + k + 2 * t));
-    const uint32_t a1 = pack(*reinterpret_cast<const float2*>(xb + k + 2 * t));
-    const uint32_t a2 = pack(*reinterpret_cast<const float2*>(xa + k + 8 + 2 * t));
-    const uint32_t a3 = pack(*reinterpret_cast<const float2*>(xb + k + 8 + 2 * t));
+    const uint32_t a0 = elem::pack_bf16x2(xa + k + 2 * t);
+    const uint32_t a1 = elem::pack_bf16x2(xb + k + 2 * t);
+    const uint32_t a2 = elem::pack_bf16x2(xa + k + 8 + 2 * t);
+    const uint32_t a3 = elem::pack_bf16x2(xb + k + 8 + 2 * t);
 #pragma unroll
     for (int j = 0; j < NF; ++j) {
       const uint32_t b0 = *reinterpret_cast<const uint32_t*>(wrow[j] + k + 2 * t);
@@ -536,17 +559,17 @@ void check_launch(const char* what) {
   if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
 
-template <bool FP4, int BN, int STAGES, bool SWIGLU = false>
+template <bool FP4, int BN, int STAGES, bool SWIGLU = false, bool OUT_BF16 = false>
 void launch_shape(const GemmArgs& p, cudaStream_t s) {
   using S = Shape<BN, STAGES>;
   static bool configured = false;
   if (!configured) {
-    cudaFuncSetAttribute(prefill_gemm_kernel<FP4, BN, STAGES, SWIGLU>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         S::kSmemBytes);
+    cudaFuncSetAttribute(prefill_gemm_kernel<FP4, BN, STAGES, SWIGLU, OUT_BF16>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSmemBytes);
     configured = true;
   }
   const dim3 grid((p.M + kBM - 1) / kBM, (SWIGLU ? 2 * p.N : p.N) / BN);
-  prefill_gemm_kernel<FP4, BN, STAGES, SWIGLU><<<grid, kThreads, S::kSmemBytes, s>>>(p);
+  prefill_gemm_kernel<FP4, BN, STAGES, SWIGLU, OUT_BF16><<<grid, kThreads, S::kSmemBytes, s>>>(p);
 }
 
 // LING_GEMM_SHAPE (experiments): 0 automatic, 1: 128 x 128 x 4 stages, 2: 128 x 256 x 3 stages.
@@ -558,15 +581,15 @@ int gemm_shape() {
   return v;
 }
 
-template <bool FP4>
+template <bool FP4, bool OUT_BF16 = false>
 void launch_gemm(const GemmArgs& p, cudaStream_t s) {
   if (p.N % 128 != 0 || p.K % 128 != 0) throw std::runtime_error("prefill_gemm: N % 128 and K % 128 must be 0");
   if (p.M < 1) return;
   int shape = gemm_shape();
   // 128 x 256 tiles (measured +12-25% on the NVFP4 matrices at 512-2,048 rows) when they still give two waves.
   if (shape == 0) shape = (p.M + kBM - 1) / kBM * (p.N / 256) >= 96 ? 2 : 1;
-  if (shape == 2 && p.N % 256 == 0) launch_shape<FP4, 256, 3>(p, s);
-  else launch_shape<FP4, 128, 4>(p, s);
+  if (shape == 2 && p.N % 256 == 0) launch_shape<FP4, 256, 3, false, OUT_BF16>(p, s);
+  else launch_shape<FP4, 128, 4, false, OUT_BF16>(p, s);
   check_launch(FP4 ? "prefill_gemm_nvfp4" : "prefill_gemm_fp8");
 }
 
@@ -587,8 +610,14 @@ void silu_mul_quant_nvfp4(const float* g, const float* u, int M, int K, float in
 
 void quant_act_fp8(const float* x, int M, int K, float input_scale, uint8_t* q, cudaStream_t s) {
   const size_t quads = static_cast<size_t>(M) * K / 4;
-  quant_fp8_kernel<<<grid_for(quads), 256, 0, s>>>(x, quads, 1.f / input_scale, q);
+  quant_fp8_kernel<float><<<grid_for(quads), 256, 0, s>>>(x, quads, 1.f / input_scale, q);
   check_launch("quant_act_fp8");
+}
+
+void quant_act_fp8_bf16in(const __nv_bfloat16* x, int M, int K, float input_scale, uint8_t* q, cudaStream_t s) {
+  const size_t quads = static_cast<size_t>(M) * K / 4;
+  quant_fp8_kernel<__nv_bfloat16><<<grid_for(quads), 256, 0, s>>>(x, quads, 1.f / input_scale, q);
+  check_launch("quant_act_fp8_bf16in");
 }
 
 void rmsnorm_quant(const float* x, const __nv_bfloat16* w, float* out, int M, int H, float eps, bool nvfp4,
@@ -599,11 +628,26 @@ void rmsnorm_quant(const float* x, const __nv_bfloat16* w, float* out, int M, in
   check_launch("rmsnorm_quant");
 }
 
+void rmsnorm_quant_bf16(const float* x, const __nv_bfloat16* w, __nv_bfloat16* out, int M, int H, float eps, bool nvfp4,
+                        float input_scale, uint8_t* q, uint8_t* sf, cudaStream_t s) {
+  if (H % 1024 != 0) throw std::runtime_error("rmsnorm_quant_bf16: H % 1024 must be 0");
+  if (nvfp4) norm_quant_kernel<true, __nv_bfloat16><<<M, 256, 0, s>>>(x, w, out, H, eps, 1.f / input_scale, q, sf);
+  else norm_quant_kernel<false, __nv_bfloat16><<<M, 256, 0, s>>>(x, w, out, H, eps, 1.f / input_scale, q, nullptr);
+  check_launch("rmsnorm_quant_bf16");
+}
+
 void gated_rmsnorm_fp8(const float* x, const float* z, const __nv_bfloat16* w, int rows, int D, float eps,
                        float input_scale, uint8_t* q, cudaStream_t s) {
   if (D != 128) throw std::runtime_error("gated_rmsnorm_fp8: D must be 128");
-  gated_norm_fp8_kernel<<<(rows + 7) / 8, 256, 0, s>>>(x, z, w, rows, eps, 1.f / input_scale, q);
+  gated_norm_fp8_kernel<float><<<(rows + 7) / 8, 256, 0, s>>>(x, z, w, rows, eps, 1.f / input_scale, q);
   check_launch("gated_rmsnorm_fp8");
+}
+
+void gated_rmsnorm_fp8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* z, const __nv_bfloat16* w, int rows, int D,
+                            float eps, float input_scale, uint8_t* q, cudaStream_t s) {
+  if (D != 128) throw std::runtime_error("gated_rmsnorm_fp8_bf16: D must be 128");
+  gated_norm_fp8_kernel<__nv_bfloat16><<<(rows + 7) / 8, 256, 0, s>>>(x, z, w, rows, eps, 1.f / input_scale, q);
+  check_launch("gated_rmsnorm_fp8_bf16");
 }
 
 void sigmoid_mul_fp8(const float* x, const float* gate, size_t n, float input_scale, uint8_t* q, cudaStream_t s) {
@@ -619,8 +663,15 @@ void prefill_gemm_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8
 void narrow_bf16(const float* x, int M, const __nv_bfloat16* wa, const __nv_bfloat16* wb, float* ya, float* yb, int N,
                  int K, cudaStream_t s) {
   if (2 * N != 96 || K % 16 != 0) throw std::runtime_error("narrow_bf16: built for two 48-row matrices, K % 16 == 0");
-  narrow_bf16_kernel<<<dim3((M + 15) / 16, 4), 32, 0, s>>>(x, M, wa, wb, ya, yb, N, K);
+  narrow_bf16_kernel<float><<<dim3((M + 15) / 16, 4), 32, 0, s>>>(x, M, wa, wb, ya, yb, N, K);
   check_launch("narrow_bf16");
+}
+
+void narrow_bf16_bf16in(const __nv_bfloat16* x, int M, const __nv_bfloat16* wa, const __nv_bfloat16* wb, float* ya,
+                        float* yb, int N, int K, cudaStream_t s) {
+  if (2 * N != 96 || K % 16 != 0) throw std::runtime_error("narrow_bf16: built for two 48-row matrices, K % 16 == 0");
+  narrow_bf16_kernel<__nv_bfloat16><<<dim3((M + 15) / 16, 4), 32, 0, s>>>(x, M, wa, wb, ya, yb, N, K);
+  check_launch("narrow_bf16_bf16in");
 }
 
 void prefill_swiglu_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8_t* gate, float alpha_gate,
@@ -642,6 +693,13 @@ void prefill_swiglu_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uin
 void prefill_gemm_fp8(const uint8_t* xq, int M, const uint8_t* w, float alpha, float* y, int ldy, int N, int K,
                       bool accumulate, cudaStream_t s) {
   launch_gemm<false>(GemmArgs{xq, nullptr, w, alpha, y, ldy, M, N, K, accumulate}, s);
+}
+
+void prefill_gemm_fp8_bf16out(const uint8_t* xq, int M, const uint8_t* w, float alpha, __nv_bfloat16* y, int ldy, int N,
+                              int K, cudaStream_t s) {
+  GemmArgs p{xq, nullptr, w, alpha, nullptr, ldy, M, N, K, false};
+  p.y_bf16 = y;
+  launch_gemm<false, true>(p, s);
 }
 
 }  // namespace ling::kernels
