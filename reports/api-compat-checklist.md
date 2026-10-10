@@ -100,7 +100,7 @@ These are ignored without an error. An error (400) is better than silence until 
 
 | Field | Who sends it | ling-serve | Test |
 | --- | --- | --- | --- |
-| `logprobs`, `top_logprobs` | none of the four by default | ignored | `test_logprobs_are_returned_or_refused` |
+| `logprobs`, `top_logprobs` | none of the four by default | **returned** since 2026-10-10 in vLLM's shapes on both routes (API §3); out-of-range values are a 400 | `test_logprobs_shapes`, `test_logprobs_are_returned_or_refused` |
 | `n > 1` | none | ignored (one choice) | `test_n_is_honoured_or_refused` |
 | `response_format` / `text.format` | Codex `--output-schema`; scripts | ignored | `test_response_format_is_honoured_or_refused` |
 | `tool_choice: "required"` or a named function | none by default | not enforced (a named choice filters the tool list) | `test_tool_choice_required_yields_a_call` |
@@ -120,5 +120,5 @@ For one user on one GB10 with 1–4 agents:
 6. **`reasoning_effort: "none"` on chat completions** is a 400.
 7. **Invalid-JSON arguments in a chat history** are a 400 on every later request ([vllm#47761](https://github.com/vllm-project/vllm/issues/47761) is the same class).
 8. **`reasoning_tokens` is always 0.** Done 2026-10-10.
-9. **Silently ignored controls** (section 6): reject what is not built.
+9. **Silently ignored controls** (section 6): reject what is not built. `logprobs` built 2026-10-10; `n > 1` and `response_format` remain.
 10. **No embeddings or rerank** for Continue's indexing. Probably stays out of scope; document it.

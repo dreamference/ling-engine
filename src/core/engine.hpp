@@ -116,7 +116,11 @@ class Engine {
   // the same distribution (exact rejection sampling).
   bool has_drafter() const { return draft_ != nullptr; }
   bool can_speculate(const SamplingParams& p) const;
-  std::vector<int> speculate(int anchor, const SamplingParams& p);
+  // `row_logits`, when given, receives the raw logits each returned token was chosen from: one row of
+  // config().vocab floats per returned token, in the same order (the verify's rows, which the
+  // row-invariant rows path makes bit for bit what plain decoding gives). Null by default: nothing is
+  // copied off the device beyond each row's top K.
+  std::vector<int> speculate(int anchor, const SamplingParams& p, std::vector<float>* row_logits = nullptr);
   const SpecStats& spec_stats() {
     score_shadow(true);
     return spec_stats_;
