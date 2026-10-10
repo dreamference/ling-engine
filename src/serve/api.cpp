@@ -201,6 +201,12 @@ Request parse_request(const json& body, bool chat) {
     if (kw.contains("reasoning_effort")) opts.reasoning_effort = kw["reasoning_effort"].get<std::string>();
     if (body.contains("reasoning_effort") && body["reasoning_effort"].is_string())
       opts.reasoning_effort = body["reasoning_effort"].get<std::string>();
+    // `none` means thinking off, as `reasoning.effort: "none"` does on /v1/responses (vllm#53284,
+    // vllm#52738): the template knows no such effort and would refuse it.
+    if (opts.reasoning_effort == "none") {
+      opts.reasoning_effort.reset();
+      if (!opts.enable_thinking.has_value()) opts.enable_thinking = false;
+    }
     if (body.contains("tools") && body["tools"].is_array() && body.value("tool_choice", json("auto")) != "none")
       r.tools = canonical_tools(body["tools"], body.contains("tool_choice") ? body["tool_choice"] : json("auto"));
     r.prompt_text = render_chat(production_messages(body["messages"]), r.tools, opts);

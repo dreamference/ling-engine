@@ -27,7 +27,7 @@ ling-serve was checked at `3122b07` in `src/serve/api.cpp` and `src/serve/main.c
 | **Custom (freeform) tools** | Code Mode's `exec` is `{type: "custom", format: {type: "grammar", syntax: "lark", …}}`; history carries `custom_tool_call` / `custom_tool_call_output` | partial since 2026-10-10 (API §4): offered as a one-parameter function, answered as a `custom_tool_call` item with `custom_tool_call_input.delta/.done`; history replays. The grammar is rendered with the description, not enforced. | The patch dialect is the model's choice until the grammar is enforced (BACKLOG §19.13): in the test run of 2026-10-10 the model wrote apply_patch's syntax (`*** Begin Patch` / `*** Add File`) with the grammar rendered, and a unified diff without it. Live under Code Mode (`exec`): the acceptance run of 2026-10-10 passed (three `exec` calls as `custom_tool_call` items; production SGLang never called it). For `apply_patch`, not until the launcher's catalog offers the freeform tool. |
 | Namespace / `web_search` / `tool_search` tools | Codex's own namespaces that patch 0020 does not flatten | ignored | Those tools are invisible to the model |
 | Input items | `message` (user, developer, assistant), `function_call`, `function_call_output`, `reasoning` | ok: developer → system; items of one turn merged as production merges them (test: `api_tests` merge case) | |
-| **Images** | The catalog leaves `input_modalities` at its default (text and image), so a pasted image goes out as `input_image`. `view_image` returns an image inside `function_call_output`. | **refused** (400) for a message image. Inside a tool output, silently reduced to its text. | Codex treats a 400 as terminal: the turn dies. Set `input_modalities: ["text"]` in the launcher catalog now, and answer with a placeholder instead of a 400 until the vision encoder lands (test: `test_image_input_does_not_fail_the_turn`). |
+| **Images** | The catalog leaves `input_modalities` at its default (text and image), so a pasted image goes out as `input_image`. `view_image` returns an image inside `function_call_output`. | ok since 2026-10-10: a message image renders as the placeholder `[image]` (no vision encoder yet), the turn goes on. Inside a tool output, silently reduced to its text. | Codex treats a 400 as terminal, which this closes (test: `test_image_input_does_not_fail_the_turn`). Still open on the launcher's side: set `input_modalities: ["text"]` in the catalog so the image is not sent at all until the vision encoder lands. |
 | SSE events read | `response.created` (id), `output_item.added` / `.done`, `output_text.delta`, `reasoning_text.delta` (needs `content_index`), `reasoning_summary_text.*`, `completed`, `failed`, `incomplete`. `function_call_arguments.delta` is ignored by Codex. | ok (test: `test_responses_stream_event_order`) | |
 | `response.completed.usage` | `input_tokens`, `input_tokens_details.cached_tokens`, `output_tokens`, `output_tokens_details.reasoning_tokens`, `total_tokens` | ok since 2026-10-10: `reasoning_tokens` counted by the engine from the token ids | (test: `test_responses_reasoning_tokens_counted`) |
 | Cut at `max_output_tokens` | `response.incomplete` is a stream error to Codex | ling-serve sends `response.completed` with `status: incomplete`, deliberately | Keep; documented in `generate_responses` |
@@ -45,8 +45,8 @@ Cline is now built on the AI SDK's chat-completions-compatible model, through th
 | `max_tokens` | `min(32000, window − estimate − 1024)` | ok (clamped to the remaining context) | |
 | Sampling | `temperature` only if configured; never `top_p`, `stop` or `seed` | ok (the checkpoint's defaults otherwise) | |
 | Tools | Native `tools[]`; `tool_choice` left to the SDK default; no `parallel_tool_calls` | ok | |
-| `reasoning_effort` | Only when reasoning is switched on, snapped to the model's advertised levels | partial: `none` → **400** on chat completions | Map `none` to thinking off as the Responses path does (test: `test_reasoning_effort_none_chat`, `api_tests`) |
-| Messages | System string; content part arrays; `image_url` data URIs; `role: "tool"` with string content; `reasoning_content` replayed on assistant turns | ok, except **images → 400** | Default model info claims image support |
+| `reasoning_effort` | Only when reasoning is switched on, snapped to the model's advertised levels | ok since 2026-10-10: `none` → thinking off, as the Responses path does | Done (test: `test_reasoning_effort_none_chat`, `api_tests`) |
+| Messages | System string; content part arrays; `image_url` data URIs; `role: "tool"` with string content; `reasoning_content` replayed on assistant turns | ok; an image part renders as `[image]` since 2026-10-10 (no vision encoder) | Default model info claims image support; the model answers from the placeholder and the text around it |
 | Response read | `delta.content`; `delta.reasoning_content` or `delta.reasoning`; `tool_calls` by `index` with `id` and `name`; a `finish_reason`; `usage` with `cached_tokens` | ok (test: `test_stream_chunk_shape`) | |
 | Errors after the stream starts | Expects a status code, or a stream that still ends properly | partial: HTTP 200, then `data: {"error": …}`, then end of stream with **no finish chunk and no `[DONE]`** | Validate before sending headers. Anything after them should end with a finish chunk and `[DONE]`. |
 
@@ -113,11 +113,11 @@ These are ignored without an error. An error (400) is better than silence until 
 For one user on one GB10 with 1–4 agents:
 
 1. **Overflow errors** (section 5). A small change with the largest effect: the agent can compact instead of failing the turn.
-2. **Images refused with 400.** For Codex, a catalog change in the launcher plus a placeholder in ling-serve.
+2. **Images refused with 400.** Done 2026-10-10 in ling-serve: an image part renders as `[image]` on both routes. The launcher's catalog change (`input_modalities: ["text"]`) is still open.
 3. **Stop-list streaming splits UTF-8.** It breaks Continue's autocomplete and OpenHands' fallback on non-ASCII text.
 4. **Custom tools dropped** (Codex Code Mode). Built 2026-10-10 (API §4), partial: the dialect question stays with BACKLOG §19.13.
 5. **Errors after the stream starts** end without a finish chunk or `[DONE]`.
-6. **`reasoning_effort: "none"` on chat completions** is a 400.
+6. **`reasoning_effort: "none"` on chat completions** was a 400. Done 2026-10-10: thinking off, as on the Responses path.
 7. **Invalid-JSON arguments in a chat history** are a 400 on every later request ([vllm#47761](https://github.com/vllm-project/vllm/issues/47761) is the same class).
 8. **`reasoning_tokens` is always 0.** Done 2026-10-10.
 9. **Silently ignored controls** (section 6): reject what is not built.
