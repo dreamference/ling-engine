@@ -26,7 +26,17 @@ struct Request {
   std::vector<std::string> stop;
   bool reasoning = true;            // the prompt ends inside <think> (chat with thinking on)
   json tools = json::array();
+  std::vector<std::string> custom_tools;  // Responses `type: custom` tools, offered as one-parameter functions
 };
+
+// The one parameter a custom (freeform) tool is offered with: the model has no freeform format, so the
+// tool is rendered as a function taking `input` (a string), and the call comes back as a custom_tool_call
+// item whose input is that parameter's text.
+constexpr const char* kCustomToolInput = "input";
+
+// The input of a custom tool call from the arguments the parser produced: the `input` parameter; failing
+// that the single string parameter the model used instead; failing that the arguments text itself.
+std::string custom_tool_input(const std::string& arguments);
 
 // Throws std::invalid_argument with a message for the client.
 Request parse_request(const json& body, bool chat);
