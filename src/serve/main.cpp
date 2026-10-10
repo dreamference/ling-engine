@@ -100,13 +100,22 @@ struct ServerContext {
   Tokenizer* tok = nullptr;
   std::string model_name;
   int im_end = -1;
+  // The token ids that end the thinking span: `</think>`, then the blank line the template puts after it
+  // ("\n\n" as one token, or "\n" twice). -1 when the tokenizer has no such single token.
+  int think_end = -1, newline = -1, blank_line = -1;
   Metrics metrics;
 };
 
 // What a job reports back, called on the engine thread.
 struct JobSink {
   std::function<void(const std::string&)> text;
-  std::function<void(const std::string& finish, int prompt_tokens, int completion_tokens, int cached_tokens)> done;
+  // reasoning_tokens: the thinking span's share of completion_tokens, counted from the token ids as they
+  // are produced (up to and including `</think>` and the blank line after it; every token when the answer
+  // was cut inside the span; 0 with thinking off), so an accepted draft block that crosses `</think>` is
+  // split exactly and the count never exceeds completion_tokens (vllm#49711, sglang#39826).
+  std::function<void(const std::string& finish, int prompt_tokens, int completion_tokens, int cached_tokens,
+                     int reasoning_tokens)>
+      done;
   // The message, and the code the client sees (server_error, or context_length_exceeded).
   std::function<void(const std::string& message, const std::string& code)> error;
 };
@@ -179,7 +188,9 @@ class Worker {
     StreamDecoder dec(*ctx_.tok);
     StopScanner stops(job.req.stop);
     std::string finish = "length";
-    int produced = 0, passes = 0;
+    int produced = 0, passes = 0, reasoning = 0;
+    bool in_think = job.req.reasoning;  // the prompt ends inside <think>
+    int newlines_after_think = 0;       // of the blank line after </think>, still to count
     bool ended_by_eos = false;
     double ttft = -1;
     // `pending` holds chosen tokens not yet emitted: the first from the prefill's logits, then a
@@ -201,6 +212,23 @@ class Worker {
           break;
         }
         ++produced;
+        if (in_think) {
+          ++reasoning;
+          if (t == ctx_.think_end) {
+            in_think = false;
+            newlines_after_think = 2;
+          }
+        } else if (newlines_after_think > 0) {
+          if (t == ctx_.blank_line && newlines_after_think == 2) {
+            ++reasoning;
+            newlines_after_think = 0;
+          } else if (t == ctx_.newline) {
+            ++reasoning;
+            --newlines_after_think;
+          } else {
+            newlines_after_think = 0;
+          }
+        }
         const std::string ready = stops.push(dec.push(t));
         if (!ready.empty()) job.sink.text(ready);
         if (stops.stopped()) {
@@ -256,7 +284,7 @@ class Worker {
                                       " tokens/pass").c_str()
                                    : "");
     job.sink.done(finish == "cancelled" ? "stop" : finish, static_cast<int>(job.prompt.size()), produced,
-                  stats.reused_tokens);
+                  stats.reused_tokens, reasoning);
   }
 
   ServerContext& ctx_;
@@ -457,13 +485,15 @@ class Handler : public proxygen::RequestHandler {
         post(ex, [error, status](proxygen::ResponseHandler* d) { send_json(d, status, error); });
       }
     };
-    job.sink.done = [=](const std::string& finish_in, int prompt_tokens, int completion_tokens, int cached) {
+    job.sink.done = [=](const std::string& finish_in, int prompt_tokens, int completion_tokens, int cached,
+                        int reasoning_tokens) {
       if (chat) deliver(st->parser.finish());
       const std::string finish = !st->calls.empty() && finish_in == "stop" ? "tool_calls" : finish_in;
       json usage = {{"prompt_tokens", prompt_tokens},
                     {"completion_tokens", completion_tokens},
                     {"total_tokens", prompt_tokens + completion_tokens},
                     {"prompt_tokens_details", {{"cached_tokens", cached}}}};
+      if (chat) usage["completion_tokens_details"] = {{"reasoning_tokens", reasoning_tokens}};
       if (req.stream) {
         sse(chunk_of(json::object(), finish));
         if (req.include_usage) {
@@ -650,7 +680,8 @@ class Handler : public proxygen::RequestHandler {
 
     job.sink.text = [=](const std::string& piece) { deliver(st->parser.push(piece)); };
     job.sink.error = fail;
-    job.sink.done = [=](const std::string& finish, int prompt_tokens, int completion_tokens, int cached) {
+    job.sink.done = [=](const std::string& finish, int prompt_tokens, int completion_tokens, int cached,
+                        int reasoning_tokens) {
       deliver(st->parser.finish());
       close_reasoning();
       close_message();
@@ -659,7 +690,7 @@ class Handler : public proxygen::RequestHandler {
       resp["usage"] = {{"input_tokens", prompt_tokens},
                        {"input_tokens_details", {{"cached_tokens", cached}}},
                        {"output_tokens", completion_tokens},
-                       {"output_tokens_details", {{"reasoning_tokens", 0}}},
+                       {"output_tokens_details", {{"reasoning_tokens", reasoning_tokens}}},
                        {"total_tokens", prompt_tokens + completion_tokens}};
       if (req.stream) {
         // A response cut at max_output_tokens still ends with response.completed: the agent treats
@@ -768,6 +799,12 @@ int main(int argc, char** argv) {
   ctx.engine = &engine;
   ctx.tok = &tok;
   ctx.im_end = tok.token_id("<|im_end|>");
+  ctx.think_end = tok.token_id("</think>");
+  {
+    const std::vector<int> one = tok.encode("\n"), two = tok.encode("\n\n");
+    ctx.newline = one.size() == 1 ? one[0] : -1;
+    ctx.blank_line = two.size() == 1 ? two[0] : -1;
+  }
   if (name.empty()) {
     name = model_dir;
     while (!name.empty() && name.back() == '/') name.pop_back();

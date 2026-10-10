@@ -591,18 +591,25 @@ def test_responses_custom_tool_replay_matches_what_the_model_wrote(server):
     assert second["usage"]["input_tokens"] == chat["usage"]["prompt_tokens"]
 
 
-@pytest.mark.xfail(reason="usage.output_tokens_details.reasoning_tokens is always 0", strict=False)
 def test_responses_reasoning_tokens_counted(server):
     """vllm#49711, sglang#39826.
 
     Their bugs: reasoning_tokens reported 0 when the prompt opened the thinking span; under speculation
     it exceeded output_tokens when an accepted block crossed EOS. Check: with thinking on, 0 <
-    reasoning_tokens <= output_tokens."""
-    r = server.post("/v1/responses", {"input": "Is 91 prime? Think, then answer yes or no.",
-                                      "reasoning": {"effort": "low"}, "temperature": 0, "max_output_tokens": 600})
+    reasoning_tokens < output_tokens on both routes (the answer after the span is at least one token);
+    with thinking off, 0."""
+    q = "Is 91 prime? Think, then answer yes or no."
+    r = server.post("/v1/responses", {"input": q, "reasoning": {"effort": "low"}, "temperature": 0, "max_output_tokens": 600})
     u = r["usage"]
     assert any(item["type"] == "reasoning" for item in r["output"])
-    assert 0 < u["output_tokens_details"]["reasoning_tokens"] <= u["output_tokens"]
+    assert 0 < u["output_tokens_details"]["reasoning_tokens"] < u["output_tokens"], u
+    c = server.post("/v1/chat/completions", {"messages": [{"role": "user", "content": q}], "reasoning_effort": "low",
+                                             "temperature": 0, "max_tokens": 600})
+    cu = c["usage"]
+    assert c["choices"][0]["message"].get("reasoning_content")
+    assert 0 < cu["completion_tokens_details"]["reasoning_tokens"] < cu["completion_tokens"], cu
+    off = server.post("/v1/responses", {"input": "Say yes.", "reasoning": {"effort": "none"}, "temperature": 0, "max_output_tokens": 8})
+    assert off["usage"]["output_tokens_details"]["reasoning_tokens"] == 0
 
 
 # --- Errors, limits, cancellation ---------------------------------------------------------------------
