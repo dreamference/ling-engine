@@ -1,5 +1,7 @@
 // Tests the output parsers and the chat template without a server or a GPU.
+#include <cmath>
 #include <cstdio>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -451,6 +453,63 @@ int main() {
       ok = false;
     }
     EXPECT(ok && valid_utf8(out) && out.find("\xEF\xBF\xBD") != std::string::npos);
+  }
+  {
+    // Logprobs (API §3): the log-softmax of the raw logits, exact values on a small row, in vLLM's order
+    // (the chosen token first, then the top k by rank without it; ties to the lower id, as greedy picks).
+    using ling::serve::top_logprobs;
+    auto near = [](double a, double b) { return std::fabs(a - b) < 1e-5; };
+    const std::vector<float> row = {1.f, 3.f, 2.f, 0.f};
+    // m = 3; log(e^-2 + 1 + e^-1 + e^-3) = log(1.5530018) = 0.4401897; logprob(i) = row[i] - 3 - 0.4401897.
+    const double lse = 0.44018970;
+    auto ok = top_logprobs(row, 1, 2);  // the argmax chosen: k entries
+    EXPECT(ok.size() == 2);
+    if (ok.size() == 2) {
+      EXPECT(ok[0].token == 1 && near(ok[0].logprob, -lse));
+      EXPECT(ok[1].token == 2 && near(ok[1].logprob, -1 - lse));
+      EXPECT(ok[0].logprob <= 0.f);  // the argmax's logprob never rounds above 0
+    }
+    auto off = top_logprobs(row, 3, 2);  // the chosen token outside the top k: k + 1 entries, chosen first
+    EXPECT(off.size() == 3);
+    if (off.size() == 3) {
+      EXPECT(off[0].token == 3 && near(off[0].logprob, -3 - lse));
+      EXPECT(off[1].token == 1 && near(off[1].logprob, -lse));
+      EXPECT(off[2].token == 2 && near(off[2].logprob, -1 - lse));
+    }
+    auto only = top_logprobs(row, 0, 0);  // k = 0: the chosen token alone
+    EXPECT(only.size() == 1 && only[0].token == 0 && near(only[0].logprob, -2 - lse));
+    auto all = top_logprobs(row, 2, 4);  // k = the vocabulary: every token once, probabilities summing to 1
+    double total = 0;
+    for (const auto& e : all) total += std::exp(e.logprob);
+    EXPECT(all.size() == 4 && near(total, 1.0) && all[0].token == 2 && all[1].token == 1 && all[2].token == 0 && all[3].token == 3);
+    const std::vector<float> tie = {2.f, 2.f, 1.f};  // log(2 + e^-1) = 0.8619948
+    auto t1 = top_logprobs(tie, 0, 1);
+    EXPECT(t1.size() == 1 && t1[0].token == 0 && near(t1[0].logprob, -0.8619948));
+    auto t2 = top_logprobs(tie, 1, 1);  // the tie's lower id ranks first; the chosen one still heads the list
+    EXPECT(t2.size() == 2 && t2[0].token == 1 && t2[1].token == 0 && near(t2[1].logprob, -0.8619948));
+    EXPECT(top_logprobs(std::vector<float>{}, 0, 2).empty());
+    // The request fields as vLLM validates them.
+    auto parses = [](const char* text, bool chat) {
+      try {
+        return std::optional<ling::serve::Request>(ling::serve::parse_request(json::parse(text), chat));
+      } catch (const std::invalid_argument&) {
+        return std::optional<ling::serve::Request>();
+      }
+    };
+    auto c1 = parses(R"({"messages":[{"role":"user","content":"hi"}],"logprobs":true,"top_logprobs":3})", true);
+    EXPECT(c1 && c1->logprobs && c1->top_logprobs == 3);
+    auto c0 = parses(R"({"messages":[{"role":"user","content":"hi"}]})", true);
+    EXPECT(c0 && !c0->logprobs && c0->top_logprobs == 0);
+    EXPECT(!parses(R"({"messages":[{"role":"user","content":"hi"}],"top_logprobs":2})", true));  // needs logprobs: true
+    EXPECT(!parses(R"({"messages":[{"role":"user","content":"hi"}],"logprobs":true,"top_logprobs":21})", true));
+    EXPECT(!parses(R"({"messages":[{"role":"user","content":"hi"}],"logprobs":2})", true));  // chat: a boolean
+    auto p2 = parses(R"({"prompt":"hi","logprobs":2})", false);
+    EXPECT(p2 && p2->logprobs && p2->top_logprobs == 2);
+    auto p0 = parses(R"({"prompt":"hi","logprobs":0})", false);
+    EXPECT(p0 && p0->logprobs && p0->top_logprobs == 0);
+    auto pn = parses(R"({"prompt":"hi","logprobs":null})", false);
+    EXPECT(pn && !pn->logprobs);
+    EXPECT(!parses(R"({"prompt":"hi","logprobs":21})", false) && !parses(R"({"prompt":"hi","logprobs":-1})", false));
   }
   if (known_gaps) std::printf("%d known gaps (not failures; see reports/engine-issues-2026-10-09.md)\n", known_gaps);
   std::printf(failures ? "%d API TEST FAILURES\n" : "all api tests passed\n", failures);

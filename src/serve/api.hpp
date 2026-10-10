@@ -3,6 +3,7 @@
 #pragma once
 
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -27,7 +28,26 @@ struct Request {
   bool reasoning = true;            // the prompt ends inside <think> (chat with thinking on)
   json tools = json::array();
   std::vector<std::string> custom_tools;  // Responses `type: custom` tools, offered as one-parameter functions
+  // Logprobs, in vLLM's shapes (API §3): chat `logprobs: true` with `top_logprobs: k`; completions
+  // `logprobs: k`. k is 0 .. kMaxTopLogprobs.
+  bool logprobs = false;
+  int top_logprobs = 0;
 };
+
+constexpr int kMaxTopLogprobs = 20;  // vLLM's --max-logprobs default
+
+// One token's log-probability (the log-softmax of the raw logits: vLLM's raw_logprobs mode).
+struct TokenLogprob {
+  int token;
+  float logprob;
+};
+
+// The log-softmax of one row of raw logits at `chosen` and at the k most likely tokens, in the order
+// vLLM reports them: the chosen token first, then the top k by rank without it, so k entries when the
+// chosen token is among the k most likely and k + 1 otherwise (ties rank the lower id first, as greedy
+// sampling picks it). Chat completions show the first k of these as `top_logprobs`; completions show
+// them all. Every logits value must be finite (the engine guarantees it before sampling).
+std::vector<TokenLogprob> top_logprobs(std::span<const float> logits, int chosen, int k);
 
 // The one parameter a custom (freeform) tool is offered with: the model has no freeform format, so the
 // tool is rendered as a function taking `input` (a string), and the call comes back as a custom_tool_call

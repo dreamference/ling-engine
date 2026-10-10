@@ -131,6 +131,10 @@ struct JobSink {
       done;
   // The message, and the code the client sees (server_error, or context_length_exceeded).
   std::function<void(const std::string& message, const std::string& code)> error;
+  // Per produced token, only when the request asked for logprobs: the token's own logprob first, then the
+  // top k (top_logprobs(), api.hpp). Called before the token's text, which the decoder or the parser may
+  // still hold back.
+  std::function<void(const std::vector<TokenLogprob>& entries)> logprobs;
 };
 
 struct Job {
@@ -221,9 +225,16 @@ class Worker {
     // `pending` holds chosen tokens not yet emitted: the first from the prefill's logits, then a
     // speculative step's accepted drafts and its next token, or a plain step's sample.
     std::vector<int> pending = {eng.sample(logits, job.req.sampling, eng.history())};
+    // Logprobs (API §3), only when asked: each pending token's logprobs come from the row it was chosen
+    // from, `logits` on the plain path and the prefill, or the verify's rows that speculate() copies to
+    // `rows` (one per pending token, in order). Nothing here runs otherwise.
+    const bool want_logprobs = job.req.logprobs;
+    const size_t vocab = eng.config().vocab;
+    std::vector<float> rows;
     bool done = false;
     while (!done) {
-      for (int t : pending) {
+      for (size_t j = 0; j < pending.size(); ++j) {
+        const int t = pending[j];
         if (ttft < 0) ttft = std::chrono::duration<double>(std::chrono::steady_clock::now() - job.received).count();
         if (job.cancelled->load()) {
           finish = "cancelled";
@@ -237,6 +248,10 @@ class Worker {
           break;
         }
         ++produced;
+        if (want_logprobs) {
+          const float* row = rows.empty() ? logits.data() : rows.data() + j * vocab;
+          job.sink.logprobs(top_logprobs(std::span<const float>(row, vocab), t, job.req.top_logprobs));
+        }
         if (in_think) {
           ++reasoning;
           if (t == ctx_.think_end) {
@@ -269,7 +284,10 @@ class Worker {
       if (done) break;
       ++passes;
       if (spec) {
-        pending = eng.speculate(pending.back(), job.req.sampling);
+        pending = eng.speculate(pending.back(), job.req.sampling, want_logprobs ? &rows : nullptr);
+        // The verify checks only each row's top K for NaN and inf (the plain path's sample() checks the
+        // whole row); a row reported as logprobs is checked whole, so a NaN never reaches the client.
+        if (want_logprobs) require_finite(rows);
       } else {
         logits = eng.step(pending.back());
         pending = {eng.sample(logits, job.req.sampling, eng.history())};
@@ -449,24 +467,44 @@ class Handler : public proxygen::RequestHandler {
       std::string content, reasoning;
       std::vector<ToolCall> calls;
       bool first = true;
+      // Logprobs in the route's shape (API §3): chat, the `content` entries; completions, the object with
+      // `tokens`, `token_logprobs`, `top_logprobs` and `text_offset`. Streamed, what the next chunk takes.
+      json logprobs;
+      int text_chars = 0;  // characters of output text so far (completions text_offset)
       State(bool r, const json& t) : parser(r, t) {}
     };
     auto st = std::make_shared<State>(chat && req.reasoning, req.tools);
+    auto fresh_logprobs = [chat]() {
+      return chat ? json(json::array())
+                  : json{{"tokens", json::array()}, {"token_logprobs", json::array()}, {"top_logprobs", json::array()},
+                         {"text_offset", json::array()}};
+    };
+    st->logprobs = fresh_logprobs();
+    auto pending_logprobs = [=]() { return chat ? !st->logprobs.empty() : !st->logprobs["tokens"].empty(); };
+    auto take_logprobs = [=]() {  // choices[0].logprobs from what has been collected, which starts afresh
+      json out = chat ? json{{"content", st->logprobs}} : st->logprobs;
+      st->logprobs = fresh_logprobs();
+      return out;
+    };
 
     auto sse = [ex](const json& chunk) {
       std::string data = "data: " + dump_json(chunk) + "\n\n";
       post(ex, [data](proxygen::ResponseHandler* d) { ResponseBuilder(d).body(data).send(); });
     };
-    auto chunk_of = [=](json delta, json finish) {
+    auto chunk_of = [=](json delta, json finish, json logprobs = json()) {
       json c = {{"id", id}, {"object", chat ? "chat.completion.chunk" : "text_completion"}, {"created", created},
                 {"model", model}};
       json choice = {{"index", 0}};
       if (chat) choice["delta"] = std::move(delta);
       else choice["text"] = delta.is_string() ? delta : json("");
+      if (!logprobs.is_null()) choice["logprobs"] = std::move(logprobs);
       choice["finish_reason"] = std::move(finish);
       c["choices"] = json::array({choice});
       return c;
     };
+    // A streamed chunk carries the logprobs of the tokens produced since the previous chunk (the text of
+    // a token may follow its entry by a chunk when the decoder or the parser held it back).
+    auto chunk_logprobs = [=]() { return req.logprobs ? take_logprobs() : json(); };
     auto deliver = [=](const OutputParser::Delta& d) {
       st->content += d.content;
       st->reasoning += d.reasoning;
@@ -475,7 +513,7 @@ class Handler : public proxygen::RequestHandler {
         return;
       }
       if (!chat) {
-        if (!d.content.empty()) sse(chunk_of(json(d.content), nullptr));
+        if (!d.content.empty()) sse(chunk_of(json(d.content), nullptr, chunk_logprobs()));
         return;
       }
       json delta = json::object();
@@ -496,10 +534,43 @@ class Handler : public proxygen::RequestHandler {
         }
         delta["tool_calls"] = calls;
       }
-      if (delta.size() > 0) sse(chunk_of(delta, nullptr));
+      if (delta.size() > 0) sse(chunk_of(delta, nullptr, chunk_logprobs()));
     };
 
     job.sink.text = [=](const std::string& piece) { deliver(chat ? st->parser.push(piece) : OutputParser::Delta{{}, piece, {}}); };
+    if (req.logprobs) {
+      // One entry per produced token, in vLLM's shapes. `token` is the token's text (U+FFFD where a
+      // character is split across tokens, as dump_json writes it) and `bytes` its exact bytes, so a client
+      // can reassemble a character from its pieces. text_offset counts characters of the output text (a
+      // byte that is not a continuation byte starts one), so a character split across tokens counts once.
+      const Tokenizer* tok = ctx_.tok;
+      auto token_json = [tok](const TokenLogprob& e) {
+        const std::string text = tok->token_bytes(e.token);
+        json bytes = json::array();
+        for (const unsigned char c : text) bytes.push_back(static_cast<int>(c));
+        return json{{"token", text}, {"logprob", e.logprob}, {"bytes", bytes}};
+      };
+      const int k = req.top_logprobs;
+      job.sink.logprobs = [=](const std::vector<TokenLogprob>& entries) {
+        if (entries.empty()) return;
+        if (chat) {
+          json e = token_json(entries[0]);
+          json top = json::array();
+          for (size_t i = 0; i < entries.size() && i < static_cast<size_t>(k); ++i) top.push_back(token_json(entries[i]));
+          e["top_logprobs"] = std::move(top);
+          st->logprobs.push_back(std::move(e));
+          return;
+        }
+        const std::string text = tok->token_bytes(entries[0].token);
+        json top = json::object();
+        for (const TokenLogprob& e : entries) top[tok->token_bytes(e.token)] = e.logprob;
+        st->logprobs["tokens"].push_back(text);
+        st->logprobs["token_logprobs"].push_back(entries[0].logprob);
+        st->logprobs["top_logprobs"].push_back(std::move(top));
+        st->logprobs["text_offset"].push_back(st->text_chars);
+        for (const unsigned char c : text) st->text_chars += (c & 0xC0) != 0x80;
+      };
+    }
     job.sink.error = [=](const std::string& msg, const std::string& code) {
       const json error = error_body(msg, error_type(code), code);
       if (req.stream) {  // the headers are out: end the stream properly after the error
@@ -520,7 +591,8 @@ class Handler : public proxygen::RequestHandler {
                     {"prompt_tokens_details", {{"cached_tokens", cached}}}};
       if (chat) usage["completion_tokens_details"] = {{"reasoning_tokens", reasoning_tokens}};
       if (req.stream) {
-        sse(chunk_of(json::object(), finish));
+        // Entries still pending (their text held back to the end) ride on the finish chunk.
+        sse(chunk_of(json::object(), finish, req.logprobs && pending_logprobs() ? take_logprobs() : json()));
         if (req.include_usage) {
           json u = {{"id", id}, {"object", chat ? "chat.completion.chunk" : "text_completion"}, {"created", created},
                     {"model", model}, {"choices", json::array()}, {"usage", usage}};
@@ -544,6 +616,7 @@ class Handler : public proxygen::RequestHandler {
       } else {
         choice["text"] = st->content;
       }
+      if (req.logprobs) choice["logprobs"] = take_logprobs();
       json body = {{"id", id}, {"object", chat ? "chat.completion" : "text_completion"}, {"created", created},
                    {"model", model}, {"choices", json::array({choice})}, {"usage", usage}};
       post(ex, [body](proxygen::ResponseHandler* d) { send_json(d, 200, body); });
