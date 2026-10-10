@@ -374,21 +374,26 @@ def test_tool_choice_none_returns_text(server):
     assert r["choices"][0]["finish_reason"] in ("stop", "length")
 
 
-@pytest.mark.xfail(reason="render_chat refuses tool-call arguments that are not valid JSON (400)", strict=False)
 def test_history_with_invalid_tool_arguments_is_accepted(server):
     """vllm#47761 (Continue), vllm#55495 (a Codex conversation).
 
     Their bug: once one assistant tool call in the history had arguments that were not valid JSON (cut
-    off, or with a leaked tag), every later request of the conversation was a 400. Check: such a history
-    is served."""
+    off, or with a leaked tag), every later request of the conversation was a 400. Production (SGLang
+    0.5.19 and 0.5.21) refuses too: 400 "Assistant tool call function.arguments must be valid JSON."
+    before the template. The owner's decision (2026-10-10, API section 3): the string is rendered
+    verbatim where the parameter blocks would go, so the conversation goes on. Check: such a history is
+    served and the next turn answers normally (text or a tool call, with a finish_reason)."""
     status, out = server.request("/v1/chat/completions", {
         "messages": [{"role": "user", "content": "Read src/main.py."},
                      {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {
                          "name": "shell", "arguments": "{\"command\": [\"cat\", \"src/ma"}}]},
                      {"role": "tool", "tool_call_id": "c1", "content": "error: bad arguments"},
                      {"role": "user", "content": "Try again."}],
-        "tools": [SHELL_TOOL], "temperature": 0, "max_tokens": 8, "chat_template_kwargs": NO_THINK})
+        "tools": [SHELL_TOOL], "temperature": 0, "max_tokens": 64, "chat_template_kwargs": NO_THINK})
     assert status == 200, out
+    choice = out["choices"][0]
+    assert choice["message"].get("content") or choice["message"].get("tool_calls"), out
+    assert choice["finish_reason"] in ("stop", "length", "tool_calls"), out
 
 
 @pytest.mark.parametrize("effort", ["minimal", "low", "medium", "high", "xhigh", "max"])
