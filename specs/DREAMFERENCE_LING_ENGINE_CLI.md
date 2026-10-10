@@ -10,7 +10,7 @@ Four programs are built from the repository (`CMakeLists.txt`): `ling-serve`, th
 ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N]
            [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]]
            [--pretokenizer production|checkpoint] [--prefix-checkpoints N]
-           [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N]
+           [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N]
 ```
 
 | Flag | Default | What it does |
@@ -30,6 +30,7 @@ ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-cont
 | `--pdl` | off | Programmatic dependent launch for the rows path's kernels (M3). |
 | `--attn-bulk` | off | The rows path's attention loads its tiles with bulk copies (M3). |
 | `--attn-prefetch N` | `2` | How many KV tiles ahead the rows path's attention prefetches into L2; 0 switches it off (M3). |
+| `--keepalive-seconds N` | `15` | How often a streamed request that has produced no token yet (waiting in the queue, or in prefill) is sent a keep-alive, so a client with an idle timeout keeps the stream: a `response.in_progress` event on `/v1/responses`, an SSE comment line on the chat and completions routes ([API §3, §4](./DREAMFERENCE_LING_ENGINE_API.md)). 0 switches them off. `LING_KEEPALIVE_SECONDS` overrides it. |
 
 Startup prints `loading DIR …`, then `loaded X GB of weights`, then with a drafter `drafter: X GB, block N`; the server is ready when `GET /health` answers. The HTTP server runs two threads for the connections and one engine worker that runs requests one at a time ([API](./DREAMFERENCE_LING_ENGINE_API.md)); an idle connection is closed after 30 minutes; `SIGINT` and `SIGTERM` stop it. Each finished request logs one line to stderr: prompt tokens (and how many were reused from a kept state), prefill seconds, tokens generated, decode seconds and tokens/s, the finish reason, the number of passes and, speculatively, tokens per pass.
 
@@ -78,7 +79,7 @@ ling-template --responses tokenizer.json [checkpoint] < bodies.jsonl
 
 ## 4. Environment variables
 
-Read by the engine at start (`src/core/engine.cpp`) and by two kernels. **A variable set in the environment overrides the matching flag**, so a flag that seems to have no effect was probably overruled by one of these; they exist so a benchmark can switch a path without rebuilding the launch line.
+Read by the engine at start (`src/core/engine.cpp`) and by two kernels, and the last one by `ling-serve`. **A variable set in the environment overrides the matching flag**, so a flag that seems to have no effect was probably overruled by one of these; they exist so a benchmark can switch a path without rebuilding the launch line.
 
 | Variable | Effect |
 |---|---|
@@ -91,5 +92,6 @@ Read by the engine at start (`src/core/engine.cpp`) and by two kernels. **A vari
 | `LING_GEMM_SHAPE` | Selects the prefill GEMM tile shape (`src/core/prefill_gemm.cu`); a tuning switch for the benchmarks. |
 | `LING_ATTN_CHUNK` | The decode attention's key chunk (`src/core/kernels.cu`); a tuning switch. |
 | `LING_PDL_ATTN` | Programmatic dependent launch for the attention kernel alone (`src/core/kernels.cu`). |
+| `LING_KEEPALIVE_SECONDS=N` | Overrides `--keepalive-seconds` (read by `ling-serve`, `src/serve/main.cpp`). |
 
-None of these is read by the HTTP layer; the server's behaviour towards clients is the flags' alone.
+Only the last is read by the HTTP layer; the rest of the server's behaviour towards clients is the flags' alone.
