@@ -403,8 +403,6 @@ def test_reasoning_efforts_chat(server, effort):
     assert status == 200, out
 
 
-@pytest.mark.xfail(reason="chat completions passes reasoning_effort 'none' to the template, which refuses it; "
-                          "the Responses path maps it to thinking off", strict=False)
 def test_reasoning_effort_none_chat(server):
     """vllm#53284, vllm#52738.
 
@@ -756,12 +754,11 @@ def test_tool_choice_required_yields_a_call(server):
     assert calls and all("</parameter" not in c["function"]["arguments"] for c in calls)
 
 
-@pytest.mark.xfail(reason="an image part is refused with HTTP 400 ('does not accept images or video')", strict=False)
 def test_image_input_does_not_fail_the_turn(server):
     """reports/api-compat-checklist.md: Codex's model catalog advertises image input, and Cline's default
     model info claims it, so a pasted screenshot reaches the server. Codex treats an HTTP 400 as terminal
-    for the turn. Check: until the vision encoder exists, an image part is answered (for example with a
-    placeholder in its place), not refused."""
+    for the turn. Check: until the vision encoder exists, an image part is answered (rendered as the
+    placeholder `[image]` in the prompt), not refused."""
     png = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
     status, out = server.request("/v1/responses", {"input": [{"type": "message", "role": "user", "content": [
         {"type": "input_text", "text": "What is in this image?"}, {"type": "input_image", "image_url": png}]}],
