@@ -1,6 +1,7 @@
 #include "serve/api.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <random>
 #include <stdexcept>
 
@@ -191,6 +192,33 @@ Request parse_request(const json& body, bool chat) {
     else if (body["stop"].is_array())
       for (const auto& s : body["stop"]) r.stop.push_back(s);
   }
+  // Logprobs as vLLM validates them: on chat, a boolean `logprobs` and an integer `top_logprobs` that
+  // needs `logprobs: true`; on completions, an integer `logprobs` (null or absent: none).
+  if (chat) {
+    if (body.contains("logprobs") && !body["logprobs"].is_null()) {
+      if (!body["logprobs"].is_boolean()) throw std::invalid_argument("logprobs must be a boolean");
+      r.logprobs = body["logprobs"].get<bool>();
+    }
+    if (body.contains("top_logprobs") && !body["top_logprobs"].is_null()) {
+      if (!body["top_logprobs"].is_number_integer()) throw std::invalid_argument("top_logprobs must be an integer");
+      const auto k = body["top_logprobs"].get<long long>();
+      if (k < 0 || k > kMaxTopLogprobs)
+        throw std::invalid_argument("top_logprobs must be between 0 and " + std::to_string(kMaxTopLogprobs));
+      if (k > 0 && !r.logprobs) throw std::invalid_argument("when using top_logprobs, logprobs must be set to true");
+      r.top_logprobs = static_cast<int>(k);
+    }
+  } else if (body.contains("logprobs") && !body["logprobs"].is_null()) {
+    if (body["logprobs"].is_boolean()) {  // `true` asks for the chosen token's logprob alone
+      r.logprobs = body["logprobs"].get<bool>();
+    } else {
+      if (!body["logprobs"].is_number_integer()) throw std::invalid_argument("logprobs must be an integer");
+      const auto k = body["logprobs"].get<long long>();
+      if (k < 0 || k > kMaxTopLogprobs)
+        throw std::invalid_argument("logprobs must be between 0 and " + std::to_string(kMaxTopLogprobs));
+      r.logprobs = true;
+      r.top_logprobs = static_cast<int>(k);
+    }
+  }
   if (chat) {
     if (!body.contains("messages")) throw std::invalid_argument("messages is required");
     ChatOptions opts;
@@ -222,6 +250,32 @@ Request parse_request(const json& body, bool chat) {
     r.reasoning = false;
   }
   return r;
+}
+
+std::vector<TokenLogprob> top_logprobs(std::span<const float> logits, int chosen, int k) {
+  std::vector<TokenLogprob> out;
+  if (logits.empty()) return out;
+  // log p(i) = (x_i - m) - log(sum_j exp(x_j - m)) with m the row's maximum: the sum is at least 1 (the
+  // maximum's own term), so the argmax's logprob is <= 0 in float as well.
+  const float m = *std::max_element(logits.begin(), logits.end());
+  double sum = 0;
+  for (const float x : logits) sum += std::exp(double(x) - m);
+  const double lse = std::log(sum);
+  auto lp = [&](int i) { return static_cast<float>((double(logits[i]) - m) - lse); };
+  // The k highest logits, by one pass over the row keeping a short list sorted by (logit desc, id asc).
+  std::vector<int> top;
+  top.reserve(size_t(k) + 1);
+  for (int i = 0; i < static_cast<int>(logits.size()); ++i) {
+    if (static_cast<int>(top.size()) == k && !(k > 0 && logits[i] > logits[top.back()])) continue;
+    auto at = top.begin();
+    while (at != top.end() && logits[*at] >= logits[i]) ++at;
+    top.insert(at, i);
+    if (static_cast<int>(top.size()) > k) top.pop_back();
+  }
+  if (chosen >= 0 && chosen < static_cast<int>(logits.size())) out.push_back({chosen, lp(chosen)});
+  for (const int i : top)
+    if (i != chosen) out.push_back({i, lp(i)});
+  return out;
 }
 
 OutputParser::Delta OutputParser::push(const std::string& text) {

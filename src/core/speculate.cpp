@@ -320,7 +320,7 @@ void Engine::commit_launch(int n) {
   draft_materialize(n, dpos(), 0);
 }
 
-std::vector<int> Engine::speculate(int anchor, const SamplingParams& p) {
+std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vector<float>* row_logits) {
   if (!can_speculate(p)) throw std::runtime_error("speculate: unsupported sampling parameters or no drafter");
   const int room = opts_.max_context - pos_;
   if (room < 1) throw std::runtime_error("context is longer than max_context");
@@ -328,6 +328,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p) {
   const bool greedy = p.temperature <= 0.f;
   if (B < 2) {  // no room to draft: one plain step
     step(anchor);
+    if (row_logits) *row_logits = logits_;
     return {sample(logits_, p, history_)};
   }
   // Graphs have the block's shape and the drafter's chain; a short block at the context's end or a lookup
@@ -441,6 +442,14 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p) {
 
   // 4. Commit the anchor and the accepted drafts.
   const int n = accepted + 1;
+  if (row_logits) {  // the rows the returned tokens were chosen from: row i chose rows[i + 1], row accepted chose next
+    const size_t vocab = model_->config().vocab;
+    row_logits->resize(size_t(n) * vocab);
+    check(cudaMemcpyAsync(row_logits->data(), logits_dev_, size_t(n) * vocab * sizeof(float), cudaMemcpyDeviceToHost,
+                          stream_),
+          "row logits");
+    check(cudaStreamSynchronize(stream_), "row logits");
+  }
   if (graph) {
     if (commit_graphs_.size() < size_t(V) + 1) commit_graphs_.resize(size_t(V) + 1, nullptr);
     run_graph(commit_graphs_[n], "commit", [&] { commit_launch(n); });
