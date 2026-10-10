@@ -45,7 +45,9 @@ def want(ref_path, cases_path):
     if len(ref) != len(cases):
         sys.exit(f"{len(ref)} scored prompts against {len(cases)} cases")
     for r, c in zip(ref, cases):
-        c["want"] = [[t for t, _ in pos["top"]] for pos in r["pos"]]
+        old = c.get("want", [])  # production's ids, when the case carries them: kept, so --prod can score the mode too
+        c["want"] = [sorted(set(t for t, _ in pos["top"]) | set(old[j] if j < len(old) else []))
+                     for j, pos in enumerate(r["pos"])]
         print(json.dumps(c))
 
 
@@ -55,7 +57,7 @@ def compare(ref_path, mode_path, cases_path, kl_max, prod_path):
         sys.exit(f"{len(ref)} reference, {len(mode)} mode, {len(cases)} cases: not the same prompts")
     prod = load(prod_path) if prod_path else None
     rows = []  # (kl, prompt index, position, prompt length, flip, top5)
-    kl_prod_ref, kl_prod_mode = [], []
+    kl_prod_ref, kl_prod_mode, prod_skipped = [], [], 0
     for i, (r, m, c) in enumerate(zip(ref, mode, cases)):
         plen = len(c["prompt"])
         for j, (pr, pm) in enumerate(zip(r["pos"], m["pos"])):
@@ -70,8 +72,12 @@ def compare(ref_path, mode_path, cases_path, kl_max, prod_path):
             rows.append((kl, i, j, plen, flip, pm["top"][0][0] in ref_top[:5]))
             if prod is not None and j < len(prod[i]["top"]):
                 pa = prod[i]["top"][j]
-                kl_prod_ref.append(kl_top(pa, lp_map(pr)))
-                kl_prod_mode.append(kl_top(pa, lpm))
+                lpr = lp_map(pr)
+                if all(t in lpr and t in lpm for t, _ in pa):  # both engines reported production's ids
+                    kl_prod_ref.append(kl_top(pa, lpr))
+                    kl_prod_mode.append(kl_top(pa, lpm))
+                else:
+                    prod_skipped += 1
     kls = sorted(k for k, *_ in rows)
     n = len(rows)
     mean, p99, mx = st.mean(kls), kls[min(n - 1, int(math.ceil(0.99 * n)) - 1)], kls[-1]
@@ -89,9 +95,12 @@ def compare(ref_path, mode_path, cases_path, kl_max, prod_path):
             print(f"  prompt length {name:>6}: {len(ks):5d} positions, mean KL {st.mean(ks):.6f}, max {max(ks):.6f}")
     worst = sorted(rows, key=lambda r: -r[0])[:5]
     print("  worst:", ", ".join(f"prompt {i} pos {j} ({plen} tokens) {k:.5f}" for k, i, j, plen, _, _ in worst))
-    if prod is not None:
-        print(f"against production's cold reference: exact engine mean KL {st.mean(kl_prod_ref):.6f}, "
-              f"mode mean KL {st.mean(kl_prod_mode):.6f} (analyze.py's number for a build)")
+    if prod is not None and kl_prod_ref:
+        print(f"against production's cold reference ({len(kl_prod_ref)} positions, {prod_skipped} without both engines' "
+              f"log-probs of its ids): exact engine mean KL {st.mean(kl_prod_ref):.6f}, mode mean KL "
+              f"{st.mean(kl_prod_mode):.6f} (analyze.py's number for a build)")
+    elif prod is not None:
+        print("against production: no position had both engines' log-probs of production's ids (cases without `want`?)")
     ok_mean = mean <= kl_max
     ok_top5 = top5 == n
     longest = [name for name in [b[2] for b in BUCKETS] if name in by_bucket][-1]
