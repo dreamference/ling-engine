@@ -79,6 +79,12 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   xsf_ = alloc<uint8_t>(M * widest / 16);  // NVFP4 block scales
   xq2_ = alloc<uint8_t>(M * c.intermediate / 2);  // the FFN's fused gate/up output (the down projection's input)
   xsf2_ = alloc<uint8_t>(M * c.intermediate / 16);
+  // --prefill-bf16's tensors live in the FP32 buffers they replace (each BF16 [M][n] fits its FP32 [M][n]).
+  xn_bf16_ = reinterpret_cast<__nv_bfloat16*>(xn_);
+  t2_bf16_ = reinterpret_cast<__nv_bfloat16*>(t2_);
+  z_bf16_ = reinterpret_cast<__nv_bfloat16*>(z_);
+  mixed_bf16_ = reinterpret_cast<__nv_bfloat16*>(mixed_);
+  core_bf16_ = reinterpret_cast<__nv_bfloat16*>(core_);
   ids_dev_ = alloc<int>(M);
   pos_dev_ = alloc<int>(1);
   check(cudaHostAlloc(reinterpret_cast<void**>(&pin_), sizeof(StepPinned), cudaHostAllocDefault), "pinned step buffers");
@@ -128,6 +134,10 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   int prefetch = opts_.attention_prefetch;
   if (const char* e = std::getenv("LING_ATTN_PREFETCH")) prefetch = std::atoi(e);
   kernels::set_attention_prefetch(prefetch);
+  // B34: BF16 DeltaNet intermediates in the prefill (not exact; off by default, MILESTONES §14).
+  prefill_bf16_ = opts_.prefill_bf16;
+  if (const char* e = std::getenv("LING_PREFILL_BF16")) prefill_bf16_ = std::atoi(e) != 0;
+  if (prefill_bf16_) std::fprintf(stderr, "prefill: BF16 DeltaNet intermediates (not the exact path)\n");
 }
 
 Engine::~Engine() {
@@ -369,13 +379,16 @@ void Engine::forward(const int* ids, int M, Pass pass, int keep_at) {
   for (int li = 0; li < c.layers; ++li) {
     const LayerWeights& L = model_->layers()[li];
     const int slot = layer_slot_[li];
+    // --prefill-bf16 (B34): a DeltaNet layer of a prefill takes the BF16 branch below, which runs its own norm.
+    const bool bf16_gdn = !L.full && quantized_ && prefill_bf16_;
     // The prefill path quantizes the norm's output for the projections that follow; the DeltaNet's a and b
     // projections (BF16) also read it in FP32.
     // (FP32 too wherever the projections' input scales differ, so the others can quantize it themselves.)
     const bool xn_half =
-        L.full ? norm_rows(h_, L.input_norm, xn_, M, L.q.in_scale, false,
-                           L.k.in_scale != L.q.in_scale || L.v.in_scale != L.q.in_scale)
-               : norm_rows(h_, L.input_norm, xn_, M, L.in_qkv.in_scale, false, true);
+        bf16_gdn ? false
+        : L.full ? norm_rows(h_, L.input_norm, xn_, M, L.q.in_scale, false,
+                             L.k.in_scale != L.q.in_scale || L.v.in_scale != L.q.in_scale)
+                 : norm_rows(h_, L.input_norm, xn_, M, L.in_qkv.in_scale, false, true);
     if (L.full) {
       NvtxRange r("attention");
       linear_fp8_multi({{&L.q, q_gate_}, {&L.k, k_}, {&L.v, v_}}, xn_, M, xn_half);
@@ -399,6 +412,45 @@ void Engine::forward(const int* ids, int M, Pass pass, int keep_at) {
       mark("attn_core");
       linear_fp8_residual(L.o, attn_, M, quantized_);
       mark("attn_proj");
+    } else if (bf16_gdn) {
+      // --prefill-bf16 (B34; off by default under MILESTONES §14's exactness policy): the DeltaNet layer of a
+      // prefill with its intermediates in BF16 where production keeps BF16 (reports/M2-prefill.md §8 item 3,
+      // cited as §7.3 in the backlog's B34 row), through the BF16 instantiations of the same kernels; the exact
+      // FP32 branch below is untouched when the switch is off, and a verify never comes here. The tensors:
+      //   xn_    the input norm's copy for the a/b projections (value-identical: narrow_bf16 rounds its FP32
+      //          input to the same BF16 values; bandwidth only);
+      //   t2_    the in_qkv projection, the conv's input and the source of its state window;
+      //   z_     the in_z projection, the gated norm's gate;
+      //   mixed_ the conv's output, the recurrence's input;
+      //   core_  the recurrence's output, the gated norm's input.
+      // The conv and recurrent state (and their checkpoints), a, b, g, beta and the residual stream stay FP32.
+      NvtxRange r("deltanet");
+      const int Vs = c.lin_value_size();
+      kernels::rmsnorm_quant_bf16(h_, L.input_norm, xn_bf16_, M, H, c.eps, false, L.in_qkv.in_scale, xq_, xsf_, stream_);
+      set_xq(L.in_qkv.in_scale, false);
+      kernels::prefill_gemm_fp8_bf16out(xq_, M, L.in_qkv.w, L.in_qkv.in_scale * L.in_qkv.scale, t2_bf16_, C, C,
+                                        L.in_qkv.K, stream_);
+      if (!xq_is(L.in_z.in_scale, false)) {  // in_z quantizes differently (not in this checkpoint): from the copy
+        kernels::quant_act_fp8_bf16in(xn_bf16_, M, L.in_z.K, L.in_z.in_scale, xq_, stream_);
+        set_xq(L.in_z.in_scale, false);
+      }
+      kernels::prefill_gemm_fp8_bf16out(xq_, M, L.in_z.w, L.in_z.in_scale * L.in_z.scale, z_bf16_, Vs, Vs, L.in_z.K,
+                                        stream_);
+      kernels::narrow_bf16_bf16in(xn_bf16_, M, L.in_a.w, L.in_b.w, a_, b_, L.in_a.N, L.in_a.K, stream_);
+      mark("gdn_proj");
+      const bool keep = keep_at > 0 && keep_at < M;
+      kernels::gdn_conv_prefill_bf16(t2_bf16_, mixed_bf16_, conv_state_[slot], L.conv, M, C, stream_,
+                                     keep ? snap_.conv[slot] : nullptr, keep_at);
+      kernels::gdn_gating(a_, b_, L.A_log, L.dt_bias, g_, beta_, M, c.lin_v_heads, stream_);
+      mark("gdn_conv");
+      kernels::gdn_recurrent_prefill_bf16(mixed_bf16_, g_, beta_, gdn_state_[slot], core_bf16_, M, c.lin_k_heads,
+                                          c.lin_v_heads, pos_, stream_, keep ? snap_.gdn[slot] : nullptr, keep_at);
+      mark("gdn_recurrent");
+      kernels::gated_rmsnorm_fp8_bf16(core_bf16_, z_bf16_, L.lin_norm, M * c.lin_v_heads, c.lin_v_dim, c.eps,
+                                      L.out.in_scale, xq_, stream_);
+      set_xq(L.out.in_scale, false);
+      linear_fp8_residual(L.out, normed_, M, true);
+      mark("gdn_proj");
     } else {
       NvtxRange r("deltanet");
       // A verify keeps this layer's inputs for commit() and leaves the conv and recurrent state as they

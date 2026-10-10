@@ -63,6 +63,12 @@ struct EngineOptions {
   // set_attention_prefetch); bit for bit the same output. Measured at 24K: -12% per layer at 2. 0 turns it off;
   // LING_ATTN_PREFETCH overrides.
   int attention_prefetch = 2;
+  // B34: the prefill's DeltaNet intermediates (the norm's copy for the a/b projections, the in_qkv and in_z
+  // projections, the conv's output, the recurrence's output) in BF16 where production keeps BF16, instead of
+  // FP32 (reports/M2-prefill.md §8 item 3). Not exact: a change of the prefill's numerics, so off by default
+  // under MILESTONES §14's exactness policy until its KL and agreement checks pass (bench/prefill_bf16_check.sh).
+  // The decode and verify rows path is untouched either way. LING_PREFILL_BF16=0/1 overrides.
+  bool prefill_bf16 = false;
 };
 
 struct EngineStats {
@@ -171,6 +177,7 @@ class Engine {
   static constexpr int kAttnSlice = 256;
   static constexpr int kResumeAlign = 32;  // kept states sit at multiples of this (the DeltaNet's chunk)  // prefill attention: queries per call (bounds the partials' scratch)
   bool quantized_ = false;                // set by forward(): the pass is a prefill
+  bool prefill_bf16_ = false;             // opts_.prefill_bf16 or LING_PREFILL_BF16: BF16 DeltaNet intermediates
   // RMSNorm; on the rows path it also leaves the FP16 copy for the next linear call (x_ready).
   // On the prefill path it writes the quantized input of the next GEMMs instead (input scale `in_scale`,
   // NVFP4 or FP8), and `out` only when `f32`.
@@ -256,6 +263,10 @@ class Engine {
   float *q_gate_ = nullptr, *k_ = nullptr, *v_ = nullptr, *q_ = nullptr, *gate_ = nullptr, *attn_ = nullptr;
   float *attn_scratch_ = nullptr, *logits_dev_ = nullptr;
   __nv_bfloat16* x_bf16_ = nullptr;
+  // --prefill-bf16: the BF16 views of xn_, t2_, z_, mixed_ and core_ (the same allocations, half the bytes used),
+  // each live only between its producer and its consumer inside one DeltaNet layer of a prefill pass.
+  __nv_bfloat16 *xn_bf16_ = nullptr, *t2_bf16_ = nullptr, *z_bf16_ = nullptr, *mixed_bf16_ = nullptr;
+  __nv_bfloat16* core_bf16_ = nullptr;
   uint8_t *xq_ = nullptr, *xsf_ = nullptr;  // the prefill path's quantized activations and their block scales
   uint8_t *xq2_ = nullptr, *xsf2_ = nullptr;
   __half* xh_ = nullptr;     // the rows path's FP16 activations [32][max K]
