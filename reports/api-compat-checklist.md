@@ -118,7 +118,7 @@ For one user on one GB10 with 1–4 agents:
 4. **Custom tools dropped** (Codex Code Mode). Built 2026-10-10 (API §4), partial: the dialect question stays with BACKLOG §19.13.
 5. **Errors after the stream starts** end without a finish chunk or `[DONE]`.
 6. **`reasoning_effort: "none"` on chat completions** was a 400. Done 2026-10-10: thinking off, as on the Responses path.
-7. **Invalid-JSON arguments in a chat history** are a 400 on every later request ([vllm#47761](https://github.com/vllm-project/vllm/issues/47761) is the same class).
+7. **Invalid-JSON arguments in a chat history** are a 400 on every later request ([vllm#47761](https://github.com/vllm-project/vllm/issues/47761) is the same class). Done 2026-10-10, the owner's decision: such a string is rendered verbatim where the parameter blocks would go and the conversation goes on (the Responses path keeps substituting `{}`). The broken arguments are what the model emitted on an earlier turn, clients replay history unchanged and Codex ends the turn on a 400; ling-serve's own parser never emits them, so only histories from other servers reach this path. Production refuses (SGLang 0.5.19 and 0.5.21: 400 "Assistant tool call function.arguments must be valid JSON." before the template); this is the one place ling-serve knowingly renders a prompt production would not.
 8. **`reasoning_tokens` is always 0.** Done 2026-10-10.
 9. **Silently ignored controls** (section 6): reject what is not built.
 10. **No embeddings or rerank** for Continue's indexing. Probably stays out of scope; document it.

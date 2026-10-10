@@ -279,17 +279,32 @@ int main() {
   }
   {
     // vllm#47761: the same on chat completions (Continue and Cline replay their history there).
-    json body = json::parse(R"({"messages":[{"role":"user","content":"run it"},
-      {"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"shell",
-       "arguments":"{\"command\": [\"ec"}}]},
-      {"role":"tool","tool_call_id":"c1","content":"error"}]})");
-    bool ok = true;
-    try {
-      (void)ling::serve::parse_request(body, true);
-    } catch (const std::exception&) {
-      ok = false;
-    }
-    KNOWN(ok);
+    // The owner's decision (2026-10-10, API section 3): a string that is not a JSON object is rendered
+    // verbatim where the parameter blocks would go, one newline added when it has none; an empty
+    // string renders no parameters; an object renders as parameters. Production refuses such a history
+    // (SGLang's parse_tool_call_arguments, 400 "Assistant tool call function.arguments must be valid
+    // JSON."), so this is the one place ling-serve knowingly renders a prompt production would not.
+    auto replay = [](const std::string& arguments) {
+      json body = json::parse(R"({"messages":[{"role":"user","content":"run it"},
+        {"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"shell",
+         "arguments":""}}]},
+        {"role":"tool","tool_call_id":"c1","content":"error"}]})");
+      body["messages"][1]["tool_calls"][0]["function"]["arguments"] = arguments;
+      try {
+        return ling::serve::parse_request(body, true).prompt_text;
+      } catch (const std::exception& e) {
+        return std::string("refused: ") + e.what();
+      }
+    };
+    const std::string head = "<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=shell>\n";
+    const std::string tail =
+        "</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nerror\n</tool_response><|im_end|>\n";
+    EXPECT(replay("{\"command\": [\"ec").find(head + "{\"command\": [\"ec\n" + tail) != std::string::npos);
+    EXPECT(replay("{\"command\": [\"ec\n").find(head + "{\"command\": [\"ec\n" + tail) != std::string::npos);
+    EXPECT(replay("").find(head + tail) != std::string::npos);
+    EXPECT(replay("[\"ec\"]").find(head + "[\"ec\"]\n" + tail) != std::string::npos);
+    EXPECT(replay("{\"command\": [\"ec\"]}").find(head + "<parameter=command>\n[\"ec\"]\n</parameter>\n" + tail) !=
+           std::string::npos);
   }
   {
     // vllm#37167, sglang#42110: one assistant turn replayed as reasoning, a commentary message and two

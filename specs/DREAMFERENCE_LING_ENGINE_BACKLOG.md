@@ -23,12 +23,13 @@ What users of SGLang and vLLM asked for, and what the four clients send that lin
    - unoffered names;
    - prose before a call;
    - unclosed middle parameter;
-   - unrenderable history arguments rendered instead of refused.
+   - unrenderable history arguments rendered instead of refused (done 2026-10-10, the owner's decision, [API §3](./DREAMFERENCE_LING_ENGINE_API.md): the string is written verbatim where the parameter blocks would go, because the broken arguments are what the model emitted on an earlier turn, clients replay history unchanged and Codex ends the turn on a 400; ling-serve's own parser never emits them. Production refuses, SGLang 0.5.19 and 0.5.21 answering 400 "Assistant tool call function.arguments must be valid JSON." before the template; this is the one place ling-serve knowingly renders a prompt production would not).
 7. **Small request fixes:**
    - presence and repetition penalties over output tokens only;
    - `reasoning_effort: "none"` on chat completions (done 2026-10-10: thinking off, as on `/v1/responses`, [API §3](./DREAMFERENCE_LING_ENGINE_API.md));
    - `reasoning_tokens` counted (done 2026-10-10: from the token ids in the engine's loop, [API §3 and §4](./DREAMFERENCE_LING_ENGINE_API.md));
    - `reasoning` accepted as an alias of `reasoning_content` on input;
+   - invalid-JSON tool-call arguments in a chat history: see item 6 (done 2026-10-10, rendered verbatim);
    - a negative `max_tokens` refused.
 8. **Several resident sessions** ([section 11](./DREAMFERENCE_LING_ENGINE_SESSIONS.md)). Two interleaved agents evict each other's history today, and each then re-prefills from its last checkpoint. With several sessions resident, `prompt_cache_key` (Codex sends the thread id) is the natural session key. Upstream's equivalent complaint is lost prefix hits per turn ([vllm#53670](https://github.com/vllm-project/vllm/issues/53670), [vllm#53477](https://github.com/vllm-project/vllm/issues/53477)).
 9. **Short requests ahead of long prefills.** Run a short request (autocomplete, a title) between the chunks of a long prefill ([sglang#42530](https://github.com/sgl-project/sglang/issues/42530)).
