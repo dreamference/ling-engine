@@ -345,6 +345,13 @@ int main() {
     EXPECT(ling::serve::custom_tool_input("{\"patch\": \"p\"}") == "p");
     EXPECT(ling::serve::custom_tool_input("{\"a\": \"p\", \"b\": \"q\"}") == "{\"a\": \"p\", \"b\": \"q\"}");
     EXPECT(ling::serve::custom_tool_input("not json") == "not json");
+    EXPECT(ling::serve::custom_tool_input("{}") == "");
+    // A chat tool without a `type`, or with one that is not a string, is still a function tool.
+    json untyped = json::parse(R"({"messages":[{"role":"user","content":"hi"}],"tools":[
+      {"function":{"name":"shell","parameters":{"type":"object"}}},
+      {"type":null,"function":{"name":"edit","parameters":{"type":"object"}}}]})");
+    const std::string u = ling::serve::parse_request(untyped, true).prompt_text;
+    EXPECT(u.find("\"name\": \"shell\"") != std::string::npos && u.find("\"name\": \"edit\"") != std::string::npos);
     // A function_call_output and a custom_tool_call_output share one wire shape; tool_choice "none"
     // drops custom tools with the rest.
     json none = body;

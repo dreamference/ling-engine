@@ -70,7 +70,8 @@ json canonical_tools(const json& tools, const json& tool_choice) {
     only = tool_choice["function"].value("name", "");
   json out = json::array();
   for (const json& t : tools) {
-    if (!t.is_object() || t.value("type", "function") != "function") continue;
+    if (!t.is_object()) continue;
+    if (t.contains("type") && t["type"].is_string() && t["type"] != "function") continue;
     const json& f = t.contains("function") && t["function"].is_object() ? t["function"] : t;
     json fn = json::object();
     fn["description"] = f.contains("description") && f["description"].is_string() ? f["description"] : json();
@@ -656,6 +657,7 @@ std::string custom_tool_input(const std::string& arguments) {
   const json args = json::parse(arguments, nullptr, false);
   if (args.is_object()) {
     if (args.contains(kCustomToolInput) && args[kCustomToolInput].is_string()) return args[kCustomToolInput];
+    if (args.empty()) return "";  // a call with no parameters: an empty input, not the text "{}"
     if (args.size() == 1 && args.begin()->is_string()) return args.begin().value();
   }
   return arguments;

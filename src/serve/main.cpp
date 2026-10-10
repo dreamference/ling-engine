@@ -153,12 +153,10 @@ class Worker {
     thread_.join();
   }
   void submit(Job job) {
-    {
-      std::lock_guard<std::mutex> l(mu_);
-      queue_.push_back(std::move(job));
-    }
-    {
-      std::lock_guard<std::mutex> l(ctx_.metrics.mu);
+    std::lock_guard<std::mutex> l(mu_);
+    queue_.push_back(std::move(job));
+    {  // under mu_ as well, so the worker's decrement cannot precede this increment
+      std::lock_guard<std::mutex> m(ctx_.metrics.mu);
       ctx_.metrics.queued += 1;
     }
     cv_.notify_one();
@@ -174,9 +172,7 @@ class Worker {
         if (stop_) return;
         job = std::move(queue_.front());
         queue_.pop_front();
-      }
-      {
-        std::lock_guard<std::mutex> l(ctx_.metrics.mu);
+        std::lock_guard<std::mutex> m(ctx_.metrics.mu);  // mu_ then metrics.mu, as submit() takes them
         ctx_.metrics.queued -= 1;
         ctx_.metrics.running = 1;
       }

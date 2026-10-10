@@ -35,7 +35,8 @@ struct Request {
 constexpr const char* kCustomToolInput = "input";
 
 // The input of a custom tool call from the arguments the parser produced: the `input` parameter; failing
-// that the single string parameter the model used instead; failing that the arguments text itself.
+// that the single string parameter the model used instead; an empty input for a call without
+// parameters; failing all that, the arguments text itself.
 std::string custom_tool_input(const std::string& arguments);
 
 // Throws std::invalid_argument with a message for the client.
