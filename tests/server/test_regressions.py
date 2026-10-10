@@ -549,14 +549,14 @@ def test_responses_custom_tool_call_stream(server):
 
 
 def test_responses_custom_tool_replay_matches_what_the_model_wrote(server):
-    """BACKLOG §19.13: a replayed custom_tool_call must render exactly as the model emitted it, or the
-    next turn misses the prefix cache and (with speculation) can diverge from a cold run.
+    """BACKLOG §19.13: the next turn after a custom tool call must work from the replayed history.
 
-    Check: after the turn above, the next turn with the call and its output replayed as custom_tool_call /
-    custom_tool_call_output answers warm (cached tokens reported) exactly as it answers cold; and the
-    replay has as many prompt tokens as the same turn as chat messages with a one-parameter function
-    call, which is how it is offered to the model. (The cached-token count itself is a checkpoint
-    position, not the first divergent token, so it is not compared with the first prompt's length.)"""
+    Check: the turn with the call and its output replayed as custom_tool_call / custom_tool_call_output
+    is accepted, reuses the prefix, answers warm exactly as cold, and has as many prompt tokens as the
+    same turn as chat messages with the one-parameter function call. Whether the replayed call renders
+    byte for byte as the model wrote it is a template property checked in ling-api-tests (the rendered
+    <parameter=input> block), not here: over HTTP the cached-token count is a checkpoint position, not
+    the first divergent token."""
     user = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": PATCH_PROMPT}]}
     evict(server)
     first = server.post("/v1/responses", {"input": [user], "tools": [APPLY_PATCH_CUSTOM], "reasoning": {"effort": "none"},
