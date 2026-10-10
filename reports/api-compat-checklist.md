@@ -31,7 +31,7 @@ ling-serve was checked at `3122b07` in `src/serve/api.cpp` and `src/serve/main.c
 | SSE events read | `response.created` (id), `output_item.added` / `.done`, `output_text.delta`, `reasoning_text.delta` (needs `content_index`), `reasoning_summary_text.*`, `completed`, `failed`, `incomplete`. `function_call_arguments.delta` is ignored by Codex. | ok (test: `test_responses_stream_event_order`) | |
 | `response.completed.usage` | `input_tokens`, `input_tokens_details.cached_tokens`, `output_tokens`, `output_tokens_details.reasoning_tokens`, `total_tokens` | ok since 2026-10-10: `reasoning_tokens` counted by the engine from the token ids | (test: `test_responses_reasoning_tokens_counted`) |
 | Cut at `max_output_tokens` | `response.incomplete` is a stream error to Codex | ling-serve sends `response.completed` with `status: incomplete`, deliberately | Keep; documented in `generate_responses` |
-| Idle timeout | 300 s between SSE events | No keep-alive and no `in_progress` events during prefill | Fine at 65K (prefill ≈ 30–40 s at M2’s rates); a risk only with a much larger `--max-context` |
+| Idle timeout | 300 s between SSE events | answered 2026-10-10: while no token has been produced (waiting in the queue, or in prefill) a `response.in_progress` event every `--keepalive-seconds` (15), numbered like any event; on chat completions and completions an SSE comment line (API §3, §4) | A long prefill (45K tokens is about 21 s) or a queue of requests ahead no longer risks the timeout; the keep-alives stop at the first token (test: `test_keepalive_before_first_token` and its chat variant, run with the morning's server tests) |
 | **Context overflow** | See section 5 | **wrong shape** | The largest gap |
 
 ## 2. Cline: chat completions

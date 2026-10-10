@@ -646,6 +646,79 @@ def test_metrics_has_the_harness_gauges(server):
     assert gauges()["sglang:num_running_reqs"] == 0
 
 
+KEEPALIVE_PROMPT_TOKENS = 45000  # at least; the lines run 20 to 24 tokens each, so up to 1.2 times this
+KEEPALIVE_MIN_PROMPT_TOKENS = 34000  # 16 s of prefill at 2,100 tokens/s: still longer than the 15 s interval
+
+
+def long_distinct_prompt(tokens):
+    """At least `tokens` tokens of text no earlier request sent (numbered function definitions, 20 to
+    24 tokens each, so between `tokens` and 1.2 times as many), so the prefix cache cannot shortcut the
+    prefill."""
+    return code_text(max(1, tokens // 20)) + "\nWhat does f1 return? Answer in one line."
+
+
+def skip_unless_room_for_keepalive_prompt(server):
+    if server.max_model_len < int(KEEPALIVE_PROMPT_TOKENS * 1.2) + 4096:
+        pytest.skip(f"max_model_len {server.max_model_len} is too small for a {KEEPALIVE_PROMPT_TOKENS}-token prompt")
+
+
+@pytest.mark.slow
+def test_keepalive_before_first_token(server):
+    """reports/api-compat-checklist.md, section 1, "Idle timeout": Codex ends a stream after 300 s
+    without an SSE event, and until 2026-10-10 ling-serve sent nothing between response.created and
+    the first token, so a long prefill or a queue of requests ahead risked the timeout. Check: on a
+    45K-token prompt at least one response.in_progress event arrives between response.created and the
+    first response.output_item.added and none after it, each carrying the created response's id with
+    an empty output; the sequence numbers stay consecutive and response.completed is last.
+
+    Needs a prefill longer than the keep-alive interval: 45K tokens at about 2,100 tokens/s is about
+    21 s against the default 15 s, so the test fails by design when the server runs with
+    --keepalive-seconds (or LING_KEEPALIVE_SECONDS) at or above its prefill time, and skips when the
+    context is too small for the prompt."""
+    skip_unless_room_for_keepalive_prompt(server)
+    evict(server)
+    evs = responses_events(server, {"input": long_distinct_prompt(KEEPALIVE_PROMPT_TOKENS),
+                                    "reasoning": {"effort": "none"}, "temperature": 0, "max_output_tokens": 4})
+    names = [e["event"] for e in evs]
+    assert names[0] == "response.created" and names[-1] == "response.completed", names
+    seqs = [e["data"]["sequence_number"] for e in evs]
+    assert seqs == list(range(seqs[0], seqs[0] + len(seqs))), seqs
+    first_item = names.index("response.output_item.added")
+    assert "response.in_progress" in names[1:first_item], names
+    assert "response.in_progress" not in names[first_item:], "a keep-alive after the first token"
+    created = evs[0]["data"]["response"]
+    for e in evs:
+        if e["event"] == "response.in_progress":
+            r = e["data"]["response"]
+            assert r["id"] == created["id"] and r["status"] == "in_progress" and r["output"] == [], r
+    usage = evs[-1]["data"]["response"]["usage"]
+    assert usage["input_tokens"] >= KEEPALIVE_MIN_PROMPT_TOKENS, f"the prompt was shorter than intended: {usage}"
+
+
+@pytest.mark.slow
+def test_keepalive_comment_on_chat_completions(server):
+    """The chat-completions side of test_keepalive_before_first_token: while nothing has been produced,
+    the raw stream carries the SSE comment line `: keep-alive`, which a conforming SSE parser ignores
+    (read in the OpenAI Python SDK and in Codex's eventsource-stream; the AI SDK's parser is assumed to
+    follow the specification). The conftest's stream() drops comment lines, so the raw response is read
+    here. Check: on a 45K-token prompt a line starting with ':' precedes the first `data:` line, none
+    follows it, and the stream ends with [DONE]. The timing caveat of that test applies."""
+    skip_unless_room_for_keepalive_prompt(server)
+    evict(server)
+    r = server.open_stream("/v1/chat/completions", {
+        "messages": [{"role": "user", "content": long_distinct_prompt(KEEPALIVE_PROMPT_TOKENS)}],
+        "max_tokens": 4, "temperature": 0, "stream": True, "chat_template_kwargs": NO_THINK})
+    with r:
+        assert r.status == 200
+        lines = [raw.decode("utf-8").rstrip("\r\n") for raw in r]
+    comments = [i for i, line in enumerate(lines) if line.startswith(":")]
+    data = [i for i, line in enumerate(lines) if line.startswith("data:")]
+    assert comments and data, lines[:5]
+    assert comments[0] < data[0], lines[:5]
+    assert comments[-1] < data[0], "a keep-alive after the first token"
+    assert lines[data[-1]] == "data: [DONE]", lines[-3:]
+
+
 # --- Errors, limits, cancellation ---------------------------------------------------------------------
 
 

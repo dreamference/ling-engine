@@ -3,12 +3,13 @@
 //
 //   ling-serve --model DIR [--host 0.0.0.0] [--port 8000] [--served-model-name NAME] [--max-context N]
 //              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs] [--pdl]
-//              [--attn-bulk] [--attn-prefetch N]
+//              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N]
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
 // tiles with bulk copies (M3); --attn-prefetch N sets how many KV tiles ahead its attention prefetches into L2
-// (default 2, 0 off; M3).
+// (default 2, 0 off; M3). --keepalive-seconds N (default 15, 0 off; LING_KEEPALIVE_SECONDS overrides it) is
+// how often a streamed request that has produced no token yet is sent a keep-alive (API §3, §4).
 //
 // With --draft, requests decode speculatively with the DFlash2 drafter (requests that set penalties
 // decode plainly). GET /metrics exports SGLang's counter names, so M0's replay harness reads them as is.
@@ -28,6 +29,7 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <deque>
 #include <functional>
@@ -116,6 +118,8 @@ struct ServerContext {
   // The token ids that end the thinking span: `</think>`, then the blank line the template puts after it
   // ("\n\n" as one token, or "\n" twice). -1 when the tokenizer has no such single token.
   int think_end = -1, newline = -1, blank_line = -1;
+  // How often a streamed request that has produced no token yet is sent a keep-alive (0: never).
+  int keepalive_ms = 15000;
   Metrics metrics;
 };
 
@@ -325,12 +329,51 @@ struct Exchange {
   proxygen::ResponseHandler* downstream = nullptr;  // null once the client is gone
   folly::EventBase* evb = nullptr;
   std::shared_ptr<std::atomic<bool>> cancelled = std::make_shared<std::atomic<bool>>(false);
+  bool keepalive = false;  // a keep-alive timer is armed (arm_keepalive); cleared by stop_keepalive
+  int seq = 0;             // the Responses route's sequence numbers, stamped in write order (emit_event)
 };
 
 void post(const std::shared_ptr<Exchange>& ex, std::function<void(proxygen::ResponseHandler*)> fn) {
   ex->evb->runInEventBaseThread([ex, fn = std::move(fn)] {
     if (ex->downstream) fn(ex->downstream);
   });
+}
+
+// Keep-alives (API §3, §4). While a streamed request has produced nothing (waiting in the worker's queue,
+// or in prefill) the request's event base writes one every `interval_ms`, so a client with an idle
+// timeout (Codex ends a stream after 300 s without an event) keeps the stream through a long prefill or
+// a queue ahead. Armed on the handler's thread right before the job is submitted. Stopped by
+// stop_keepalive, which the engine thread posts before its first write (the first token, done, or
+// error): posts from one thread run in order, so a tick never follows that write, and since every write
+// runs on the event base a tick never interleaves with one. A tick after EOM, or after a disconnect,
+// finds `downstream` null (Handler::finish) and does nothing. The timer itself is not cancelled
+// (runAfterDelay has no handle): a cleared flag makes the next tick a no-op that does not re-arm, which
+// releases its closure within one interval.
+void keepalive_tick(std::shared_ptr<Exchange> ex, int interval_ms, std::function<void(proxygen::ResponseHandler*)> write) {
+  ex->evb->tryRunAfterDelay(
+      [ex, interval_ms, write] {
+        if (!ex->keepalive || !ex->downstream) return;
+        write(ex->downstream);
+        keepalive_tick(ex, interval_ms, write);
+      },
+      static_cast<uint32_t>(interval_ms));
+}
+
+void arm_keepalive(const std::shared_ptr<Exchange>& ex, int interval_ms, std::function<void(proxygen::ResponseHandler*)> write) {
+  if (interval_ms <= 0) return;
+  ex->keepalive = true;
+  keepalive_tick(ex, interval_ms, std::move(write));
+}
+
+void stop_keepalive(const std::shared_ptr<Exchange>& ex) {
+  ex->evb->runInEventBaseThread([ex] { ex->keepalive = false; });
+}
+
+// Writes one Responses event, numbered in write order. The event base's thread only, with a client.
+void emit_event(Exchange& ex, const std::string& type, json payload) {
+  payload["type"] = type;
+  payload["sequence_number"] = ex.seq++;
+  ResponseBuilder(ex.downstream).body("event: " + type + "\ndata: " + dump_json(payload) + "\n\n").send();
 }
 
 void send_json(proxygen::ResponseHandler* d, int status, const json& body) {
@@ -449,6 +492,7 @@ class Handler : public proxygen::RequestHandler {
       std::string content, reasoning;
       std::vector<ToolCall> calls;
       bool first = true;
+      bool keepalive = false;  // keep-alives are armed and nothing has been written yet
       State(bool r, const json& t) : parser(r, t) {}
     };
     auto st = std::make_shared<State>(chat && req.reasoning, req.tools);
@@ -456,6 +500,12 @@ class Handler : public proxygen::RequestHandler {
     auto sse = [ex](const json& chunk) {
       std::string data = "data: " + dump_json(chunk) + "\n\n";
       post(ex, [data](proxygen::ResponseHandler* d) { ResponseBuilder(d).body(data).send(); });
+    };
+    // Before the first write of any kind (the first token, done, or error): no keep-alive after it.
+    auto stop_ticks = [=]() {
+      if (!st->keepalive) return;
+      st->keepalive = false;
+      stop_keepalive(ex);
     };
     auto chunk_of = [=](json delta, json finish) {
       json c = {{"id", id}, {"object", chat ? "chat.completion.chunk" : "text_completion"}, {"created", created},
@@ -499,8 +549,12 @@ class Handler : public proxygen::RequestHandler {
       if (delta.size() > 0) sse(chunk_of(delta, nullptr));
     };
 
-    job.sink.text = [=](const std::string& piece) { deliver(chat ? st->parser.push(piece) : OutputParser::Delta{{}, piece, {}}); };
+    job.sink.text = [=](const std::string& piece) {
+      stop_ticks();
+      deliver(chat ? st->parser.push(piece) : OutputParser::Delta{{}, piece, {}});
+    };
     job.sink.error = [=](const std::string& msg, const std::string& code) {
+      stop_ticks();
       const json error = error_body(msg, error_type(code), code);
       if (req.stream) {  // the headers are out: end the stream properly after the error
         const std::string tail = stream_error_tail(error, chunk_of(json::object(), kStreamErrorFinish));
@@ -512,6 +566,7 @@ class Handler : public proxygen::RequestHandler {
     };
     job.sink.done = [=](const std::string& finish_in, int prompt_tokens, int completion_tokens, int cached,
                         int reasoning_tokens) {
+      stop_ticks();
       if (chat) deliver(st->parser.finish());
       const std::string finish = !st->calls.empty() && finish_in == "stop" ? "tool_calls" : finish_in;
       json usage = {{"prompt_tokens", prompt_tokens},
@@ -548,6 +603,12 @@ class Handler : public proxygen::RequestHandler {
                    {"model", model}, {"choices", json::array({choice})}, {"usage", usage}};
       post(ex, [body](proxygen::ResponseHandler* d) { send_json(d, 200, body); });
     };
+    if (req.stream && ctx_.keepalive_ms > 0) {  // an SSE comment, which every conforming parser ignores (API §3)
+      st->keepalive = true;
+      arm_keepalive(ex, ctx_.keepalive_ms, [](proxygen::ResponseHandler* d) {
+        ResponseBuilder(d).body(std::string(": keep-alive\n\n")).send();
+      });
+    }
     worker_.submit(std::move(job));
   }
 
@@ -577,12 +638,12 @@ class Handler : public proxygen::RequestHandler {
     struct State {
       OutputParser parser;
       std::string id = new_id("resp_");
-      int seq = 0;
       json output = json::array();   // finished items, in order
       std::string reasoning, content;
       std::string reasoning_id, message_id;
       int reasoning_index = -1, message_index = -1;
       bool reasoning_open = false, message_open = false;
+      bool keepalive = false;  // keep-alives are armed and nothing has been written yet
       std::vector<std::string> custom_tools;
       State(bool r, const json& t, std::vector<std::string> c) : parser(r, t), custom_tools(std::move(c)) {}
       bool custom(const std::string& name) const {
@@ -594,12 +655,17 @@ class Handler : public proxygen::RequestHandler {
       return json{{"id", st->id}, {"object", "response"}, {"created_at", created}, {"status", status},
                   {"model", model}, {"output", st->output}, {"tools", json::array()}};
     };
+    // Events are numbered when they are written, on the event base (emit_event), so a keep-alive written
+    // by the timer and an event posted by the engine thread share one counter and stay consecutive.
     auto event = [=](const std::string& type, json payload) {
-      payload["type"] = type;
-      payload["sequence_number"] = st->seq++;
       if (!req.stream) return;
-      std::string data = "event: " + type + "\ndata: " + dump_json(payload) + "\n\n";
-      post(ex, [data](proxygen::ResponseHandler* d) { ResponseBuilder(d).body(data).send(); });
+      post(ex, [ex, type, payload](proxygen::ResponseHandler*) { emit_event(*ex, type, payload); });
+    };
+    // Before the first write of any kind (the first token, done, or error): no keep-alive after it.
+    auto stop_ticks = [=]() {
+      if (!st->keepalive) return;
+      st->keepalive = false;
+      stop_keepalive(ex);
     };
     auto close_reasoning = [=]() {
       if (!st->reasoning_open) return;
@@ -687,6 +753,7 @@ class Handler : public proxygen::RequestHandler {
     // Streamed, an error is response.failed carrying its code (context_length_exceeded is what makes
     // Codex compact; server_error is retried); not streamed, an HTTP error with the same code.
     auto fail = [=](const std::string& msg, const std::string& code) {
+      stop_ticks();
       if (req.stream) {
         json failed = response_obj("failed");
         failed["error"] = {{"code", code}, {"message", msg}};
@@ -703,10 +770,14 @@ class Handler : public proxygen::RequestHandler {
       return;
     }
 
-    job.sink.text = [=](const std::string& piece) { deliver(st->parser.push(piece)); };
+    job.sink.text = [=](const std::string& piece) {
+      stop_ticks();
+      deliver(st->parser.push(piece));
+    };
     job.sink.error = fail;
     job.sink.done = [=](const std::string& finish, int prompt_tokens, int completion_tokens, int cached,
                         int reasoning_tokens) {
+      stop_ticks();
       deliver(st->parser.finish());
       close_reasoning();
       close_message();
@@ -726,6 +797,15 @@ class Handler : public proxygen::RequestHandler {
         post(ex, [resp](proxygen::ResponseHandler* d) { send_json(d, 200, resp); });
       }
     };
+    if (req.stream && ctx_.keepalive_ms > 0) {
+      // response.in_progress with the response object as response.created sent it (the output is still
+      // empty, and it is taken here, before the engine thread can touch it); Codex ignores the kind.
+      st->keepalive = true;
+      const json in_progress = {{"response", response_obj("in_progress")}};
+      arm_keepalive(ex, ctx_.keepalive_ms, [ex, in_progress](proxygen::ResponseHandler*) {
+        emit_event(*ex, "response.in_progress", in_progress);
+      });
+    }
     worker_.submit(std::move(job));
   }
 
@@ -759,7 +839,7 @@ int main(int argc, char** argv) {
   int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false;
-  int attn_prefetch = 2;
+  int attn_prefetch = 2, keepalive_seconds = 15;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -784,14 +864,23 @@ int main(int argc, char** argv) {
     else if (a == "--pdl") pdl = true;
     else if (a == "--attn-bulk") attn_bulk = true;
     else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
+    else if (a == "--keepalive-seconds") keepalive_seconds = std::stoi(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N]\n";
     return 2;
+  }
+  if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
+    try {
+      keepalive_seconds = std::stoi(e);
+    } catch (const std::exception&) {
+      std::cerr << "LING_KEEPALIVE_SECONDS must be an integer\n";
+      return 2;
+    }
   }
   int fake_argc = 1;
   char** fake_argv = argv;
@@ -825,6 +914,7 @@ int main(int argc, char** argv) {
   ctx.tok = &tok;
   ctx.im_end = tok.token_id("<|im_end|>");
   ctx.metrics.max_total_tokens = max_context;
+  ctx.keepalive_ms = keepalive_seconds > 0 ? keepalive_seconds * 1000 : 0;
   ctx.think_end = tok.token_id("</think>");
   {
     const std::vector<int> one = tok.encode("\n"), two = tok.encode("\n\n");
