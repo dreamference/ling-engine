@@ -15,9 +15,13 @@ Two measurements were made for this section on the served checkpoint (`RadixArk/
 ### 16.1 Five measurements M0 should add
 
 1. **Bytes in flight.** Measure GPU DRAM latency with a pointer chase. Bandwidth × latency is the number of bytes every weight-streaming kernel must keep outstanding. At 273 GB/s and ~1 µs, that is ~270 KB across the chip, ~6 KB per SM on 48 SMs. Pipeline depth (TMA or `cp.async` stages) is sized from it, not tuned by trial.
+
+   *Measured 2026-10-10* (M0's pointer chase re-run with the reference server resident but idle; [reports/micro-2026-10-10.md](../reports/micro-2026-10-10.md) §1): 395–402 ns to DRAM, 136 ns in L2, unchanged from M0's idle machine. At the measured 257 GB/s: ~103 KB in flight across the chip, ~2.1 KB per SM on 48 SMs, ~13 KB per SM if 8 SMs stream.
 2. **How many SMs saturate the bus.** Stream with 8, 16, 24, 32 and 48 SMs. If about half of them reach the measured peak, then:
    - wave quantization stops mattering for weight streams (16.8);
    - the remaining SMs can run the non-streaming work (the DeltaNet scan, sampling) at the same time (16.6).
+
+   *Measured 2026-10-10* (reference server resident but idle; micro-2026-10-10.md §2): 4 SMs 248 GB/s, 8 SMs 257, 12–24 SMs 257–258, 48 SMs 255–259; the sweep's best read 258.1 GB/s (94.6% of 273) and 257.0 sustained for 15 s, against M0's 262.8 on a bare GPU. Eight SMs reach 99% of the 48-SM figure: both consequences above hold.
 3. **The ISA sm_121 exposes:**
    - warp-level block-scaled `mma.sync` for NVFP4 and FP8;
    - TMA;
@@ -25,8 +29,14 @@ Two measurements were made for this section on the served checkpoint (`RadixArk/
    - programmatic dependent launch.
 
    sm_100's `tcgen05`/TMEM path is not expected. Every kernel in [section 9](./DREAMFERENCE_LING_ENGINE_ARCHITECTURE.md) assumes warp-level MMA, and results that depend on TMEM (MpFA's attention, CuTile's B200 numbers) do not transfer. CuTile's attention reached 53% of FlashAttention-2 on sm_120.
+
+   *Measured 2026-10-10* (CUDA 13.0.88, `bench/membw/isa_probe.cu` and `bench/micro/tcgen05_probe.cu`; micro-2026-10-10.md §3): the four features above all run and check out (clusters up to 8 blocks; PDL's secondary prologue starts while the primary runs). `tcgen05.alloc` is refused by ptxas for `sm_121a` and accepted for `sm_100a`, so TMEM is absent as a compiled fact. `-arch=sm_121a` still emits `compute_121` PTX that rejects the block-scaled MMAs; `-gencode arch=compute_121a,code=sm_121a` is required.
 4. **Clocks, power and temperature** across a 10-minute decode and a long prefill. A short paper on the DGX Spark found that alternating compute-heavy and memory-heavy phases at a finer grain avoids throttling, worth up to 2%.
+
+   *Measured 2026-10-10* (ten minutes of two-stream decode on the reference server, `bench/micro/decode_clocks.py`; micro-2026-10-10.md §4): SM clock 2,405–2,476 MHz (median 2,431, never below base), power 44–45 W, temperature 68–69 °C, throttle-reason mask 0x0 in all 709 samples. No throttling at a decode load; the long-prefill case is still unmeasured (M0's replays, with 25K-token prompts, peaked at 82 W and 79 °C, also without throttling).
 5. **DFlash2's acceptance histogram,** not only its mean. If many steps accept all 16 tokens (the ceiling bin), the drafter's block length is leaving speed unused (16.12).
+
+   *Measured* in M0 §4 (production, 16 draft tokens, 1,295 steps of the tuning set): ceiling bin 3.6%, 43% of steps accept 0–2 drafted tokens; M1 §4 measured ling-serve's at the same block (ceiling 3.6%). Not re-measured on 2026-10-10: it needs ling-serve's model loaded, which was not done beside the resident reference server (micro-2026-10-10.md §5). Production and ling-serve run 12 draft tokens since 2026-10-09; the 12-draft histogram on the tuning set is still to be taken.
 
 ### 16.2 An all-NVFP4 checkpoint already exists and is validated (−3.2 GB per pass)
 
