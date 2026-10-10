@@ -677,7 +677,7 @@ class Factory : public proxygen::RequestHandlerFactory {
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "0.0.0.0", name;
-  int port = 8000, max_context = 65536, draft_block = 16, lookup = 1, lookup_min = 8, checkpoints = 8;
+  int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false;
   int attn_prefetch = 2;

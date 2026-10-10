@@ -47,7 +47,7 @@ int main(int argc, char** argv) {
   uint64_t seed = 0;
   int attn_prefetch = 2;
   std::string draft;
-  int block = 16, lookup = 1, lookup_min = 8;
+  int block = 12, lookup = 1, lookup_min = 8;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
