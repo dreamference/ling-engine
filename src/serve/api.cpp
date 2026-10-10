@@ -82,7 +82,7 @@ json canonical_tools(const json& tools, const json& tool_choice) {
     if (!defer.is_null() || (f.contains("defer_loading") && f["defer_loading"].is_boolean()))
       fn["defer_loading"] = defer.is_null() ? f["defer_loading"] : defer;
     if (!only.empty() && fn["name"] != only) continue;
-    out.push_back(json{{"type", t.value("type", "function")}, {"function", fn}, {"defer_loading", defer}});
+    out.push_back(json{{"type", "function"}, {"function", fn}, {"defer_loading", defer}});
   }
   return out;
 }
