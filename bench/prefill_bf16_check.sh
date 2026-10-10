@@ -36,7 +36,7 @@ FORCE=$BUILD/ling-force
 mkdir -p "$OUT"
 cd "$OUT"
 echo "build $BUILD, model $M, study $STUDY, prompt $P35" | tee summary.txt
-if [ ! -x "$FORCE" ]; then  # the agreement study's engine tool, built against this build's libraries (no GPU needed)
+if [ ! -x "$FORCE" ] || [ "$BUILD/libling_core.a" -nt "$FORCE" ]; then  # the agreement study's engine tool, built against this build's libraries (no GPU needed)
   NVCC=${NVCC:-$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)}
   "$NVCC" -std=c++20 -O2 -gencode arch=compute_121a,code=sm_121a -I"$SRC/src" "$H/agreement/ling_force.cpp" \
     "$BUILD/libling_core.a" "$BUILD/libling_tokenizer.a" -lcublas -lpcre2-8 -licuuc -o "$FORCE"
@@ -48,8 +48,9 @@ i=0
 for mode in off on on off; do
   i=$((i + 1))
   flag=""; [ "$mode" = on ] && flag="--prefill-bf16"
-  "$RUN" --model "$M" --prompts-file "$P35" --max-tokens 2 --max-context 40000 $flag > "time-$mode-$i.out" 2> "time-$mode-$i.err"
-  echo "$mode $i: $(grep '^prefill:' "time-$mode-$i.err")" | tee -a summary.txt
+  "$RUN" --model "$M" --prompts-file "$P35" --max-tokens 2 --max-context 40000 $flag > "time-$mode-$i.out" 2> "time-$mode-$i.err" \
+    || echo "$mode $i: ling-run FAILED (exit $?): $(tail -n 2 "time-$mode-$i.err")" | tee -a summary.txt
+  echo "$mode $i: $(grep '^prefill:' "time-$mode-$i.err" || echo 'no prefill line')" | tee -a summary.txt
 done
 
 # ---- 2. Exactness within the mode ----
@@ -57,11 +58,11 @@ echo "== 2. prefix check and spec check with the switch on" | tee -a summary.txt
 { head -n 30 "$STUDY/prompts.jsonl"; sed -n '31,33p' "$STUDY/prompts.jsonl"; } > prefix-prompts.jsonl
 "$RUN" --model "$M" --prompts-file prefix-prompts.jsonl --prefix-check --max-context 40000 --prefill-bf16 \
   > prefix-check-on.txt 2> prefix-check-on.err || true
-grep -E 'prefix check passed|PREFIX CHECK FAILED' prefix-check-on.txt | tee -a summary.txt
+{ grep -E 'prefix check passed|PREFIX CHECK FAILED' prefix-check-on.txt || echo "prefix check: no verdict, see prefix-check-on.err"; } | tee -a summary.txt
 if [ -n "$D" ] && [ -f "$HOME/m2/spec.jsonl" ]; then
   "$RUN" --model "$M" --draft "$D" --prompts-file "$HOME/m2/spec.jsonl" --spec-check --max-tokens 200 \
     --max-context 40000 --prefill-bf16 > spec-check-on.txt 2> spec-check-on.err || true
-  grep -E 'spec check passed|SPEC CHECK FAILED' spec-check-on.txt | tee -a summary.txt
+  { grep -E 'spec check passed|SPEC CHECK FAILED' spec-check-on.txt || echo "spec check: no verdict, see spec-check-on.err"; } | tee -a summary.txt
 else
   echo "spec check skipped: no drafter or no ~/m2/spec.jsonl" | tee -a summary.txt
 fi
@@ -72,7 +73,8 @@ echo "== 3. KL against the exact engine (study prompts)" | tee -a summary.txt
 python3 "$H/agreement/mode_kl.py" want eng-off.jsonl "$STUDY/cases.jsonl" > cases-on.jsonl
 LING_PREFILL_BF16=1 "$FORCE" score "$M" 20 < cases-on.jsonl > eng-on.jsonl 2> eng-on.err
 python3 "$H/agreement/mode_kl.py" compare eng-off.jsonl eng-on.jsonl "$STUDY/cases.jsonl" \
-  --prod "$STUDY/prod-force-cold-c1.jsonl" | tee kl-study.txt | tee -a summary.txt || true
+  --prod "$STUDY/prod-force-cold-c1.jsonl" 2>&1 | tee kl-study.txt | tee -a summary.txt || true
+grep -q 'MODE CHECK' kl-study.txt || echo "KL (study): no verdict, see kl-study.txt, eng-off.err and eng-on.err" | tee -a summary.txt
 
 # ---- 4. The same at the 35K prompt ----
 echo "== 4. KL against the exact engine at 35K" | tee -a summary.txt
@@ -87,7 +89,8 @@ PY
 "$FORCE" score "$M" 20 < cases-35k.jsonl > eng-35k-off.jsonl 2> eng-35k-off.err
 python3 "$H/agreement/mode_kl.py" want eng-35k-off.jsonl cases-35k.jsonl > cases-35k-on.jsonl
 LING_PREFILL_BF16=1 "$FORCE" score "$M" 20 < cases-35k-on.jsonl > eng-35k-on.jsonl 2> eng-35k-on.err
-python3 "$H/agreement/mode_kl.py" compare eng-35k-off.jsonl eng-35k-on.jsonl cases-35k.jsonl | tee kl-35k.txt | tee -a summary.txt || true
+python3 "$H/agreement/mode_kl.py" compare eng-35k-off.jsonl eng-35k-on.jsonl cases-35k.jsonl 2>&1 | tee kl-35k.txt | tee -a summary.txt || true
+grep -q 'MODE CHECK' kl-35k.txt || echo "KL (35K): no verdict, see kl-35k.txt and eng-35k-*.err" | tee -a summary.txt
 
 # ---- 5. Optional: long greedy continuations of the agent prompts in both modes ----
 if [ "${B34_GEN400:-0}" = 1 ]; then
