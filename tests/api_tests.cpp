@@ -359,7 +359,7 @@ int main() {
   }
   {
     // vllm#53284, vllm#52738: reasoning_effort "none" on chat completions means thinking off, as it
-    // already does on the Responses path (today: 400 "Unexpected reasoning effort none").
+    // already does on the Responses path (it used to be a 400, "Unexpected reasoning effort none").
     json body = json::parse(R"({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"})");
     bool ok = true, thinking_off = false;
     try {
@@ -367,7 +367,45 @@ int main() {
     } catch (const std::exception&) {
       ok = false;
     }
-    KNOWN(ok && thinking_off);
+    EXPECT(ok && thinking_off);
+    // The same through chat_template_kwargs; and the other efforts are untouched (high still thinks).
+    json kw = json::parse(R"({"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"reasoning_effort":"none"}})");
+    EXPECT(!ling::serve::parse_request(kw, true).reasoning);
+    json high = json::parse(R"({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"})");
+    const ling::serve::Request h = ling::serve::parse_request(high, true);
+    EXPECT(h.reasoning && h.prompt_text.find("Reasoning effort is set to xhigh") != std::string::npos);
+  }
+  {
+    // reports/api-compat-checklist.md gap 2: an image part is rendered as the placeholder `[image]` (no
+    // vision encoder yet) instead of a 400, which ends the turn in Codex; the text parts stay as they are.
+    // On chat completions (Cline's `image_url` part) ...
+    json chat = json::parse(R"({"messages":[{"role":"user","content":[{"type":"text","text":"What is in this image?"},
+      {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}},
+      {"type":"text","text":"Be brief."}]}],"chat_template_kwargs":{"enable_thinking":false}})");
+    bool ok = true;
+    std::string t;
+    try {
+      t = ling::serve::parse_request(chat, true).prompt_text;
+    } catch (const std::exception&) {
+      ok = false;
+    }
+    EXPECT(ok);
+    EXPECT(t.find("What is in this image?[image]Be brief.") != std::string::npos);
+    EXPECT(t.find("base64") == std::string::npos);
+    // ... and on the Responses path (Codex's `input_image` part).
+    json resp = json::parse(R"({"reasoning":{"effort":"none"},"input":[{"type":"message","role":"user","content":[
+      {"type":"input_text","text":"What is in this image?"},
+      {"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}]})");
+    ok = true;
+    t.clear();
+    try {
+      t = ling::serve::parse_responses_request(resp).prompt_text;
+    } catch (const std::exception&) {
+      ok = false;
+    }
+    EXPECT(ok);
+    EXPECT(t.find("What is in this image?[image]") != std::string::npos);
+    EXPECT(t.find("base64") == std::string::npos);
   }
   {
     // Stop strings while streaming multi-byte text (the sglang#40529 family): the hold-back used to count
