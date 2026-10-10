@@ -501,6 +501,96 @@ def test_responses_replayed_turn_renders_like_merged_chat(server):
     assert resp["usage"]["input_tokens"] == chat["usage"]["prompt_tokens"]
 
 
+# Codex's freeform apply_patch, as its pinned source offers it: the description and the grammar from
+# codex-rs/core/assets/tools/apply_patch.lark (rendered to the model with the description, API §4).
+APPLY_PATCH_LARK = "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?\n\nhunk: add_hunk | delete_hunk | update_hunk\nadd_hunk: \"*** Add File: \" filename LF add_line+\ndelete_hunk: \"*** Delete File: \" filename LF\nupdate_hunk: \"*** Update File: \" filename LF change_move? change?\n\nfilename: /(.+)/\nadd_line: \"+\" /(.*)/ LF -> line\n\nchange_move: \"*** Move to: \" filename LF\nchange: (change_context | change_line)+ eof_line?\nchange_context: (\"@@\" | \"@@ \" /(.+)/) LF\nchange_line: (\"+\" | \"-\" | \" \") /(.*)/ LF\neof_line: \"*** End of File\" LF\n\n%import common.LF\n"
+APPLY_PATCH_CUSTOM = {"type": "custom", "name": "apply_patch",
+                      "description": "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, "
+                                     "so do not wrap the patch in JSON.",
+                      "format": {"type": "grammar", "syntax": "lark", "definition": APPLY_PATCH_LARK}}
+PATCH_PROMPT = ("Create the file hello.txt containing the single line `hello` by calling the apply_patch tool. "
+                "Call the tool now; do not explain.")
+
+
+def test_responses_custom_tool_call_stream(server):
+    """BACKLOG §19.13: a `type: custom` tool was dropped and no custom_tool_call item ever emitted.
+
+    Check, against what Codex's parser requires: the tool's call arrives as a custom_tool_call item,
+    added with `input` already present (Codex drops an item without it), then exactly one
+    custom_tool_call_input.delta carrying item_id and call_id, then .done, then output_item.done with the
+    full input, the same item in response.completed; no tool markup in output_text; the input is the
+    patch text itself, not JSON."""
+    evs = responses_events(server, {
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": PATCH_PROMPT}]}],
+        "tools": [APPLY_PATCH_CUSTOM], "reasoning": {"effort": "none"}, "temperature": 0, "max_output_tokens": 400})
+    names = [e["event"] for e in evs]
+    assert names[0] == "response.created" and names[-1] == "response.completed", names
+    for e in evs:
+        if e["event"] == "response.output_text.delta":
+            assert "<tool_call>" not in e["data"]["delta"] and "<function=" not in e["data"]["delta"]
+    added = [e["data"] for e in evs if e["event"] == "response.output_item.added" and e["data"]["item"]["type"] == "custom_tool_call"]
+    assert len(added) == 1, f"expected one custom_tool_call item, got {names}"
+    item, index = added[0]["item"], added[0]["output_index"]
+    assert item["name"] == "apply_patch" and item["call_id"] and item["id"] and item["input"] == ""
+    deltas = [e["data"] for e in evs if e["event"] == "response.custom_tool_call_input.delta"]
+    dones = [e["data"] for e in evs if e["event"] == "response.custom_tool_call_input.done"]
+    assert len(deltas) == 1 and len(dones) == 1
+    assert deltas[0]["item_id"] == item["id"] and deltas[0]["call_id"] == item["call_id"] and deltas[0]["output_index"] == index
+    finished = [e["data"]["item"] for e in evs if e["event"] == "response.output_item.done" and e["data"]["output_index"] == index]
+    assert len(finished) == 1 and finished[0]["type"] == "custom_tool_call" and finished[0]["status"] == "completed"
+    text = finished[0]["input"]
+    assert text == deltas[0]["delta"] == dones[0]["input"] and text.strip()
+    # Free text, not JSON. The dialect is the model's to choose: the grammar is rendered, not enforced
+    # (API §4); which one it wrote is recorded in reports/api-compat-checklist.md, not asserted here.
+    assert "hello" in text and not text.lstrip().startswith("{"), text
+    assert names.index("response.custom_tool_call_input.delta") < names.index("response.custom_tool_call_input.done")
+    completed = evs[-1]["data"]["response"]["output"]
+    assert any(o["type"] == "custom_tool_call" and o["input"] == text and o["call_id"] == item["call_id"] for o in completed)
+
+
+def test_responses_custom_tool_replay_matches_what_the_model_wrote(server):
+    """BACKLOG §19.13: a replayed custom_tool_call must render exactly as the model emitted it, or the
+    next turn misses the prefix cache and (with speculation) can diverge from a cold run.
+
+    Check: after the turn above, the next turn with the call and its output replayed as custom_tool_call /
+    custom_tool_call_output answers warm (cached tokens reported) exactly as it answers cold; and the
+    replay has as many prompt tokens as the same turn as chat messages with a one-parameter function
+    call, which is how it is offered to the model. (The cached-token count itself is a checkpoint
+    position, not the first divergent token, so it is not compared with the first prompt's length.)"""
+    user = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": PATCH_PROMPT}]}
+    evict(server)
+    first = server.post("/v1/responses", {"input": [user], "tools": [APPLY_PATCH_CUSTOM], "reasoning": {"effort": "none"},
+                                          "temperature": 0, "max_output_tokens": 400})
+    calls = [o for o in first["output"] if o["type"] == "custom_tool_call"]
+    assert len(calls) == 1, [o["type"] for o in first["output"]]
+    call = calls[0]
+    replay = [user, {"type": "custom_tool_call", "call_id": call["call_id"], "name": "apply_patch", "input": call["input"]},
+              {"type": "custom_tool_call_output", "call_id": call["call_id"], "output": "Done!"}]
+    body = {"input": replay, "tools": [APPLY_PATCH_CUSTOM], "reasoning": {"effort": "none"}, "temperature": 0,
+            "max_output_tokens": 40}
+    warm = server.post("/v1/responses", body)
+    assert warm["usage"]["input_tokens_details"]["cached_tokens"] > 0, "the replayed turn reused nothing"
+    evict(server)
+    cold = server.post("/v1/responses", body)
+
+    def answer(r):
+        return [(o["type"], o.get("input") or "".join(c.get("text", "") for c in o.get("content", []))) for o in r["output"]]
+    assert answer(warm) == answer(cold), "warm and cold answers differ after the replayed custom call"
+    second = server.post("/v1/responses", dict(body, max_output_tokens=1))
+    chat = server.post("/v1/chat/completions", {"messages": [
+        {"role": "user", "content": PATCH_PROMPT},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": call["call_id"], "type": "function",
+                                                              "function": {"name": "apply_patch", "arguments": json.dumps({"input": call["input"]})}}]},
+        {"role": "tool", "tool_call_id": call["call_id"], "content": "Done!"}],
+        "tools": [{"type": "function", "function": {
+            "name": "apply_patch",
+            "description": APPLY_PATCH_CUSTOM["description"] + "\n\nThe input must follow this lark grammar:\n" + APPLY_PATCH_LARK,
+            "parameters": {"type": "object", "properties": {"input": {"type": "string", "description": "The tool's input, as free text"}},
+                           "required": ["input"]}}}],
+        "chat_template_kwargs": NO_THINK, "max_tokens": 1, "temperature": 0})
+    assert second["usage"]["input_tokens"] == chat["usage"]["prompt_tokens"]
+
+
 @pytest.mark.xfail(reason="usage.output_tokens_details.reasoning_tokens is always 0", strict=False)
 def test_responses_reasoning_tokens_counted(server):
     """vllm#49711, sglang#39826.

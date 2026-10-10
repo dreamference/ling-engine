@@ -61,14 +61,16 @@ json production_messages(const json& messages) {
 // The tools as production's server hands them to the chat template: each one validated into its
 // `Tool`/`Function` models and dumped again, which fixes the keys and their order:
 // {"type", "function": {"description", "name", "parameters", "strict"}, "defer_loading"}. A named
-// tool_choice keeps only that tool.
+// tool_choice keeps only that tool. Only `function` tools are offered on this route: any other type (a
+// Responses `custom` tool sent to chat completions) is dropped, as the vLLM-compatible surface has no
+// other kind (the Responses route converts custom tools before reaching here).
 json canonical_tools(const json& tools, const json& tool_choice) {
   std::string only;
   if (tool_choice.is_object() && tool_choice.contains("function") && tool_choice["function"].is_object())
     only = tool_choice["function"].value("name", "");
   json out = json::array();
   for (const json& t : tools) {
-    if (!t.is_object()) continue;
+    if (!t.is_object() || t.value("type", "function") != "function") continue;
     const json& f = t.contains("function") && t["function"].is_object() ? t["function"] : t;
     json fn = json::object();
     fn["description"] = f.contains("description") && f["description"].is_string() ? f["description"] : json();
@@ -423,9 +425,25 @@ std::string text_of_parts(const json& parts) {
   return out;
 }
 
+std::string call_id_of(const json& item) {
+  return item.contains("call_id") && item["call_id"].is_string() && !item["call_id"].get<std::string>().empty()
+             ? item["call_id"].get<std::string>()
+             : item.value("id", "");
+}
+
 // One Responses input item as a chat message, or null to drop it.
 json normalize_item(const json& item) {
   const std::string type = item.value("type", "message");
+  if (type == "custom_tool_call") {
+    // Replayed as the one-parameter function call it was offered as, so the turn renders as the model
+    // wrote it and the prefix cache still matches.
+    json args = json::object();
+    args[kCustomToolInput] = item.contains("input") && item["input"].is_string() ? item["input"] : json("");
+    return json{{"role", "assistant"},
+                {"tool_calls", json::array({json{{"id", call_id_of(item)},
+                                                 {"type", "function"},
+                                                 {"function", {{"name", item.value("name", "")}, {"arguments", args.dump()}}}}})}};
+  }
   if (type == "function_call") {
     std::string args = "{}";
     if (item.contains("arguments")) {
@@ -437,15 +455,12 @@ json normalize_item(const json& item) {
         args = raw.dump();
       }
     }
-    const std::string id = item.contains("call_id") && item["call_id"].is_string() && !item["call_id"].get<std::string>().empty()
-                               ? item["call_id"].get<std::string>()
-                               : item.value("id", "");
     return json{{"role", "assistant"},
-                {"tool_calls", json::array({json{{"id", id},
+                {"tool_calls", json::array({json{{"id", call_id_of(item)},
                                                  {"type", "function"},
                                                  {"function", {{"name", item.value("name", "")}, {"arguments", args}}}}})}};
   }
-  if (type == "function_call_output") {
+  if (type == "function_call_output" || type == "custom_tool_call_output") {
     const json& out = item.contains("output") ? item["output"] : json("");
     return json{{"role", "tool"}, {"tool_call_id", item.value("call_id", "")}, {"content", text_of_parts(out)}};
   }
@@ -575,9 +590,41 @@ Request parse_responses_request(const json& body) {
   json chat = json::object();
   chat["messages"] = final_messages;
   json tools = json::array();
+  std::vector<std::string> custom;
   if (body.contains("tools") && body["tools"].is_array()) {
     for (const json& t : body["tools"]) {
-      if (t.value("type", "") != "function") continue;
+      if (!t.is_object()) continue;
+      const std::string type = t.value("type", "");
+      if (type == "custom") {
+        // A custom (freeform) tool, as Codex offers apply_patch under some model families: the model has
+        // no freeform format, so it is offered as a function with the one string parameter `input`. Its
+        // description is rendered with the grammar from `format` appended (without it the model wrote a
+        // unified diff where apply_patch's syntax was wanted, 2026-10-10); the grammar is not enforced
+        // (API §4).
+        json fn = {{"name", t.value("name", "")}};
+        std::string description = t.contains("description") && t["description"].is_string() ? t["description"] : "";
+        if (t.contains("format") && t["format"].is_object() && t["format"].value("type", "") == "grammar" &&
+            t["format"].contains("definition") && t["format"]["definition"].is_string()) {
+          const std::string syntax = t["format"].value("syntax", "");
+          description += (description.empty() ? "" : "\n\n") + std::string("The input must follow this ") +
+                         (syntax.empty() ? "" : syntax + " ") + "grammar:\n" + t["format"]["definition"].get<std::string>();
+        }
+        fn["description"] = description.empty() ? json() : json(description);
+        json prop = json::object();
+        prop["type"] = "string";
+        prop["description"] = "The tool's input, as free text";
+        json props = json::object();
+        props[kCustomToolInput] = prop;
+        fn["parameters"] = json::object();
+        fn["parameters"]["type"] = "object";
+        fn["parameters"]["properties"] = props;
+        fn["parameters"]["required"] = json::array({kCustomToolInput});
+        fn["strict"] = json();
+        tools.push_back({{"type", "function"}, {"function", fn}});
+        custom.push_back(fn["name"].get<std::string>());
+        continue;
+      }
+      if (type != "function") continue;
       json fn = {{"name", t.value("name", "")}};
       fn["description"] = t.contains("description") ? t["description"] : json();
       fn["parameters"] = t.contains("parameters") ? t["parameters"] : json();
@@ -600,7 +647,18 @@ Request parse_responses_request(const json& body) {
       chat["reasoning_effort"] = effort;
     }
   }
-  return parse_request(chat, true);
+  Request r = parse_request(chat, true);
+  r.custom_tools = std::move(custom);
+  return r;
+}
+
+std::string custom_tool_input(const std::string& arguments) {
+  const json args = json::parse(arguments, nullptr, false);
+  if (args.is_object()) {
+    if (args.contains(kCustomToolInput) && args[kCustomToolInput].is_string()) return args[kCustomToolInput];
+    if (args.size() == 1 && args.begin()->is_string()) return args.begin().value();
+  }
+  return arguments;
 }
 
 }  // namespace ling::serve

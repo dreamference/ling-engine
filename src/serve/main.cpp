@@ -22,6 +22,7 @@
 #include <proxygen/httpserver/RequestHandlerFactory.h>
 #include <proxygen/httpserver/ResponseBuilder.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -527,9 +528,13 @@ class Handler : public proxygen::RequestHandler {
       std::string reasoning_id, message_id;
       int reasoning_index = -1, message_index = -1;
       bool reasoning_open = false, message_open = false;
-      State(bool r, const json& t) : parser(r, t) {}
+      std::vector<std::string> custom_tools;
+      State(bool r, const json& t, std::vector<std::string> c) : parser(r, t), custom_tools(std::move(c)) {}
+      bool custom(const std::string& name) const {
+        return std::find(custom_tools.begin(), custom_tools.end(), name) != custom_tools.end();
+      }
     };
-    auto st = std::make_shared<State>(req.reasoning, req.tools);
+    auto st = std::make_shared<State>(req.reasoning, req.tools, req.custom_tools);
     auto response_obj = [=](const std::string& status) {
       return json{{"id", st->id}, {"object", "response"}, {"created_at", created}, {"status", status},
                   {"model", model}, {"output", st->output}, {"tools", json::array()}};
@@ -588,9 +593,27 @@ class Handler : public proxygen::RequestHandler {
       for (const ToolCall& c : d.tool_calls) {
         close_reasoning();
         close_message();
+        const int index = static_cast<int>(st->output.size());
+        if (st->custom(c.name)) {
+          // A custom (freeform) tool call: the item is added with its `input` present and empty (Codex
+          // parses the item only with that field), the whole input is one custom_tool_call_input.delta
+          // keyed by item_id and call_id, then the done events.
+          const std::string input = custom_tool_input(c.arguments);
+          json item = {{"type", "custom_tool_call"}, {"id", new_id("ctc_")}, {"call_id", new_id("call_")},
+                       {"name", c.name}, {"input", ""}, {"status", "in_progress"}};
+          event("response.output_item.added", {{"output_index", index}, {"item", item}});
+          event("response.custom_tool_call_input.delta",
+                {{"item_id", item["id"]}, {"output_index", index}, {"call_id", item["call_id"]}, {"delta", input}});
+          event("response.custom_tool_call_input.done",
+                {{"item_id", item["id"]}, {"output_index", index}, {"call_id", item["call_id"]}, {"input", input}});
+          item["input"] = input;
+          item["status"] = "completed";
+          st->output.push_back(item);
+          event("response.output_item.done", {{"output_index", index}, {"item", item}});
+          continue;
+        }
         json item = {{"type", "function_call"}, {"id", new_id("fc_")}, {"call_id", new_id("call_")},
                      {"name", c.name}, {"arguments", c.arguments}, {"status", "completed"}};
-        const int index = static_cast<int>(st->output.size());
         event("response.output_item.added", {{"output_index", index}, {"item", item}});
         st->output.push_back(item);
         event("response.output_item.done", {{"output_index", index}, {"item", item}});

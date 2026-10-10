@@ -308,6 +308,56 @@ int main() {
     EXPECT(t.find("Look first.") != std::string::npos && t.find("Checking.") != std::string::npos);
   }
   {
+    // BACKLOG §19.13: a `type: custom` (freeform) tool is offered to the model as a function with the one
+    // string parameter `input`, its grammar appended to its description; the request remembers
+    // which names are custom; a replayed custom_tool_call and its output render as that call and its
+    // tool response.
+    json body = json::parse(R"({"tools":[{"type":"custom","name":"apply_patch","description":"Edit files.",
+      "format":{"type":"grammar","syntax":"lark","definition":"start: x"}},
+      {"type":"function","name":"shell","description":"Run","parameters":{"type":"object"},"strict":false}],
+      "reasoning":{"effort":"none"},
+      "input":[{"type":"message","role":"user","content":"fix it"},
+      {"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch\n*** End Patch"},
+      {"type":"custom_tool_call_output","call_id":"c1","output":"Done!"}]})");
+    const ling::serve::Request r = ling::serve::parse_responses_request(body);
+    const std::string& t = r.prompt_text;
+    EXPECT(r.custom_tools == std::vector<std::string>{"apply_patch"});
+    EXPECT(t.find("{\"type\": \"function\", \"function\": {\"description\": \"Edit files.\\n\\nThe input must follow "
+                  "this lark grammar:\\nstart: x\", \"name\": \"apply_patch\", "
+                  "\"parameters\": {\"type\": \"object\", \"properties\": {\"input\": {\"type\": \"string\", "
+                  "\"description\": \"The tool's input, as free text\"}}, \"required\": [\"input\"]}, "
+                  "\"strict\": false}, \"defer_loading\": null}") != std::string::npos);
+    EXPECT(t.find("\"name\": \"shell\"") != std::string::npos);
+    EXPECT(t.find("\"format\"") == std::string::npos);  // the grammar reaches the model as prose, not as a field
+    EXPECT(t.find("<tool_call>\n<function=apply_patch>\n<parameter=input>\n*** Begin Patch\n*** End Patch\n</parameter>\n"
+                  "</function>\n</tool_call><|im_end|>") != std::string::npos);
+    EXPECT(t.find("<tool_response>\nDone!\n</tool_response>") != std::string::npos);
+    // The parser hands the call back with `input` as a string, whatever the text looks like, and the
+    // custom tool input is that text; a call the model made with some other single parameter, or with
+    // no parsable arguments, still yields a usable input.
+    OutputParser p(false, r.tools);
+    const auto d = p.push("<tool_call>\n<function=apply_patch>\n<parameter=input>\n*** Begin Patch\n*** Update File: a.py\n"
+                          "@@\n-1\n+2\n*** End Patch\n</parameter>\n</function>\n</tool_call>");
+    EXPECT(d.tool_calls.size() == 1 && d.tool_calls[0].name == "apply_patch");
+    if (d.tool_calls.size() == 1)
+      EXPECT(ling::serve::custom_tool_input(d.tool_calls[0].arguments) ==
+             "*** Begin Patch\n*** Update File: a.py\n@@\n-1\n+2\n*** End Patch");
+    EXPECT(ling::serve::custom_tool_input("{\"patch\": \"p\"}") == "p");
+    EXPECT(ling::serve::custom_tool_input("{\"a\": \"p\", \"b\": \"q\"}") == "{\"a\": \"p\", \"b\": \"q\"}");
+    EXPECT(ling::serve::custom_tool_input("not json") == "not json");
+    // A function_call_output and a custom_tool_call_output share one wire shape; tool_choice "none"
+    // drops custom tools with the rest.
+    json none = body;
+    none["tool_choice"] = "none";
+    EXPECT(ling::serve::parse_responses_request(none).prompt_text.find("# Tools") == std::string::npos);
+    // On chat completions (the vLLM-compatible route) a custom tool is dropped, function tools stay.
+    json chat = json::parse(R"({"messages":[{"role":"user","content":"hi"}],"tools":[
+      {"type":"custom","name":"apply_patch","description":"Edit files.","format":{"type":"grammar","syntax":"lark","definition":"start: x"}},
+      {"type":"function","function":{"name":"shell","parameters":{"type":"object"}}}]})");
+    const std::string c = ling::serve::parse_request(chat, true).prompt_text;
+    EXPECT(c.find("\"name\": \"shell\"") != std::string::npos && c.find("apply_patch") == std::string::npos);
+  }
+  {
     // vllm#53284, vllm#52738: reasoning_effort "none" on chat completions means thinking off, as it
     // already does on the Responses path (today: 400 "Unexpected reasoning effort none").
     json body = json::parse(R"({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"})");
