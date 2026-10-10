@@ -789,12 +789,77 @@ def test_disconnect_frees_the_engine(server):
 # --- Request features the clients send that ling-serve ignores (reports/api-compat-checklist.md) -----
 
 
-@pytest.mark.xfail(reason="logprobs are not implemented and the field is ignored", strict=False)
 def test_logprobs_are_returned_or_refused(server):
+    """Built 2026-10-10 (API §3): a chat request with logprobs gets `choices[0].logprobs.content`."""
     status, out = server.request("/v1/chat/completions", {
         "messages": [{"role": "user", "content": "Say hi."}], "logprobs": True, "top_logprobs": 2, "max_tokens": 4,
         "chat_template_kwargs": NO_THINK})
     assert status == 400 or (out["choices"][0].get("logprobs") or {}).get("content")
+
+
+def test_logprobs_shapes(server):
+    """API §3: logprobs in vLLM's shapes on both routes. Chat: one `content` entry per produced token
+    (`completion_tokens` of them, the thinking span included) with `token`, `logprob`, `bytes` and
+    `top_logprobs`; completions: `tokens`, `token_logprobs`, `top_logprobs` (one {token: logprob} map
+    per position) and `text_offset`. Every logprob is <= 0 (a log-softmax of the raw logits); at
+    temperature 0 the chosen token is the most likely one, so it heads `top_logprobs` with the same
+    value; the streamed chunks' entries concatenate to the unstreamed list; a request without logprobs
+    has no `logprobs` key (or null), as before; `top_logprobs` above 20, or without `logprobs: true`,
+    is a 400."""
+    messages = [{"role": "user", "content": "Say hi."}]
+    out = greedy_chat(server, messages, max_tokens=6, logprobs=True, top_logprobs=2)
+    content = out["choices"][0]["logprobs"]["content"]
+    assert len(content) == out["usage"]["completion_tokens"] > 0
+    for e in content:
+        assert e["logprob"] <= 0 and isinstance(e["bytes"], list)
+        assert bytes(e["bytes"]).decode("utf-8", "replace") == e["token"]
+        assert 1 <= len(e["top_logprobs"]) <= 2
+        assert e["top_logprobs"][0]["token"] == e["token"] and e["top_logprobs"][0]["logprob"] == e["logprob"]
+        assert all(t["logprob"] <= e["logprob"] for t in e["top_logprobs"])
+    assert "".join(e["token"] for e in content) == chat_text(out)
+    status, events = server.stream("/v1/chat/completions", {
+        "messages": messages, "temperature": 0, "max_tokens": 6, "chat_template_kwargs": NO_THINK,
+        "logprobs": True, "top_logprobs": 2, "stream": True})
+    assert status == 200
+    streamed = [e for ev in events if ev["data"] != "[DONE]" for ch in ev["data"].get("choices") or []
+                for e in ((ch.get("logprobs") or {}).get("content") or [])]
+    assert [(e["token"], e["logprob"]) for e in streamed] == [(e["token"], e["logprob"]) for e in content]
+    # Thinking on: the thinking span's tokens have entries too, and top_logprobs 0 lists nothing.
+    out = server.post("/v1/chat/completions", {
+        "messages": [{"role": "user", "content": "What is 2 + 2?"}], "temperature": 0, "max_tokens": 12, "logprobs": True})
+    thinking = out["choices"][0]["logprobs"]["content"]
+    assert len(thinking) == out["usage"]["completion_tokens"] > 0
+    assert out["usage"]["completion_tokens_details"]["reasoning_tokens"] > 0
+    assert all(e["top_logprobs"] == [] and e["logprob"] <= 0 for e in thinking)
+    # Completions.
+    prompt = "The capital of France is"
+    out = greedy_completion(server, prompt, max_tokens=6, logprobs=2)
+    lp = out["choices"][0]["logprobs"]
+    n = out["usage"]["completion_tokens"]
+    assert set(lp) == {"tokens", "token_logprobs", "top_logprobs", "text_offset"}
+    assert len(lp["tokens"]) == len(lp["token_logprobs"]) == len(lp["top_logprobs"]) == len(lp["text_offset"]) == n > 0
+    assert all(v <= 0 for v in lp["token_logprobs"])
+    assert "".join(lp["tokens"]) == out["choices"][0]["text"]
+    assert lp["text_offset"] == [sum(len(t) for t in lp["tokens"][:i]) for i in range(n)]
+    for tok, v, top in zip(lp["tokens"], lp["token_logprobs"], lp["top_logprobs"]):
+        assert 1 <= len(top) <= 3 and top[tok] == v and max(top.values()) == v
+    status, events = server.stream("/v1/completions", {
+        "prompt": prompt, "temperature": 0, "max_tokens": 6, "logprobs": 2, "stream": True})
+    assert status == 200
+    chunks = [ch["logprobs"] for ev in events if ev["data"] != "[DONE]" for ch in ev["data"].get("choices") or []
+              if ch.get("logprobs")]
+    assert [t for c in chunks for t in c["tokens"]] == lp["tokens"]
+    assert [o for c in chunks for o in c["text_offset"]] == lp["text_offset"]
+    # Not asked for: no logprobs, as before.
+    assert greedy_chat(server, messages, max_tokens=4)["choices"][0].get("logprobs") is None
+    assert greedy_completion(server, prompt, max_tokens=4)["choices"][0].get("logprobs") is None
+    # vLLM's bounds.
+    status, _ = server.request("/v1/chat/completions", {"messages": messages, "logprobs": True, "top_logprobs": 21, "max_tokens": 4})
+    assert status == 400
+    status, _ = server.request("/v1/chat/completions", {"messages": messages, "top_logprobs": 2, "max_tokens": 4})
+    assert status == 400
+    status, _ = server.request("/v1/completions", {"prompt": prompt, "logprobs": 21, "max_tokens": 4})
+    assert status == 400
 
 
 @pytest.mark.xfail(reason="n is ignored: one choice comes back", strict=False)
