@@ -28,9 +28,15 @@ std::string render_content(const json& content, bool is_system) {
     for (const json& item : content) {
       const std::string type = item.value("type", "");
       if (item.contains("image") || item.contains("image_url") || type == "image" || type == "image_url" ||
-          item.contains("video") || type == "video") {
-        throw std::invalid_argument(is_system ? "System message cannot contain images."
-                                              : "ling-engine v0 does not accept images or video");
+          type == "input_image") {
+        // No vision encoder yet: the image is stood in for by a placeholder, so the turn goes on. A 400
+        // here ends the turn in Codex (API §7).
+        out += "[image]";
+        continue;
+      }
+      if (item.contains("video") || type == "video") {
+        throw std::invalid_argument(is_system ? "System message cannot contain video."
+                                              : "ling-engine v0 does not accept video");
       }
       if (item.contains("text")) out += item["text"].get<std::string>();
       else throw std::invalid_argument("Unexpected item type in content.");

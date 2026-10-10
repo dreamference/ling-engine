@@ -11,7 +11,7 @@ What users of SGLang and vLLM asked for, and what the four clients send that lin
    - The Responses API: `response.failed` with that code, the only shape Codex compacts on.
 
    Today Codex retries the same prompt five times and OpenHands for two minutes; neither compacts.
-2. **Images.** Answer with a placeholder instead of a 400 until the vision encoder (M4) lands, and set `input_modalities: ["text"]` in the launcher's catalog meanwhile. Codex treats a 400 as the end of the turn.
+2. **Images.** Answer with a placeholder instead of a 400 until the vision encoder (M4) lands (done 2026-10-10: an image part renders as `[image]` on both routes, [API §7](./DREAMFERENCE_LING_ENGINE_API.md)), and set `input_modalities: ["text"]` in the launcher's catalog meanwhile (still open). Codex treats a 400 as the end of the turn.
 3. **Stream fixes:**
    - hold back stop-string output to a character boundary;
    - end every started stream with a finish chunk and `[DONE]`;
@@ -26,7 +26,7 @@ What users of SGLang and vLLM asked for, and what the four clients send that lin
    - unrenderable history arguments rendered instead of refused.
 7. **Small request fixes:**
    - presence and repetition penalties over output tokens only;
-   - `reasoning_effort: "none"` on chat completions;
+   - `reasoning_effort: "none"` on chat completions (done 2026-10-10: thinking off, as on `/v1/responses`, [API §3](./DREAMFERENCE_LING_ENGINE_API.md));
    - `reasoning_tokens` counted (done 2026-10-10: from the token ids in the engine's loop, [API §3 and §4](./DREAMFERENCE_LING_ENGINE_API.md));
    - `reasoning` accepted as an alias of `reasoning_content` on input;
    - a negative `max_tokens` refused.
