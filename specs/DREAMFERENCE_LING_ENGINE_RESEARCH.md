@@ -36,7 +36,15 @@ Two measurements were made for this section on the served checkpoint (`RadixArk/
    *Measured 2026-10-10* (ten minutes of two-stream decode on the reference server, `bench/micro/decode_clocks.py`; micro-2026-10-10.md §4): SM clock 2,405–2,476 MHz (median 2,431, never below base), power 44–45 W, temperature 68–69 °C, throttle-reason mask 0x0 in all 709 samples. No throttling at a decode load; the long-prefill case is still unmeasured (M0's replays, with 25K-token prompts, peaked at 82 W and 79 °C, also without throttling).
 5. **DFlash2's acceptance histogram,** not only its mean. If many steps accept all 16 tokens (the ceiling bin), the drafter's block length is leaving speed unused (16.12).
 
-   *Measured* in M0 §4 (production, 16 draft tokens, 1,295 steps of the tuning set): ceiling bin 3.6%, 43% of steps accept 0–2 drafted tokens; M1 §4 measured ling-serve's at the same block (ceiling 3.6%). Not re-measured on 2026-10-10: it needs ling-serve's model loaded, which was not done beside the resident reference server (micro-2026-10-10.md §5). Production and ling-serve run 12 draft tokens since 2026-10-09; the 12-draft histogram on the tuning set is still to be taken.
+   *Measured* in M0 §4 (production, 16 draft tokens, 1,295 steps of the tuning set): ceiling bin 3.6%, 43% of steps accept 0–2 drafted tokens; M1 §4 measured ling-serve's at the same block (ceiling 3.6%). *Measured 2026-10-10 at 12 draft tokens* (ling-serve 7f02d8f on second-puffin beside the resident reference server, M0's tuning set replayed single-stream with the M0 harness, window 8, thinking off, warm-up outside the count; `/spec_stats` before and after, run files `~/m0/runs/ling-hist12-*` on second-puffin): 1,336 steps, 4.82 accepted drafts per step, 5.82 tokens per step, 55.5 tokens/s decode at a 103.6 ms host step. Shares by accepted drafts 0–11:
+
+   | Accepted | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 |
+   | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+   | Share | 12.5% | 12.3% | 11.8% | 11.2% | 7.1% | 7.0% | 5.6% | 5.5% | 3.4% | 3.5% | 3.3% | 16.8% |
+
+   - **Against production at the same block:** M0 §4 measured production's 12-draft setting at 5.76 tokens per step and 53.9 tokens/s on this set; the engine's 5.82 and 55.5 match it.
+   - **The ceiling bin is 16.8% at 12 drafts** against 3.6% at 16 (M0 §4, M1 §4): one step in six accepts the whole block, so block 12 clips what the drafter would have delivered. That is the same fact M1 §4 found from the other side (block 16 ran 49.8 against 45.8 tokens/s on this set on the engine, where production gains from 12). A 16-draft pass on this build, bundled with the next restart of the shared server, is the comparison still to take; whether the engine should run 16 while production runs 12 is then the owner's call (the default stays 12, the production setting, [CLI](./DREAMFERENCE_LING_ENGINE_CLI.md)).
+   - **37% of steps accept 0–2 drafted tokens** (43% at 16): the share a second draft source or a tree of alternatives (16.12, M2) addresses is unchanged in kind.
 
 ### 16.2 An all-NVFP4 checkpoint already exists and is validated (−3.2 GB per pass)
 
