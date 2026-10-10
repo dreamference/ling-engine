@@ -105,6 +105,26 @@ void prefill_swiglu_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uin
 void narrow_bf16(const float* x, int M, const __nv_bfloat16* wa, const __nv_bfloat16* wb, float* ya, float* yb, int N,
                  int K, cudaStream_t s);
 
+// ---- --prefill-bf16 (EngineOptions::prefill_bf16, off by default; MILESTONES §14's exactness policy): the
+// prefill's DeltaNet intermediates in BF16 where production keeps BF16 (M2 §8 item 3, cited as §7.3 in the
+// backlog's B34 row). Each is a new instantiation of the kernel above or below it over the element type
+// (elem.cuh); the FP32 kernels are untouched. ----
+// rmsnorm_quant with the FP32 copy replaced by a BF16 one (the a/b projections' input; the same values
+// narrow_bf16 rounds its FP32 input to).
+void rmsnorm_quant_bf16(const float* x, const __nv_bfloat16* w, __nv_bfloat16* out, int M, int H, float eps, bool nvfp4,
+                        float input_scale, uint8_t* q, uint8_t* sf, cudaStream_t s);
+// quant_act_fp8 over the BF16 copy (the same bytes as from the FP32 values it was rounded from).
+void quant_act_fp8_bf16in(const __nv_bfloat16* x, int M, int K, float input_scale, uint8_t* q, cudaStream_t s);
+// prefill_gemm_fp8 with its FP32 output rounded to BF16 (the in_qkv and in_z projections; never accumulated).
+void prefill_gemm_fp8_bf16out(const uint8_t* xq, int M, const uint8_t* w, float alpha, __nv_bfloat16* y, int ldy, int N,
+                              int K, cudaStream_t s);
+// narrow_bf16 over the BF16 copy of the norm (the same MMA fragments).
+void narrow_bf16_bf16in(const __nv_bfloat16* x, int M, const __nv_bfloat16* wa, const __nv_bfloat16* wb, float* ya,
+                        float* yb, int N, int K, cudaStream_t s);
+// gated_rmsnorm_fp8 over the recurrence's BF16 output and the BF16 z projection.
+void gated_rmsnorm_fp8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* z, const __nv_bfloat16* w, int rows, int D,
+                            float eps, float input_scale, uint8_t* q, cudaStream_t s);
+
 // RMSNorm (as rmsnorm) that also writes the FP16 copy and scales to_half_rows would make from its output.
 void rmsnorm_half(const float* x, const __nv_bfloat16* w, float* out, __half* xh, float* xinv, int rows, int H, float eps,
                   bool gemma, cudaStream_t s);
@@ -176,6 +196,15 @@ void gdn_conv_prefill(const float* in, float* out, float* conv_state, const __nv
 // state_at (optional): also the state after the first `at` tokens, which must end a chunk (pos0 + at % 32 == 0).
 void gdn_recurrent_prefill(const float* mixed, const float* g, const float* beta, float* state, float* out, int M, int H,
                            int HV, int pos0, cudaStream_t s, float* state_at = nullptr, int at = -1);
+// The two above over BF16 activations (--prefill-bf16; see the block after narrow_bf16): the conv reads the
+// in_qkv projection in BF16 and writes its output in BF16 (the state window then holds BF16 values, as
+// production's conv state does), the recurrence reads that and writes its output in BF16. The conv and
+// recurrent state, g and beta stay FP32; the same chunk invariance holds.
+void gdn_conv_prefill_bf16(const __nv_bfloat16* in, __nv_bfloat16* out, float* conv_state, const __nv_bfloat16* w, int M,
+                           int C, cudaStream_t s, float* window_at = nullptr, int at = -1);
+void gdn_recurrent_prefill_bf16(const __nv_bfloat16* mixed, const float* g, const float* beta, float* state,
+                                __nv_bfloat16* out, int M, int H, int HV, int pos0, cudaStream_t s,
+                                float* state_at = nullptr, int at = -1);
 // out = rmsnorm(x) * w * silu(z), rows of length D.
 void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float* out, int rows, int D,
                    float eps, cudaStream_t s);

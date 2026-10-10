@@ -10,7 +10,7 @@ Four programs are built from the repository (`CMakeLists.txt`): `ling-serve`, th
 ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N]
            [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]]
            [--pretokenizer production|checkpoint] [--prefix-checkpoints N]
-           [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N]
+           [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16]
 ```
 
 | Flag | Default | What it does |
@@ -30,6 +30,7 @@ ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-cont
 | `--pdl` | off | Programmatic dependent launch for the rows path's kernels (M3). |
 | `--attn-bulk` | off | The rows path's attention loads its tiles with bulk copies (M3). |
 | `--attn-prefetch N` | `2` | How many KV tiles ahead the rows path's attention prefetches into L2; 0 switches it off (M3). |
+| `--prefill-bf16` | off | The prefill's DeltaNet intermediates (the input norm's copy for the a/b projections, the in_qkv and in_z projections, the conv's output, the recurrence's output) kept in BF16 as production keeps them, instead of FP32 (B34; [reports/M2-prefill.md](../reports/M2-prefill.md) §8 item 3). Not exact: a change of the prefill's numerics, so off until the checks of [MILESTONES §14](./DREAMFERENCE_LING_ENGINE_MILESTONES.md) pass (`bench/prefill_bf16_check.sh`). The decode and verify rows path is untouched either way. |
 
 Startup prints `loading DIR …`, then `loaded X GB of weights`, then with a drafter `drafter: X GB, block N`; the server is ready when `GET /health` answers. The HTTP server runs two threads for the connections and one engine worker that runs requests one at a time ([API](./DREAMFERENCE_LING_ENGINE_API.md)); an idle connection is closed after 30 minutes; `SIGINT` and `SIGTERM` stop it. Each finished request logs one line to stderr: prompt tokens (and how many were reused from a kept state), prefill seconds, tokens generated, decode seconds and tokens/s, the finish reason, the number of passes and, speculatively, tokens per pass.
 
@@ -40,7 +41,7 @@ ling-run --model DIR (--text T | --chat T | --ids 1,2,3 | --prompts-file F)
          [--max-tokens N] [--max-context N] [--temperature T] [--seed N]
          [--ids-out] [--prompt-ids-out]
          [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N]]
-         [--prefix-check] [--graphs] [--graph-check] [--pdl] [--attn-bulk] [--attn-prefetch N]
+         [--prefix-check] [--graphs] [--graph-check] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16]
 ```
 
 Loads the model and generates from a prompt; prints the text, the timings and, asked to, the token ids, for checking against a reference server (`bench/validate_v0.py`, `bench/agreement/`).
@@ -62,6 +63,7 @@ Loads the model and generates from a prompt; prints the text, the timings and, a
 | `--spec-check` | off | Greedy only: decode each prompt plainly, then speculatively, and check that the tokens are identical and that the recurrent state after the speculative run equals a plain run's over the same tokens, bit for bit. Prints `spec check passed` or `SPEC CHECK FAILED`. |
 | `--prefix-check` | off | Prefill each prompt after the one before it (resuming from a kept state or a prefix checkpoint), then again from scratch, and check that the DeltaNet and conv state and the next token agree (M2). |
 | `--graphs`, `--pdl`, `--attn-bulk`, `--attn-prefetch N` | off, off, off, `2` | As for `ling-serve`. |
+| `--prefill-bf16` | off | As for `ling-serve`: BF16 DeltaNet intermediates in the prefill (not exact). The checks below run within the mode when it is on: `--prefix-check` and `--spec-check` must still pass bit for bit, which `bench/prefill_bf16_check.sh` verifies. |
 | `--graph-check` | off | Decode each prompt speculatively twice from the same prefill, without and with step graphs, greedily and then sampling (top-k 20, top-p 0.95, seeded by `--seed` or 1), and check that the tokens, the recurrent state (bit for bit) and the step and acceptance counts agree. |
 
 The three checks are the exactness tests the milestones' gates name ([MILESTONES §14](./DREAMFERENCE_LING_ENGINE_MILESTONES.md)); a failed check is reported and the exit status is 1.
@@ -86,6 +88,7 @@ Read by the engine at start (`src/core/engine.cpp`) and by two kernels. **A vari
 | `LING_PDL=0\|1` | Overrides `--pdl`. |
 | `LING_ATTN_BULK=0\|1` | Overrides `--attn-bulk`. |
 | `LING_ATTN_PREFETCH=N` | Overrides `--attn-prefetch`. |
+| `LING_PREFILL_BF16=0\|1` | Overrides `--prefill-bf16` (also the way to switch it on in a program without the flag, such as `bench/agreement/ling_force.cpp`). |
 | `LING_PROFILE` | Set to anything: per-phase timing with a synchronization after each phase. Switches step graphs off (nothing may synchronize inside a captured step). |
 | `LING_KSPLIT=N` | Split-K for the streaming GEMM; set and non-zero it allocates a buffer per step, which also switches step graphs off. |
 | `LING_GEMM_SHAPE` | Selects the prefill GEMM tile shape (`src/core/prefill_gemm.cu`); a tuning switch for the benchmarks. |
