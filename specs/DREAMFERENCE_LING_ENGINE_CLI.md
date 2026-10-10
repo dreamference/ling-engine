@@ -21,7 +21,7 @@ ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-cont
 | `--served-model-name N` | the last path component of `DIR` | The id `GET /v1/models` reports and every response carries. Mightling's tools ask the server which model runs, so this must be the id the registry expects ([INTEGRATION §12](./DREAMFERENCE_LING_ENGINE_INTEGRATION.md)). |
 | `--max-context N` | `65536` | The context length: `max_model_len` in `/v1/models`, the limit of `context_length_exceeded`, and the size of the KV and state allocations. |
 | `--draft DIR` | none | The DFlash2 drafter's checkpoint. Without it every request decodes plainly. |
-| `--draft-block N` | `16` | Draft tokens per speculative step. The code's default is the drafter's published block; production SGLang runs 12 since 2026-10-09 (measured +7% single-stream), so a launch that should match production passes `--draft-block 12`. |
+| `--draft-block N` | `12` | Draft tokens per speculative step. The default follows production, which runs 12 since 2026-10-09 (measured +7% single-stream over the drafter's published block of 16; the owner's decision of 2026-10-10 made 12 the code default too). The M0 reference container on the development machine keeps 16 on purpose. |
 | `--lookup 0\|1\|2` | `1` | The context-lookup draft source ([SPECULATION §10](./DREAMFERENCE_LING_ENGINE_SPECULATION.md)): 0 off, 1 on, 2 shadow mode (counted in `/spec_stats`, not used). |
 | `--lookup-min N` | `8` | The shortest match the lookup accepts. |
 | `--pretokenizer production\|checkpoint` | `production` | The pre-tokenizer pattern: production's (how SGLang tokenizes this checkpoint) or the checkpoint's own `tokenizer.json` pattern. Any other value exits 2. |
@@ -57,7 +57,7 @@ Loads the model and generates from a prompt; prints the text, the timings and, a
 | `--temperature T` | `0` (greedy) | Sampling temperature. `ling-serve`'s default is the checkpoint's 1.0; the checker is greedy so its output can be compared token for token. |
 | `--seed N` | `0` | Seeds sampling when the temperature is above 0 (0 draws a random seed). |
 | `--ids-out`, `--prompt-ids-out` | off | Print the generated ids, or the prompt's ids, one list per prompt. |
-| `--draft DIR`, `--block N`, `--lookup`, `--lookup-min` | none, `16`, `1`, `8` | The drafter and its settings, as `ling-serve`'s `--draft`, `--draft-block`, `--lookup`, `--lookup-min`. |
+| `--draft DIR`, `--block N`, `--lookup`, `--lookup-min` | none, `12`, `1`, `8` | The drafter and its settings, as `ling-serve`'s `--draft`, `--draft-block`, `--lookup`, `--lookup-min`. |
 | `--spec` | off | Decode speculatively with the drafter. |
 | `--spec-check` | off | Greedy only: decode each prompt plainly, then speculatively, and check that the tokens are identical and that the recurrent state after the speculative run equals a plain run's over the same tokens, bit for bit. Prints `spec check passed` or `SPEC CHECK FAILED`. |
 | `--prefix-check` | off | Prefill each prompt after the one before it (resuming from a kept state or a prefix checkpoint), then again from scratch, and check that the DeltaNet and conv state and the next token agree (M2). |
