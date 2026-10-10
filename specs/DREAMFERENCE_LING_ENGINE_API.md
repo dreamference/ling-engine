@@ -31,7 +31,7 @@ Part of the ling-engine specification; the index is [README.md](./README.md). Wr
 
 | Field | Default | Notes |
 |---|---|---|
-| `messages` (chat) | required | Rendered through the checkpoint's chat template with production's two patches ([docs/V0.md](../docs/V0.md)). Tool messages whose content is a list of text parts are joined; a trailing assistant message is continued. |
+| `messages` (chat) | required | Rendered through the checkpoint's chat template with production's two patches ([docs/V0.md](../docs/V0.md)). Tool messages whose content is a list of text parts are joined; a trailing assistant message is continued. An assistant tool call whose `arguments` string is not a JSON object (cut off by a client, or returned by another server) is rendered verbatim where the parameter blocks would go, the owner's decision of 2026-10-10 and the one place ling-serve knowingly renders a prompt production would not: production answers 400 "Assistant tool call function.arguments must be valid JSON.", clients replay history unchanged and Codex ends the turn on a 400, so the conversation must go on; ling-serve's own parser never emits such arguments, so only histories from other servers reach this path. |
 | `prompt` (completions) | required | A string, a one-string list, or a list of token ids. Anything else is a 400. |
 | `stream` | `false` | Server-sent events when true. |
 | `stream_options.include_usage` | `false` | Streamed: a final chunk with empty `choices` and the `usage` object before `[DONE]`. |

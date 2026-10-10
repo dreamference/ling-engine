@@ -181,10 +181,10 @@ std::string render_chat(const json& messages, const json& tools, const ChatOptio
           else out += "\n<tool_call>\n<function=" + name + ">\n";
           first = false;
           json args = call.contains("arguments") ? call["arguments"] : json();
+          std::string raw;  // a string that is not a JSON object, rendered verbatim
           if (args.is_string()) {
-            const std::string s = args.get<std::string>();
-            args = s.empty() ? json() : json::parse(s, nullptr, false);
-            if (args.is_discarded()) throw std::invalid_argument("tool call arguments are not valid JSON");
+            raw = args.get<std::string>();
+            args = raw.empty() ? json() : json::parse(raw, nullptr, false);
           }
           if (args.is_object()) {
             for (auto it = args.begin(); it != args.end(); ++it) {
@@ -192,6 +192,16 @@ std::string render_chat(const json& messages, const json& tools, const ChatOptio
               out += it.value().is_string() ? it.value().get<std::string>() : python_json(it.value());
               out += "\n</parameter>\n";
             }
+          } else if (!raw.empty()) {
+            // The owner's decision (2026-10-10), the one place ling-serve knowingly renders a prompt
+            // production would not. The broken arguments are what the model itself emitted on an earlier
+            // turn; clients replay history unchanged and Codex ends the turn on a 400, so the
+            // conversation must go on. ling-serve's own parser never emits invalid arguments, so only
+            // histories from other servers reach this path. Production (SGLang's chat path,
+            // parse_tool_call_arguments) answers 400 "Assistant tool call function.arguments must be
+            // valid JSON." before the template, whose `items` filter could not render a string anyway.
+            out += raw;
+            if (raw.back() != '\n') out += '\n';
           }
           out += "</function>\n</tool_call>";
         }
