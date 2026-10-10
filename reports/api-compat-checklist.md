@@ -29,7 +29,7 @@ ling-serve was checked at `3122b07` in `src/serve/api.cpp` and `src/serve/main.c
 | Input items | `message` (user, developer, assistant), `function_call`, `function_call_output`, `reasoning` | ok: developer → system; items of one turn merged as production merges them (test: `api_tests` merge case) | |
 | **Images** | The catalog leaves `input_modalities` at its default (text and image), so a pasted image goes out as `input_image`. `view_image` returns an image inside `function_call_output`. | **refused** (400) for a message image. Inside a tool output, silently reduced to its text. | Codex treats a 400 as terminal: the turn dies. Set `input_modalities: ["text"]` in the launcher catalog now, and answer with a placeholder instead of a 400 until the vision encoder lands (test: `test_image_input_does_not_fail_the_turn`). |
 | SSE events read | `response.created` (id), `output_item.added` / `.done`, `output_text.delta`, `reasoning_text.delta` (needs `content_index`), `reasoning_summary_text.*`, `completed`, `failed`, `incomplete`. `function_call_arguments.delta` is ignored by Codex. | ok (test: `test_responses_stream_event_order`) | |
-| `response.completed.usage` | `input_tokens`, `input_tokens_details.cached_tokens`, `output_tokens`, `output_tokens_details.reasoning_tokens`, `total_tokens` | partial: `reasoning_tokens` is always 0 | The token display under-reports reasoning (test: `test_responses_reasoning_tokens_counted`) |
+| `response.completed.usage` | `input_tokens`, `input_tokens_details.cached_tokens`, `output_tokens`, `output_tokens_details.reasoning_tokens`, `total_tokens` | ok since 2026-10-10: `reasoning_tokens` counted by the engine from the token ids | (test: `test_responses_reasoning_tokens_counted`) |
 | Cut at `max_output_tokens` | `response.incomplete` is a stream error to Codex | ling-serve sends `response.completed` with `status: incomplete`, deliberately | Keep; documented in `generate_responses` |
 | Idle timeout | 300 s between SSE events | No keep-alive and no `in_progress` events during prefill | Fine at 65K (prefill ≈ 30–40 s at M2’s rates); a risk only with a much larger `--max-context` |
 | **Context overflow** | See section 5 | **wrong shape** | The largest gap |
@@ -119,6 +119,6 @@ For one user on one GB10 with 1–4 agents:
 5. **Errors after the stream starts** end without a finish chunk or `[DONE]`.
 6. **`reasoning_effort: "none"` on chat completions** is a 400.
 7. **Invalid-JSON arguments in a chat history** are a 400 on every later request ([vllm#47761](https://github.com/vllm-project/vllm/issues/47761) is the same class).
-8. **`reasoning_tokens` is always 0.**
+8. **`reasoning_tokens` is always 0.** Done 2026-10-10.
 9. **Silently ignored controls** (section 6): reject what is not built.
 10. **No embeddings or rerank** for Continue's indexing. Probably stays out of scope; document it.
