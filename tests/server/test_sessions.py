@@ -1,21 +1,26 @@
-"""Resident sessions (M4 stage 1: specs/drafts/M4-sessions-and-batches-2026-10-10.md §1, §6, §7).
+"""Resident sessions and the interleaved scheduler (M4 stages 1 and 2:
+specs/drafts/M4-sessions-and-batches-2026-10-10.md §1, §3, §6, §7).
 
 ling-serve keeps --sessions (default 2) resident sessions, each with its own KV cache and state, and runs
 each request in the session it continues, else in a new session that takes a free slot or evicts the least
 recently used one. Sessions bound with a prompt_cache_key whose last request ran less than
---session-protect-seconds ago are never evicted: a new session's request waits instead.
+--session-protect-seconds ago are never evicted: a new session's request waits instead. Up to --batch
+(default 2) requests run at once, each in its own session, taking turns one prefill chunk or decode step at
+a time.
 
 The queueing test runs last and leaves its two keyed sessions protected for the protection window, so a
 new conversation sent right after this file (a re-run of the suite) waits up to that long.
 
     LING_SERVE_URL=http://127.0.0.1:8300 python3 -m pytest tests/server -q
 """
+import json
 import socket
+import threading
 import time
 
 import pytest
 
-from test_regressions import code_text, evict, greedy_chat
+from test_regressions import NO_THINK, code_text, evict, greedy_chat
 
 
 def metrics(server):
@@ -82,6 +87,58 @@ def test_two_alternating_conversations_stay_warm(server):
     assert cached(a2_cold) < 0.5 * a2_cold["usage"]["prompt_tokens"], "the cold reference was not cold"
     assert a2["choices"][0]["message"] == a2_cold["choices"][0]["message"], "A's warm turn differs from cold"
     assert b2["choices"][0]["message"] == b2_cold["choices"][0]["message"], "B's warm turn differs from cold"
+
+
+@pytest.mark.slow
+def test_two_requests_run_at_once_and_each_equals_alone(server):
+    """M4 §3 (stage 2): up to --batch requests run at once, each in its own resident session, the
+    scheduler interleaving their prefill chunks and decode steps. Check: two streamed greedy requests with
+    unrelated prompts both run (num_running_reqs 2) and both stream text before either finishes; each
+    answer equals the same request sent alone afterwards (nothing numeric changes when they interleave)."""
+    m = metrics(server)
+    if m.get("ling:batch", 1) < 2:
+        pytest.skip("this server runs one request at a time")
+    bodies = [{"messages": [{"role": "system", "content": f"Module {tag}.\n" + code_text(60).replace("def f", f"def {tag}_f")},
+                            {"role": "user", "content": f"Write out every {tag} function's body, one line each, in order."}],
+               "max_tokens": 160, "temperature": 0, "stream": True, "chat_template_kwargs": NO_THINK}
+              for tag in ("left", "right")]
+    evict(server)
+    out = [{"text": "", "first": None, "done": None, "error": None} for _ in bodies]
+
+    def stream(i):
+        try:
+            r = server.open_stream("/v1/chat/completions", bodies[i])
+            with r:
+                for raw in r:
+                    line = raw.decode("utf-8").strip()
+                    if not line.startswith("data: ") or line == "data: [DONE]":
+                        continue
+                    for ch in json.loads(line[6:]).get("choices") or []:
+                        piece = (ch.get("delta") or {}).get("content") or ""
+                        if piece and out[i]["first"] is None:
+                            out[i]["first"] = time.monotonic()
+                        out[i]["text"] += piece
+            out[i]["done"] = time.monotonic()
+        except Exception as e:  # reported below, on the test's thread
+            out[i]["error"] = repr(e)
+
+    threads = [threading.Thread(target=stream, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    running = 0
+    while any(t.is_alive() for t in threads):
+        running = max(running, metrics(server)["sglang:num_running_reqs"])
+        time.sleep(0.1)
+    for t in threads:
+        t.join()
+    assert not out[0]["error"] and not out[1]["error"], out
+    assert running == 2, f"never two requests running (max {running})"
+    assert max(o["first"] for o in out) < min(o["done"] for o in out), "the two requests did not overlap"
+    for i, body in enumerate(bodies):
+        alone = greedy_chat(server, body["messages"], max_tokens=body["max_tokens"])
+        assert (alone["choices"][0]["message"].get("content") or "") == out[i]["text"], \
+            f"request {i}'s answer alone differs from its answer beside the other"
+    assert metrics(server)["sglang:num_running_reqs"] == 0
 
 
 @pytest.mark.slow

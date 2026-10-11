@@ -1,10 +1,11 @@
-// ling-serve: the HTTP front of ling-engine (proxygen). One engine worker thread runs requests one at a
+// ling-serve: the HTTP front of ling-engine (proxygen). One engine thread (the scheduler) runs up to --batch
+// requests at once, each in its own resident session, taking turns one prefill chunk or decode step at a
 // time; the HTTP threads parse requests and stream server-sent events back.
 //
 //   ling-serve --model DIR [--host 0.0.0.0] [--port 8000] [--served-model-name NAME] [--max-context N]
 //              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
-//              [--sessions N] [--session-protect-seconds S]
+//              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
 //
 // --sessions N (default 2; M4 §1) keeps N resident sessions, each with its own KV cache and state, so N
 // agent tasks that alternate keep their histories warm. A request runs in the session it extends (its
@@ -12,6 +13,13 @@
 // takes a free slot or evicts the least recently used one. A session bound with a prompt_cache_key whose
 // last request ran less than --session-protect-seconds ago (default 30, 0 off; the owner's decision of 2026-10-11) is never evicted: a new
 // session's request waits in the queue instead, while requests that continue a resident session run.
+//
+// --batch N (default 2, at most --sessions; M4 §3, stage 2) requests run at once, each in its own session,
+// interleaved: the running requests take turns, one prefill chunk or one decode step each. While another
+// request decodes, a prefill runs in chunks of --prefill-chunk-contended N tokens (default 256, a multiple
+// of 32 up to the prefill chunk of 2,048), so the decoding request's step period stays near twice its
+// normal step during a long prefill. A request that continues a running request's session waits for it.
+// Nothing numeric changes: every unit runs in its own session's state exactly as it would alone.
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -44,7 +52,9 @@
 #include <deque>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #include "core/engine.hpp"
@@ -65,10 +75,14 @@ struct Metrics {
   double accepted_drafts = 0, drafted = 0;
   double nonfinite = 0;  // requests ended because the logits were not finite
   SpecStats spec;  // the engine's speculation counters after the last request
-  // Gauges the benchmark harness reads (its admission and its parallelism): requests running and
-  // queued (one runs at a time, the rest wait), and the token pool a night's tasks are budgeted
+  // Gauges the benchmark harness reads (its admission and its parallelism): requests running (up to
+  // --batch at once, M4 §3) and queued, and the token pool a night's tasks are budgeted
   // against: the resident sessions times the context size (M4 §1, SESSIONS §11).
   int running = 0, queued = 0, max_total_tokens = 0;
+  // The scheduler (M4 §3): requests that run at once, the prefill chunk size beside a decode, and the
+  // prefill chunks run between another request's steps so far.
+  int batch = 0, prefill_chunk_contended = 0;
+  double prefill_chunks_interleaved = 0;
   // The session pool (M4 §1): slots, slots holding a session, evictions so far, the protection window.
   int sessions = 0, sessions_resident = 0;
   double session_evictions = 0, protect_seconds = 0;
@@ -111,18 +125,23 @@ struct Metrics {
     counter("ling:spec_accepted_tokens_total", accepted_drafts, "Drafted tokens accepted.");
     counter("ling:nonfinite_logits_total", nonfinite, "Requests ended because the logits were NaN or inf.");
     counter("ling:session_evictions_total", session_evictions, "Resident sessions replaced by a new session.");
+    counter("ling:prefill_chunks_interleaved_total", prefill_chunks_interleaved,
+            "Prefill chunks run between another request's decode steps.");
     auto gauge = [&](const char* name, double v, const char* help) {
       out += std::string("# HELP ") + name + " " + help + "\n# TYPE " + name + " gauge\n";
       char buf[64];
       std::snprintf(buf, sizeof buf, "%.6f", v);
       out += std::string(name) + lab + " " + buf + "\n";
     };
-    gauge("sglang:num_running_reqs", running, "Requests being generated (at most one).");
+    gauge("sglang:num_running_reqs", running, "Requests being prefilled or generated (at most --batch).");
     gauge("sglang:num_queue_reqs", queued, "Requests waiting for the engine.");
     gauge("sglang:max_total_num_tokens", max_total_tokens,
           "Tokens the resident sessions can hold (sessions times the context size).");
     gauge("ling:sessions", sessions, "Resident session slots.");
     gauge("ling:sessions_resident", sessions_resident, "Slots holding a session.");
+    gauge("ling:batch", batch, "Requests that run at once (each in its own session).");
+    gauge("ling:prefill_chunk_contended", prefill_chunk_contended,
+          "Prefill chunk size, in tokens, while another request decodes.");
     gauge("ling:session_protect_seconds", protect_seconds,
           "How long a keyed session is protected from eviction after its last request.");
     return out;
@@ -166,15 +185,60 @@ struct Job {
   std::vector<int> prompt;
   JobSink sink;
   std::shared_ptr<std::atomic<bool>> cancelled;
-  int session = -1;    // the session it runs in (bound when the worker picks it)
+  int session = -1;    // the session it runs in (bound when the scheduler admits it)
   bool fresh = false;  // a new session in that slot
 };
 
-class Worker {
+// Step periods of one decoding request: the time from the start of one of its steps (or its first token) to
+// the start of the next, split by whether another request was prefilling meanwhile (M4 §3: a prefill chunk
+// runs between two of its steps).
+struct Periods {
+  double sum = 0, max = 0;
+  int n = 0;
+  void add(double s) {
+    sum += s;
+    max = std::max(max, s);
+    ++n;
+  }
+  double mean_ms() const { return n ? 1e3 * sum / n : 0.0; }
+};
+
+// A request the scheduler is running (M4 §3): its prefill cursor, then what one decode step needs (what
+// generate() kept in locals when one request ran at a time).
+struct Running {
+  Job job;
+  Engine::PrefillCursor cur;
+  bool prefilling = true;
+  int limit = 0;
+  bool spec = false;
+  std::vector<float> logits;  // the prefill's logits (the first token), then a plain step's
+  std::vector<float> rows;    // the verify's rows, when the request asked for logprobs
+  std::vector<int> pending;   // chosen tokens not yet emitted
+  std::optional<StreamDecoder> dec;
+  std::optional<StopScanner> stops;
+  std::string finish = "length";
+  int produced = 0, passes = 0, reasoning = 0;
+  bool in_think = false;
+  int newlines_after_think = 0;  // of the blank line after </think>, still to count
+  bool ended_by_eos = false;
+  double ttft = -1;
+  std::chrono::steady_clock::time_point t_decode, last_step;
+  long steps0 = 0, drafted0 = 0, accepted0 = 0;
+  int chunks_beside = 0;  // prefill chunks run while another request was decoding (contended size)
+  Periods alone, beside;  // step periods without and with another request's prefill in between
+};
+
+// The engine thread (M4 §3). Up to `batch` requests run at once, each in its own resident session: a request
+// is admitted when it can be bound (its session is not another running request's, or a slot is free or
+// evictable), then the running requests take turns, one unit each: a prefill chunk while its prompt is not
+// done, else one decode step (speculative, or plain). A prefill chunk that runs while another request is
+// decoding is at most `contended` tokens, which bounds the decoding request's step period during a long
+// prefill. Nothing numeric changes: each unit runs in its own session's state, as it would alone.
+class Scheduler {
  public:
-  Worker(ServerContext& ctx, double protect_seconds)
-      : ctx_(ctx), protect_seconds_(protect_seconds), thread_([this] { run(); }) {}
-  ~Worker() {
+  Scheduler(ServerContext& ctx, double protect_seconds, int batch, int contended)
+      : ctx_(ctx), protect_seconds_(protect_seconds), batch_(batch), contended_(contended), thread_([this] { run(); }) {}
+  ~Scheduler() {
     {
       std::lock_guard<std::mutex> l(mu_);
       stop_ = true;
@@ -185,7 +249,8 @@ class Worker {
   void submit(Job job) {
     std::lock_guard<std::mutex> l(mu_);
     queue_.push_back(std::move(job));
-    {  // under mu_ as well, so the worker's decrement cannot precede this increment
+    dirty_ = true;
+    {  // under mu_ as well, so the scheduler's decrement cannot precede this increment
       std::lock_guard<std::mutex> m(ctx_.metrics.mu);
       ctx_.metrics.queued += 1;
     }
@@ -195,8 +260,9 @@ class Worker {
  private:
   // Under mu_. Drops the jobs whose client has gone, then takes the first job that can run now and binds
   // its session (M4 §1): the resident session it continues, else a slot for a new session. Sessions that a
-  // queued job continues are pinned, so a new session never takes them; when every other slot is pinned or
-  // protected, the new session's job waits and the jobs behind it that continue a session still run.
+  // running request holds or a queued job continues are pinned, so a new session never takes them; a job
+  // that continues a running request's session waits for it (one request per session at a time), and when
+  // every other slot is pinned or protected a new session's job waits while the jobs behind it still run.
   bool pick(Job& out) {
     Engine& eng = *ctx_.engine;
     for (auto it = queue_.begin(); it != queue_.end();) {
@@ -208,14 +274,17 @@ class Worker {
       std::lock_guard<std::mutex> m(ctx_.metrics.mu);  // mu_ then metrics.mu, as submit() takes them
       ctx_.metrics.queued -= 1;
     }
+    std::vector<bool> busy(eng.sessions(), false);
+    for (const auto& r : running_) busy[r->job.session] = true;
     std::vector<int> match(queue_.size());
-    std::vector<bool> pinned(eng.sessions(), false);
+    std::vector<bool> pinned = busy;
     for (size_t j = 0; j < queue_.size(); ++j) {
       match[j] = eng.match_session(queue_[j].prompt, queue_[j].req.session_key);
       if (match[j] >= 0) pinned[match[j]] = true;
     }
     for (size_t j = 0; j < queue_.size(); ++j) {
       int s = match[j];
+      if (s >= 0 && busy[s]) continue;
       const bool fresh = s < 0;
       if (fresh) s = eng.free_session(protect_seconds_, pinned);
       if (s < 0) continue;
@@ -223,192 +292,285 @@ class Worker {
       out.session = s;
       out.fresh = fresh;
       queue_.erase(queue_.begin() + j);
+      std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+      ctx_.metrics.queued -= 1;
       return true;
     }
     return false;
   }
 
-  void run() {
-    while (true) {
-      Job job;
-      {
-        std::unique_lock<std::mutex> l(mu_);
-        while (true) {
-          if (stop_) return;
+  // Waits while nothing runs and nothing can be admitted; admits at most one job. Returns false to stop.
+  bool admit() {
+    Job job;
+    {
+      std::unique_lock<std::mutex> l(mu_);
+      while (true) {
+        if (stop_) return false;
+        const auto now = std::chrono::steady_clock::now();
+        // A job that could not be placed is looked at again when something changed (a new job, a request
+        // ended) or once a second (a protection expires, a waiting client leaves).
+        const bool look = static_cast<int>(running_.size()) < batch_ && !queue_.empty() &&
+                          (dirty_ || now - last_look_ >= std::chrono::seconds(1));
+        if (look) {
+          dirty_ = false;
+          last_look_ = now;
           if (pick(job)) break;
-          // Nothing can run: wait for a new job, or (a job is waiting for a slot) re-check every second,
-          // as a protection expires or a waiting client leaves.
-          if (queue_.empty()) cv_.wait(l);
-          else cv_.wait_for(l, std::chrono::seconds(1));
         }
-        std::lock_guard<std::mutex> m(ctx_.metrics.mu);  // mu_ then metrics.mu, as submit() takes them
-        ctx_.metrics.queued -= 1;
-        ctx_.metrics.running = 1;
+        if (!running_.empty()) return true;
+        if (queue_.empty()) cv_.wait(l);
+        else cv_.wait_for(l, std::chrono::seconds(1));
       }
-      Engine& eng = *ctx_.engine;
-      eng.activate_session(job.session, job.req.session_key, job.fresh);
+    }
+    start(std::move(job));
+    return true;
+  }
+
+  // Binds the admitted job's session and readies its prefill; a job refused here is answered at once.
+  void start(Job job) {
+    Engine& eng = *ctx_.engine;
+    auto r = std::make_unique<Running>();
+    r->job = std::move(job);
+    Job& j = r->job;
+    try {
+      if (exceeds_context(j.prompt.size(), eng.max_context())) throw ContextOverflow(j.prompt.size(), eng.max_context());
+      eng.activate_session(j.session, j.req.session_key, j.fresh);
+      r->cur = eng.begin_prefill(j.prompt);
+    } catch (const std::exception& e) {
+      fail(*r, e);
+      eng.touch_session(j.session);
+      return;
+    }
+    running_.push_back(std::move(r));
+    std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+    ctx_.metrics.running = static_cast<int>(running_.size());
+    ctx_.metrics.sessions_resident = eng.sessions_resident();
+    ctx_.metrics.session_evictions = static_cast<double>(eng.session_evictions());
+  }
+
+  void fail(Running& r, const std::exception& e) {
+    if (const auto* o = dynamic_cast<const ContextOverflow*>(&e)) {
+      r.job.sink.error(o->what(), kContextLengthExceeded);
+      return;
+    }
+    if (dynamic_cast<const NonFiniteLogits*>(&e)) {
       {
-        std::lock_guard<std::mutex> m(ctx_.metrics.mu);
-        ctx_.metrics.sessions_resident = eng.sessions_resident();
-        ctx_.metrics.session_evictions = static_cast<double>(eng.session_evictions());
+        std::lock_guard<std::mutex> l(ctx_.metrics.mu);
+        ctx_.metrics.nonfinite += 1;
       }
-      struct Done {  // the gauge drops however generate() ends, and the session's clock restarts
-        ServerContext& ctx;
-        ~Done() {
-          ctx.engine->touch_session();
-          std::lock_guard<std::mutex> l(ctx.metrics.mu);
-          ctx.metrics.running = 0;
-        }
-      } done_guard{ctx_};
+      std::fprintf(stderr, "request failed: %s (%zu prompt tokens)\n", e.what(), r.job.prompt.size());
+    }
+    r.job.sink.error(e.what(), "server_error");
+  }
+
+  void run() {
+    while (admit()) {
+      if (running_.empty()) continue;
+      const size_t k = turn_++ % running_.size();
+      Running& r = *running_[k];
+      bool ended = false;
       try {
-        generate(job);
-      } catch (const ContextOverflow& e) {
-        job.sink.error(e.what(), kContextLengthExceeded);
-      } catch (const NonFiniteLogits& e) {
-        {
-          std::lock_guard<std::mutex> l(ctx_.metrics.mu);
-          ctx_.metrics.nonfinite += 1;
-        }
-        std::fprintf(stderr, "request failed: %s (%zu prompt tokens)\n", e.what(), job.prompt.size());
-        job.sink.error(e.what(), "server_error");
+        ended = unit(r);
       } catch (const std::exception& e) {
-        job.sink.error(e.what(), "server_error");
+        fail(r, e);
+        ended = true;
       }
+      if (!ended) continue;
+      ctx_.engine->touch_session(r.job.session);  // the session's clock restarts however the request ended
+      running_.erase(running_.begin() + k);
+      {
+        std::lock_guard<std::mutex> l(mu_);
+        dirty_ = true;  // its session may be what a queued job waits for
+      }
+      std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+      ctx_.metrics.running = static_cast<int>(running_.size());
     }
   }
 
-  void generate(Job& job) {
+  bool other_decoding(const Running& self) const {
+    for (const auto& r : running_)
+      if (r.get() != &self && !r->prefilling) return true;
+    return false;
+  }
+  bool other_prefilling(const Running& self) const {
+    for (const auto& r : running_)
+      if (r.get() != &self && r->prefilling) return true;
+    return false;
+  }
+
+  // One prefill chunk or one decode step of `r`. Returns true when the request has ended (and was answered).
+  bool unit(Running& r) {
     Engine& eng = *ctx_.engine;
-    if (exceeds_context(job.prompt.size(), eng.max_context())) throw ContextOverflow(job.prompt.size(), eng.max_context());
-    const int ctx_left = eng.max_context() - static_cast<int>(job.prompt.size());
-    const int limit = job.req.max_tokens > 0 ? std::min(job.req.max_tokens, ctx_left) : ctx_left;
-    EngineStats stats;
-    std::vector<float> logits = eng.prefill(job.prompt, &stats);
-    const bool spec = eng.can_speculate(job.req.sampling);
-    const long steps0 = eng.spec_stats().steps, drafted0 = eng.spec_stats().drafted, accepted0 = eng.spec_stats().accepted;
-    const auto t_decode = std::chrono::steady_clock::now();
-    StreamDecoder dec(*ctx_.tok);
-    StopScanner stops(job.req.stop);
-    std::string finish = "length";
-    int produced = 0, passes = 0, reasoning = 0;
-    bool in_think = job.req.reasoning;  // the prompt ends inside <think>
-    int newlines_after_think = 0;       // of the blank line after </think>, still to count
-    bool ended_by_eos = false;
-    double ttft = -1;
+    if (r.prefilling) {
+      const bool contended = other_decoding(r);
+      const bool last = eng.prefill_chunk(r.cur, contended ? contended_ : 0);
+      if (contended) count_interleaved(r);
+      if (!last) return false;
+      r.prefilling = false;
+      begin_decode(r);
+      return emit(r) && end(r);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    (other_prefilling(r) ? r.beside : r.alone).add(std::chrono::duration<double>(now - r.last_step).count());
+    r.last_step = now;
+    eng.select_session(r.job.session);
+    ++r.passes;
+    if (r.spec) {
+      r.pending = eng.speculate(r.pending.back(), r.job.req.sampling, r.job.req.logprobs ? &r.rows : nullptr);
+      // The verify checks only each row's top K for NaN and inf (the plain path's sample() checks the
+      // whole row); a row reported as logprobs is checked whole, so a NaN never reaches the client.
+      if (r.job.req.logprobs) require_finite(r.rows);
+    } else {
+      r.logits = eng.step(r.pending.back());
+      r.pending = {eng.sample(r.logits, r.job.req.sampling, eng.history())};
+    }
+    return emit(r) && end(r);
+  }
+
+  void count_interleaved(Running& r) {
+    ++r.chunks_beside;
+    std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+    ctx_.metrics.prefill_chunks_interleaved += 1;
+  }
+
+  // After the last prefill chunk (the engine's active session is the request's, its logits the prompt's).
+  void begin_decode(Running& r) {
+    Engine& eng = *ctx_.engine;
+    const Job& j = r.job;
+    const int ctx_left = eng.max_context() - static_cast<int>(j.prompt.size());
+    r.limit = j.req.max_tokens > 0 ? std::min(j.req.max_tokens, ctx_left) : ctx_left;
+    r.spec = eng.can_speculate(j.req.sampling);
+    const SpecStats& s = eng.session_spec_stats(j.session);
+    r.steps0 = s.steps;
+    r.drafted0 = s.drafted;
+    r.accepted0 = s.accepted;
+    r.t_decode = r.last_step = std::chrono::steady_clock::now();
+    r.dec.emplace(*ctx_.tok);
+    r.stops.emplace(j.req.stop);
+    r.in_think = j.req.reasoning;  // the prompt ends inside <think>
+    r.logits = eng.logits();
     // `pending` holds chosen tokens not yet emitted: the first from the prefill's logits, then a
     // speculative step's accepted drafts and its next token, or a plain step's sample.
-    std::vector<int> pending = {eng.sample(logits, job.req.sampling, eng.history())};
+    r.pending = {eng.sample(r.logits, j.req.sampling, eng.history())};
+    r.rows.clear();
+  }
+
+  // Emits r's pending tokens, as generate() did per token. Returns true when the request is done.
+  bool emit(Running& r) {
+    Job& job = r.job;
+    const int eos = ctx_.engine->config().eos_token;
     // Logprobs (API §3), only when asked: each pending token's logprobs come from the row it was chosen
     // from, `logits` on the plain path and the prefill, or the verify's rows that speculate() copies to
     // `rows` (one per pending token, in order). Nothing here runs otherwise.
-    const bool want_logprobs = job.req.logprobs;
-    const size_t vocab = eng.config().vocab;
-    std::vector<float> rows;
-    bool done = false;
-    while (!done) {
-      for (size_t j = 0; j < pending.size(); ++j) {
-        const int t = pending[j];
-        if (ttft < 0) ttft = std::chrono::duration<double>(std::chrono::steady_clock::now() - job.received).count();
-        if (job.cancelled->load()) {
-          finish = "cancelled";
-          done = true;
-          break;
+    const size_t vocab = ctx_.engine->config().vocab;
+    for (size_t j = 0; j < r.pending.size(); ++j) {
+      const int t = r.pending[j];
+      if (r.ttft < 0) r.ttft = std::chrono::duration<double>(std::chrono::steady_clock::now() - job.received).count();
+      if (job.cancelled->load()) {
+        r.finish = "cancelled";
+        return true;
+      }
+      if (t == eos || t == ctx_.im_end) {
+        r.finish = "stop";
+        r.ended_by_eos = true;
+        return true;
+      }
+      ++r.produced;
+      if (job.req.logprobs) {
+        const float* row = r.rows.empty() ? r.logits.data() : r.rows.data() + j * vocab;
+        job.sink.logprobs(top_logprobs(std::span<const float>(row, vocab), t, job.req.top_logprobs));
+      }
+      if (r.in_think) {
+        ++r.reasoning;
+        if (t == ctx_.think_end) {
+          r.in_think = false;
+          r.newlines_after_think = 2;
         }
-        if (t == eng.config().eos_token || t == ctx_.im_end) {
-          finish = "stop";
-          ended_by_eos = true;
-          done = true;
-          break;
-        }
-        ++produced;
-        if (want_logprobs) {
-          const float* row = rows.empty() ? logits.data() : rows.data() + j * vocab;
-          job.sink.logprobs(top_logprobs(std::span<const float>(row, vocab), t, job.req.top_logprobs));
-        }
-        if (in_think) {
-          ++reasoning;
-          if (t == ctx_.think_end) {
-            in_think = false;
-            newlines_after_think = 2;
-          }
-        } else if (newlines_after_think > 0) {
-          if (t == ctx_.blank_line && newlines_after_think == 2) {
-            ++reasoning;
-            newlines_after_think = 0;
-          } else if (t == ctx_.newline) {
-            ++reasoning;
-            --newlines_after_think;
-          } else {
-            newlines_after_think = 0;
-          }
-        }
-        const std::string ready = stops.push(dec.push(t));
-        if (!ready.empty()) job.sink.text(ready);
-        if (stops.stopped()) {
-          finish = "stop";
-          done = true;
-          break;
-        }
-        if (produced >= limit) {
-          done = true;
-          break;
+      } else if (r.newlines_after_think > 0) {
+        if (t == ctx_.blank_line && r.newlines_after_think == 2) {
+          ++r.reasoning;
+          r.newlines_after_think = 0;
+        } else if (t == ctx_.newline) {
+          ++r.reasoning;
+          --r.newlines_after_think;
+        } else {
+          r.newlines_after_think = 0;
         }
       }
-      if (done) break;
-      ++passes;
-      if (spec) {
-        pending = eng.speculate(pending.back(), job.req.sampling, want_logprobs ? &rows : nullptr);
-        // The verify checks only each row's top K for NaN and inf (the plain path's sample() checks the
-        // whole row); a row reported as logprobs is checked whole, so a NaN never reaches the client.
-        if (want_logprobs) require_finite(rows);
-      } else {
-        logits = eng.step(pending.back());
-        pending = {eng.sample(logits, job.req.sampling, eng.history())};
+      const std::string ready = r.stops->push(r.dec->push(t));
+      if (!ready.empty()) job.sink.text(ready);
+      if (r.stops->stopped()) {
+        r.finish = "stop";
+        return true;
       }
+      if (r.produced >= r.limit) return true;
     }
-    if (!stops.stopped()) {  // what the decoder and the stop scanner still hold back
-      std::string rest = stops.push(dec.flush());
-      if (!stops.stopped()) rest += stops.finish();
+    return false;
+  }
+
+  // The request's end: what the decoder and the stop scanner still hold, the counters, the log line, done.
+  bool end(Running& r) {
+    Engine& eng = *ctx_.engine;
+    Job& job = r.job;
+    if (!r.stops->stopped()) {
+      std::string rest = r.stops->push(r.dec->flush());
+      if (!r.stops->stopped()) rest += r.stops->finish();
       if (!rest.empty()) job.sink.text(rest);
     }
     const auto now = std::chrono::steady_clock::now();
-    const double decode_s = std::chrono::duration<double>(now - t_decode).count();
-    const long steps = eng.spec_stats().steps - steps0;
+    const double decode_s = std::chrono::duration<double>(now - r.t_decode).count();
+    const SpecStats& s = eng.session_spec_stats(job.session);
+    const long steps = s.steps - r.steps0;
+    const EngineStats& stats = r.cur.stats;
     {
       Metrics& m = ctx_.metrics;
       std::lock_guard<std::mutex> l(m.mu);
       m.prompt_tokens += job.prompt.size();
       m.cached_tokens += stats.reused_tokens;
-      m.generation_tokens += produced + (ended_by_eos ? 1 : 0);  // SGLang counts the stop token
-      m.verify_calls += passes;
+      m.generation_tokens += r.produced + (r.ended_by_eos ? 1 : 0);  // SGLang counts the stop token
+      m.verify_calls += r.passes;
       m.e2e_sum += std::chrono::duration<double>(now - job.received).count();
       m.e2e_count += 1;
-      if (ttft >= 0) {
-        m.ttft_sum += ttft;
+      if (r.ttft >= 0) {
+        m.ttft_sum += r.ttft;
         m.ttft_count += 1;
       }
-      m.drafted += eng.spec_stats().drafted - drafted0;
-      m.accepted_drafts += eng.spec_stats().accepted - accepted0;
-      m.spec = eng.spec_stats();
+      m.drafted += s.drafted - r.drafted0;
+      m.accepted_drafts += s.accepted - r.accepted0;
+      m.spec = eng.spec_stats_total();
     }
+    // Step periods (M4 §3): mean and max, apart from those with another request's prefill chunk between.
+    char periods[200] = "";
+    if (r.alone.n + r.beside.n > 0)
+      std::snprintf(periods, sizeof periods, "; step period %.1f ms mean, %.1f max over %d; beside a prefill %.1f ms mean, %.1f max over %d",
+                    r.alone.mean_ms(), 1e3 * r.alone.max, r.alone.n, r.beside.mean_ms(), 1e3 * r.beside.max, r.beside.n);
     std::fprintf(stderr,
-                 "request: session %d%s, %zu prompt tokens (%d reused), prefill %.2f s; %d tokens in %.2f s (%.1f "
-                 "tok/s), %s; %d passes%s\n",
-                 job.session, job.fresh ? " (new)" : "", job.prompt.size(), stats.reused_tokens, stats.prefill_seconds, produced, decode_s,
-                 decode_s > 0 ? produced / decode_s : 0.0, finish.c_str(), passes,
-                 spec && steps > 0 ? (", " + std::to_string(double(produced) / std::max(1, passes)).substr(0, 4) +
-                                      " tokens/pass").c_str()
-                                   : "");
-    job.sink.done(finish == "cancelled" ? "stop" : finish, static_cast<int>(job.prompt.size()), produced,
-                  stats.reused_tokens, reasoning);
+                 "request: session %d%s, %zu prompt tokens (%d reused), prefill %.2f s (%d chunks, %d beside a decode, "
+                 "%.0f tok/s of compute); %d tokens in %.2f s (%.1f tok/s), %s; %d passes%s%s\n",
+                 job.session, job.fresh ? " (new)" : "", job.prompt.size(), stats.reused_tokens, stats.prefill_seconds,
+                 stats.chunks, r.chunks_beside,
+                 stats.compute_seconds > 0 ? stats.prefill_tokens / stats.compute_seconds : 0.0, r.produced, decode_s,
+                 decode_s > 0 ? r.produced / decode_s : 0.0, r.finish.c_str(), r.passes,
+                 r.spec && steps > 0 ? (", " + std::to_string(double(r.produced) / std::max(1, r.passes)).substr(0, 4) +
+                                        " tokens/pass").c_str()
+                                     : "",
+                 periods);
+    job.sink.done(r.finish == "cancelled" ? "stop" : r.finish, static_cast<int>(job.prompt.size()), r.produced,
+                  stats.reused_tokens, r.reasoning);
+    return true;
   }
 
   ServerContext& ctx_;
   double protect_seconds_;
+  int batch_, contended_;
   std::mutex mu_;
   std::condition_variable cv_;
   std::deque<Job> queue_;
   bool stop_ = false;
+  bool dirty_ = false;  // the queue or the running set changed since pick() last looked
+  std::chrono::steady_clock::time_point last_look_{};
+  // Touched by the engine thread only.
+  std::vector<std::unique_ptr<Running>> running_;
+  size_t turn_ = 0;
   std::thread thread_;
 };
 
@@ -485,7 +647,7 @@ std::string error_type(const std::string& code) {
 
 class Handler : public proxygen::RequestHandler {
  public:
-  Handler(ServerContext& ctx, Worker& worker) : ctx_(ctx), worker_(worker) {}
+  Handler(ServerContext& ctx, Scheduler& scheduler) : ctx_(ctx), scheduler_(scheduler) {}
 
   void onRequest(std::unique_ptr<HTTPMessage> headers) noexcept override {
     method_ = headers->getMethodString();
@@ -752,7 +914,7 @@ class Handler : public proxygen::RequestHandler {
         ResponseBuilder(d).body(std::string(": keep-alive\n\n")).send();
       });
     }
-    worker_.submit(std::move(job));
+    scheduler_.submit(std::move(job));
   }
 
   // The Responses API, streamed as the event sequence Mightling's agent parses: response.created, then
@@ -949,11 +1111,11 @@ class Handler : public proxygen::RequestHandler {
         emit_event(*ex, "response.in_progress", in_progress);
       });
     }
-    worker_.submit(std::move(job));
+    scheduler_.submit(std::move(job));
   }
 
   ServerContext& ctx_;
-  Worker& worker_;
+  Scheduler& scheduler_;
   std::string method_, path_;
   folly::IOBufQueue body_{folly::IOBufQueue::cacheChainLength()};
   bool too_large_ = false;
@@ -962,16 +1124,16 @@ class Handler : public proxygen::RequestHandler {
 
 class Factory : public proxygen::RequestHandlerFactory {
  public:
-  Factory(ServerContext& ctx, Worker& worker) : ctx_(ctx), worker_(worker) {}
+  Factory(ServerContext& ctx, Scheduler& scheduler) : ctx_(ctx), scheduler_(scheduler) {}
   void onServerStart(folly::EventBase*) noexcept override {}
   void onServerStop() noexcept override {}
   proxygen::RequestHandler* onRequest(proxygen::RequestHandler*, HTTPMessage*) noexcept override {
-    return new Handler(ctx_, worker_);
+    return new Handler(ctx_, scheduler_);
   }
 
  private:
   ServerContext& ctx_;
-  Worker& worker_;
+  Scheduler& scheduler_;
 };
 
 }  // namespace
@@ -982,7 +1144,7 @@ int main(int argc, char** argv) {
   int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
-  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2;
+  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256;
   double protect_seconds = 30;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -1012,13 +1174,15 @@ int main(int argc, char** argv) {
     else if (a == "--prefill-bf16") prefill_bf16 = true;
     else if (a == "--sessions") sessions = std::stoi(next());
     else if (a == "--session-protect-seconds") protect_seconds = std::stod(next());
+    else if (a == "--batch") batch = std::stoi(next());
+    else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]\n";
     return 2;
   }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
@@ -1065,6 +1229,17 @@ int main(int argc, char** argv) {
   ctx.metrics.max_total_tokens = engine.sessions() * max_context;
   ctx.metrics.sessions = engine.sessions();
   ctx.metrics.protect_seconds = protect_seconds;
+  if (batch < 1) {
+    std::cerr << "--batch must be at least 1\n";
+    return 2;
+  }
+  batch = std::min(batch, engine.sessions());  // one running request per session
+  if (contended < 32 || contended > engine.prefill_chunk_size()) {
+    std::cerr << "--prefill-chunk-contended must be in [32, " << engine.prefill_chunk_size() << "]\n";
+    return 2;
+  }
+  ctx.metrics.batch = batch;
+  ctx.metrics.prefill_chunk_contended = contended;
   ctx.keepalive_ms = keepalive_seconds > 0 ? keepalive_seconds * 1000 : 0;
   ctx.think_end = tok.token_id("</think>");
   {
@@ -1078,7 +1253,7 @@ int main(int argc, char** argv) {
     name = name.substr(name.find_last_of('/') + 1);
   }
   ctx.model_name = name;
-  ling::serve::Worker worker(ctx, protect_seconds);
+  ling::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended);
 
   proxygen::HTTPServerOptions options;
   options.threads = 2;
@@ -1086,7 +1261,7 @@ int main(int argc, char** argv) {
   options.shutdownOn = {SIGINT, SIGTERM};
   options.enableContentCompression = false;
   options.handlerFactories =
-      proxygen::RequestHandlerChain().addThen<ling::serve::Factory>(ctx, worker).build();
+      proxygen::RequestHandlerChain().addThen<ling::serve::Factory>(ctx, scheduler).build();
   std::vector<proxygen::HTTPServer::IPConfig> ips = {
       {folly::SocketAddress(host, static_cast<uint16_t>(port), true), proxygen::HTTPServer::Protocol::HTTP}};
   proxygen::HTTPServer server(std::move(options));
