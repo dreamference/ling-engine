@@ -244,12 +244,14 @@ void copy_rows_bf16(const float* src, int rows, int H, __nv_bfloat16* dst, int d
 // Per-head RMSNorm (plain weight) and NeoX RoPE over the full 128-dim head at positions pos0 + row, in place.
 void draft_qk_rope(float* x, int rows, int heads, int row_stride, const __nv_bfloat16* norm, DevPos pos0, float theta,
                    float eps, cudaStream_t s);
-// k/v rows [rows][kv_size] into the BF16 caches [position][kv_size] at positions pos0 ...
+// k/v rows [rows][kv_size] into the BF16 rings [ring][kv_size] at positions pos0 ... (position p in row p % ring;
+// M4 §1). rows <= ring.
 void draft_store_kv(const float* k, const float* v, int rows, int kv_size, DevPos pos0, __nv_bfloat16* kc,
-                    __nv_bfloat16* vc, cudaStream_t s);
+                    __nv_bfloat16* vc, int ring, cudaStream_t s);
 // The block's B queries (positions L .. L + B - 1) over the cached context [L + j - window_left, L) and the
-// whole block (bidirectional within it). q [B][Hq][128], kb/vb [B][Hkv][128].
-void draft_attention(const float* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, const float* kb,
+// whole block (bidirectional within it). q [B][Hq][128], kb/vb [B][Hkv][128]. The context is read from the
+// rings kc/vc (position p in row p % ring, ring > window_left).
+void draft_attention(const float* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, int ring, const float* kb,
                      const float* vb, DevPos L, int B, int window_left, int Hq, int Hkv, float* out, cudaStream_t s);
 // DFlash2's two-tap grouped dynamic convolution over a block (side 0 wraps a sublayer's input, 1 its output).
 void grouped_conv(const float* h, const float* coef, const __nv_bfloat16* base, int side, float* out, int rows,

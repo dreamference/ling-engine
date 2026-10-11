@@ -4,6 +4,14 @@
 //   ling-serve --model DIR [--host 0.0.0.0] [--port 8000] [--served-model-name NAME] [--max-context N]
 //              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
+//              [--sessions N] [--session-protect-seconds S]
+//
+// --sessions N (default 2; M4 §1) keeps N resident sessions, each with its own KV cache and state, so N
+// agent tasks that alternate keep their histories warm. A request runs in the session it extends (its
+// prompt_cache_key's session is looked at first; the token prefix decides), else in a new session, which
+// takes a free slot or evicts the least recently used one. A session bound with a prompt_cache_key whose
+// last request ran less than --session-protect-seconds ago (default 180, 0 off) is never evicted: a new
+// session's request waits in the queue instead, while requests that continue a resident session run.
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -59,8 +67,11 @@ struct Metrics {
   SpecStats spec;  // the engine's speculation counters after the last request
   // Gauges the benchmark harness reads (its admission and its parallelism): requests running and
   // queued (one runs at a time, the rest wait), and the token pool a night's tasks are budgeted
-  // against (one resident history today, so the context size; several sessions later, SESSIONS §11).
+  // against: the resident sessions times the context size (M4 §1, SESSIONS §11).
   int running = 0, queued = 0, max_total_tokens = 0;
+  // The session pool (M4 §1): slots, slots holding a session, evictions so far, the protection window.
+  int sessions = 0, sessions_resident = 0;
+  double session_evictions = 0, protect_seconds = 0;
 
   json spec_json() {
     std::lock_guard<std::mutex> l(mu);
@@ -99,6 +110,7 @@ struct Metrics {
     counter("ling:spec_drafted_tokens_total", drafted, "Drafted tokens offered to the verify.");
     counter("ling:spec_accepted_tokens_total", accepted_drafts, "Drafted tokens accepted.");
     counter("ling:nonfinite_logits_total", nonfinite, "Requests ended because the logits were NaN or inf.");
+    counter("ling:session_evictions_total", session_evictions, "Resident sessions replaced by a new session.");
     auto gauge = [&](const char* name, double v, const char* help) {
       out += std::string("# HELP ") + name + " " + help + "\n# TYPE " + name + " gauge\n";
       char buf[64];
@@ -107,7 +119,12 @@ struct Metrics {
     };
     gauge("sglang:num_running_reqs", running, "Requests being generated (at most one).");
     gauge("sglang:num_queue_reqs", queued, "Requests waiting for the engine.");
-    gauge("sglang:max_total_num_tokens", max_total_tokens, "Tokens the resident history can hold (the context size).");
+    gauge("sglang:max_total_num_tokens", max_total_tokens,
+          "Tokens the resident sessions can hold (sessions times the context size).");
+    gauge("ling:sessions", sessions, "Resident session slots.");
+    gauge("ling:sessions_resident", sessions_resident, "Slots holding a session.");
+    gauge("ling:session_protect_seconds", protect_seconds,
+          "How long a keyed session is protected from eviction after its last request.");
     return out;
   }
 };
@@ -149,11 +166,14 @@ struct Job {
   std::vector<int> prompt;
   JobSink sink;
   std::shared_ptr<std::atomic<bool>> cancelled;
+  int session = -1;    // the session it runs in (bound when the worker picks it)
+  bool fresh = false;  // a new session in that slot
 };
 
 class Worker {
  public:
-  explicit Worker(ServerContext& ctx) : ctx_(ctx), thread_([this] { run(); }) {}
+  Worker(ServerContext& ctx, double protect_seconds)
+      : ctx_(ctx), protect_seconds_(protect_seconds), thread_([this] { run(); }) {}
   ~Worker() {
     {
       std::lock_guard<std::mutex> l(mu_);
@@ -173,22 +193,69 @@ class Worker {
   }
 
  private:
+  // Under mu_. Drops the jobs whose client has gone, then takes the first job that can run now and binds
+  // its session (M4 §1): the resident session it continues, else a slot for a new session. Sessions that a
+  // queued job continues are pinned, so a new session never takes them; when every other slot is pinned or
+  // protected, the new session's job waits and the jobs behind it that continue a session still run.
+  bool pick(Job& out) {
+    Engine& eng = *ctx_.engine;
+    for (auto it = queue_.begin(); it != queue_.end();) {
+      if (!it->cancelled->load()) {
+        ++it;
+        continue;
+      }
+      it = queue_.erase(it);
+      std::lock_guard<std::mutex> m(ctx_.metrics.mu);  // mu_ then metrics.mu, as submit() takes them
+      ctx_.metrics.queued -= 1;
+    }
+    std::vector<int> match(queue_.size());
+    std::vector<bool> pinned(eng.sessions(), false);
+    for (size_t j = 0; j < queue_.size(); ++j) {
+      match[j] = eng.match_session(queue_[j].prompt, queue_[j].req.session_key);
+      if (match[j] >= 0) pinned[match[j]] = true;
+    }
+    for (size_t j = 0; j < queue_.size(); ++j) {
+      int s = match[j];
+      const bool fresh = s < 0;
+      if (fresh) s = eng.free_session(protect_seconds_, pinned);
+      if (s < 0) continue;
+      out = std::move(queue_[j]);
+      out.session = s;
+      out.fresh = fresh;
+      queue_.erase(queue_.begin() + j);
+      return true;
+    }
+    return false;
+  }
+
   void run() {
     while (true) {
       Job job;
       {
         std::unique_lock<std::mutex> l(mu_);
-        cv_.wait(l, [&] { return stop_ || !queue_.empty(); });
-        if (stop_) return;
-        job = std::move(queue_.front());
-        queue_.pop_front();
+        while (true) {
+          if (stop_) return;
+          if (pick(job)) break;
+          // Nothing can run: wait for a new job, or (a job is waiting for a slot) re-check every second,
+          // as a protection expires or a waiting client leaves.
+          if (queue_.empty()) cv_.wait(l);
+          else cv_.wait_for(l, std::chrono::seconds(1));
+        }
         std::lock_guard<std::mutex> m(ctx_.metrics.mu);  // mu_ then metrics.mu, as submit() takes them
         ctx_.metrics.queued -= 1;
         ctx_.metrics.running = 1;
       }
-      struct Done {  // the gauge drops however generate() ends
+      Engine& eng = *ctx_.engine;
+      eng.activate_session(job.session, job.req.session_key, job.fresh);
+      {
+        std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+        ctx_.metrics.sessions_resident = eng.sessions_resident();
+        ctx_.metrics.session_evictions = static_cast<double>(eng.session_evictions());
+      }
+      struct Done {  // the gauge drops however generate() ends, and the session's clock restarts
         ServerContext& ctx;
         ~Done() {
+          ctx.engine->touch_session();
           std::lock_guard<std::mutex> l(ctx.metrics.mu);
           ctx.metrics.running = 0;
         }
@@ -325,9 +392,9 @@ class Worker {
       m.spec = eng.spec_stats();
     }
     std::fprintf(stderr,
-                 "request: %zu prompt tokens (%d reused), prefill %.2f s; %d tokens in %.2f s (%.1f tok/s), %s; "
-                 "%d passes%s\n",
-                 job.prompt.size(), stats.reused_tokens, stats.prefill_seconds, produced, decode_s,
+                 "request: session %d%s, %zu prompt tokens (%d reused), prefill %.2f s; %d tokens in %.2f s (%.1f "
+                 "tok/s), %s; %d passes%s\n",
+                 job.session, job.fresh ? " (new)" : "", job.prompt.size(), stats.reused_tokens, stats.prefill_seconds, produced, decode_s,
                  decode_s > 0 ? produced / decode_s : 0.0, finish.c_str(), passes,
                  spec && steps > 0 ? (", " + std::to_string(double(produced) / std::max(1, passes)).substr(0, 4) +
                                       " tokens/pass").c_str()
@@ -337,6 +404,7 @@ class Worker {
   }
 
   ServerContext& ctx_;
+  double protect_seconds_;
   std::mutex mu_;
   std::condition_variable cv_;
   std::deque<Job> queue_;
@@ -914,7 +982,8 @@ int main(int argc, char** argv) {
   int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
-  int attn_prefetch = 2, keepalive_seconds = 15;
+  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2;
+  double protect_seconds = 180;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -941,13 +1010,15 @@ int main(int argc, char** argv) {
     else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
     else if (a == "--keepalive-seconds") keepalive_seconds = std::stoi(next());
     else if (a == "--prefill-bf16") prefill_bf16 = true;
+    else if (a == "--sessions") sessions = std::stoi(next());
+    else if (a == "--session-protect-seconds") protect_seconds = std::stod(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S]\n";
     return 2;
   }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
@@ -982,6 +1053,7 @@ int main(int argc, char** argv) {
   opts.attention_bulk = attn_bulk;
   opts.attention_prefetch = attn_prefetch;
   opts.prefill_bf16 = prefill_bf16;
+  opts.sessions = sessions;
   std::cerr << "loading " << model_dir << " ...\n";
   ling::Engine engine(model_dir, opts);
   std::cerr << "loaded " << engine.model().device_bytes() / 1e9 << " GB of weights\n";
@@ -990,7 +1062,9 @@ int main(int argc, char** argv) {
   ctx.engine = &engine;
   ctx.tok = &tok;
   ctx.im_end = tok.token_id("<|im_end|>");
-  ctx.metrics.max_total_tokens = max_context;
+  ctx.metrics.max_total_tokens = engine.sessions() * max_context;
+  ctx.metrics.sessions = engine.sessions();
+  ctx.metrics.protect_seconds = protect_seconds;
   ctx.keepalive_ms = keepalive_seconds > 0 ? keepalive_seconds * 1000 : 0;
   ctx.think_end = tok.token_id("</think>");
   {
@@ -1004,7 +1078,7 @@ int main(int argc, char** argv) {
     name = name.substr(name.find_last_of('/') + 1);
   }
   ctx.model_name = name;
-  ling::serve::Worker worker(ctx);
+  ling::serve::Worker worker(ctx, protect_seconds);
 
   proxygen::HTTPServerOptions options;
   options.threads = 2;

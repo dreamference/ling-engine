@@ -51,10 +51,21 @@ def greedy_completion(server, prompt, max_tokens=24, **extra):
     return server.post("/v1/completions", body)
 
 
+def resident_sessions(server):
+    """The number of resident session slots (ling:sessions in /metrics; 1 for a server without the gauge)."""
+    status, text = server.request("/metrics")
+    for line in text.splitlines() if status == 200 else []:
+        if line.startswith("ling:sessions{"):
+            return int(float(line.rsplit(" ", 1)[1]))
+    return 1
+
+
 def evict(server):
-    """Replaces the engine's resident history with an unrelated prompt, so the next request starts cold
-    (ling-serve keeps one history and the checkpoints that lie inside it)."""
-    greedy_completion(server, "Unrelated: list three prime numbers.", max_tokens=4)
+    """Replaces every resident session with an unrelated prompt, one per slot, so the next request starts
+    cold: no session holds its prefix, so no kept state is usable (M4 §1: the checkpoint store keeps its
+    entries, but resuming from one needs the prefix's KV in some session)."""
+    for i in range(resident_sessions(server)):
+        greedy_completion(server, f"Unrelated {i}: list three prime numbers.", max_tokens=4)
 
 
 def code_text(lines):
@@ -619,7 +630,8 @@ def test_metrics_has_the_harness_gauges(server):
     """The benchmark harness's admission reads sglang:num_running_reqs and sglang:num_queue_reqs from
     /metrics and refuses to start while another client's request runs; its parallelism divides
     sglang:max_total_num_tokens by its per-task budget (API §6). Check: the three gauges are there,
-    running is 1 while a request streams and 0 after, and the pool equals max_model_len."""
+    running is 1 while a request streams and 0 after, and the pool equals the resident sessions times
+    max_model_len (M4 §1)."""
     def gauges():
         status, text = server.request("/metrics")
         assert status == 200
@@ -633,7 +645,7 @@ def test_metrics_has_the_harness_gauges(server):
     idle = gauges()
     assert set(idle) == {"sglang:num_running_reqs", "sglang:num_queue_reqs", "sglang:max_total_num_tokens"}, idle
     assert idle["sglang:num_running_reqs"] == 0 and idle["sglang:num_queue_reqs"] == 0
-    assert idle["sglang:max_total_num_tokens"] == server.max_model_len
+    assert idle["sglang:max_total_num_tokens"] == resident_sessions(server) * server.max_model_len
     r = server.open_stream("/v1/completions", {"prompt": "Count from one to two hundred, separated by commas: 1, 2, 3,",
                                                "max_tokens": 300, "temperature": 0, "stream": True})
     try:
