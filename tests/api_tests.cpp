@@ -132,6 +132,15 @@ int main() {
     const std::string tail = "<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
     EXPECT(t.size() >= tail.size() && t.compare(t.size() - tail.size(), tail.size(), tail) == 0);
   }
+  {
+    // M4 §1: prompt_cache_key (Codex's thread id) becomes the request's session key, the hint the session
+    // pool looks at first; a request without one has an empty key.
+    json body = json::parse(R"({"input":"hi","prompt_cache_key":"thread-1"})");
+    EXPECT(ling::serve::parse_responses_request(body).session_key == "thread-1");
+    EXPECT(ling::serve::parse_responses_request(json::parse(R"({"input":"hi"})")).session_key.empty());
+    EXPECT(ling::serve::parse_request(json::parse(R"({"messages":[{"role":"user","content":"hi"}],
+      "prompt_cache_key":"chat-1"})"), true).session_key == "chat-1");
+  }
   // Bug classes from SGLang's and vLLM's trackers (reports/engine-issues-2026-10-09.md, specs/DREAMFERENCE_LING_ENGINE_VALIDATION.md §18 "Known
   // pitfalls"). Each block names the upstream issue it guards against.
   const json edit_tools = json::parse(R"([{"type":"function","function":{"name":"edit","parameters":{"type":"object",

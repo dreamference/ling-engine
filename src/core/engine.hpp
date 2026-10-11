@@ -1,4 +1,4 @@
-// One sequence at a time: the forward pass (chunked prefill, then decode or speculative verify), its
+// One sequence at a time, out of a pool of resident sessions (M4 stage 1): the forward pass (chunked prefill, then decode or speculative verify), its
 // state (paged-free: a flat KV cache for the full-attention layers, DeltaNet and conv state for the rest),
 // sampling, and speculation with the DFlash2 drafter (speculate.cpp).
 //
@@ -15,6 +15,7 @@
 #include <functional>
 #include <initializer_list>
 #include <utility>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <random>
@@ -69,6 +70,10 @@ struct EngineOptions {
   // under MILESTONES §14's exactness policy until its KL and agreement checks pass (bench/prefill_bf16_check.sh).
   // The decode and verify rows path is untouched either way. LING_PREFILL_BF16=0/1 overrides.
   bool prefill_bf16 = false;
+  // M4 §1: resident sessions, each a fixed slot with its own KV cache, DeltaNet and conv state, end-of-prompt
+  // state, drafter context ring, history and RNG, all allocated here. Requests run one at a time in the
+  // active session (select it with activate_session); the prefix checkpoints are shared by all of them.
+  int sessions = 1;
 };
 
 struct EngineStats {
@@ -106,7 +111,11 @@ class Engine {
   // Brings the state to exactly `prompt` (reusing the current state when `prompt` extends the tokens
   // already processed) and returns the logits after its last token. Throws NonFiniteLogits, keeping no
   // state from the failed pass, when a pass's logits are not finite.
-  const std::vector<float>& prefill(const std::vector<int>& prompt, EngineStats* stats = nullptr);
+  // The state comes from the active session's own kept states, the shared checkpoint store, or (when they
+  // reach further) another session's, whose KV for the shared prefix is copied in first (M4 §1).
+  // `from_scratch`: reuse nothing (the reference --prefix-check compares a resumed prefill with).
+  const std::vector<float>& prefill(const std::vector<int>& prompt, EngineStats* stats = nullptr,
+                                    bool from_scratch = false);
   // Appends one token and returns the logits after it.
   const std::vector<float>& step(int token);
   // Picks the next token from logits (sample_logits). `history` is history(): a seed is offset by its
@@ -133,7 +142,7 @@ class Engine {
   }
   void reset_spec_stats() {
     spec_stats_ = SpecStats{};
-    shadow_.clear();
+    for (Session& s : sessions_) s.shadow.clear();
   }
   void set_lookup(int mode, int min_match) {
     opts_.lookup_mode = mode;
@@ -147,8 +156,32 @@ class Engine {
   // where graphs are unavailable.
   void set_step_graphs(bool on);
 
-  const std::vector<int>& history() const { return history_; }
+  const std::vector<int>& history() const { return s_->history; }
+  // The active session to the empty state, and the checkpoint store emptied (a cold engine).
   void reset();
+  // The active session only: its history, kept states and drafter context forgotten; the store stays.
+  void reset_session();
+
+  // ---- The session pool (M4 §1). The binding policy lives here so ling-serve and ling-run share it. ----
+  int sessions() const { return static_cast<int>(sessions_.size()); }
+  int active_session() const { return static_cast<int>(s_ - sessions_.data()); }
+  // The resident session a prompt continues, or -1 (a new session). A session is bound only when the
+  // prompt extends it: the common prefix covers every complete message of the session's last prompt, so
+  // what differs is at most its last turn's generation prompt and output (a next turn re-renders them). Among those the longest common prefix wins, the key's
+  // session on a tie. When none is extended, the key's own session (the same thread, diverged: it
+  // re-prefills from the divergence). The key is a hint: the token prefix decides what is reused.
+  int match_session(const std::vector<int>& prompt, const std::string& key) const;
+  // A slot for a new session: one never used, else the least recently used one that is neither in `pinned`
+  // nor protected; -1 when there is none (the request waits). Protected: a session bound with a key (an
+  // agent's thread) whose last request ran less than protect_seconds ago (M4 §7 question 6).
+  int free_session(double protect_seconds, const std::vector<bool>& pinned) const;
+  // Makes session i active. `fresh`: a new session takes the slot (an eviction when another held it).
+  // Nothing is copied out or cleared: the slot's tokens stay usable as KV by a prompt that shares them.
+  void activate_session(int i, const std::string& key, bool fresh);
+  // Stamps the active session's last use (the LRU order and the protection clock).
+  void touch_session();
+  int sessions_resident() const;
+  long session_evictions() const { return evictions_; }
   // FNV-1a over every DeltaNet and conv state, bit for bit (the exactness tests compare runs with it).
   uint64_t state_hash();
 
@@ -225,11 +258,10 @@ class Engine {
   bool use_dev_pos_ = false;  // set while capturing: dpos() points the kernels at pos_dev_
   int* pos_dev_ = nullptr;
   kernels::DevPos dpos(int off = 0) const {
-    return use_dev_pos_ ? kernels::DevPos(pos_ + off, pos_dev_, off) : kernels::DevPos(pos_ + off);
+    return use_dev_pos_ ? kernels::DevPos(s_->pos + off, pos_dev_, off) : kernels::DevPos(s_->pos + off);
   }
-  cudaGraphExec_t draft_graph_ = nullptr;
-  std::map<int, cudaGraphExec_t> verify_graphs_;  // by top-K (1 when greedy)
-  std::vector<cudaGraphExec_t> commit_graphs_;    // by accepted count + 1
+  // The graphs themselves are per session (Session::draft_graph ...): they bake the session's cache and
+  // state pointers into their kernels' arguments.
   // Runs `body` as the graph in `slot` (captured on first use), or eagerly when graphs are off. A failed
   // capture turns graphs off for the engine's lifetime, says why, and runs `body` eagerly.
   void run_graph(cudaGraphExec_t& slot, const char* what, const std::function<void()>& body);
@@ -273,22 +305,20 @@ class Engine {
   float* xinv_ = nullptr;    // and their per-row scales
   int* ids_dev_ = nullptr;
 
-  // Sequence state.
-  std::vector<__nv_bfloat16*> kcache_, vcache_;  // per full-attention layer, [max_context][Hkv][D]
-  std::vector<float*> gdn_state_, conv_state_;    // per linear layer
-  std::vector<int> layer_slot_;                   // layer -> index into the vectors above
-  std::vector<int> history_;
-  size_t prompt_len_ = 0;  // the last prefill's prompt: history_ past it is the current request's output
-  // Kept states. Each is the state after history_[0, pos), valid while those tokens stay in history_.
-  StateSlot snap_;     // the end of the last prompt
-  int snap_pos_ = -1;
+  std::vector<int> layer_slot_;  // layer -> index into a session's kcache/vcache or gdn/conv
+  int n_linear_ = 0;             // DeltaNet layers
+  // The checkpoint store (M4 §1), shared by the sessions and owning its identity: each entry is the state
+  // after exactly `tokens` (a prompt prefix of at most checkpoint_limit ids), found by a hash of the prefix
+  // and confirmed by comparing the ids. It outlives the history it was taken from; resuming from it also
+  // needs the prefix's KV, which the target session holds or copies from another session.
   struct Checkpoint {
     int pos, slot;
+    uint64_t hash;
+    std::vector<int> tokens;
   };
   std::vector<StateSlot> ckpt_slots_;
   std::vector<Checkpoint> ckpts_;  // sorted by position
-  int dkv_lo_ = 0;  // the drafter's context KV is valid for positions [dkv_lo_, history_.size())
-  int pos_ = 0;
+  bool ckpt_match(const Checkpoint& k, const std::vector<int>& prompt, const std::vector<uint64_t>& prefix_hash) const;
 
   // A verify's per-layer DeltaNet inputs, kept for commit(): the in-projection before and after the conv,
   // the decay and the write strength, for up to 32 rows.
@@ -307,18 +337,56 @@ class Engine {
   int* dcand_ = nullptr;
   float *topk_scratch_ = nullptr, *vals_dev_ = nullptr;
   int* ids_out_dev_ = nullptr;
+  // The drafter attends to the last sliding_window positions only, so its context KV is a ring of
+  // ring_ positions per session, position p at p % ring_ (M4 §1). The slack past the window keeps a resume
+  // usable when the session's history ran up to that many tokens past the new prompt (a re-rendered last
+  // output); the extra kMaxStreamRows cover a commit's rows.
+  int ring_ = 0;
   struct ShadowRecord {
     int pos;                  // the anchor's position
     std::vector<int> tokens;  // the lookup's proposal for the positions after it
     int match, dflash_accepted, bucket;
   };
-  std::vector<ShadowRecord> shadow_;
-  void score_shadow(bool all);  // scores records whose continuation is known (all: the rest as far as known)  // the prompt's drafter context starts here (positions before are not needed)
+  void score_shadow(bool all);  // scores records whose continuation is known (all: the rest as far as known)
+
+  // A resident session (M4 §1): everything that belongs to one sequence.
+  struct Session {
+    std::vector<__nv_bfloat16*> kcache, vcache;  // per full-attention layer, [Hkv][max_context][D]
+    std::vector<float*> gdn, conv;                // DeltaNet and conv state, per linear layer
+    std::vector<int> history;  // the tokens whose KV the caches hold (kept when another session takes the slot)
+    size_t prompt_len = 0;     // the last prefill's prompt: history past it is the current request's output
+    int turn_start = 0;        // where that prompt's last turn starts: after its last boundary_token (or its end)
+    // The state after history[0, snap_pos) (the end of the last prompt), valid while those tokens stay.
+    StateSlot snap;
+    int snap_pos = -1;
+    std::vector<__nv_bfloat16*> dkc, dvc;  // the drafter's context KV ring, per drafter layer
+    // The ring holds positions [dkv_lo, history.size()), and of those only the last ring_ (dkv_from()).
+    int dkv_lo = 0;
+    int pos = 0;
+    std::vector<ShadowRecord> shadow;
+    std::mt19937_64 rng;
+    cudaGraphExec_t draft_graph = nullptr;
+    std::map<int, cudaGraphExec_t> verify_graphs;  // by top-K (1 when greedy)
+    std::vector<cudaGraphExec_t> commit_graphs;    // by accepted count + 1
+    // The pool's bookkeeping.
+    bool owned = false;  // a session has been bound to the slot
+    std::string key;     // the prompt_cache_key it was bound with ("" without one)
+    std::chrono::steady_clock::time_point last_used{};
+  };
+  std::vector<Session> sessions_;
+  Session* s_ = nullptr;  // the active session
+  long evictions_ = 0;
+  // The first position whose drafter context KV session s still holds.
+  int dkv_from(const Session& s) const {
+    return std::max(s.dkv_lo, static_cast<int>(s.history.size()) - ring_);
+  }
+  // Copies session `from`'s KV for positions [0, n), its drafter ring and its history into the active
+  // session, which then holds what `from` holds for its first n tokens.
+  void adopt_prefix(const Session& from, int n);
 
   std::vector<float> logits_;
   bool profile_ = false;
   std::map<std::string, double> phase_seconds_;
-  std::mt19937_64 rng_;
   SpecStats spec_stats_;
 };
 

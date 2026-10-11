@@ -107,10 +107,14 @@ void Engine::alloc_drafter() {
   }
   cap_stride_ = nfeat * H;
   cap_ = alloc<__nv_bfloat16>(size_t(R) * cap_stride_);
-  for (int l = 0; l < d.layers; ++l) {
-    dkc_.push_back(alloc<__nv_bfloat16>(size_t(opts_.max_context) * dkv));
-    dvc_.push_back(alloc<__nv_bfloat16>(size_t(opts_.max_context) * dkv));
-  }
+  // Each session's context KV is a ring (M4 §1): the window, kRingSlack positions of slack, and a commit's rows.
+  constexpr int kRingSlack = 6144;
+  ring_ = d.sliding_window + kRingSlack + kernels::kMaxStreamRows;
+  for (Session& s : sessions_)
+    for (int l = 0; l < d.layers; ++l) {
+      s.dkc.push_back(alloc<__nv_bfloat16>(size_t(ring_) * dkv));
+      s.dvc.push_back(alloc<__nv_bfloat16>(size_t(ring_) * dkv));
+    }
   dctx_ = alloc<float>(size_t(R) * H);
   dk_ = alloc<float>(size_t(R) * dkv);
   dv_ = alloc<float>(size_t(R) * dkv);
@@ -133,7 +137,7 @@ void Engine::alloc_drafter() {
   ids_out_dev_ = alloc<int>(size_t(B) * 64);
   if (d.selector_top_k > 16) throw std::runtime_error("drafter selector_top_k > 16");
   const int C = c.lin_conv_channels();
-  for (size_t i = 0; i < gdn_state_.size(); ++i) {
+  for (size_t i = 0; i < s_->gdn.size(); ++i) {
     v_pre_.push_back(alloc<float>(size_t(B) * C));
     v_post_.push_back(alloc<float>(size_t(B) * C));
     v_g_.push_back(alloc<float>(size_t(B) * c.lin_v_heads));
@@ -157,13 +161,15 @@ void Engine::set_step_graphs(bool on) {
 }
 
 void Engine::clear_graphs() {
-  if (draft_graph_) cudaGraphExecDestroy(draft_graph_);
-  draft_graph_ = nullptr;
-  for (auto& [k, g] : verify_graphs_) cudaGraphExecDestroy(g);
-  verify_graphs_.clear();
-  for (cudaGraphExec_t g : commit_graphs_)
-    if (g) cudaGraphExecDestroy(g);
-  commit_graphs_.clear();
+  for (Session& s : sessions_) {
+    if (s.draft_graph) cudaGraphExecDestroy(s.draft_graph);
+    s.draft_graph = nullptr;
+    for (auto& [k, g] : s.verify_graphs) cudaGraphExecDestroy(g);
+    s.verify_graphs.clear();
+    for (cudaGraphExec_t g : s.commit_graphs)
+      if (g) cudaGraphExecDestroy(g);
+    s.commit_graphs.clear();
+  }
 }
 
 cudaGraphExec_t Engine::capture(const std::function<void()>& body) {
@@ -211,11 +217,11 @@ void Engine::commit(int n) {
   const ModelConfig& c = model_->config();
   for (int li = 0; li < c.layers; ++li) {
     const LayerWeights& L = model_->layers()[li];
-    if (L.full) continue;  // the verify already wrote the KV; rows past pos_ + n are overwritten later
+    if (L.full) continue;  // the verify already wrote the KV; rows past pos + n are overwritten later
     const int slot = layer_slot_[li];
     // The conv window advances over the accepted rows' raw inputs, the recurrence over their conv outputs.
-    kernels::gdn_conv(v_pre_[slot], conv_state_[slot], L.conv, n, c.lin_conv_channels(), stream_);
-    kernels::gdn_recurrent(v_post_[slot], v_g_[slot], v_beta_[slot], gdn_state_[slot], gdn_state_[slot], core_, n,
+    kernels::gdn_conv(v_pre_[slot], s_->conv[slot], L.conv, n, c.lin_conv_channels(), stream_);
+    kernels::gdn_recurrent(v_post_[slot], v_g_[slot], v_beta_[slot], s_->gdn[slot], s_->gdn[slot], core_, n,
                            c.lin_k_heads, c.lin_v_heads, stream_);
   }
 }
@@ -237,7 +243,7 @@ void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
     const DraftLayer& L = draft_->layers()[l];
     linear_fp4_multi({{&L.k, dk_}, {&L.v, dv_}}, dctx_, rows);
     kernels::draft_qk_rope(dk_, rows, d.kv_heads, dkv, L.k_norm, pos0, d.rope_theta, d.eps, stream_);
-    kernels::draft_store_kv(dk_, dv_, rows, dkv, pos0, dkc_[l], dvc_[l], stream_);
+    kernels::draft_store_kv(dk_, dv_, rows, dkv, pos0, s_->dkc[l], s_->dvc[l], ring_, stream_);
   }
 }
 
@@ -264,8 +270,8 @@ void Engine::draft_launch(int B) {
     linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, B);
     kernels::draft_qk_rope(dq_, B, d.heads, dq, L.q_norm, dpos(), d.rope_theta, d.eps, stream_);
     kernels::draft_qk_rope(dk_, B, d.kv_heads, dkv, L.k_norm, dpos(), d.rope_theta, d.eps, stream_);
-    kernels::draft_attention(dq_, dkc_[l], dvc_[l], dk_, dv_, dpos(), B, d.sliding_window - 1, d.heads, d.kv_heads,
-                             dattn_, stream_);
+    kernels::draft_attention(dq_, s_->dkc[l], s_->dvc[l], ring_, dk_, dv_, dpos(), B, d.sliding_window - 1, d.heads,
+                             d.kv_heads, dattn_, stream_);
     linear_fp4(L.o, dattn_, B, dh2_);
     kernels::grouped_conv(dh2_, dcoef_, L.attn_base, 1, dout_, B, H, d.conv_groups, B, stream_);
     kernels::add_inplace(dres_, dout_, B * H, stream_);
@@ -297,7 +303,7 @@ void Engine::draft_launch(int B) {
 void Engine::draft_propose(int anchor, int B, bool graph) {
   pin_->draft_ids[0] = anchor;
   for (int i = 1; i < B; ++i) pin_->draft_ids[i] = draft_->config().mask_token;
-  if (graph) run_graph(draft_graph_, "draft", [&] { draft_launch(B); });
+  if (graph) run_graph(s_->draft_graph, "draft", [&] { draft_launch(B); });
   else draft_launch(B);
   check(cudaStreamSynchronize(stream_), "draft");
 }
@@ -322,21 +328,21 @@ void Engine::commit_launch(int n) {
 
 std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vector<float>* row_logits) {
   if (!can_speculate(p)) throw std::runtime_error("speculate: unsupported sampling parameters or no drafter");
-  const int room = opts_.max_context - pos_;
+  const int room = opts_.max_context - s_->pos;
   if (room < 1) throw std::runtime_error("context is longer than max_context");
   const int B = std::min(opts_.draft_block, room);
   const bool greedy = p.temperature <= 0.f;
   if (B < 2) {  // no room to draft: one plain step
     step(anchor);
     if (row_logits) *row_logits = logits_;
-    return {sample(logits_, p, history_)};
+    return {sample(logits_, p, s_->history)};
   }
   // Graphs have the block's shape and the drafter's chain; a short block at the context's end or a lookup
   // chain runs eagerly. Either way the same kernels run, so the result is the same.
   const bool graph = graphs_ && B == opts_.draft_block && !(opts_.lookup_mode == 2);
   const int K16 = draft_->config().selector_top_k;
   int E = B - 1;
-  if (p.seed != 0) rng_.seed(p.seed + history_.size());
+  if (p.seed != 0) s_->rng.seed(p.seed + s_->history.size());
   std::uniform_real_distribution<double> uni(0.0, 1.0);
   auto t0 = std::chrono::steady_clock::now();
 
@@ -344,7 +350,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   // only recorded and scored later (shadow).
   LookupProposal lp;
   if (opts_.lookup_mode > 0) {
-    std::vector<int> seq(history_);
+    std::vector<int> seq(s_->history);
     seq.push_back(anchor);
     lp = lookup_propose(seq, E);
   }
@@ -356,7 +362,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
     E = static_cast<int>(lp.tokens.size());
   }
   if (graph) {  // the position every graph of this step reads
-    pin_->pos = pos_;
+    pin_->pos = s_->pos;
     check(cudaMemcpyAsync(pos_dev_, &pin_->pos, sizeof(int), cudaMemcpyHostToDevice, stream_), "position");
   }
 
@@ -382,7 +388,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
       double sum = 0;
       for (int k = 0; k < K16; ++k) sum += q[e][k] = std::exp((s[k] - mx) / T);
       for (double& v : q[e]) v /= sum;
-      const double u = uni(rng_);
+      const double u = uni(s_->rng);
       double cum = 0;
       pick = K16 - 1;
       for (int k = 0; k < K16; ++k) {
@@ -405,7 +411,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   const int K = greedy ? 1 : p.top_k;
   std::copy(rows.begin(), rows.end(), pin_->rows);
   if (graph) {
-    cudaGraphExec_t& g = verify_graphs_[K];
+    cudaGraphExec_t& g = s_->verify_graphs[K];
     run_graph(g, "verify", [&] { verify_launch(V, K); });
   } else {
     verify_launch(V, K);
@@ -433,7 +439,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
     };
     std::vector<Dist> P(V);
     for (int i = 0; i < V; ++i) P[i] = target_dist(vals + size_t(i) * K, ids + size_t(i) * K, K, p);
-    const auto [acc, tok] = accept_sampled(P, std::vector<int>(rows.begin() + 1, rows.end()), q_of, rng_);
+    const auto [acc, tok] = accept_sampled(P, std::vector<int>(rows.begin() + 1, rows.end()), q_of, s_->rng);
     accepted = acc;
     next = tok;
   }
@@ -451,13 +457,13 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
     check(cudaStreamSynchronize(stream_), "row logits");
   }
   if (graph) {
-    if (commit_graphs_.size() < size_t(V) + 1) commit_graphs_.resize(size_t(V) + 1, nullptr);
-    run_graph(commit_graphs_[n], "commit", [&] { commit_launch(n); });
+    if (s_->commit_graphs.size() < size_t(V) + 1) s_->commit_graphs.resize(size_t(V) + 1, nullptr);
+    run_graph(s_->commit_graphs[n], "commit", [&] { commit_launch(n); });
   } else {
     commit_launch(n);
   }
-  history_.insert(history_.end(), rows.begin(), rows.begin() + n);
-  pos_ += n;
+  s_->history.insert(s_->history.end(), rows.begin(), rows.begin() + n);
+  s_->pos += n;
   check(cudaStreamSynchronize(stream_), "commit");
   spec_stats_.commit_seconds += seconds_since(t2);
   spec_stats_.steps += 1;
@@ -469,12 +475,12 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
     spec_stats_.lookup_accepted += accepted;
   } else if (opts_.lookup_mode == 1 && !lp.tokens.empty()) {
     const int bucket = lp.match >= 32 ? 4 : lp.match >= 16 ? 3 : lp.match >= 8 ? 2 : lp.match >= 4 ? 1 : 0;
-    shadow_.push_back({pos_ - n, std::move(lp.tokens), lp.match, accepted, bucket});
+    s_->shadow.push_back({s_->pos - n, std::move(lp.tokens), lp.match, accepted, bucket});
   }
   if (!use_lookup && opts_.lookup_mode == 1) {
     spec_stats_.shadow_total_steps += 1;
     spec_stats_.shadow_dflash_all += accepted;
-    if (shadow_.empty() || shadow_.back().pos != pos_ - n) spec_stats_.shadow_best += accepted;  // no proposal
+    if (s_->shadow.empty() || s_->shadow.back().pos != s_->pos - n) spec_stats_.shadow_best += accepted;  // no proposal
   }
   score_shadow(false);
 
@@ -486,23 +492,23 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
 void Engine::score_shadow(bool all) {
   // A record is scored once the tokens after its anchor are known (or, with `all`, as far as they are):
   // the proposal would have had accepted its leading tokens that equal what was generated.
-  const int L = static_cast<int>(history_.size());
+  const int L = static_cast<int>(s_->history.size());
   size_t keep = 0;
-  for (size_t i = 0; i < shadow_.size(); ++i) {
-    ShadowRecord& r = shadow_[i];
+  for (size_t i = 0; i < s_->shadow.size(); ++i) {
+    ShadowRecord& r = s_->shadow[i];
     const int need = r.pos + 1 + static_cast<int>(r.tokens.size());
     if (need > L && !all) {
-      shadow_[keep++] = std::move(r);
+      s_->shadow[keep++] = std::move(r);
       continue;
     }
     int k = 0;
-    while (k < static_cast<int>(r.tokens.size()) && r.pos + 1 + k < L && history_[r.pos + 1 + k] == r.tokens[k]) ++k;
+    while (k < static_cast<int>(r.tokens.size()) && r.pos + 1 + k < L && s_->history[r.pos + 1 + k] == r.tokens[k]) ++k;
     spec_stats_.shadow_steps[r.bucket] += 1;
     spec_stats_.shadow_lookup[r.bucket] += k;
     spec_stats_.shadow_dflash[r.bucket] += r.dflash_accepted;
     spec_stats_.shadow_best += std::max(k, r.dflash_accepted);
   }
-  shadow_.resize(keep);
+  s_->shadow.resize(keep);
 }
 
 }  // namespace ling

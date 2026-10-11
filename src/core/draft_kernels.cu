@@ -41,11 +41,12 @@ __global__ void draft_qk_rope_kernel(float* __restrict__ x, int row_stride, cons
 }
 
 __global__ void draft_store_kv_kernel(const float* __restrict__ k, const float* __restrict__ v, int kv_size,
-                                      DevPos pos0_arg, __nv_bfloat16* __restrict__ kc, __nv_bfloat16* __restrict__ vc) {
+                                      DevPos pos0_arg, __nv_bfloat16* __restrict__ kc, __nv_bfloat16* __restrict__ vc,
+                                      int ring) {
   pdl_begin();  // first statement: see launch.cuh
   const int r = blockIdx.x, pos0 = pos_value(pos0_arg);
   for (int i = threadIdx.x; i < kv_size; i += blockDim.x) {
-    const size_t dst = static_cast<size_t>(pos0 + r) * kv_size + i;
+    const size_t dst = static_cast<size_t>((pos0 + r) % ring) * kv_size + i;
     kc[dst] = __float2bfloat16(k[static_cast<size_t>(r) * kv_size + i]);
     vc[dst] = __float2bfloat16(v[static_cast<size_t>(r) * kv_size + i]);
   }
@@ -57,7 +58,7 @@ __global__ void draft_store_kv_kernel(const float* __restrict__ k, const float* 
 template <int G>
 __global__ void __launch_bounds__(256)
     draft_attention_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
-                           const __nv_bfloat16* __restrict__ vc, const float* __restrict__ kb,
+                           const __nv_bfloat16* __restrict__ vc, int ring, const float* __restrict__ kb,
                            const float* __restrict__ vb, DevPos L_arg, int window_left, int Hkv, float* __restrict__ out) {
   pdl_begin();  // first statement: see launch.cuh
   __shared__ float wm[8][G], wl[8][G], wacc[8][kDD];
@@ -82,7 +83,7 @@ __global__ void __launch_bounds__(256)
   for (int kk = warp; kk < nk; kk += 8) {
     float kf[4], vf[4];
     if (kk < nctx) {
-      const size_t off = (static_cast<size_t>(lo + kk) * Hkv + kvh) * kDD + lane * 4;
+      const size_t off = (static_cast<size_t>((lo + kk) % ring) * Hkv + kvh) * kDD + lane * 4;
       const uint2 kr = *reinterpret_cast<const uint2*>(kc + off);
       const uint2 vr = *reinterpret_cast<const uint2*>(vc + off);
       const __nv_bfloat16* k16 = reinterpret_cast<const __nv_bfloat16*>(&kr);
@@ -213,15 +214,18 @@ void draft_qk_rope(float* x, int rows, int heads, int row_stride, const __nv_bfl
 }
 
 void draft_store_kv(const float* k, const float* v, int rows, int kv_size, DevPos pos0, __nv_bfloat16* kc,
-                    __nv_bfloat16* vc, cudaStream_t s) {
-  launch_kernel("draft_store_kv", draft_store_kv_kernel, dim3(rows), dim3(256), 0, s, k, v, kv_size, pos0, kc, vc);
+                    __nv_bfloat16* vc, int ring, cudaStream_t s) {
+  if (rows > ring) throw std::runtime_error("draft_store_kv: more rows than the ring holds");
+  launch_kernel("draft_store_kv", draft_store_kv_kernel, dim3(rows), dim3(256), 0, s, k, v, kv_size, pos0, kc, vc,
+                ring);
 }
 
-void draft_attention(const float* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, const float* kb,
+void draft_attention(const float* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, int ring, const float* kb,
                      const float* vb, DevPos L, int B, int window_left, int Hq, int Hkv, float* out, cudaStream_t s) {
   if (Hq != 4 * Hkv) throw std::runtime_error("draft_attention: built for 4 query heads per KV head");
-  launch_kernel("draft_attention", draft_attention_kernel<4>, dim3(B, Hkv), dim3(256), 0, s, q, kc, vc, kb, vb, L,
-                window_left, Hkv, out);
+  if (ring <= window_left) throw std::runtime_error("draft_attention: the ring is shorter than the window");
+  launch_kernel("draft_attention", draft_attention_kernel<4>, dim3(B, Hkv), dim3(256), 0, s, q, kc, vc, ring, kb, vb,
+                L, window_left, Hkv, out);
 }
 
 void grouped_conv(const float* h, const float* coef, const __nv_bfloat16* base, int side, float* out, int rows,

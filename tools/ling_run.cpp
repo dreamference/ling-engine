@@ -5,6 +5,7 @@
 //            [--prompts-file F] [--ids-out] [--prompt-ids-out] [--max-context N]
 //            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N]]
 //            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16] [--graph-check] [--seed N]
+//            [--prefix-check [--sessions N]]
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -23,7 +24,12 @@
 //
 // --prefix-check prefills each prompt after the one before it (so it resumes from a kept state: the end of
 // the previous prompt or a prefix checkpoint), then again from scratch, and checks that the DeltaNet and
-// conv state and the next token are the same both ways (M2: prefix checkpoints).
+// conv state and the next token are the same both ways (M2: prefix checkpoints). With --draft it also
+// decodes 64 tokens speculatively (greedy) after each prefill and checks that the tokens, the state, the
+// steps and the accepted drafts are the same both ways (the drafter's context ring after a resume, M4 §1).
+// --sessions N (M4 §1) keeps N resident sessions and binds each prompt to one as ling-serve does (the
+// session it extends, else a free or the least recently used slot), so each prompt resumes from its own
+// session's state, from the shared checkpoint store, or from another session's KV.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -48,7 +54,7 @@ int main(int argc, char** argv) {
   uint64_t seed = 0;
   int attn_prefetch = 2;
   std::string draft;
-  int block = 12, lookup = 1, lookup_min = 8;
+  int block = 12, lookup = 1, lookup_min = 8, sessions = 1;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -82,6 +88,7 @@ int main(int argc, char** argv) {
     else if (a == "--attn-bulk") attn_bulk = true;
     else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
     else if (a == "--prefill-bf16") prefill_bf16 = true;
+    else if (a == "--sessions") sessions = std::stoi(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
@@ -127,6 +134,7 @@ int main(int argc, char** argv) {
     opts.attention_bulk = attn_bulk;
     opts.attention_prefetch = attn_prefetch;
     opts.prefill_bf16 = prefill_bf16;
+    opts.sessions = sessions;
     ling::Engine engine(model, opts);
     auto t1 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "loaded %.1f GB of weights in %.1f s\n", engine.model().device_bytes() / 1e9,
@@ -173,21 +181,63 @@ int main(int argc, char** argv) {
     int failures = 0;
     if (prefix_check) {
       auto argmax = [](const std::vector<float>& l) { return int(std::max_element(l.begin(), l.end()) - l.begin()); };
+      // With a drafter: 64 tokens decoded speculatively (greedy) from the state the prefill left.
+      struct After {
+        std::vector<int> tokens;
+        long steps = 0, accepted = 0;
+        uint64_t hash = 0;
+      };
+      auto continue_spec = [&](const std::vector<float>& logits) {
+        After a;
+        if (!engine.has_drafter()) return a;
+        ling::SamplingParams gp;
+        gp.temperature = 0.f;
+        engine.reset_spec_stats();
+        std::vector<int> pending = {engine.sample(logits, gp, engine.history())};
+        while (true) {
+          a.tokens.insert(a.tokens.end(), pending.begin(), pending.end());
+          if (a.tokens.size() >= 64 || is_end(a.tokens.back())) break;
+          pending = engine.speculate(pending.back(), gp);
+        }
+        a.steps = engine.spec_stats().steps;
+        a.accepted = engine.spec_stats().accepted;
+        a.hash = engine.state_hash();
+        return a;
+      };
       engine.reset();
       for (size_t i = 0; i < prompts.size(); ++i) {
+        // Bind the prompt as ling-serve does: the session it extends, else a new one (a never-used slot,
+        // else the least recently used).
+        int si = engine.match_session(prompts[i], "");
+        const bool fresh_session = si < 0;
+        if (fresh_session) si = engine.free_session(0.0, {});
+        engine.activate_session(si, "", fresh_session);
         ling::EngineStats st;
-        const int resumed = argmax(engine.prefill(prompts[i], &st));
+        const std::vector<float> resumed_logits = engine.prefill(prompts[i], &st);
+        const int resumed = argmax(resumed_logits);
         const uint64_t h_resumed = engine.state_hash();
-        engine.reset();
+        const After a_resumed = continue_spec(resumed_logits);
         ling::EngineStats fresh_st;
-        const int fresh = argmax(engine.prefill(prompts[i], &fresh_st));
+        const std::vector<float> fresh_logits = engine.prefill(prompts[i], &fresh_st, /*from_scratch=*/true);
+        const int fresh = argmax(fresh_logits);
         const uint64_t h_fresh = engine.state_hash();
+        const After a_fresh = continue_spec(fresh_logits);
+        engine.touch_session();
         const bool same = resumed == fresh && h_resumed == h_fresh;
-        failures += !same;
-        std::printf("prompt %zu: %zu tokens, resumed at %d (%.2f s) against %.2f s from scratch: state %s, next token %s\n",
-                    i, prompts[i].size(), st.reused_tokens, st.prefill_seconds, fresh_st.prefill_seconds,
-                    h_resumed == h_fresh ? "identical" : "DIFFERS", resumed == fresh ? "identical" : "DIFFERS");
-        // Leave the engine as a server would be after prompt i, with the checkpoints of its prefill.
+        const bool spec_same = a_resumed.tokens == a_fresh.tokens && a_resumed.hash == a_fresh.hash &&
+                               a_resumed.steps == a_fresh.steps && a_resumed.accepted == a_fresh.accepted;
+        failures += !same + !spec_same;
+        std::printf("prompt %zu: %zu tokens, session %d%s, resumed at %d (%.2f s) against %.2f s from scratch: state %s, "
+                    "next token %s",
+                    i, prompts[i].size(), si, fresh_session ? " (new)" : "", st.reused_tokens, st.prefill_seconds,
+                    fresh_st.prefill_seconds, h_resumed == h_fresh ? "identical" : "DIFFERS",
+                    resumed == fresh ? "identical" : "DIFFERS");
+        if (engine.has_drafter())
+          std::printf("; speculative continuation %zu tokens, %ld steps %ld accepted against %ld steps %ld accepted: %s",
+                      a_resumed.tokens.size(), a_resumed.steps, a_resumed.accepted, a_fresh.steps, a_fresh.accepted,
+                      spec_same ? "identical" : "DIFFERS");
+        std::printf("\n");
+        // The session is left as a server would leave it after prompt i (and its continuation).
       }
       std::printf(failures ? "PREFIX CHECK FAILED\n" : "prefix check passed\n");
       return failures ? 1 : 0;

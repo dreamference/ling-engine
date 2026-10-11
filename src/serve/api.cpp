@@ -249,6 +249,8 @@ Request parse_request(const json& body, bool chat) {
     else throw std::invalid_argument("prompt must be a string or a list of token ids");
     r.reasoning = false;
   }
+  if (body.contains("prompt_cache_key") && body["prompt_cache_key"].is_string())
+    r.session_key = body["prompt_cache_key"].get<std::string>();
   return r;
 }
 
@@ -710,6 +712,8 @@ Request parse_responses_request(const json& body) {
   }
   Request r = parse_request(chat, true);
   r.custom_tools = std::move(custom);
+  if (body.contains("prompt_cache_key") && body["prompt_cache_key"].is_string())
+    r.session_key = body["prompt_cache_key"].get<std::string>();
   return r;
 }
 

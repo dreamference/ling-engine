@@ -32,6 +32,10 @@ struct Request {
   // `logprobs: k`. k is 0 .. kMaxTopLogprobs.
   bool logprobs = false;
   int top_logprobs = 0;
+  // `prompt_cache_key` (Codex sends its thread id, API §4): where the engine looks for the request's
+  // resident session first, and which sessions are protected from eviction (M4 §1). A hint only: the
+  // token prefix decides what is reused. Empty when the request carries none.
+  std::string session_key;
 };
 
 constexpr int kMaxTopLogprobs = 20;  // vLLM's --max-logprobs default
