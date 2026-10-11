@@ -227,6 +227,54 @@ void Engine::activate_session(int i, const std::string& key, bool fresh) {
 
 void Engine::touch_session() { s_->last_used = std::chrono::steady_clock::now(); }
 
+void Engine::touch_session(int i) { sessions_.at(i).last_used = std::chrono::steady_clock::now(); }
+
+void Engine::select_session(int i) {
+  if (i < 0 || i >= static_cast<int>(sessions_.size())) throw std::runtime_error("no such session");
+  s_ = &sessions_[i];
+}
+
+void Engine::reset_all() {
+  for (Session& s : sessions_) {
+    s_ = &s;
+    reset_session();
+    s.spec = SpecStats{};
+  }
+  s_ = &sessions_[0];
+  ckpts_.clear();
+}
+
+const SpecStats& Engine::session_spec_stats(int i) {
+  Session& s = sessions_.at(i);
+  score_shadow(s, true);
+  return s.spec;
+}
+
+SpecStats Engine::spec_stats_total() const {
+  SpecStats t;
+  for (const Session& s : sessions_) {
+    const SpecStats& a = s.spec;
+    t.steps += a.steps;
+    t.drafted += a.drafted;
+    t.accepted += a.accepted;
+    for (size_t k = 0; k < t.accept_hist.size() && k < a.accept_hist.size(); ++k) t.accept_hist[k] += a.accept_hist[k];
+    t.draft_seconds += a.draft_seconds;
+    t.verify_seconds += a.verify_seconds;
+    t.commit_seconds += a.commit_seconds;
+    t.lookup_steps += a.lookup_steps;
+    t.lookup_accepted += a.lookup_accepted;
+    for (int b = 0; b < 5; ++b) {
+      t.shadow_steps[b] += a.shadow_steps[b];
+      t.shadow_lookup[b] += a.shadow_lookup[b];
+      t.shadow_dflash[b] += a.shadow_dflash[b];
+    }
+    t.shadow_best += a.shadow_best;
+    t.shadow_total_steps += a.shadow_total_steps;
+    t.shadow_dflash_all += a.shadow_dflash_all;
+  }
+  return t;
+}
+
 int Engine::sessions_resident() const {
   int n = 0;
   for (const Session& s : sessions_) n += s.owned;
@@ -677,9 +725,12 @@ void Engine::forward(const int* ids, int M, Pass pass, int keep_at) {
   s_->pos += M;
 }
 
-const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, EngineStats* stats, bool from_scratch) {
+Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool from_scratch) {
   if (prompt.empty()) throw std::runtime_error("empty prompt");
-  auto t0 = std::chrono::steady_clock::now();
+  PrefillCursor cur;
+  cur.t0 = std::chrono::steady_clock::now();
+  cur.session = active_session();
+  cur.prompt = prompt;
   const int L = static_cast<int>(prompt.size());
   // A session's caches hold the KV of its history; DeltaNet and conv state exist only where a state was
   // kept: the end of a session's last prompt (its snap) and the shared checkpoint store. The prompt resumes
@@ -688,6 +739,8 @@ const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, Engine
   // its new tokens, and a new session whose system message (instructions and tool schemas) was already
   // processed starts after it. When the furthest such state is another session's, that session's KV for the
   // prefix is copied into the active one first (M4 §1); copies are exact, so the state is the same.
+  // Another session may be mid-request (M4 §3): its history holds only tokens already processed, and its
+  // snap and the store only states a finished pass left, so whatever is copied from it is complete.
   // The drafter attends to the last `window` positions: resuming at p > window start needs its context
   // KV from the window start up to p, which the session's ring holds only from dkv_from() on.
   const int window = draft_ ? std::max(0, L - draft_->config().sliding_window) : 0;
@@ -741,65 +794,90 @@ const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, Engine
   // Every kept state sits at a multiple of kResumeAlign: the prefill DeltaNet runs in 32-token chunks at
   // absolute positions, so a prompt resumed there computes exactly what a prefill from scratch does.
   auto align = [](int p) { return p - p % kResumeAlign; };
-  std::vector<int> bounds;
   if (!ckpt_slots_.empty()) {
     int messages = 0;
     for (int i = 0; i < L && i < opts_.checkpoint_limit && messages < 2; ++i)
       if (prompt[i] == opts_.boundary_token) {
-        if (align(i + 1) > 0) bounds.push_back(align(i + 1));
+        if (align(i + 1) > 0) cur.bounds.push_back(align(i + 1));
         ++messages;
       }
     for (int b = opts_.prefill_chunk; b < std::min(L, opts_.checkpoint_limit + 1); b += opts_.prefill_chunk)
-      bounds.push_back(b);
-    std::sort(bounds.begin(), bounds.end());
+      cur.bounds.push_back(b);
+    std::sort(cur.bounds.begin(), cur.bounds.end());
   }
-  const int snap_at = align(L);  // the end-of-prompt state is kept here (the tokens after it are re-prefilled)
-  for (int i = reuse; i < L;) {
-    int end = std::min(i + opts_.prefill_chunk, L);
-    for (int b : bounds)
-      if (b > i && b < end) {
-        end = b;
-        break;
-      }
-    // The end-of-prompt state at snap_at < end is captured inside the pass (no separate pass for the tail).
-    const int keep_at = snap_at > i && snap_at < end ? snap_at - i : -1;
-    if (keep_at > 0) s_->snap_pos = -1;  // the snap is rewritten by the pass
-    const int n = end - i, pos0 = s_->pos;
-    forward(prompt.data() + i, n, Pass::Prefill, keep_at);
-    // A pass whose logits are not finite left a broken state (a NaN anywhere in it reaches the last
-    // token's logits). Keep nothing from it: the snap stays invalid if the pass wrote it, no checkpoint is
-    // saved and its tokens do not join the history. A non-finite checkpoint would be reused by every later
-    // prompt that shares the prefix. (A decode step's state is never kept, so only prefill needs this.)
-    if (!all_finite(logits_)) {
-      s_->pos = i;
-      throw NonFiniteLogits();
+  cur.snap_at = align(L);  // the end-of-prompt state is kept here (the tokens after it are re-prefilled)
+  cur.window = window;
+  cur.next = reuse;
+  cur.stats.reused_tokens = reuse;
+  cur.stats.prefill_tokens = L - reuse;
+  return cur;
+}
+
+bool Engine::prefill_chunk(PrefillCursor& cur, int max_tokens) {
+  if (cur.done()) return true;
+  select_session(cur.session);
+  const auto t_chunk = std::chrono::steady_clock::now();
+  const std::vector<int>& prompt = cur.prompt;
+  const int L = static_cast<int>(prompt.size());
+  int chunk = max_tokens > 0 ? std::min(max_tokens, opts_.prefill_chunk) : opts_.prefill_chunk;
+  chunk = std::max(kResumeAlign, chunk - chunk % kResumeAlign);
+  const int i = cur.next, snap_at = cur.snap_at, window = cur.window;
+  int end = std::min(i + chunk, L);
+  for (int b : cur.bounds)
+    if (b > i && b < end) {
+      end = b;
+      break;
     }
-    if (keep_at > 0) s_->snap_pos = snap_at;
-    if (draft_) {
-      const int first = std::max(pos0, window);
-      if (first < pos0 + n) draft_materialize(pos0 + n - first, first, first - pos0);  // still quantized_
-    }
-    s_->history.insert(s_->history.end(), prompt.begin() + i, prompt.begin() + end);
-    i = end;
-    if (end == snap_at) {
-      copy_state(s_->snap, true);
-      s_->snap_pos = snap_at;
-    }
-    if (end < L && std::binary_search(bounds.begin(), bounds.end(), end)) save_checkpoint(end);
+  // The end-of-prompt state at snap_at < end is captured inside the pass (no separate pass for the tail).
+  const int keep_at = snap_at > i && snap_at < end ? snap_at - i : -1;
+  if (keep_at > 0) s_->snap_pos = -1;  // the snap is rewritten by the pass
+  const int n = end - i, pos0 = s_->pos;
+  forward(prompt.data() + i, n, Pass::Prefill, keep_at);
+  // A pass whose logits are not finite left a broken state (a NaN anywhere in it reaches the last
+  // token's logits). Keep nothing from it: the snap stays invalid if the pass wrote it, no checkpoint is
+  // saved and its tokens do not join the history. A non-finite checkpoint would be reused by every later
+  // prompt that shares the prefix. (A decode step's state is never kept, so only prefill needs this.)
+  if (!all_finite(logits_)) {
+    s_->pos = i;
+    throw NonFiniteLogits();
+  }
+  if (keep_at > 0) s_->snap_pos = snap_at;
+  if (draft_) {
+    const int first = std::max(pos0, window);
+    if (first < pos0 + n) draft_materialize(pos0 + n - first, first, first - pos0);  // still quantized_
+  }
+  s_->history.insert(s_->history.end(), prompt.begin() + i, prompt.begin() + end);
+  cur.next = end;
+  if (end == snap_at) {
+    copy_state(s_->snap, true);
+    s_->snap_pos = snap_at;
+  }
+  if (end < L && std::binary_search(cur.bounds.begin(), cur.bounds.end(), end)) save_checkpoint(end);
+  cur.stats.chunks += 1;
+  if (end < L) {
+    cur.stats.compute_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_chunk).count();
+    return false;
   }
   check(cudaStreamSynchronize(stream_), "prefill");
   s_->prompt_len = L;
   s_->turn_start = L;  // a raw prompt without message boundaries is bound only when extended whole
-  for (int i = L - 1; i >= 0; --i)
-    if (prompt[i] == opts_.boundary_token) {
-      s_->turn_start = i + 1;
+  for (int k = L - 1; k >= 0; --k)
+    if (prompt[k] == opts_.boundary_token) {
+      s_->turn_start = k + 1;
       break;
     }
-  if (stats) {
-    stats->reused_tokens = reuse;
-    stats->prefill_tokens = L - reuse;
-    stats->prefill_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  const auto now = std::chrono::steady_clock::now();
+  cur.stats.compute_seconds += std::chrono::duration<double>(now - t_chunk).count();
+  cur.stats.prefill_seconds = std::chrono::duration<double>(now - cur.t0).count();
+  return true;
+}
+
+const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, EngineStats* stats, bool from_scratch) {
+  PrefillCursor cur = begin_prefill(prompt, from_scratch);
+  while (!prefill_chunk(cur)) {
   }
+  if (stats) *stats = cur.stats;
   return logits_;
 }
 
