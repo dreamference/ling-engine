@@ -10,7 +10,7 @@
 // agent tasks that alternate keep their histories warm. A request runs in the session it extends (its
 // prompt_cache_key's session is looked at first; the token prefix decides), else in a new session, which
 // takes a free slot or evicts the least recently used one. A session bound with a prompt_cache_key whose
-// last request ran less than --session-protect-seconds ago (default 180, 0 off) is never evicted: a new
+// last request ran less than --session-protect-seconds ago (default 30, 0 off; the owner's decision of 2026-10-11) is never evicted: a new
 // session's request waits in the queue instead, while requests that continue a resident session run.
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
@@ -983,7 +983,7 @@ int main(int argc, char** argv) {
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2;
-  double protect_seconds = 180;
+  double protect_seconds = 30;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
