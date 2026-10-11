@@ -11,7 +11,7 @@ ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-cont
            [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]]
            [--pretokenizer production|checkpoint] [--prefix-checkpoints N]
            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N]
-           [--prefill-bf16]
+           [--prefill-bf16] [--sessions N] [--session-protect-seconds S]
 ```
 
 | Flag | Default | What it does |
@@ -32,6 +32,8 @@ ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-cont
 | `--attn-bulk` | off | The rows path's attention loads its tiles with bulk copies (M3). |
 | `--attn-prefetch N` | `2` | How many KV tiles ahead the rows path's attention prefetches into L2; 0 switches it off (M3). |
 | `--keepalive-seconds N` | `15` | How often a streamed request that has produced no token yet (waiting in the queue, or in prefill) is sent a keep-alive, so a client with an idle timeout keeps the stream: a `response.in_progress` event on `/v1/responses`, an SSE comment line on the chat and completions routes ([API §3, §4](./DREAMFERENCE_LING_ENGINE_API.md)). 0 switches them off. `LING_KEEPALIVE_SECONDS` overrides it. |
+| `--sessions N` | `2` | Resident sessions, each with its own BF16 KV cache, DeltaNet and conv state and drafter context (about 4.8 GB each at 65,536 tokens of context), all allocated at start (M4 stage 1, [drafts/M4 §1](./drafts/M4-sessions-and-batches-2026-10-10.md)). A request runs in the session it extends (its `prompt_cache_key`'s session looked at first, the token prefix deciding), else in a new session that takes a free slot or evicts the least recently used one. `sglang:max_total_num_tokens` reports sessions × `--max-context`. Requests still run one at a time. |
+| `--session-protect-seconds S` | `180` | A session bound with a `prompt_cache_key` whose last request ran less than S seconds ago is never evicted: a new session's request waits in the queue (`sglang:num_queue_reqs`) while requests that continue a resident session run (M4 §7 question 6). Sessions without a key are protected only while a request of theirs runs or waits. 0 turns protection off. |
 | `--prefill-bf16` | off | The prefill's DeltaNet intermediates (the input norm's copy for the a/b projections, the in_qkv and in_z projections, the conv's output, the recurrence's output) kept in BF16 as production keeps them, instead of FP32 (B34; [reports/M2-prefill.md](../reports/M2-prefill.md) §8 item 3). Not exact: a change of the prefill's numerics, so off until the checks of [MILESTONES §14](./DREAMFERENCE_LING_ENGINE_MILESTONES.md) pass (`bench/prefill_bf16_check.sh`). The decode and verify rows path is untouched either way. |
 
 Startup prints `loading DIR …`, then `loaded X GB of weights`, then with a drafter `drafter: X GB, block N`; the server is ready when `GET /health` answers. The HTTP server runs two threads for the connections and one engine worker that runs requests one at a time ([API](./DREAMFERENCE_LING_ENGINE_API.md)); an idle connection is closed after 30 minutes; `SIGINT` and `SIGTERM` stop it. Each finished request logs one line to stderr: prompt tokens (and how many were reused from a kept state), prefill seconds, tokens generated, decode seconds and tokens/s, the finish reason, the number of passes and, speculatively, tokens per pass.
@@ -43,7 +45,8 @@ ling-run --model DIR (--text T | --chat T | --ids 1,2,3 | --prompts-file F)
          [--max-tokens N] [--max-context N] [--temperature T] [--seed N]
          [--ids-out] [--prompt-ids-out]
          [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N]]
-         [--prefix-check] [--graphs] [--graph-check] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16]
+         [--prefix-check [--sessions N]] [--graphs] [--graph-check] [--pdl] [--attn-bulk] [--attn-prefetch N]
+         [--prefill-bf16]
 ```
 
 Loads the model and generates from a prompt; prints the text, the timings and, asked to, the token ids, for checking against a reference server (`bench/validate_v0.py`, `bench/agreement/`).
@@ -63,7 +66,8 @@ Loads the model and generates from a prompt; prints the text, the timings and, a
 | `--draft DIR`, `--block N`, `--lookup`, `--lookup-min` | none, `12`, `1`, `8` | The drafter and its settings, as `ling-serve`'s `--draft`, `--draft-block`, `--lookup`, `--lookup-min`. |
 | `--spec` | off | Decode speculatively with the drafter. |
 | `--spec-check` | off | Greedy only: decode each prompt plainly, then speculatively, and check that the tokens are identical and that the recurrent state after the speculative run equals a plain run's over the same tokens, bit for bit. Prints `spec check passed` or `SPEC CHECK FAILED`. |
-| `--prefix-check` | off | Prefill each prompt after the one before it (resuming from a kept state or a prefix checkpoint), then again from scratch, and check that the DeltaNet and conv state and the next token agree (M2). |
+| `--prefix-check` | off | Prefill each prompt after the one before it (resuming from a kept state or a prefix checkpoint), then again from scratch, and check that the DeltaNet and conv state and the next token agree (M2). With `--draft`, also decode 64 tokens speculatively (greedy) after each prefill and check that the tokens, the state, the steps and the accepted drafts agree (the drafter's context ring after a resume, M4). |
+| `--sessions N` | `1` | With `--prefix-check`: N resident sessions, each prompt bound to one as `ling-serve` binds a request, so each resumes from its own session's state, the shared checkpoint store, or another session's KV (M4 stage 1). |
 | `--graphs`, `--pdl`, `--attn-bulk`, `--attn-prefetch N` | off, off, off, `2` | As for `ling-serve`. |
 | `--prefill-bf16` | off | As for `ling-serve`: BF16 DeltaNet intermediates in the prefill (not exact). The checks below run within the mode when it is on: `--prefix-check` and `--spec-check` must still pass bit for bit, which `bench/prefill_bf16_check.sh` verifies. |
 | `--graph-check` | off | Decode each prompt speculatively twice from the same prefill, without and with step graphs, greedily and then sampling (top-k 20, top-p 0.95, seeded by `--seed` or 1), and check that the tokens, the recurrent state (bit for bit) and the step and acceptance counts agree. |
