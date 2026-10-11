@@ -1,4 +1,5 @@
-// One sequence at a time, out of a pool of resident sessions (M4 stage 1): the forward pass (chunked prefill, then decode or speculative verify), its
+// One sequence at a time, out of a pool of resident sessions (M4 stages 1 and 2: the server interleaves two
+// sessions' prefill chunks and steps, switching the active session between them): the forward pass (chunked prefill, then decode or speculative verify), its
 // state (paged-free: a flat KV cache for the full-attention layers, DeltaNet and conv state for the rest),
 // sampling, and speculation with the DFlash2 drafter (speculate.cpp).
 //
@@ -77,9 +78,11 @@ struct EngineOptions {
 };
 
 struct EngineStats {
-  double prefill_seconds = 0;
+  double prefill_seconds = 0;  // wall time from begin_prefill to the last chunk (other sessions' work included)
+  double compute_seconds = 0;  // the prefill's own chunks only
   int prefill_tokens = 0;
   int reused_tokens = 0;
+  int chunks = 0;
 };
 
 // Counters of speculative steps since the last reset.
@@ -116,6 +119,28 @@ class Engine {
   // `from_scratch`: reuse nothing (the reference --prefix-check compares a resumed prefill with).
   const std::vector<float>& prefill(const std::vector<int>& prompt, EngineStats* stats = nullptr,
                                     bool from_scratch = false);
+  // The same prefill one chunk at a time (M4 §3), so a server can run another session's step between chunks.
+  // begin_prefill picks the state to resume from and readies the active session (prefill()'s first half);
+  // each prefill_chunk call makes the cursor's session active and runs one pass of at most `max_tokens`
+  // tokens (0: the full prefill_chunk; rounded down to a multiple of kResumeAlign, so every chunk ends
+  // where a resumed prefill could start and the state is the same however the prompt was split), saving
+  // the snap and checkpoints at the same positions prefill() does. It returns true after the last chunk,
+  // when logits() holds the logits after the prompt's last token (until the next pass of any session).
+  struct PrefillCursor {
+    int session = -1;
+    std::vector<int> prompt;
+    int next = 0;          // the first position not yet processed
+    int snap_at = 0;       // where the end-of-prompt state is kept
+    int window = 0;        // the drafter's context starts here
+    std::vector<int> bounds;  // chunk ends where checkpoints are saved
+    std::chrono::steady_clock::time_point t0;
+    EngineStats stats;
+    bool done() const { return next >= static_cast<int>(prompt.size()); }
+  };
+  PrefillCursor begin_prefill(const std::vector<int>& prompt, bool from_scratch = false);
+  bool prefill_chunk(PrefillCursor& cur, int max_tokens = 0);
+  const std::vector<float>& logits() const { return logits_; }
+  int prefill_chunk_size() const { return opts_.prefill_chunk; }
   // Appends one token and returns the logits after it.
   const std::vector<float>& step(int token);
   // Picks the next token from logits (sample_logits). `history` is history(): a seed is offset by its
@@ -136,13 +161,21 @@ class Engine {
   // row-invariant rows path makes bit for bit what plain decoding gives). Null by default: nothing is
   // copied off the device beyond each row's top K.
   std::vector<int> speculate(int anchor, const SamplingParams& p, std::vector<float>* row_logits = nullptr);
+  // The active session's speculation counters (each session counts its own steps, M4 §3), its lookup
+  // shadow records scored as far as known.
   const SpecStats& spec_stats() {
-    score_shadow(true);
-    return spec_stats_;
+    score_shadow(*s_, true);
+    return s_->spec;
   }
+  // Session i's counters, scored the same way.
+  const SpecStats& session_spec_stats(int i);
+  // Every session's counters added up (what /spec_stats reports), without scoring records still in flight.
+  SpecStats spec_stats_total() const;
   void reset_spec_stats() {
-    spec_stats_ = SpecStats{};
-    for (Session& s : sessions_) s.shadow.clear();
+    for (Session& s : sessions_) {
+      s.spec = SpecStats{};
+      s.shadow.clear();
+    }
   }
   void set_lookup(int mode, int min_match) {
     opts_.lookup_mode = mode;
@@ -178,8 +211,14 @@ class Engine {
   // Makes session i active. `fresh`: a new session takes the slot (an eviction when another held it).
   // Nothing is copied out or cleared: the slot's tokens stay usable as KV by a prompt that shares them.
   void activate_session(int i, const std::string& key, bool fresh);
-  // Stamps the active session's last use (the LRU order and the protection clock).
+  // Makes session i active for the next pass, with no other effect (the scheduler switches between the
+  // sessions of its running requests, M4 §3).
+  void select_session(int i);
+  // Stamps the active session's (or session i's) last use (the LRU order and the protection clock).
   void touch_session();
+  void touch_session(int i);
+  // Every session emptied and the checkpoint store cleared (the exactness checks start from a cold engine).
+  void reset_all();
   int sessions_resident() const;
   long session_evictions() const { return evictions_; }
   // FNV-1a over every DeltaNet and conv state, bit for bit (the exactness tests compare runs with it).
@@ -347,7 +386,9 @@ class Engine {
     std::vector<int> tokens;  // the lookup's proposal for the positions after it
     int match, dflash_accepted, bucket;
   };
-  void score_shadow(bool all);  // scores records whose continuation is known (all: the rest as far as known)
+  struct Session;
+  // Scores s's records whose continuation is known (all: the rest as far as known) into s.spec.
+  void score_shadow(Session& s, bool all);
 
   // A resident session (M4 §1): everything that belongs to one sequence.
   struct Session {
@@ -364,6 +405,7 @@ class Engine {
     int dkv_lo = 0;
     int pos = 0;
     std::vector<ShadowRecord> shadow;
+    SpecStats spec;  // this session's speculative steps
     std::mt19937_64 rng;
     cudaGraphExec_t draft_graph = nullptr;
     std::map<int, cudaGraphExec_t> verify_graphs;  // by top-K (1 when greedy)
@@ -387,7 +429,6 @@ class Engine {
   std::vector<float> logits_;
   bool profile_ = false;
   std::map<std::string, double> phase_seconds_;
-  SpecStats spec_stats_;
 };
 
 }  // namespace ling

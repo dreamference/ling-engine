@@ -405,7 +405,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   }
   const int V = E + 1;  // rows verified
   auto t1 = std::chrono::steady_clock::now();
-  spec_stats_.draft_seconds += std::chrono::duration<double>(t1 - t0).count();
+  s_->spec.draft_seconds += std::chrono::duration<double>(t1 - t0).count();
 
   // 2. Verify, with each row's top K (the argmax when greedy) on the GPU.
   const int K = greedy ? 1 : p.top_k;
@@ -444,7 +444,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
     next = tok;
   }
   auto t2 = std::chrono::steady_clock::now();
-  spec_stats_.verify_seconds += std::chrono::duration<double>(t2 - t1).count();
+  s_->spec.verify_seconds += std::chrono::duration<double>(t2 - t1).count();
 
   // 4. Commit the anchor and the accepted drafts.
   const int n = accepted + 1;
@@ -465,50 +465,50 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   s_->history.insert(s_->history.end(), rows.begin(), rows.begin() + n);
   s_->pos += n;
   check(cudaStreamSynchronize(stream_), "commit");
-  spec_stats_.commit_seconds += seconds_since(t2);
-  spec_stats_.steps += 1;
-  spec_stats_.drafted += E;
-  spec_stats_.accepted += accepted;
-  spec_stats_.accept_hist[accepted] += 1;
+  s_->spec.commit_seconds += seconds_since(t2);
+  s_->spec.steps += 1;
+  s_->spec.drafted += E;
+  s_->spec.accepted += accepted;
+  s_->spec.accept_hist[accepted] += 1;
   if (use_lookup) {
-    spec_stats_.lookup_steps += 1;
-    spec_stats_.lookup_accepted += accepted;
+    s_->spec.lookup_steps += 1;
+    s_->spec.lookup_accepted += accepted;
   } else if (opts_.lookup_mode == 1 && !lp.tokens.empty()) {
     const int bucket = lp.match >= 32 ? 4 : lp.match >= 16 ? 3 : lp.match >= 8 ? 2 : lp.match >= 4 ? 1 : 0;
     s_->shadow.push_back({s_->pos - n, std::move(lp.tokens), lp.match, accepted, bucket});
   }
   if (!use_lookup && opts_.lookup_mode == 1) {
-    spec_stats_.shadow_total_steps += 1;
-    spec_stats_.shadow_dflash_all += accepted;
-    if (s_->shadow.empty() || s_->shadow.back().pos != s_->pos - n) spec_stats_.shadow_best += accepted;  // no proposal
+    s_->spec.shadow_total_steps += 1;
+    s_->spec.shadow_dflash_all += accepted;
+    if (s_->shadow.empty() || s_->shadow.back().pos != s_->pos - n) s_->spec.shadow_best += accepted;  // no proposal
   }
-  score_shadow(false);
+  score_shadow(*s_, false);
 
   std::vector<int> out(rows.begin() + 1, rows.begin() + n);
   out.push_back(next);
   return out;
 }
 
-void Engine::score_shadow(bool all) {
+void Engine::score_shadow(Session& s, bool all) {
   // A record is scored once the tokens after its anchor are known (or, with `all`, as far as they are):
   // the proposal would have had accepted its leading tokens that equal what was generated.
-  const int L = static_cast<int>(s_->history.size());
+  const int L = static_cast<int>(s.history.size());
   size_t keep = 0;
-  for (size_t i = 0; i < s_->shadow.size(); ++i) {
-    ShadowRecord& r = s_->shadow[i];
+  for (size_t i = 0; i < s.shadow.size(); ++i) {
+    ShadowRecord& r = s.shadow[i];
     const int need = r.pos + 1 + static_cast<int>(r.tokens.size());
     if (need > L && !all) {
-      s_->shadow[keep++] = std::move(r);
+      s.shadow[keep++] = std::move(r);
       continue;
     }
     int k = 0;
-    while (k < static_cast<int>(r.tokens.size()) && r.pos + 1 + k < L && s_->history[r.pos + 1 + k] == r.tokens[k]) ++k;
-    spec_stats_.shadow_steps[r.bucket] += 1;
-    spec_stats_.shadow_lookup[r.bucket] += k;
-    spec_stats_.shadow_dflash[r.bucket] += r.dflash_accepted;
-    spec_stats_.shadow_best += std::max(k, r.dflash_accepted);
+    while (k < static_cast<int>(r.tokens.size()) && r.pos + 1 + k < L && s.history[r.pos + 1 + k] == r.tokens[k]) ++k;
+    s.spec.shadow_steps[r.bucket] += 1;
+    s.spec.shadow_lookup[r.bucket] += k;
+    s.spec.shadow_dflash[r.bucket] += r.dflash_accepted;
+    s.spec.shadow_best += std::max(k, r.dflash_accepted);
   }
-  s_->shadow.resize(keep);
+  s.shadow.resize(keep);
 }
 
 }  // namespace ling
