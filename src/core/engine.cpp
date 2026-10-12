@@ -86,7 +86,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   mixed_bf16_ = reinterpret_cast<__nv_bfloat16*>(mixed_);
   core_bf16_ = reinterpret_cast<__nv_bfloat16*>(core_);
   ids_dev_ = alloc<int>(M);
-  pos_dev_ = alloc<int>(1);
+  pos_dev_ = alloc<int>(kernels::kMaxSeqs);
   check(cudaHostAlloc(reinterpret_cast<void**>(&pin_), sizeof(StepPinned), cudaHostAllocDefault), "pinned step buffers");
   kernels::prepare_kernels();  // attributes are set here, never inside a graph capture
 
@@ -556,6 +556,17 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   // A segment's position. A captured graph (one sequence, the active one) reads it from pos_dev_ (dpos); the
   // batch path runs eagerly at each session's own position.
   auto seg_pos = [&](const Seg& g, int off) { return use_dev_pos_ ? dpos(off) : kernels::DevPos(g.s->pos + off); };
+  // Several sequences (M4 stage 4): the state kernels take them all in one launch, each row at its sequence's
+  // position and in its sequence's caches and state; a captured graph reads the positions from pos_dev_[i].
+  const bool multi = segs.size() > 1;
+  if (segs.size() > static_cast<size_t>(kernels::kMaxSeqs)) throw std::runtime_error("forward: too many sequences");
+  kernels::SeqBatch sb;
+  sb.n = static_cast<int>(segs.size());
+  for (int i = 0; i < sb.n; ++i) {
+    sb.row0[i + 1] = segs[i].row0 + segs[i].rows;
+    sb.pos[i] = segs[i].s->pos;
+  }
+  if (use_dev_pos_) sb.pos_dev = pos_dev_;
   // A prompt's tokens take the prefill path whatever the chunk's size, so the state a prompt leaves does
   // not depend on how its prefill was split or where it resumed (the prefix checkpoints rely on it).
   quantized_ = pass == Pass::Prefill;
@@ -596,7 +607,19 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       // Per sequence (M4 §2): its rows' q/k norms and RoPE at its positions, their KV into its cache, and their
       // attention over it.
       const int kvsize = c.kv_heads * c.head_dim;
-      for (const Seg& g : segs) {
+      if (multi) {
+        kernels::SeqPtrs<__nv_bfloat16> kc, vc;
+        kernels::SeqPtrs<const __nv_bfloat16> kcr, vcr;
+        for (int i = 0; i < sb.n; ++i) {
+          kcr.p[i] = kc.p[i] = segs[i].s->kcache[slot];
+          vcr.p[i] = vc.p[i] = segs[i].s->vcache[slot];
+        }
+        kernels::attn_prepare_seqs(q_gate_, k_, v_, L.q_norm, L.k_norm, sb, c.heads, c.kv_heads, c.head_dim, c.rotary_dim,
+                                   c.rope_theta, c.eps, q_, gate_, kc, vc, stream_);
+        kernels::attention_rows_seqs(q_, kcr, vcr, sb, c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_, stream_,
+                                     use_dev_pos_ ? opts_.max_context : 0);
+      }
+      for (const Seg& g : multi ? std::span<const Seg>() : segs) {
         const size_t r0 = g.row0;
         kernels::attn_prepare(q_gate_ + r0 * 2 * qsize, k_ + r0 * kvsize, v_ + r0 * kvsize, L.q_norm, L.k_norm,
                               seg_pos(g, 0), g.rows, c.heads, c.kv_heads, c.head_dim, c.rotary_dim, c.rope_theta, c.eps,
@@ -680,8 +703,13 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       if (verify) {
         check(cudaMemcpyAsync(mixed, v_pre_[slot], size_t(M) * C * sizeof(float), cudaMemcpyDeviceToDevice, stream_),
               "verify inputs");
-        // Per sequence (M4 §2), on a copy of its conv window: its rows' taps start from its own state.
-        for (const Seg& sg : segs) {
+        // Per sequence (M4 §2), from its own conv window, left unwritten.
+        if (multi) {
+          kernels::SeqPtrs<const float> st;
+          for (int i = 0; i < sb.n; ++i) st.p[i] = segs[i].s->conv[slot];
+          kernels::gdn_conv_seqs(mixed, st, L.conv, sb, C, stream_);
+        }
+        for (const Seg& sg : multi ? std::span<const Seg>() : segs) {
           check(cudaMemcpyAsync(conv_tmp_, sg.s->conv[slot], size_t(C) * (c.conv_kernel - 1) * sizeof(float),
                                 cudaMemcpyDeviceToDevice, stream_),
                 "verify conv");
@@ -698,7 +726,11 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       if (quantized_)
         kernels::gdn_recurrent_prefill(mixed, g, beta, s_->gdn[slot], core_, M, c.lin_k_heads, c.lin_v_heads, s_->pos,
                                        stream_, keep ? s_->snap.gdn[slot] : nullptr, keep_at);
-      else
+      else if (multi) {  // a verify: each sequence from its own state, left unwritten
+        kernels::SeqPtrs<const float> st;
+        for (int i = 0; i < sb.n; ++i) st.p[i] = segs[i].s->gdn[slot];
+        kernels::gdn_recurrent_seqs(mixed, g, beta, st, core_, sb, c.lin_k_heads, c.lin_v_heads, stream_);
+      } else
         for (const Seg& sg : segs) {  // per sequence, from its own state (a verify leaves it unwritten)
           const size_t r0 = sg.row0;
           kernels::gdn_recurrent(mixed + r0 * C, g + r0 * c.lin_v_heads, beta + r0 * c.lin_v_heads, sg.s->gdn[slot],

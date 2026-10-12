@@ -457,12 +457,194 @@ void bench() {
 
 }  // namespace
 
+// M4 stage 4: each state kernel over two sequences in one launch (kernels::SeqBatch) against its launch per
+// sequence, bit for bit: attn_prepare (q, gate, and the KV written into each sequence's caches), attention_rows
+// (eager, and with device positions over fixed ranges as a graph launches it), the verify's gdn_conv and
+// gdn_recurrent, and the drafter's draft_qk_rope and draft_attention over each sequence's ring.
+bool test_batched_state_kernels() {
+  namespace k = ling::kernels;
+  std::mt19937 rng(29);
+  std::normal_distribution<float> normal(0.f, 1.f);
+  auto randv = [&](size_t n, float scale = 1.f) {
+    std::vector<float> v(n);
+    for (auto& x : v) x = normal(rng) * scale;
+    return v;
+  };
+  auto randb = [&](size_t n, float scale = 1.f) {
+    std::vector<__nv_bfloat16> v(n);
+    for (auto& x : v) x = __float2bfloat16(normal(rng) * scale);
+    return v;
+  };
+  auto same = [](const void* a, const void* b, size_t bytes) { return std::memcmp(a, b, bytes) == 0; };
+  bool ok = true;
+  const int rows[2] = {12, 16}, pos[2] = {5000, 2900};  // the second sequence shorter and with more rows
+  const int M = rows[0] + rows[1];
+  k::SeqBatch sb;
+  sb.n = 2;
+  sb.row0[1] = rows[0];
+  sb.row0[2] = M;
+  sb.pos[0] = pos[0];
+  sb.pos[1] = pos[1];
+  int* dpos = upload(std::vector<int>{pos[0], pos[1]});
+  // ---- attn_prepare and attention_rows ----
+  {
+    const int Hq = 24, Hkv = 4, D = 256, ctx = 8192, rot = 64;
+    const size_t cache = size_t(ctx) * Hkv * D;
+    float* qg = upload(randv(size_t(M) * Hq * 2 * D));
+    float* kk = upload(randv(size_t(M) * Hkv * D));
+    float* vv = upload(randv(size_t(M) * Hkv * D));
+    __nv_bfloat16* qn = upload(randb(D, 0.1f));
+    __nv_bfloat16* kn = upload(randb(D, 0.1f));
+    const std::vector<__nv_bfloat16> c0 = randb(cache), c1 = randb(cache), c2 = randb(cache), c3 = randb(cache);
+    // Per sequence: caches A (k0, v0) and B (k1, v1); the batched launch writes copies of them.
+    __nv_bfloat16 *ka = upload(c0), *va = upload(c1), *kb = upload(c2), *vb = upload(c3);
+    __nv_bfloat16 *ka2 = upload(c0), *va2 = upload(c1), *kb2 = upload(c2), *vb2 = upload(c3);
+    float *q1, *g1, *q2, *g2;
+    cudaMalloc(&q1, size_t(M) * Hq * D * 4), cudaMalloc(&g1, size_t(M) * Hq * D * 4);
+    cudaMalloc(&q2, size_t(M) * Hq * D * 4), cudaMalloc(&g2, size_t(M) * Hq * D * 4);
+    for (int s = 0; s < 2; ++s) {
+      const size_t r0 = sb.row0[s];
+      k::attn_prepare(qg + r0 * Hq * 2 * D, kk + r0 * Hkv * D, vv + r0 * Hkv * D, qn, kn, pos[s], rows[s], Hq, Hkv, D, rot,
+                      1e7f, 1e-6f, q1 + r0 * Hq * D, g1 + r0 * Hq * D, s ? kb : ka, s ? vb : va, nullptr);
+    }
+    k::SeqPtrs<__nv_bfloat16> kc, vc;
+    kc.p[0] = ka2, kc.p[1] = kb2, vc.p[0] = va2, vc.p[1] = vb2;
+    k::attn_prepare_seqs(qg, kk, vv, qn, kn, sb, Hq, Hkv, D, rot, 1e7f, 1e-6f, q2, g2, kc, vc, nullptr);
+    const size_t qbytes = size_t(M) * Hq * D * 4, cbytes = cache * 2;
+    bool prep = same(download(q1, qbytes / 4).data(), download(q2, qbytes / 4).data(), qbytes) &&
+                same(download(g1, qbytes / 4).data(), download(g2, qbytes / 4).data(), qbytes);
+    for (auto [a, b] : {std::pair{ka, ka2}, {va, va2}, {kb, kb2}, {vb, vb2}})
+      prep &= same(download(a, cache).data(), download(b, cache).data(), cbytes);
+    ok &= prep;
+    std::printf("attn_prepare over two sequences in one launch identical to per sequence: %s\n", prep ? "yes ok" : "NO FAIL");
+    // attention_rows: per sequence against one launch, eager and as a graph launches it.
+    float *scratch, *o1, *o2;
+    cudaMalloc(&scratch, k::attention_rows_scratch_floats(32, Hq, D, ctx) * sizeof(float));
+    cudaMalloc(&o1, qbytes), cudaMalloc(&o2, qbytes);
+    for (int s = 0; s < 2; ++s) {
+      const size_t r0 = sb.row0[s];
+      k::attention_rows(q1 + r0 * Hq * D, s ? kb : ka, s ? vb : va, pos[s], rows[s], Hq, Hkv, D, scratch,
+                        o1 + r0 * Hq * D, nullptr);
+    }
+    k::SeqPtrs<const __nv_bfloat16> kr, vr;
+    kr.p[0] = ka, kr.p[1] = kb, vr.p[0] = va, vr.p[1] = vb;
+    k::attention_rows_seqs(q1, kr, vr, sb, Hq, Hkv, D, scratch, o2, nullptr);
+    const std::vector<float> ref = download(o1, qbytes / 4);
+    bool att = same(ref.data(), download(o2, qbytes / 4).data(), qbytes);
+    k::SeqBatch gb = sb;
+    gb.pos[0] = gb.pos[1] = -1;  // deliberately wrong: the graph form reads the device's
+    gb.pos_dev = dpos;
+    cudaMemset(o2, 0, qbytes);
+    k::attention_rows_seqs(q1, kr, vr, gb, Hq, Hkv, D, scratch, o2, nullptr, ctx);
+    const bool attg = same(ref.data(), download(o2, qbytes / 4).data(), qbytes);
+    ok &= att && attg;
+    std::printf("attention_rows over two sequences in one launch identical to per sequence: %s; with device positions "
+                "and fixed ranges: %s\n", att ? "yes ok" : "NO FAIL", attg ? "yes ok" : "NO FAIL");
+    for (void* p : {(void*)qg, (void*)kk, (void*)vv, (void*)qn, (void*)kn, (void*)ka, (void*)va, (void*)kb, (void*)vb,
+                    (void*)ka2, (void*)va2, (void*)kb2, (void*)vb2, (void*)q1, (void*)g1, (void*)q2, (void*)g2,
+                    (void*)scratch, (void*)o1, (void*)o2})
+      cudaFree(p);
+  }
+  // ---- the verify's gdn_conv and gdn_recurrent ----
+  {
+    const int H = 16, HV = 48, C = 2 * H * 128 + HV * 128;
+    const std::vector<float> mixed = randv(size_t(M) * C);
+    float *m1 = upload(mixed), *m2 = upload(mixed);
+    __nv_bfloat16* w = upload(randb(size_t(C) * 4, 0.5f));
+    const std::vector<float> s0 = randv(size_t(C) * 3), s1 = randv(size_t(C) * 3);
+    float *st0 = upload(s0), *st1 = upload(s1), *tmp = upload(s0);
+    for (int s = 0; s < 2; ++s) {
+      cudaMemcpy(tmp, s ? st1 : st0, size_t(C) * 3 * 4, cudaMemcpyDeviceToDevice);  // the verify's copy of the window
+      k::gdn_conv(m1 + size_t(sb.row0[s]) * C, tmp, w, rows[s], C, nullptr);
+    }
+    k::SeqPtrs<const float> cs;
+    cs.p[0] = st0, cs.p[1] = st1;
+    k::gdn_conv_seqs(m2, cs, w, sb, C, nullptr);
+    const bool conv = same(download(m1, size_t(M) * C).data(), download(m2, size_t(M) * C).data(), size_t(M) * C * 4) &&
+                      same(download(st0, size_t(C) * 3).data(), s0.data(), size_t(C) * 3 * 4) &&
+                      same(download(st1, size_t(C) * 3).data(), s1.data(), size_t(C) * 3 * 4);
+    ok &= conv;
+    std::printf("gdn_conv over two sequences in one launch identical to per sequence (windows unwritten): %s\n",
+                conv ? "yes ok" : "NO FAIL");
+    // The recurrence over the conv's output, with decays and strengths in range.
+    std::vector<float> g = randv(size_t(M) * HV, 0.3f), beta(size_t(M) * HV);
+    for (auto& x : g) x = -std::abs(x);
+    for (auto& x : beta) x = 1.f / (1.f + std::exp(-normal(rng)));
+    float *dg = upload(g), *db = upload(beta);
+    const size_t SS = size_t(HV) * 128 * 128;
+    const std::vector<float> r0 = randv(SS, 0.05f), r1 = randv(SS, 0.05f);
+    float *rs0 = upload(r0), *rs1 = upload(r1), *out1, *out2;
+    cudaMalloc(&out1, size_t(M) * HV * 128 * 4), cudaMalloc(&out2, size_t(M) * HV * 128 * 4);
+    for (int s = 0; s < 2; ++s) {
+      const size_t a = sb.row0[s];
+      k::gdn_recurrent(m1 + a * C, dg + a * HV, db + a * HV, s ? rs1 : rs0, nullptr, out1 + a * HV * 128, rows[s], H, HV,
+                       nullptr);
+    }
+    k::SeqPtrs<const float> rs;
+    rs.p[0] = rs0, rs.p[1] = rs1;
+    k::gdn_recurrent_seqs(m1, dg, db, rs, out2, sb, H, HV, nullptr);
+    const bool rec = same(download(out1, size_t(M) * HV * 128).data(), download(out2, size_t(M) * HV * 128).data(),
+                          size_t(M) * HV * 128 * 4) &&
+                     same(download(rs0, SS).data(), r0.data(), SS * 4) && same(download(rs1, SS).data(), r1.data(), SS * 4);
+    ok &= rec;
+    std::printf("gdn_recurrent over two sequences in one launch identical to per sequence (states unwritten): %s\n",
+                rec ? "yes ok" : "NO FAIL");
+    for (void* p : {(void*)m1, (void*)m2, (void*)w, (void*)st0, (void*)st1, (void*)tmp, (void*)dg, (void*)db, (void*)rs0,
+                    (void*)rs1, (void*)out1, (void*)out2})
+      cudaFree(p);
+  }
+  // ---- the drafter: draft_qk_rope and draft_attention over two blocks ----
+  {
+    const int Hkv = 8, Hq = 32, dd = 128, ring = 8224, window = 2048;
+    const int B = 12;  // two full blocks
+    k::SeqBatch db;
+    db.n = 2;
+    db.row0[1] = B;
+    db.row0[2] = 2 * B;
+    db.pos[0] = pos[0];
+    db.pos[1] = 9000;  // past the ring: positions wrap
+    const int R = 2 * B;
+    const std::vector<float> xq = randv(size_t(R) * Hq * dd);
+    float *x1 = upload(xq), *x2 = upload(xq);
+    __nv_bfloat16* nw = upload(randb(dd, 0.1f));
+    for (int s = 0; s < 2; ++s)
+      k::draft_qk_rope(x1 + size_t(s) * B * Hq * dd, B, Hq, Hq * dd, nw, db.pos[s], 1e6f, 1e-6f, nullptr);
+    k::draft_qk_rope_seqs(x2, Hq, Hq * dd, nw, db, 1e6f, 1e-6f, nullptr);
+    const bool rope = same(download(x1, size_t(R) * Hq * dd).data(), download(x2, size_t(R) * Hq * dd).data(),
+                           size_t(R) * Hq * dd * 4);
+    float *kb = upload(randv(size_t(R) * Hkv * dd)), *vb = upload(randv(size_t(R) * Hkv * dd));
+    __nv_bfloat16 *r0k = upload(randb(size_t(ring) * Hkv * dd)), *r0v = upload(randb(size_t(ring) * Hkv * dd));
+    __nv_bfloat16 *r1k = upload(randb(size_t(ring) * Hkv * dd)), *r1v = upload(randb(size_t(ring) * Hkv * dd));
+    float *a1, *a2;
+    cudaMalloc(&a1, size_t(R) * Hq * dd * 4), cudaMalloc(&a2, size_t(R) * Hq * dd * 4);
+    for (int s = 0; s < 2; ++s) {
+      const size_t r0 = size_t(s) * B;
+      k::draft_attention(x1 + r0 * Hq * dd, s ? r1k : r0k, s ? r1v : r0v, ring, kb + r0 * Hkv * dd, vb + r0 * Hkv * dd,
+                         db.pos[s], B, window - 1, Hq, Hkv, a1 + r0 * Hq * dd, nullptr);
+    }
+    k::SeqPtrs<const __nv_bfloat16> rk, rv;
+    rk.p[0] = r0k, rk.p[1] = r1k, rv.p[0] = r0v, rv.p[1] = r1v;
+    k::draft_attention_seqs(x1, rk, rv, ring, kb, vb, db, window - 1, Hq, Hkv, a2, nullptr);
+    const bool datt = same(download(a1, size_t(R) * Hq * dd).data(), download(a2, size_t(R) * Hq * dd).data(),
+                           size_t(R) * Hq * dd * 4);
+    ok &= rope && datt;
+    std::printf("draft_qk_rope and draft_attention over two blocks in one launch identical to per sequence: %s, %s\n",
+                rope ? "yes ok" : "NO FAIL", datt ? "yes ok" : "NO FAIL");
+    for (void* p : {(void*)x1, (void*)x2, (void*)nw, (void*)kb, (void*)vb, (void*)r0k, (void*)r0v, (void*)r1k, (void*)r1v,
+                    (void*)a1, (void*)a2})
+      cudaFree(p);
+  }
+  cudaFree(dpos);
+  return ok;
+}
+
 int main(int argc, char** argv) {
   if (const char* e = std::getenv("LING_PDL")) ling::kernels::set_pdl(std::atoi(e) != 0);
   bool ok = test_gemm();
   ok &= test_bf16_rows();
   ok &= test_attention_rows();
   ok &= test_topk();
+  ok &= test_batched_state_kernels();
   if (argc > 1 && std::string(argv[1]) == "--bench") bench();
   const cudaError_t e = cudaDeviceSynchronize();
   if (e != cudaSuccess) {

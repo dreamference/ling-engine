@@ -350,6 +350,28 @@ __global__ void gdn_conv_kernel(float* mixed, float* state, const __nv_bfloat16*
   state[c * 3 + 2] = s2;
 }
 
+// The verify's conv over several sequences (M4 stage 4): sequence blockIdx.y's rows [row0, row0 + rows) of mixed,
+// starting from its own window, which is read and left unwritten (a verify keeps no state). Each output is the
+// same arithmetic as gdn_conv_kernel's over that sequence's rows alone.
+__global__ void gdn_conv_seqs_kernel(float* mixed, SeqPtrs<const float> state, const __nv_bfloat16* __restrict__ w,
+                                     SeqBatch b, int C) {
+  pdl_begin();  // first statement: see launch.cuh
+  const int c = blockIdx.x * blockDim.x + threadIdx.x, sq = blockIdx.y;
+  if (c >= C) return;
+  const float* st = state.p[sq];
+  float s0 = st[c * 3], s1 = st[c * 3 + 1], s2 = st[c * 3 + 2];
+  const float w0 = __bfloat162float(w[c * 4]), w1 = __bfloat162float(w[c * 4 + 1]);
+  const float w2 = __bfloat162float(w[c * 4 + 2]), w3 = __bfloat162float(w[c * 4 + 3]);
+  for (int t = b.row0[sq]; t < b.row0[sq + 1]; ++t) {
+    const float xv = mixed[static_cast<size_t>(t) * C + c];
+    const float o = w0 * s0 + w1 * s1 + w2 * s2 + w3 * xv;
+    s0 = s1;
+    s1 = s2;
+    s2 = xv;
+    mixed[static_cast<size_t>(t) * C + c] = silu(o);
+  }
+}
+
 __global__ void gdn_gating_kernel(const float* a, const float* b, const __nv_bfloat16* A_log,
                                   const __nv_bfloat16* dt_bias, float* g, float* beta, int n, int HV) {
   pdl_begin();  // first statement: see launch.cuh
@@ -367,13 +389,12 @@ constexpr int kGdnDk = 128, kGdnDv = 128;
 // The gated delta rule, one warp per 32 value columns of a head (4 warps per head, each its own
 // block): the q and k norms by warp shuffles, no block-wide barriers, and four times the blocks to load
 // the state. Each column's arithmetic per token is the same sequence whatever M is.
-__global__ void __launch_bounds__(32)
-    gdn_recurrent_warp_kernel(const float* __restrict__ mixed, const float* __restrict__ g,
-                              const float* __restrict__ beta, const float* state_in, float* state_out,
-                              float* __restrict__ out, int M, int H, int HV) {
-  pdl_begin();  // first statement: see launch.cuh
+__device__ __forceinline__ void gdn_recurrent_body(const float* __restrict__ mixed, const float* __restrict__ g,
+                                                   const float* __restrict__ beta, const float* state_in,
+                                                   float* state_out, float* __restrict__ out, int M, int H, int HV,
+                                                   int bx) {
   __shared__ float qs[kGdnDk], ks[kGdnDk];
-  const int hv = blockIdx.x / 4, part = blockIdx.x % 4, lane = threadIdx.x, v = part * 32 + lane;
+  const int hv = bx / 4, part = bx % 4, lane = threadIdx.x, v = part * 32 + lane;
   const int h = hv / (HV / H);
   const int C = 2 * H * kGdnDk + HV * kGdnDv;
   const float* st = state_in + static_cast<size_t>(hv) * kGdnDk * kGdnDv;
@@ -421,6 +442,28 @@ __global__ void __launch_bounds__(32)
   for (int k = 0; k < kGdnDk; ++k) so[k * kGdnDv + v] = S[k];
 }
 
+__global__ void __launch_bounds__(32)
+    gdn_recurrent_warp_kernel(const float* __restrict__ mixed, const float* __restrict__ g,
+                              const float* __restrict__ beta, const float* state_in, float* state_out,
+                              float* __restrict__ out, int M, int H, int HV) {
+  pdl_begin();  // first statement: see launch.cuh
+  gdn_recurrent_body(mixed, g, beta, state_in, state_out, out, M, H, HV, blockIdx.x);
+}
+
+// The verify's recurrence over several sequences in one launch (M4 stage 4): blockIdx.y is the sequence, its rows
+// [row0, row0 + rows) read from its own state, which stays unwritten.
+__global__ void __launch_bounds__(32)
+    gdn_recurrent_seqs_kernel(const float* __restrict__ mixed, const float* __restrict__ g,
+                              const float* __restrict__ beta, SeqPtrs<const float> state, float* __restrict__ out,
+                              SeqBatch b, int H, int HV) {
+  pdl_begin();  // first statement: see launch.cuh
+  const int sq = blockIdx.y;
+  const size_t r0 = b.row0[sq];
+  const int C = 2 * H * kGdnDk + HV * kGdnDv;
+  gdn_recurrent_body(mixed + r0 * C, g + r0 * HV, beta + r0 * HV, state.p[sq], nullptr, out + r0 * HV * kGdnDv,
+                     b.row0[sq + 1] - b.row0[sq], H, HV, blockIdx.x);
+}
+
 __global__ void gated_rmsnorm_kernel(const float* __restrict__ x, const float* __restrict__ z,
                                      const __nv_bfloat16* __restrict__ w, float* __restrict__ out, int D,
                                      float eps) {
@@ -434,17 +477,16 @@ __global__ void gated_rmsnorm_kernel(const float* __restrict__ x, const float* _
     out[r * D + d] = x[r * D + d] * rstd * __bfloat162float(w[d]) * silu(z[r * D + d]);
 }
 
-__global__ void attn_prepare_kernel(const float* __restrict__ q_gate, const float* __restrict__ k,
-                                    const float* __restrict__ v, const __nv_bfloat16* __restrict__ q_norm,
-                                    const __nv_bfloat16* __restrict__ k_norm, DevPos pos0, int Hq, int Hkv, int D,
-                                    int rot, float theta, float eps, float* __restrict__ q,
-                                    float* __restrict__ gate, __nv_bfloat16* __restrict__ kcache,
-                                    __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps) {
-  pdl_begin();  // first statement: see launch.cuh
+// Row m (its position pos) of attn_prepare; the caches are its sequence's.
+__device__ __forceinline__ void attn_prepare_body(const float* __restrict__ q_gate, const float* __restrict__ k,
+                                                  const float* __restrict__ v, const __nv_bfloat16* __restrict__ q_norm,
+                                                  const __nv_bfloat16* __restrict__ k_norm, int m, int pos, int Hq,
+                                                  int Hkv, int D, int rot, float theta, float eps, float* __restrict__ q,
+                                                  float* __restrict__ gate, __nv_bfloat16* __restrict__ kcache,
+                                                  __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps) {
   extern __shared__ float xn[];
   __shared__ float red[32];
-  const int m = blockIdx.x, slot = blockIdx.y, d = threadIdx.x;
-  const int pos = pos_value(pos0) + m;
+  const int slot = blockIdx.y, d = threadIdx.x;
   if (slot >= Hq + Hkv) {  // v: copy into the cache
     const int kh = slot - Hq - Hkv;
     vcache[kh * hs + pos * ps + d] = __float2bfloat16(v[(static_cast<size_t>(m) * Hkv + kh) * D + d]);
@@ -477,6 +519,32 @@ __global__ void attn_prepare_kernel(const float* __restrict__ q_gate, const floa
   } else {
     kcache[head * hs + pos * ps + d] = __float2bfloat16(o);
   }
+}
+
+__global__ void attn_prepare_kernel(const float* __restrict__ q_gate, const float* __restrict__ k,
+                                    const float* __restrict__ v, const __nv_bfloat16* __restrict__ q_norm,
+                                    const __nv_bfloat16* __restrict__ k_norm, DevPos pos0, int Hq, int Hkv, int D,
+                                    int rot, float theta, float eps, float* __restrict__ q,
+                                    float* __restrict__ gate, __nv_bfloat16* __restrict__ kcache,
+                                    __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps) {
+  pdl_begin();  // first statement: see launch.cuh
+  const int m = blockIdx.x;
+  attn_prepare_body(q_gate, k, v, q_norm, k_norm, m, pos_value(pos0) + m, Hq, Hkv, D, rot, theta, eps, q, gate, kcache,
+                    vcache, hs, ps);
+}
+
+// Several sequences' rows in one launch (M4 stage 4): row m belongs to sequence seq_of(m), at that sequence's
+// position, into that sequence's caches.
+__global__ void attn_prepare_seqs_kernel(const float* __restrict__ q_gate, const float* __restrict__ k,
+                                         const float* __restrict__ v, const __nv_bfloat16* __restrict__ q_norm,
+                                         const __nv_bfloat16* __restrict__ k_norm, SeqBatch b, int Hq, int Hkv, int D,
+                                         int rot, float theta, float eps, float* __restrict__ q,
+                                         float* __restrict__ gate, SeqPtrs<__nv_bfloat16> kc, SeqPtrs<__nv_bfloat16> vc,
+                                         size_t hs, size_t ps) {
+  pdl_begin();  // first statement: see launch.cuh
+  const int m = blockIdx.x, sq = seq_of(b, m);
+  attn_prepare_body(q_gate, k, v, q_norm, k_norm, m, seq_pos(b, sq) + m - b.row0[sq], Hq, Hkv, D, rot, theta, eps, q,
+                    gate, kc.p[sq], vc.p[sq], hs, ps);
 }
 
 // ---- Rows-path attention on tensor cores (decode and verify, M <= 32). ----
@@ -613,18 +681,16 @@ __device__ __forceinline__ void attn_bulk_tile(__nv_bfloat16* stage, const __nv_
 // query rows per block (16 per warp), keys per tile, pipeline stages; BULK: tiles through the bulk-copy
 // engine (attn_bulk_tile) instead of cp.async. The arithmetic is the same either way, bit for bit.
 template <int ROWS, int TK, int NS, bool BULK>
-__global__ void __launch_bounds__(ROWS * 2)
-    attention_mma_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
-                         const __nv_bfloat16* __restrict__ vcache, DevPos pos0_arg, int M, int Hq, int Hkv,
-                         int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf) {
-  pdl_begin();  // first statement: see launch.cuh
+__device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
+                                                   const __nv_bfloat16* __restrict__ vcache, int pos0, int M, int Hq,
+                                                   int Hkv, int splits, int chunk, float* __restrict__ scratch, size_t hs,
+                                                   size_t ps, int pf, int bx) {
   constexpr int D = kMmaD, G = 6, KS = kMmaKS;
   extern __shared__ __align__(16) unsigned char smem[];
   auto stage = [&](int i) { return reinterpret_cast<__nv_bfloat16*>(smem + (i % NS) * mma_stage(TK)); };
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
   const int kvh = blockIdx.y, split = blockIdx.z;
-  const int pos0 = pos_value(pos0_arg);
-  const int R = M * G, r0 = blockIdx.x * ROWS, nrows = min(ROWS, R - r0);
+  const int R = M * G, r0 = bx * ROWS, nrows = min(ROWS, R - r0);
   const bool active = warp * 16 < nrows;
   const int last_m = (r0 + nrows - 1) / G;
   const int kend = pos0 + last_m + 1;  // keys [0, kend) are visible to some row of this block
@@ -809,6 +875,37 @@ __global__ void __launch_bounds__(ROWS * 2)
   }
 }
 
+template <int ROWS, int TK, int NS, bool BULK>
+__global__ void __launch_bounds__(ROWS * 2)
+    attention_mma_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
+                         const __nv_bfloat16* __restrict__ vcache, DevPos pos0_arg, int M, int Hq, int Hkv,
+                         int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf) {
+  pdl_begin();  // first statement: see launch.cuh
+  attention_mma_body<ROWS, TK, NS, BULK>(q, kcache, vcache, pos_value(pos0_arg), M, Hq, Hkv, splits, chunk, scratch, hs,
+                                         ps, pf, blockIdx.x);
+}
+
+// Several sequences in one launch (M4 stage 4): the x blocks of sequence i are [blk0[i], blk0[i + 1]); each block
+// computes what attention_mma_kernel computes for that sequence alone (its queries, its caches, its position), and
+// its partials land at the sequence's rows of `scratch`, so one combine over every row follows.
+struct AttnBlocks {
+  int blk0[kMaxSeqs + 1];
+};
+template <int ROWS, int TK, int NS, bool BULK>
+__global__ void __launch_bounds__(ROWS * 2)
+    attention_mma_seqs_kernel(const float* __restrict__ q, SeqPtrs<const __nv_bfloat16> kc,
+                              SeqPtrs<const __nv_bfloat16> vc, SeqBatch b, AttnBlocks blocks, int Hq, int Hkv,
+                              int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf) {
+  pdl_begin();  // first statement: see launch.cuh
+  int sq = 0;
+  while (sq + 1 < b.n && static_cast<int>(blockIdx.x) >= blocks.blk0[sq + 1]) ++sq;
+  constexpr int D = kMmaD;
+  const size_t r0 = b.row0[sq];
+  attention_mma_body<ROWS, TK, NS, BULK>(q + r0 * Hq * D, kc.p[sq], vc.p[sq], seq_pos(b, sq), b.row0[sq + 1] - b.row0[sq],
+                                         Hq, Hkv, splits, chunk, scratch + r0 * Hq * splits * (D + 2), hs, ps, pf,
+                                         blockIdx.x - blocks.blk0[sq]);
+}
+
 __global__ void attention_combine_kernel(const float* __restrict__ scratch, int splits, int D,
                                          float* __restrict__ out) {
   pdl_begin();  // first statement: see launch.cuh
@@ -981,6 +1078,17 @@ void gdn_recurrent(const float* mixed, const float* g, const float* beta, const 
                 state_out, out, M, H, HV);
 }
 
+void gdn_conv_seqs(float* mixed, SeqPtrs<const float> state, const __nv_bfloat16* w, const SeqBatch& b, int C,
+                   cudaStream_t s) {
+  launch_kernel("gdn_conv_seqs", gdn_conv_seqs_kernel, dim3((C + 255) / 256, b.n), dim3(256), 0, s, mixed, state, w, b, C);
+}
+
+void gdn_recurrent_seqs(const float* mixed, const float* g, const float* beta, SeqPtrs<const float> state, float* out,
+                        const SeqBatch& b, int H, int HV, cudaStream_t s) {
+  launch_kernel("gdn_recurrent_seqs", gdn_recurrent_seqs_kernel, dim3(HV * 4, b.n), dim3(32), 0, s, mixed, g, beta,
+                state, out, b, H, HV);
+}
+
 void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float* out, int rows, int D,
                    float eps, cudaStream_t s) {
   launch_kernel("gated_rmsnorm", gated_rmsnorm_kernel, dim3(rows), dim3(D), 0, s, x, z, w, out, D, eps);
@@ -993,6 +1101,15 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
   dim3 grid(M, Hq + 2 * Hkv);
   launch_kernel("attn_prepare", attn_prepare_kernel, grid, dim3(D), D * sizeof(float), s, q_gate, k, v, q_norm, k_norm,
                 pos0, Hq, Hkv, D, rot, theta, eps, q, gate, kcache, vcache, kv_hs(D), kv_ps(Hkv, D));
+}
+
+void attn_prepare_seqs(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
+                       const __nv_bfloat16* k_norm, const SeqBatch& b, int Hq, int Hkv, int D, int rot, float theta,
+                       float eps, float* q, float* gate, SeqPtrs<__nv_bfloat16> kc, SeqPtrs<__nv_bfloat16> vc,
+                       cudaStream_t s) {
+  dim3 grid(b.row0[b.n], Hq + 2 * Hkv);
+  launch_kernel("attn_prepare_seqs", attn_prepare_seqs_kernel, grid, dim3(D), D * sizeof(float), s, q_gate, k, v,
+                q_norm, k_norm, b, Hq, Hkv, D, rot, theta, eps, q, gate, kc, vc, kv_hs(D), kv_ps(Hkv, D));
 }
 
 // Fixed key ranges at fixed positions (row invariance); LING_ATTN_CHUNK picks the size for experiments.
@@ -1023,6 +1140,12 @@ void prepare_kernels() {
   check(cudaFuncSetAttribute(attention_mma_kernel<kAttnRows, kAttnTk, kAttnNs, true>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
         "attention_rows smem");
+  check(cudaFuncSetAttribute(attention_mma_seqs_kernel<kAttnRows, kAttnTk, kAttnNs, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
+        "attention_rows smem");
+  check(cudaFuncSetAttribute(attention_mma_seqs_kernel<kAttnRows, kAttnTk, kAttnNs, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
+        "attention_rows smem");
   configured = true;
 }
 
@@ -1041,6 +1164,31 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
                     pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel, dim3(M * Hq), dim3(D),
                     0, s, scratch, splits, D, out);
+}
+
+void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
+                         const SeqBatch& b, int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s,
+                         int fixed_ctx) {
+  if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
+  if (b.pos_dev && fixed_ctx <= 0) throw std::runtime_error("attention_rows: a device position needs a fixed context");
+  if (b.n < 1 || b.n > kMaxSeqs) throw std::runtime_error("attention_rows_seqs: 1 to kMaxSeqs sequences");
+  constexpr int rows = kAttnRows, tk = kAttnTk, ns = kAttnNs;
+  // One set of ranges for every sequence: those covering the furthest sequence's keys (or, in a graph, every range
+  // up to fixed_ctx). A range past a sequence's last key writes an empty partial that the combine skips, so each
+  // sequence's result is bit for bit its own launch's (the argument a captured graph already relies on).
+  int ctx = fixed_ctx;
+  if (ctx <= 0)
+    for (int i = 0; i < b.n; ++i) ctx = std::max(ctx, b.pos[i] + b.row0[i + 1] - b.row0[i]);
+  const int splits = attention_rows_splits(ctx);
+  AttnBlocks blocks{};
+  for (int i = 0; i < b.n; ++i) blocks.blk0[i + 1] = blocks.blk0[i] + ((b.row0[i + 1] - b.row0[i]) * 6 + rows - 1) / rows;
+  prepare_kernels();
+  launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_seqs",
+                    g_attn_bulk ? attention_mma_seqs_kernel<rows, tk, ns, true> : attention_mma_seqs_kernel<rows, tk, ns, false>,
+                    dim3(blocks.blk0[b.n], Hkv, splits), dim3(rows * 2), mma_smem(tk, ns), s, q, kc, vc, b, blocks, Hq, Hkv,
+                    splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch);
+  launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel,
+                    dim3(b.row0[b.n] * Hq), dim3(D), 0, s, scratch, splits, D, out);
 }
 
 }  // namespace ling::kernels
