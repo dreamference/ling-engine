@@ -115,6 +115,27 @@ def test_prompt_length_near_chunk_boundary(server, n):
 
 
 @pytest.mark.slow
+def test_used_checkpoint_store_still_saves(server):
+    """Ours (M4 stage 2's server suite on a used server, 2026-10-12).
+
+    The bug: with the checkpoint store full of other prompts' entries at lower positions (the ends of their
+    first two messages), stage 1's rule (the latest position gives way) saved nothing new, so a 2,080-token
+    prompt kept no state at 2,048 and its identical resend reused nothing (its end-of-prompt state is the
+    prompt's end, which a prompt never resumes from). The owner's decision of 2026-10-12: the least recently
+    used entry gives way. Check: after a dozen low checkpoints from unrelated chats, the resend of a cold
+    2,080-token prompt reuses at least 2,048 tokens and answers as cold."""
+    prompt = prompt_of_length(server, 2048 + 32)
+    for i in range(6):  # two kept states each (the ends of the system and the user message), all below 2,048
+        greedy_chat(server, [{"role": "system", "content": f"Store filler {i}. " + code_text(8)},
+                             {"role": "user", "content": code_text(2) + f"Say hi {i}."}], max_tokens=4)
+    evict(server)
+    cold = greedy_completion(server, prompt)
+    warm = greedy_completion(server, prompt)
+    assert warm["choices"][0]["text"] == cold["choices"][0]["text"]
+    assert warm["usage"]["prompt_tokens_details"]["cached_tokens"] >= 2048, "the 2,048 checkpoint was not kept"
+
+
+@pytest.mark.slow
 def test_growing_conversation_warm_equals_cold(server):
     """vllm#60174, vllm#43559, vllm#53912, sglang#41351, vllm#58894.
 

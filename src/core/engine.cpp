@@ -263,6 +263,7 @@ SpecStats Engine::spec_stats_total() const {
     t.commit_seconds += a.commit_seconds;
     t.lookup_steps += a.lookup_steps;
     t.lookup_accepted += a.lookup_accepted;
+    t.batched_steps += a.batched_steps;
     for (int b = 0; b < 5; ++b) {
       t.shadow_steps[b] += a.shadow_steps[b];
       t.shadow_lookup[b] += a.shadow_lookup[b];
@@ -397,23 +398,33 @@ bool Engine::ckpt_match(const Checkpoint& k, const std::vector<int>& prompt,
   return std::equal(k.tokens.begin(), k.tokens.end(), prompt.begin());
 }
 
-void Engine::save_checkpoint(int pos) {
+void Engine::save_checkpoint(int pos, uint64_t epoch) {
   const uint64_t hash = fnv_tokens(s_->history.data(), pos);
-  for (const Checkpoint& k : ckpts_)
-    if (k.pos == pos && k.hash == hash && std::equal(k.tokens.begin(), k.tokens.end(), s_->history.begin())) return;
+  for (Checkpoint& k : ckpts_)
+    if (k.pos == pos && k.hash == hash && std::equal(k.tokens.begin(), k.tokens.end(), s_->history.begin())) {
+      k.used = ++ckpt_clock_;
+      return;
+    }
   int slot = -1;
   std::vector<bool> used(ckpt_slots_.size(), false);
   for (const Checkpoint& k : ckpts_) used[k.slot] = true;
   for (size_t i = 0; i < used.size(); ++i)
     if (!used[i]) slot = static_cast<int>(i);
-  if (slot < 0) {  // full: the earliest positions are the ones other sessions share, so the latest gives way
-    if (ckpts_.empty() || ckpts_.back().pos < pos) return;
-    slot = ckpts_.back().slot;
-    ckpts_.pop_back();
+  if (slot < 0) {
+    // Full: the least recently used entry gives way (the owner's decision of 2026-10-12; stage 1 dropped the
+    // latest position, so a store full of other prompts' earlier entries saved nothing new). Entries on this
+    // prompt's own prefix were stamped at or after `epoch` and stay: a prompt longer than the store keeps its
+    // earliest positions, which the sessions that share its system prompt resume from.
+    int victim = -1;
+    for (size_t i = 0; i < ckpts_.size(); ++i)
+      if (ckpts_[i].used < epoch && (victim < 0 || ckpts_[i].used < ckpts_[victim].used)) victim = static_cast<int>(i);
+    if (victim < 0) return;
+    slot = ckpts_[victim].slot;
+    ckpts_.erase(ckpts_.begin() + victim);
   }
   // Stream-ordered: the copy completes before any later restore reads the slot (one stream, M4 §1).
   copy_state(ckpt_slots_[slot], true);
-  ckpts_.push_back({pos, slot, hash, std::vector<int>(s_->history.begin(), s_->history.begin() + pos)});
+  ckpts_.push_back({pos, slot, hash, std::vector<int>(s_->history.begin(), s_->history.begin() + pos), ++ckpt_clock_});
   std::sort(ckpts_.begin(), ckpts_.end(), [](const Checkpoint& a, const Checkpoint& b) { return a.pos < b.pos; });
 }
 
@@ -527,9 +538,24 @@ void Engine::linear_fp8(const Fp8Weight& w, const float* x, int M, float* y, boo
 }
 
 void Engine::forward(const int* ids, int M, Pass pass, int keep_at) {
+  const Seg one{s_, 0, M};
+  forward_rows(ids, M, pass, keep_at, std::span<const Seg>(&one, 1));
+}
+
+void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::span<const Seg> segs) {
   const ModelConfig& c = model_->config();
-  if (s_->pos + M > opts_.max_context) throw std::runtime_error("context is longer than max_context");
   const bool rows = M <= kernels::kMaxStreamRows, verify = pass == Pass::Verify;
+  if (segs.empty() || (segs.size() > 1 && !verify)) throw std::runtime_error("forward: several sequences only in a verify");
+  int seg_rows = 0;
+  for (const Seg& g : segs) {
+    if (g.row0 != seg_rows || g.rows < 1) throw std::runtime_error("forward: segments must tile the rows in order");
+    if (g.s->pos + g.rows > opts_.max_context) throw std::runtime_error("context is longer than max_context");
+    seg_rows += g.rows;
+  }
+  if (seg_rows != M) throw std::runtime_error("forward: segments must tile the rows");
+  // A segment's position. A captured graph (one sequence, the active one) reads it from pos_dev_ (dpos); the
+  // batch path runs eagerly at each session's own position.
+  auto seg_pos = [&](const Seg& g, int off) { return use_dev_pos_ ? dpos(off) : kernels::DevPos(g.s->pos + off); };
   // A prompt's tokens take the prefill path whatever the chunk's size, so the state a prompt leaves does
   // not depend on how its prefill was split or where it resumed (the prefix checkpoints rely on it).
   quantized_ = pass == Pass::Prefill;
@@ -567,15 +593,22 @@ void Engine::forward(const int* ids, int M, Pass pass, int keep_at) {
       NvtxRange r("attention");
       linear_fp8_multi({{&L.q, q_gate_}, {&L.k, k_}, {&L.v, v_}}, xn_, M, xn_half);
       mark("attn_proj");
-      kernels::attn_prepare(q_gate_, k_, v_, L.q_norm, L.k_norm, dpos(), M, c.heads, c.kv_heads, c.head_dim,
-                            c.rotary_dim, c.rope_theta, c.eps, q_, gate_, s_->kcache[slot], s_->vcache[slot], stream_);
-      // Fixed key ranges at fixed positions for every pass (row-invariant), in slices of queries that
-      // bound the partial results' scratch. A captured graph launches the ranges of the whole context.
-      for (int q0 = 0; q0 < M; q0 += kAttnSlice) {
-        const int n = std::min(kAttnSlice, M - q0);
-        kernels::attention_rows(q_ + size_t(q0) * qsize, s_->kcache[slot], s_->vcache[slot], dpos(q0), n, c.heads,
-                                c.kv_heads, c.head_dim, attn_scratch_, attn_ + size_t(q0) * qsize, stream_,
-                                use_dev_pos_ ? opts_.max_context : 0);
+      // Per sequence (M4 §2): its rows' q/k norms and RoPE at its positions, their KV into its cache, and their
+      // attention over it.
+      const int kvsize = c.kv_heads * c.head_dim;
+      for (const Seg& g : segs) {
+        const size_t r0 = g.row0;
+        kernels::attn_prepare(q_gate_ + r0 * 2 * qsize, k_ + r0 * kvsize, v_ + r0 * kvsize, L.q_norm, L.k_norm,
+                              seg_pos(g, 0), g.rows, c.heads, c.kv_heads, c.head_dim, c.rotary_dim, c.rope_theta, c.eps,
+                              q_ + r0 * qsize, gate_ + r0 * qsize, g.s->kcache[slot], g.s->vcache[slot], stream_);
+        // Fixed key ranges at fixed positions for every pass (row-invariant), in slices of queries that
+        // bound the partial results' scratch. A captured graph launches the ranges of the whole context.
+        for (int q0 = 0; q0 < g.rows; q0 += kAttnSlice) {
+          const int n = std::min(kAttnSlice, g.rows - q0);
+          kernels::attention_rows(q_ + (r0 + q0) * qsize, g.s->kcache[slot], g.s->vcache[slot], seg_pos(g, q0), n,
+                                  c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_ + (r0 + q0) * qsize, stream_,
+                                  use_dev_pos_ ? opts_.max_context : 0);
+        }
       }
       if (quantized_) {
         kernels::sigmoid_mul_fp8(attn_, gate_, size_t(M) * qsize, L.o.in_scale, xq_, stream_);
@@ -643,28 +676,35 @@ void Engine::forward(const int* ids, int M, Pass pass, int keep_at) {
         linear_bf16(L.in_b, xn_, M, b_);
       }
       mark("gdn_proj");
-      float* conv_state = s_->conv[slot];
+      const bool keep = quantized_ && keep_at > 0 && keep_at < M;
       if (verify) {
         check(cudaMemcpyAsync(mixed, v_pre_[slot], size_t(M) * C * sizeof(float), cudaMemcpyDeviceToDevice, stream_),
               "verify inputs");
-        check(cudaMemcpyAsync(conv_tmp_, conv_state, size_t(C) * (c.conv_kernel - 1) * sizeof(float),
-                              cudaMemcpyDeviceToDevice, stream_),
-              "verify conv");
-        conv_state = conv_tmp_;
+        // Per sequence (M4 §2), on a copy of its conv window: its rows' taps start from its own state.
+        for (const Seg& sg : segs) {
+          check(cudaMemcpyAsync(conv_tmp_, sg.s->conv[slot], size_t(C) * (c.conv_kernel - 1) * sizeof(float),
+                                cudaMemcpyDeviceToDevice, stream_),
+                "verify conv");
+          kernels::gdn_conv(mixed + size_t(sg.row0) * C, conv_tmp_, L.conv, sg.rows, C, stream_);
+        }
+      } else if (quantized_) {
+        kernels::gdn_conv_prefill(t2_, mixed, s_->conv[slot], L.conv, M, C, stream_,
+                                  keep ? s_->snap.conv[slot] : nullptr, keep_at);
+      } else {
+        kernels::gdn_conv(mixed, s_->conv[slot], L.conv, M, C, stream_);
       }
-      const bool keep = quantized_ && keep_at > 0 && keep_at < M;
-      if (quantized_)
-        kernels::gdn_conv_prefill(t2_, mixed, conv_state, L.conv, M, C, stream_, keep ? s_->snap.conv[slot] : nullptr,
-                                  keep_at);
-      else kernels::gdn_conv(mixed, conv_state, L.conv, M, C, stream_);
       kernels::gdn_gating(a_, b_, L.A_log, L.dt_bias, g, beta, M, c.lin_v_heads, stream_);
       mark("gdn_conv");
       if (quantized_)
         kernels::gdn_recurrent_prefill(mixed, g, beta, s_->gdn[slot], core_, M, c.lin_k_heads, c.lin_v_heads, s_->pos,
                                        stream_, keep ? s_->snap.gdn[slot] : nullptr, keep_at);
       else
-        kernels::gdn_recurrent(mixed, g, beta, s_->gdn[slot], verify ? nullptr : s_->gdn[slot], core_, M,
-                               c.lin_k_heads, c.lin_v_heads, stream_);
+        for (const Seg& sg : segs) {  // per sequence, from its own state (a verify leaves it unwritten)
+          const size_t r0 = sg.row0;
+          kernels::gdn_recurrent(mixed + r0 * C, g + r0 * c.lin_v_heads, beta + r0 * c.lin_v_heads, sg.s->gdn[slot],
+                                 verify ? nullptr : sg.s->gdn[slot], core_ + r0 * Vs, sg.rows, c.lin_k_heads,
+                                 c.lin_v_heads, stream_);
+        }
       mark("gdn_recurrent");
       if (quantized_) {
         kernels::gated_rmsnorm_fp8(core_, z_, L.lin_norm, M * c.lin_v_heads, c.lin_v_dim, c.eps, L.out.in_scale, xq_,
@@ -744,8 +784,8 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   // The drafter attends to the last `window` positions: resuming at p > window start needs its context
   // KV from the window start up to p, which the session's ring holds only from dkv_from() on.
   const int window = draft_ ? std::max(0, L - draft_->config().sliding_window) : 0;
-  std::vector<uint64_t> prefix_hash;  // of prompt[0, i), for the store's lookups
-  if (!from_scratch && !ckpts_.empty()) {
+  std::vector<uint64_t> prefix_hash;  // of prompt[0, i), for the store's lookups (and its LRU stamps, below)
+  if (!ckpts_.empty()) {
     const int n = std::min(L, opts_.checkpoint_limit);
     prefix_hash.resize(n + 1);
     prefix_hash[0] = kFnvBasis;
@@ -781,6 +821,12 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
       }
     }
   }
+  // The store's clock (its LRU order): every entry on this prompt's prefix is used by this prefill, and the
+  // entries it saves come after; save_checkpoint never evicts one of them for another.
+  cur.ckpt_epoch = ++ckpt_clock_;
+  if (!prefix_hash.empty())
+    for (Checkpoint& k : ckpts_)
+      if (ckpt_match(k, prompt, prefix_hash)) k.used = cur.ckpt_epoch;
   if (donor) adopt_prefix(*donor, src.reuse);
   if (src.from) copy_state(*src.from, false);
   else reset_state();
@@ -852,7 +898,7 @@ bool Engine::prefill_chunk(PrefillCursor& cur, int max_tokens) {
     copy_state(s_->snap, true);
     s_->snap_pos = snap_at;
   }
-  if (end < L && std::binary_search(cur.bounds.begin(), cur.bounds.end(), end)) save_checkpoint(end);
+  if (end < L && std::binary_search(cur.bounds.begin(), cur.bounds.end(), end)) save_checkpoint(end, cur.ckpt_epoch);
   cur.stats.chunks += 1;
   if (end < L) {
     cur.stats.compute_seconds +=
