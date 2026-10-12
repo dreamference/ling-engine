@@ -15,7 +15,7 @@ Standard tensor parallelism over two ranks, one all-reduce after each row-split 
 | Part | Shape (in × out) | Split | Per machine |
 | --- | --- | --- | --- |
 | DeltaNet in-projections (q, k, v; z) | 5120 × 10,240; 5120 × 6,144 | by output (heads) | 8 of 16 key heads, 24 of 48 value heads |
-| DeltaNet β/α, conv1d, recurrence, gated norm | per head | by head | local; the gated norm is over one head's 128 values ([MODEL §5.4](../DREAMFERENCE_LING_ENGINE_MODEL.md); the kernel is checked before building) |
+| DeltaNet β/α, conv1d, recurrence, gated norm | per head | by head | local; the gated norm is over one head's 128 values (`gated_rmsnorm` with D = 128 in `src/core/engine.cpp`, checked) |
 | DeltaNet out-projection | 6144 × 5120 | by input (K) | **all-reduce 1** |
 | Attention q (with gate), k, v | 5120 × 12,288; 5120 × 1024 × 2 | by output (heads) | 12 of 24 query heads, 2 of 4 KV heads; q/k norms and RoPE per head, local |
 | Attention out-projection | 6144 × 5120 | by input (K) | **all-reduce 1** |
@@ -76,7 +76,7 @@ Per machine, from M3's trace of the single-stream step ([reports/M3.md](../../re
 | **Step** | **113.8** | **66.5–69.7** | **62.6–66.1** | |
 | **Speed-up of decode** | | **1.63–1.71×** | **1.72–1.82×** | |
 
-The pessimistic corner is the half-shapes at 200 GB/s (+3.1 ms) with the byte-identical exchange of section 5 (×4 the bytes) at L = 30 µs (~8.8 ms, ~9.5 in Form B): 76.6 ms in Form A and 73.3 ms in Form B, 1.49× and 1.55×. Hence **about 1.5–1.8× on decode**, as the owner was told; tokens per step are unchanged (the same proposals, the same verify), so decode tokens/s scales by the same factor: ~45–48 tokens/s of decode today becomes about 70–85.
+With the half-shapes at 200 GB/s (+3.1 ms) and the plain or option-3 exchange of section 5 at L = 5–30 µs, the step is 69.6–72.8 ms in Form A (1.56–1.63×). The pessimistic corner keeps today's one-machine numerics exactly (section 5, option 1): the half-shapes at 200 GB/s, the ×4 exchange at L = 30 µs (~8.8 ms, ~9.5 in Form B) and the per-row scale exchange (128 more at L, ~3.8 ms; ~4.1 in Form B): 80.4 ms in Form A and 77.4 ms in Form B, 1.42× and 1.47×. Hence **about 1.5–1.8× on decode**, as the owner was told, while the exchange stays within ~8 ms per step, and **~1.4×** if today's exact order is kept over a 30 µs link; tokens per step are unchanged (the same proposals, the same verify), so decode tokens/s scales by the same factor: ~45–48 tokens/s of decode today becomes about 70–85.
 
 - **At two streams** the ratio is about the same or a little higher: the weight bytes are shared by the batch as on one machine, and the per-sequence work (attention, the recurrence, the commit) splits by head; the exchange grows to 3.2–6.4 ms (section 3). This is measured at M4 stage 4's shape, not assumed.
 - **Prefill gains too, less precisely:** it is compute bound (~2,100 tokens/s), and each machine does half the FLOPs. The exchange per 2,048-token chunk is 128 × 2,048 × 20 KB ≈ 5.4 GB, ~0.21 s each way at 25 GB/s, against ~0.5 s of halved compute per chunk, so prefill gains ~1.4× without overlap and approaches 2× with it (chunk n's exchange beside chunk n + 1's GEMMs).
@@ -104,6 +104,8 @@ A plain two-machine all-reduce of two half-K partials groups the sum differently
 2. **The same split, relayed.** Machine 0 sends `w0 + w1 + w2 + w3`, summed in order, which is exactly one machine's running sum after four terms. Machine 1 continues the sequence through w7 and sends the result back. That is 1× the bytes each way, but two latencies per all-reduce. The measured latency picks between 1 and 2.
 3. **Change the one-machine order first.** Make the warp reduction a fixed two-level sum, `(w0 + … + w3) + (w4 + … + w7)`, on one machine too. Then a plain 1× all-reduce of the two halves is byte-identical to the new one-machine engine; addition is commutative, so both machines get the same bits whichever adds its own partial first. It changes the exact path's rounding on one machine, so it is the owner's decision. It is judged like M1 and M2 were: [MILESTONES §14](../DREAMFERENCE_LING_ENGINE_MILESTONES.md)'s agreement test against production's own spread (the flip line), with `--spec-check`, `--prefix-check` and `--graph-check` unchanged.
 
+**The per-row FP16 scale must be shared too.** Before each GEMM, `to_half_rows` converts the FP32 input to FP16 with a power-of-two scale per row taken from the row's largest magnitude over all of K (`stream_gemm.cu`), and the GEMM's output is multiplied by its inverse. For a split by input each machine sees half of K, so the halves' scales can differ. Options 1 and 2 therefore need the two machines to exchange the per-row maximum before converting (4 bytes per row; a maximum does not depend on order, so it is exact): one more exchange per row-split projection, 256 per step instead of 128, the extra ones costing only the latency (0.6–3.8 ms at L = 5–30 µs), partly hidden by the next GEMM's weight prefetch like the others. Option 3 folds it in: the one-machine engine takes the scale per half of K as well, and no extra exchange is needed.
+
 **The same rule applies wherever two halves meet:**
 
 - **The LM head.** Under top-k sampling (production's top-k 20) the global top 20 is exactly the merge of the two halves' top 20s, with ties broken by token id as on one machine. A full-vocabulary normalizer (top-k off, as the completions canary sends, and `logprobs`) is a sum over two halves and needs the same two-level order as option 3, or both halves' terms sent.
@@ -121,7 +123,7 @@ None needs the engine changed. Items 1 and 2 need the direct cable; item 4 needs
 3. **The exact forms' cost.** The 4× exchange against the two-latency relay (section 5, options 1 and 2) on the measured link.
 4. **The half-shapes on one machine.** `stream_gemm` on every split shape (N halved for the by-output parts, K halved for the by-input parts) at 12, 16, 24 and 32 rows, with GB/s per shape, against the full shapes. This gives the per-machine weight time without a second machine.
 
-**Go rule, to be confirmed when the numbers exist:** item 2's 128-all-reduce chain at 12 rows costs ≤ ~8 ms per step in an exact form (or ≤ ~5 ms in a plain one, if the owner takes option 3), and item 4's half-shapes stream at ≥ 200 GB/s. That predicts ≥ 1.5× on decode by section 4's table. Below it, the note is closed with the numbers.
+**Go rule, to be confirmed when the numbers exist:** item 2's 128-all-reduce chain at 12 rows costs ≤ ~8 ms per step in an exact form, the per-row scale exchange included (or ≤ ~5 ms in a plain one, if the owner takes option 3), and item 4's half-shapes stream at ≥ 200 GB/s. That predicts ≥ 1.5× on decode by section 4's table. Below it, the note is closed with the numbers.
 
 ## 7. What it costs
 
