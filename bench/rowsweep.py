@@ -139,14 +139,16 @@ def summarize(out, stats_path=None):
     A = {}   # (context, block) -> [(draft, verify, commit)]
     for log in sorted(glob.glob(os.path.join(out, 'a-block*.log'))):
         B = int(re.search(r'block(\d+)', log).group(1))
-        txt = open(log, errors='replace').read().split('\n')
-        n_seen = 0
-        for line in txt:
+        L = None
+        for line in open(log, errors='replace'):
+            m = PREFILL_RE.search(line)
+            if m:   # each prompt's spec line follows its prefill line: tag it with the nearest context
+                L = min(CONTEXTS_A, key=lambda c: abs(c - int(m.group(1))))
+                continue
             m = SPEC_RE.search(line)
-            if m:
-                L = CONTEXTS_A[n_seen % len(CONTEXTS_A)]
+            if m and L is not None:
                 A.setdefault((L, B), []).append(tuple(float(m.group(k)) for k in (4, 5, 6)))
-                n_seen += 1
+                L = None
     Bm = {}  # (midpoint, N) -> ms per N-row pass
     for log in sorted(glob.glob(os.path.join(out, 'b-chunk*.log'))):
         rows = [CHUNK_RE.search(l) for l in open(log, errors='replace')]
