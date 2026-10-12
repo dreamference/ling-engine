@@ -21,6 +21,7 @@ Night of October 12–13, 2026 · the statistics half of P0 of [the repository-a
    - **The 16–31 calibration:** the oracle reaches +20% only if a 64-row copy step costs at most **1.5×** a production step.
    - **The realistic proposer:** would need copy steps at under a fifth of a step's cost (0.18× at K=64), so in practice it never reaches the bar.
    - **The cap was not the main reason for M1's +4%:** lifting it from 15 to 64 takes the realistic proposer from −0.4% to +7%.
+   - **What could flip it:** the drafter's own rate on copied spans at production's block 12, which M1 measured only at block 16. If it is ≤ 8.5 tokens per step, the oracle clears the bar up to a 1.5× copy step. The GPU session measures it in the same sitting (§6, step C).
 5. **Edits are where it pays:**
    - **Edit scripts at K=64:** +26% (oracle, conservative) and +18% (realistic) on their own tokens; `apply_patch` +25% and +20%. P1's gate for edit spans (≥2× tokens/s) is out of reach on this workload; +15–30% on edit spans is what is there.
    - **The deciding unknowns:** what a 64-row copy step costs (§6; at 1.2× a production step the realistic edit gains fall to +15–18%, at 1.5× to +10–14%), and whether interactive sessions edit in larger, copy-heavier blocks than SWE-bench's `old = """…"""` snippets (§5).
@@ -48,9 +49,9 @@ Night of October 12–13, 2026 · the statistics half of P0 of [the repository-a
 | `file_write` | `cat`/`tee` heredocs into a file, Python writing a file without a replace | 16.5% | 5,589 |
 | `edit_script` | `exec_command` edits: Python `old`/`new` replace-and-write, `sed -i` | 7.5% | 4,015 |
 | `tool_other` | other tools' arguments (code index, `write_stdin`, `wait`) | 1.0% | 17,853 |
-| `edit_patch` | `apply_patch`, as a function tool or through the shell | 0.3% | 181 |
+| `edit_patch` | `apply_patch`: 80 as a function tool, 101 through the shell, none freeform | 0.3% | 181 |
 
-The agent edits almost entirely through `exec_command`. `apply_patch` as a function tool, the form night 5 tests, barely occurs in these runs, so its rows rest on 181 calls in 99 sessions. The classes come from a heuristic on the command text; a test script written with `cat > /tmp/t.py` counts as a file write.
+The agent edits almost entirely through `exec_command`. `apply_patch` as a function tool, the form night 5 tests, barely occurs in these runs (80 calls; 101 more through the shell), so its rows rest on 181 calls in 99 sessions. The classes come from a heuristic on the command text; a test script written with `cat > /tmp/t.py` counts as a file write.
 
 **Sources.**
 
@@ -102,7 +103,7 @@ The agent edits almost entirely through `exec_command`. `apply_patch` as a funct
 | `call_syntax` | 73.2% | 13.9% | 2.9% | 1.1% |
 | `prose` | 8.9% | 3.7% | 1.9% | 0.9% |
 
-**Run lengths** (S1+S2, share of all output in runs of each length): 16–31: 23.7%, 32–63: 8.8%, 64–127: 6.0%, 128–255: 4.7%, 256–511: 2.2%, 512+: 0.7%. Most copyable text sits in runs DFlash2's 12-token block already nearly covers in one or two steps.
+**Run lengths** (S1+S2, share of all output in runs of each length): 16–31: 23.7%, 32–63: 8.8%, 64–127: 6.0%, 128–255: 4.7%, 256–511: 2.2%, 512+: 0.7%. Half of the copyable text sits in runs of 16–31 tokens, two or three steps of DFlash2's 12-token block.
 
 **By group** (S1+S2):
 
@@ -197,6 +198,7 @@ P0's gate (draft §5): long copies must add **≥20% tokens per millisecond on a
 - **B, N-row passes through the prefill path:** N = 32, 64, 96, 128 (`ling-run --chunk-check N`) on prompt pairs (4K, 12K), (24K, 40K), (48K, 64.5K).
   - **The cost of one N-row pass** at the pair's midpoint is ΔT/Δchunks, which cancels fixed costs.
   - **It is an upper bound:** this path also commits the DeltaNet state and writes the KV, and its GEMM is built for 2,048-row chunks.
+- **C, the drafter's own rate on copied spans at block 12**, the number the go/no-go hinges on (8.2 or 10.9 tokens per step, §3, both from M1 at block 16). ling-serve keeps the context lookup in shadow mode by default and reports the drafter's accepted drafts per match-length bucket in `/spec_stats`. One replay of M0's main set at production's block 12 gives the 16–31 and 32+ rates.
 - **The summary:** c(K) = copy step (verify + commit at K rows, no drafter) / production step (block 12: draft + verify + commit), both ways, beside this report's break-even values (`--stats`).
 
 Prompts are filler built from this repository's own specs and sources; no recorded session leaves this machine. Two streams are not covered: a batched verify (M4 stage 3) is what makes rows cost something at batch 2, and it should be swept when it lands.
@@ -216,8 +218,21 @@ setsid nohup python3 bench/rowsweep.py --build build --out /tmp/rowsweep \
 docker start m0-prod8000
 ```
 
+For C, the reference server still stopped:
+
+```bash
+bench/serve_bg.sh 18081                          # block 12, --graphs --pdl: production's settings
+curl -s 127.0.0.1:18081/spec_stats > /tmp/c-before.json
+python3 bench/replay/replay.py --url http://127.0.0.1:18081 --tools <tools.json> --tools-index <tools-index.json> \
+    --sessions-file <main-set sessions> --out /tmp/c-replay.jsonl      # M0's main set, as M1 ran it
+curl -s 127.0.0.1:18081/spec_stats > /tmp/c-after.json
+python3 bench/replay/spec_report.py /tmp/c-before.json /tmp/c-after.json   # "shadow": per-bucket drafter rates
+bench/serve_bg.sh stop 18081
+```
+
 Then, here: `scp second-puffin:/tmp/rowsweep/'*.log' DIR && python3 bench/rowsweep.py --summarize DIR --stats reports/moonshot-p0-copy-stats-2026-10-13.json`. The decision rule:
 
+- **First, C.** If the drafter accepts ≤ 7.5 drafts per step in the 32+ bucket at block 12 (≤ 8.5 tokens per step), read §3's `m1_16` column; above ~9.5 drafts, the `m1` column. Between, interpolate.
 - **A copy step at K=64 costs ≤1.0× a production step** (the extrapolated column at ~32K): the edit-span feature is worth +14–26% on those spans (realistic to oracle). Session-level stays below +20% (§4).
 - **≥1.5×:** P0 closes no-go; the lookup stays off and the copy branch, if any, joins M2's tree at its own row budget.
 - **Between:** the edit-span feature is marginal (+10–18% on edit spans, realistic); decide with night 5's patch-heavy sessions re-run through `copy_stats.py`.
