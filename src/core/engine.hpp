@@ -133,6 +133,7 @@ class Engine {
     int snap_at = 0;       // where the end-of-prompt state is kept
     int window = 0;        // the drafter's context starts here
     std::vector<int> bounds;  // chunk ends where checkpoints are saved
+    uint64_t ckpt_epoch = 0;  // the checkpoint store's clock at begin_prefill: entries used since are this prompt's
     std::chrono::steady_clock::time_point t0;
     EngineStats stats;
     bool done() const { return next >= static_cast<int>(prompt.size()); }
@@ -272,7 +273,10 @@ class Engine {
   StateSlot alloc_slot();
   void copy_state(const StateSlot& slot, bool save);  // save: state -> slot; else slot -> state
   void reset_state();                                 // the zero state of an empty sequence
-  void save_checkpoint(int pos);
+  // Keeps the state after history[0, pos) in the store. Full: the least recently used entry gives way, never one
+  // on the current prompt's prefix (used at or after `epoch`), so a prompt longer than the store keeps its earliest
+  // positions (the ones other sessions share); when every entry is the prompt's own, nothing is saved.
+  void save_checkpoint(int pos, uint64_t epoch);
   void truncate_history(int n);  // forget the tokens from position n on, and every state past them
 
   // Speculation (speculate.cpp).
@@ -350,11 +354,14 @@ class Engine {
   // after exactly `tokens` (a prompt prefix of at most checkpoint_limit ids), found by a hash of the prefix
   // and confirmed by comparing the ids. It outlives the history it was taken from; resuming from it also
   // needs the prefix's KV, which the target session holds or copies from another session.
+  // Each entry's last use: its save, or a prefill whose prompt resumes from it or extends its prefix.
   struct Checkpoint {
     int pos, slot;
     uint64_t hash;
     std::vector<int> tokens;
+    uint64_t used = 0;
   };
+  uint64_t ckpt_clock_ = 0;
   std::vector<StateSlot> ckpt_slots_;
   std::vector<Checkpoint> ckpts_;  // sorted by position
   bool ckpt_match(const Checkpoint& k, const std::vector<int>& prompt, const std::vector<uint64_t>& prefix_hash) const;

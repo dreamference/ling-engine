@@ -397,23 +397,33 @@ bool Engine::ckpt_match(const Checkpoint& k, const std::vector<int>& prompt,
   return std::equal(k.tokens.begin(), k.tokens.end(), prompt.begin());
 }
 
-void Engine::save_checkpoint(int pos) {
+void Engine::save_checkpoint(int pos, uint64_t epoch) {
   const uint64_t hash = fnv_tokens(s_->history.data(), pos);
-  for (const Checkpoint& k : ckpts_)
-    if (k.pos == pos && k.hash == hash && std::equal(k.tokens.begin(), k.tokens.end(), s_->history.begin())) return;
+  for (Checkpoint& k : ckpts_)
+    if (k.pos == pos && k.hash == hash && std::equal(k.tokens.begin(), k.tokens.end(), s_->history.begin())) {
+      k.used = ++ckpt_clock_;
+      return;
+    }
   int slot = -1;
   std::vector<bool> used(ckpt_slots_.size(), false);
   for (const Checkpoint& k : ckpts_) used[k.slot] = true;
   for (size_t i = 0; i < used.size(); ++i)
     if (!used[i]) slot = static_cast<int>(i);
-  if (slot < 0) {  // full: the earliest positions are the ones other sessions share, so the latest gives way
-    if (ckpts_.empty() || ckpts_.back().pos < pos) return;
-    slot = ckpts_.back().slot;
-    ckpts_.pop_back();
+  if (slot < 0) {
+    // Full: the least recently used entry gives way (the owner's decision of 2026-10-12; stage 1 dropped the
+    // latest position, so a store full of other prompts' earlier entries saved nothing new). Entries on this
+    // prompt's own prefix were stamped at or after `epoch` and stay: a prompt longer than the store keeps its
+    // earliest positions, which the sessions that share its system prompt resume from.
+    int victim = -1;
+    for (size_t i = 0; i < ckpts_.size(); ++i)
+      if (ckpts_[i].used < epoch && (victim < 0 || ckpts_[i].used < ckpts_[victim].used)) victim = static_cast<int>(i);
+    if (victim < 0) return;
+    slot = ckpts_[victim].slot;
+    ckpts_.erase(ckpts_.begin() + victim);
   }
   // Stream-ordered: the copy completes before any later restore reads the slot (one stream, M4 §1).
   copy_state(ckpt_slots_[slot], true);
-  ckpts_.push_back({pos, slot, hash, std::vector<int>(s_->history.begin(), s_->history.begin() + pos)});
+  ckpts_.push_back({pos, slot, hash, std::vector<int>(s_->history.begin(), s_->history.begin() + pos), ++ckpt_clock_});
   std::sort(ckpts_.begin(), ckpts_.end(), [](const Checkpoint& a, const Checkpoint& b) { return a.pos < b.pos; });
 }
 
@@ -744,8 +754,8 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   // The drafter attends to the last `window` positions: resuming at p > window start needs its context
   // KV from the window start up to p, which the session's ring holds only from dkv_from() on.
   const int window = draft_ ? std::max(0, L - draft_->config().sliding_window) : 0;
-  std::vector<uint64_t> prefix_hash;  // of prompt[0, i), for the store's lookups
-  if (!from_scratch && !ckpts_.empty()) {
+  std::vector<uint64_t> prefix_hash;  // of prompt[0, i), for the store's lookups (and its LRU stamps, below)
+  if (!ckpts_.empty()) {
     const int n = std::min(L, opts_.checkpoint_limit);
     prefix_hash.resize(n + 1);
     prefix_hash[0] = kFnvBasis;
@@ -781,6 +791,12 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
       }
     }
   }
+  // The store's clock (its LRU order): every entry on this prompt's prefix is used by this prefill, and the
+  // entries it saves come after; save_checkpoint never evicts one of them for another.
+  cur.ckpt_epoch = ++ckpt_clock_;
+  if (!prefix_hash.empty())
+    for (Checkpoint& k : ckpts_)
+      if (ckpt_match(k, prompt, prefix_hash)) k.used = cur.ckpt_epoch;
   if (donor) adopt_prefix(*donor, src.reuse);
   if (src.from) copy_state(*src.from, false);
   else reset_state();
@@ -852,7 +868,7 @@ bool Engine::prefill_chunk(PrefillCursor& cur, int max_tokens) {
     copy_state(s_->snap, true);
     s_->snap_pos = snap_at;
   }
-  if (end < L && std::binary_search(cur.bounds.begin(), cur.bounds.end(), end)) save_checkpoint(end);
+  if (end < L && std::binary_search(cur.bounds.begin(), cur.bounds.end(), end)) save_checkpoint(end, cur.ckpt_epoch);
   cur.stats.chunks += 1;
   if (end < L) {
     cur.stats.compute_seconds +=
