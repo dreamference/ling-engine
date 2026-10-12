@@ -83,6 +83,10 @@ struct Metrics {
   // prefill chunks run between another request's steps so far.
   int batch = 0, prefill_chunk_contended = 0;
   double prefill_chunks_interleaved = 0;
+  // Stage 3: the rows of the last decode pass (a batched verify's sum over its sequences, or one sequence's), and
+  // the batched steps so far (one per batch, whatever its size).
+  int batch_rows = 0;
+  double batched_steps = 0;
   // The session pool (M4 §1): slots, slots holding a session, evictions so far, the protection window.
   int sessions = 0, sessions_resident = 0;
   double session_evictions = 0, protect_seconds = 0;
@@ -93,6 +97,7 @@ struct Metrics {
               {"accept_histogram", spec.accept_hist}, {"draft_seconds", spec.draft_seconds},
               {"verify_seconds", spec.verify_seconds}, {"commit_seconds", spec.commit_seconds},
               {"lookup_steps", spec.lookup_steps}, {"lookup_accepted", spec.lookup_accepted},
+              {"batched_steps", spec.batched_steps},
               {"shadow_total_steps", spec.shadow_total_steps}, {"shadow_dflash_all", spec.shadow_dflash_all},
               {"shadow_best", spec.shadow_best}};
     for (int b = 0; b < 5; ++b) {
@@ -127,6 +132,8 @@ struct Metrics {
     counter("ling:session_evictions_total", session_evictions, "Resident sessions replaced by a new session.");
     counter("ling:prefill_chunks_interleaved_total", prefill_chunks_interleaved,
             "Prefill chunks run between another request's decode steps.");
+    counter("ling:batched_steps_total", batched_steps,
+            "Decode steps that verified two or more requests' rows in one pass.");
     auto gauge = [&](const char* name, double v, const char* help) {
       out += std::string("# HELP ") + name + " " + help + "\n# TYPE " + name + " gauge\n";
       char buf[64];
@@ -142,6 +149,7 @@ struct Metrics {
     gauge("ling:batch", batch, "Requests that run at once (each in its own session).");
     gauge("ling:prefill_chunk_contended", prefill_chunk_contended,
           "Prefill chunk size, in tokens, while another request decodes.");
+    gauge("ling:batch_rows", batch_rows, "Rows of the last decode pass (all its requests' rows when batched).");
     gauge("ling:session_protect_seconds", protect_seconds,
           "How long a keyed session is protected from eviction after its last request.");
     return out;
@@ -225,6 +233,7 @@ struct Running {
   std::chrono::steady_clock::time_point t_decode, last_step;
   long steps0 = 0, drafted0 = 0, accepted0 = 0;
   int chunks_beside = 0;  // prefill chunks run while another request was decoding (contended size)
+  int batched = 0;        // its decode steps taken in a batch with another request (M4 stage 3)
   Periods alone, beside;  // step periods without and with another request's prefill in between
 };
 
@@ -234,6 +243,10 @@ struct Running {
 // done, else one decode step (speculative, or plain). A prefill chunk that runs while another request is
 // decoding is at most `contended` tokens, which bounds the decoding request's step period during a long
 // prefill. Nothing numeric changes: each unit runs in its own session's state, as it would alone.
+// Stage 3: when the request whose turn it is decodes speculatively and another one does too, they take one
+// batched step together (Engine::speculate_batch: one verify pass over both requests' rows), which is bit for bit
+// each one's step alone. A request that cannot join (plain decoding, no room for a full draft block) takes its own
+// one-row step on its turn; a prefill chunk still alternates with the decode steps.
 class Scheduler {
  public:
   Scheduler(ServerContext& ctx, double protect_seconds, int batch, int contended)
@@ -367,22 +380,94 @@ class Scheduler {
       if (running_.empty()) continue;
       const size_t k = turn_++ % running_.size();
       Running& r = *running_[k];
-      bool ended = false;
-      try {
-        ended = unit(r);
-      } catch (const std::exception& e) {
-        fail(r, e);
-        ended = true;
+      std::vector<Running*> ended;
+      std::vector<Running*> batch = batch_with(r);
+      if (batch.size() >= 2) {
+        batch_step(batch, ended);
+      } else {
+        bool done = false;
+        try {
+          done = unit(r);
+        } catch (const std::exception& e) {
+          fail(r, e);
+          done = true;
+        }
+        if (done) ended.push_back(&r);
       }
-      if (!ended) continue;
-      ctx_.engine->touch_session(r.job.session);  // the session's clock restarts however the request ended
-      running_.erase(running_.begin() + k);
+      if (ended.empty()) continue;
+      for (Running* e : ended) {
+        ctx_.engine->touch_session(e->job.session);  // the session's clock restarts however the request ended
+        running_.erase(std::find_if(running_.begin(), running_.end(), [&](const auto& p) { return p.get() == e; }));
+      }
       {
         std::lock_guard<std::mutex> l(mu_);
         dirty_ = true;  // its session may be what a queued job waits for
       }
       std::lock_guard<std::mutex> m(ctx_.metrics.mu);
       ctx_.metrics.running = static_cast<int>(running_.size());
+    }
+  }
+
+  // Whether r's next decode step can join a batch: past its prompt, speculative, room for a full draft block.
+  bool batchable(const Running& r) const {
+    return !r.prefilling && r.spec && ctx_.engine->can_batch(r.job.session, r.job.req.sampling);
+  }
+  // The requests that step with r (r first, then the others in running order) while their rows fit one pass;
+  // just r, or nothing, when there is no batch to form.
+  std::vector<Running*> batch_with(Running& r) const {
+    std::vector<Running*> b;
+    if (!batchable(r)) return b;
+    b.push_back(&r);
+    const int fit = kernels::kMaxStreamRows / ctx_.engine->draft_block();
+    for (const auto& o : running_)
+      if (o.get() != &r && static_cast<int>(b.size()) < fit && batchable(*o)) b.push_back(o.get());
+    return b;
+  }
+
+  // One batched speculative step of the requests in `batch`, then each one's tokens emitted as unit() does;
+  // the requests that end are added to `ended`. A non-finite row fails only its own request.
+  void batch_step(const std::vector<Running*>& batch, std::vector<Running*>& ended) {
+    Engine& eng = *ctx_.engine;
+    std::vector<Engine::SeqStep> steps(batch.size());
+    const auto now = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < batch.size(); ++i) {
+      Running& r = *batch[i];
+      (other_prefilling(r) ? r.beside : r.alone).add(std::chrono::duration<double>(now - r.last_step).count());
+      r.last_step = now;
+      ++r.passes;
+      ++r.batched;
+      steps[i].session = r.job.session;
+      steps[i].anchor = r.pending.back();
+      steps[i].params = &r.job.req.sampling;
+      steps[i].row_logits = r.job.req.logprobs ? &r.rows : nullptr;
+    }
+    try {
+      eng.speculate_batch(steps);
+    } catch (const std::exception& e) {  // not one sequence's rows: the step itself failed
+      for (Running* r : batch) {
+        fail(*r, e);
+        ended.push_back(r);
+      }
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+      ctx_.metrics.batched_steps += 1;
+      ctx_.metrics.batch_rows = static_cast<int>(batch.size()) * eng.draft_block();  // a full block each
+    }
+    for (size_t i = 0; i < batch.size(); ++i) {
+      Running& r = *batch[i];
+      bool done = false;
+      try {
+        if (steps[i].error) std::rethrow_exception(steps[i].error);
+        r.pending = std::move(steps[i].out);
+        if (r.job.req.logprobs) require_finite(r.rows);  // as unit(): a row reported as logprobs is checked whole
+        done = emit(r) && end(r);
+      } catch (const std::exception& e) {
+        fail(r, e);
+        done = true;
+      }
+      if (done) ended.push_back(&r);
     }
   }
 
@@ -414,6 +499,10 @@ class Scheduler {
     r.last_step = now;
     eng.select_session(r.job.session);
     ++r.passes;
+    {
+      std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+      ctx_.metrics.batch_rows = r.spec ? std::min(eng.draft_block(), eng.max_context() - static_cast<int>(eng.history().size())) : 1;
+    }
     if (r.spec) {
       r.pending = eng.speculate(r.pending.back(), r.job.req.sampling, r.job.req.logprobs ? &r.rows : nullptr);
       // The verify checks only each row's top K for NaN and inf (the plain path's sample() checks the
@@ -545,11 +634,11 @@ class Scheduler {
                     r.alone.mean_ms(), 1e3 * r.alone.max, r.alone.n, r.beside.mean_ms(), 1e3 * r.beside.max, r.beside.n);
     std::fprintf(stderr,
                  "request: session %d%s, %zu prompt tokens (%d reused), prefill %.2f s (%d chunks, %d beside a decode, "
-                 "%.0f tok/s of compute); %d tokens in %.2f s (%.1f tok/s), %s; %d passes%s%s\n",
+                 "%.0f tok/s of compute); %d tokens in %.2f s (%.1f tok/s), %s; %d passes (%d batched)%s%s\n",
                  job.session, job.fresh ? " (new)" : "", job.prompt.size(), stats.reused_tokens, stats.prefill_seconds,
                  stats.chunks, r.chunks_beside,
                  stats.compute_seconds > 0 ? stats.prefill_tokens / stats.compute_seconds : 0.0, r.produced, decode_s,
-                 decode_s > 0 ? r.produced / decode_s : 0.0, r.finish.c_str(), r.passes,
+                 decode_s > 0 ? r.produced / decode_s : 0.0, r.finish.c_str(), r.passes, r.batched,
                  r.spec && steps > 0 ? (", " + std::to_string(double(r.produced) / std::max(1, r.passes)).substr(0, 4) +
                                         " tokens/pass").c_str()
                                      : "",

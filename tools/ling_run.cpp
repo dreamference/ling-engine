@@ -6,6 +6,7 @@
 //            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N]]
 //            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16] [--graph-check] [--seed N]
 //            [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N]]
+//            [--batch-check]
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -42,6 +43,15 @@
 // the two then take steps in turn, as ling-serve interleaves two requests. Per sequence the tokens, the state,
 // the steps and the accepted drafts must equal the run alone. Greedy and sampled (--temperature, default 1,
 // seeded by --seed or 1), and with the pair swapped.
+//
+// --batch-check (M4 §4, stage 3; needs --draft and --sessions 2) takes the prompts in pairs (A, B) and decodes
+// each pair as a batch of two (Engine::speculate_batch: one verify pass over both sequences' rows), --max-tokens
+// each, greedily and sampled (--temperature, default 1, seeded by --seed or 1). Four runs per pair and mode: both
+// prefilled, then batched with the rows in the order [A, B] and in the order [B, A]; and one sequence prefilling
+// in chunks of --prefill-chunk-contended tokens while the other decodes alone, then the two batched, each way
+// round. Per sequence the tokens, the state, the steps and the accepted drafts must equal the prompt decoded
+// alone (speculatively, from a cold engine, under the same seed). The batch path runs eagerly; with --graphs the
+// runs alone (and a sequence's steps outside the batch) use step graphs.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -67,7 +77,7 @@ int main(int argc, char** argv) {
   int attn_prefetch = 2;
   std::string draft;
   int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256;
-  bool interleave_check = false;
+  bool interleave_check = false, batch_check = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -104,6 +114,7 @@ int main(int argc, char** argv) {
     else if (a == "--sessions") sessions = std::stoi(next());
     else if (a == "--chunk-check") chunk_check = std::stoi(next());
     else if (a == "--interleave-check") interleave_check = true;
+    else if (a == "--batch-check") batch_check = true;
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
@@ -331,6 +342,130 @@ int main(int argc, char** argv) {
         }
       }
       std::printf(failures ? "INTERLEAVE CHECK FAILED\n" : "interleave check passed\n");
+      return failures ? 1 : 0;
+    }
+    if (batch_check) {
+      if (!engine.has_drafter() || engine.sessions() < 2 || prompts.size() < 2)
+        throw std::runtime_error("--batch-check needs --draft, --sessions 2 and at least two prompts");
+      // Emits q's pending tokens; true when q is done.
+      auto emit = [&](Seq& q, int limit) {
+        for (int t : q.pending) {
+          q.out.push_back(t);
+          if (is_end(t) || static_cast<int>(q.out.size()) >= limit) return q.done = true;
+        }
+        return false;
+      };
+      // Decodes the sequences in `order` together: every step, those still going and able to join take one
+      // batched step (rows in this order); one that cannot join takes its own one-row step.
+      auto run_batch = [&](std::vector<Seq*> order) {
+        while (true) {
+          std::vector<Seq*> live;
+          for (Seq* q : order)
+            if (!q->done && !emit(*q, max_tokens)) live.push_back(q);
+          if (live.empty()) return;
+          std::vector<ling::Engine::SeqStep> steps;
+          std::vector<Seq*> in;
+          for (Seq* q : live) {
+            if (engine.can_batch(q->session, q->sp)) {
+              ling::Engine::SeqStep st;
+              st.session = q->session;
+              st.anchor = q->pending.back();
+              st.params = &q->sp;
+              steps.push_back(std::move(st));
+              in.push_back(q);
+            } else {
+              engine.select_session(q->session);
+              q->pending = engine.speculate(q->pending.back(), q->sp);
+            }
+          }
+          engine.speculate_batch(steps);
+          for (size_t i = 0; i < steps.size(); ++i) {
+            if (steps[i].error) std::rethrow_exception(steps[i].error);
+            in[i]->pending = steps[i].out;
+          }
+        }
+      };
+      auto start = [&](Seq& q, int session, const std::vector<int>& prompt) {
+        q.session = session;
+        engine.activate_session(session, "", true);
+        engine.prefill(prompt);
+        q.pending = {engine.sample(engine.logits(), q.sp, engine.history())};
+      };
+      for (size_t pi = 0; pi + 1 < prompts.size(); pi += 2) {
+        const std::vector<int>* P[2] = {&prompts[pi], &prompts[pi + 1]};
+        for (int sampled = 0; sampled < 2; ++sampled) {
+          ling::SamplingParams sp;
+          sp.temperature = sampled ? (temperature > 0.f ? temperature : 1.f) : 0.f;
+          sp.seed = seed ? seed : 1;
+          Result alone[2];
+          for (int k = 0; k < 2; ++k) {
+            engine.reset_all();
+            Seq q;
+            q.sp = sp;
+            start(q, 0, *P[k]);
+            while (!q.done) advance(q, max_tokens);
+            alone[k] = result_of(q);
+          }
+          // Runs: 0 and 1 both prefilled, rows [A, B] and [B, A]; 2 and 3 the first decoding while the second
+          // prefills (A first, then B first), then rows [first, second].
+          const char* names[4] = {"together, rows [A, B]", "together, rows [B, A]", "B prefilling beside A",
+                                  "A prefilling beside B"};
+          for (int run = 0; run < 4; ++run) {
+            engine.reset_all();
+            Seq q[2];
+            q[0].sp = q[1].sp = sp;
+            int chunks_beside = 0, steps_beside = 0;
+            if (run < 2) {
+              start(q[0], 0, *P[0]);
+              start(q[1], 1, *P[1]);
+              run_batch(run == 0 ? std::vector<Seq*>{&q[0], &q[1]} : std::vector<Seq*>{&q[1], &q[0]});
+            } else {
+              const int f = run == 2 ? 0 : 1, o = 1 - f;  // first (decoding), other (prefilling)
+              start(q[f], 0, *P[f]);
+              for (int k = 0; k < 2 && !q[f].done; ++k) advance(q[f], max_tokens);
+              q[o].session = 1;
+              engine.activate_session(1, "", true);
+              ling::Engine::PrefillCursor cur = engine.begin_prefill(*P[o]);
+              while (!cur.done()) {
+                if (engine.prefill_chunk(cur, q[f].done ? 0 : contended))
+                  q[o].pending = {engine.sample(engine.logits(), q[o].sp, engine.history())};
+                chunks_beside += !q[f].done;
+                if (!q[f].done) {
+                  advance(q[f], max_tokens);
+                  ++steps_beside;
+                }
+              }
+              run_batch({&q[f], &q[o]});
+            }
+            Result r[2];
+            long batched[2];
+            for (int k = 0; k < 2; ++k) {
+              r[k] = result_of(q[k]);
+              batched[k] = engine.session_spec_stats(q[k].session).batched_steps;
+            }
+            const bool same[2] = {r[0] == alone[0], r[1] == alone[1]};
+            failures += !same[0] + !same[1];
+            std::printf("pair %zu, %s, %s%s: A %zu prompt tokens, %zu out, %ld steps (%ld batched) %ld accepted: %s | "
+                        "B %zu prompt tokens, %zu out, %ld steps (%ld batched) %ld accepted: %s\n",
+                        pi / 2, sampled ? "sampled" : "greedy", names[run],
+                        run >= 2 ? (" (" + std::to_string(chunks_beside) + " chunks beside " +
+                                    std::to_string(steps_beside) + " steps)").c_str()
+                                 : "",
+                        P[0]->size(), r[0].tokens.size(), r[0].steps, batched[0], r[0].accepted,
+                        same[0] ? "identical" : "DIFFERS", P[1]->size(), r[1].tokens.size(), r[1].steps, batched[1],
+                        r[1].accepted, same[1] ? "identical" : "DIFFERS");
+            for (int k = 0; k < 2; ++k)
+              if (!same[k]) {
+                size_t i = 0;
+                while (i < r[k].tokens.size() && i < alone[k].tokens.size() && r[k].tokens[i] == alone[k].tokens[i]) ++i;
+                std::printf("  %c alone: %zu out, %ld steps %ld accepted, state %s; first token difference at %zu\n",
+                            "AB"[k], alone[k].tokens.size(), alone[k].steps, alone[k].accepted,
+                            alone[k].hash == r[k].hash ? "identical" : "differs", i);
+              }
+          }
+        }
+      }
+      std::printf(failures ? "BATCH CHECK FAILED\n" : "batch check passed\n");
       return failures ? 1 : 0;
     }
     if (prefix_check) {

@@ -213,16 +213,18 @@ void Engine::run_graph(cudaGraphExec_t& slot, const char* what, const std::funct
   body();
 }
 
-void Engine::commit(int n) {
+void Engine::commit(int row0, int n) {
   const ModelConfig& c = model_->config();
+  const size_t C = c.lin_conv_channels(), r0 = row0;
   for (int li = 0; li < c.layers; ++li) {
     const LayerWeights& L = model_->layers()[li];
     if (L.full) continue;  // the verify already wrote the KV; rows past pos + n are overwritten later
     const int slot = layer_slot_[li];
     // The conv window advances over the accepted rows' raw inputs, the recurrence over their conv outputs.
-    kernels::gdn_conv(v_pre_[slot], s_->conv[slot], L.conv, n, c.lin_conv_channels(), stream_);
-    kernels::gdn_recurrent(v_post_[slot], v_g_[slot], v_beta_[slot], s_->gdn[slot], s_->gdn[slot], core_, n,
-                           c.lin_k_heads, c.lin_v_heads, stream_);
+    // In a batch the sequence's rows start at row0; the conv runs in place over its own rows only.
+    kernels::gdn_conv(v_pre_[slot] + r0 * C, s_->conv[slot], L.conv, n, c.lin_conv_channels(), stream_);
+    kernels::gdn_recurrent(v_post_[slot] + r0 * C, v_g_[slot] + r0 * c.lin_v_heads, v_beta_[slot] + r0 * c.lin_v_heads,
+                           s_->gdn[slot], s_->gdn[slot], core_, n, c.lin_k_heads, c.lin_v_heads, stream_);
   }
 }
 
@@ -319,11 +321,143 @@ void Engine::verify_launch(int V, int K) {
         "topk");
 }
 
-void Engine::commit_launch(int n) {
+void Engine::commit_launch(int row0, int n) {
   NvtxRange range("commit");
   quantized_ = false;  // at most 32 rows: the rows path, whatever the last forward() left (see draft_launch)
-  commit(n);
-  draft_materialize(n, dpos(), 0);
+  commit(row0, n);
+  draft_materialize(n, dpos(), row0);  // the verify's target features of those rows
+}
+
+// One sequence's part of a speculative step on the host: what speculate() kept in locals, so a batch can hold
+// one per sequence.
+struct Engine::StepPlan {
+  Session* s = nullptr;
+  const SamplingParams* p = nullptr;
+  int anchor = 0;
+  bool greedy = true, use_lookup = false;
+  int E = 0, V = 0, K = 1, row0 = 0;
+  LookupProposal lp;
+  std::vector<int> rows;                // the anchor, then the drafted (or looked-up) tokens
+  std::vector<std::vector<double>> q;   // the draft's distribution over its candidates, per drafted position
+  std::vector<int> cand;                // the drafter's candidates [E][K16] (pin_ holds one sequence's at a time)
+  int accepted = 0, next = 0;
+  bool failed = false;
+};
+
+void Engine::plan_begin(StepPlan& sp, int B) {
+  Session& s = *sp.s;
+  const SamplingParams& p = *sp.p;
+  sp.greedy = p.temperature <= 0.f;
+  sp.E = B - 1;
+  if (p.seed != 0) s.rng.seed(p.seed + s.history.size());
+  // 0. The context lookup: verified instead of the drafter's chain on a long verbatim match (auto), or
+  // only recorded and scored later (shadow).
+  if (opts_.lookup_mode > 0) {
+    std::vector<int> seq(s.history);
+    seq.push_back(sp.anchor);
+    sp.lp = lookup_propose(seq, sp.E);
+  }
+  sp.use_lookup = opts_.lookup_mode == 2 && !sp.lp.tokens.empty() && sp.lp.match >= opts_.lookup_min_match;
+  sp.rows.assign(1, sp.anchor);
+  if (sp.use_lookup) {
+    sp.rows.insert(sp.rows.end(), sp.lp.tokens.begin(), sp.lp.tokens.end());
+    sp.E = static_cast<int>(sp.lp.tokens.size());
+  }
+  sp.V = sp.E + 1;
+  sp.K = sp.greedy ? 1 : p.top_k;
+}
+
+void Engine::plan_draft(StepPlan& sp, int B, bool graph) {
+  // 1. Draft (the active session must be sp.s), and walk the selector's lattice (SGLang's sample_path).
+  const SamplingParams& p = *sp.p;
+  const int K16 = draft_->config().selector_top_k, E = sp.E;
+  std::uniform_real_distribution<double> uni(0.0, 1.0);
+  draft_propose(sp.anchor, B, graph);
+  sp.cand.assign(pin_->cand, pin_->cand + size_t(E) * K16);
+  const float* scores_host = pin_->scores;
+  sp.rows.resize(B);
+  sp.q.assign(E, std::vector<double>(K16, 0.0));
+  int prev = 0;
+  for (int e = 0; e < E; ++e) {
+    const float* sc = scores_host + (size_t(e) * K16 + (e == 0 ? 0 : prev)) * K16;
+    std::vector<double>& q = sp.q[e];
+    int pick = 0;
+    if (sp.greedy) {
+      for (int k = 1; k < K16; ++k)
+        if (sc[k] > sc[pick]) pick = k;  // ties to the lower index
+      q[pick] = 1.0;
+    } else {
+      const double T = std::max(double(p.temperature), 1e-5);
+      double mx = sc[0];
+      for (int k = 1; k < K16; ++k) mx = std::max(mx, double(sc[k]));
+      double sum = 0;
+      for (int k = 0; k < K16; ++k) sum += q[k] = std::exp((sc[k] - mx) / T);
+      for (double& v : q) v /= sum;
+      const double u = uni(sp.s->rng);
+      double cum = 0;
+      pick = K16 - 1;
+      for (int k = 0; k < K16; ++k) {
+        cum += q[k];
+        if (u < cum) {
+          pick = k;
+          break;
+        }
+      }
+    }
+    sp.rows[e + 1] = sp.cand[size_t(e) * K16 + pick];
+    prev = pick;
+  }
+}
+
+void Engine::plan_accept(StepPlan& sp, const float* vals, const int* ids) {
+  // On the host, after the step (graph or not): no verified row may be NaN or inf (core/sampling.hpp).
+  const int V = sp.V, K = sp.K, E = sp.E;
+  require_finite_topk({vals, size_t(V) * K}, {ids, size_t(V) * K}, model_->config().vocab);
+  // 3. Accept.
+  if (sp.greedy) {  // K = 1: ids holds each row's argmax
+    int accepted = 0;
+    while (accepted < E && sp.rows[accepted + 1] == ids[accepted]) ++accepted;
+    sp.accepted = accepted;
+    sp.next = ids[accepted];
+    return;
+  }
+  const int K16 = draft_->config().selector_top_k;
+  auto q_of = [&](int e, int token) {  // the draft's probability of `token` at drafted position e
+    if (sp.use_lookup) return token == sp.rows[e + 1] ? 1.0 : 0.0;  // a deterministic proposal
+    double qt = 0;
+    const int* cand = sp.cand.data() + size_t(e) * K16;
+    for (int k = 0; k < K16; ++k)
+      if (cand[k] == token) qt += sp.q[e][k];
+    return qt;
+  };
+  std::vector<Dist> P(V);
+  for (int i = 0; i < V; ++i) P[i] = target_dist(vals + size_t(i) * K, ids + size_t(i) * K, K, *sp.p);
+  const auto [acc, tok] = accept_sampled(P, std::vector<int>(sp.rows.begin() + 1, sp.rows.end()), q_of, sp.s->rng);
+  sp.accepted = acc;
+  sp.next = tok;
+}
+
+void Engine::plan_count(StepPlan& sp) {
+  Session& s = *sp.s;
+  const int accepted = sp.accepted, n = accepted + 1;
+  s.spec.steps += 1;
+  s.spec.drafted += sp.E;
+  s.spec.accepted += accepted;
+  s.spec.accept_hist[accepted] += 1;
+  if (sp.use_lookup) {
+    s.spec.lookup_steps += 1;
+    s.spec.lookup_accepted += accepted;
+  } else if (opts_.lookup_mode == 1 && !sp.lp.tokens.empty()) {
+    const int m = sp.lp.match;
+    const int bucket = m >= 32 ? 4 : m >= 16 ? 3 : m >= 8 ? 2 : m >= 4 ? 1 : 0;
+    s.shadow.push_back({s.pos - n, std::move(sp.lp.tokens), m, accepted, bucket});
+  }
+  if (!sp.use_lookup && opts_.lookup_mode == 1) {
+    s.spec.shadow_total_steps += 1;
+    s.spec.shadow_dflash_all += accepted;
+    if (s.shadow.empty() || s.shadow.back().pos != s.pos - n) s.spec.shadow_best += accepted;  // no proposal
+  }
+  score_shadow(s, false);
 }
 
 std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vector<float>* row_logits) {
@@ -331,7 +465,6 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   const int room = opts_.max_context - s_->pos;
   if (room < 1) throw std::runtime_error("context is longer than max_context");
   const int B = std::min(opts_.draft_block, room);
-  const bool greedy = p.temperature <= 0.f;
   if (B < 2) {  // no room to draft: one plain step
     step(anchor);
     if (row_logits) *row_logits = logits_;
@@ -340,76 +473,23 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   // Graphs have the block's shape and the drafter's chain; a short block at the context's end or a lookup
   // chain runs eagerly. Either way the same kernels run, so the result is the same.
   const bool graph = graphs_ && B == opts_.draft_block && !(opts_.lookup_mode == 2);
-  const int K16 = draft_->config().selector_top_k;
-  int E = B - 1;
-  if (p.seed != 0) s_->rng.seed(p.seed + s_->history.size());
-  std::uniform_real_distribution<double> uni(0.0, 1.0);
   auto t0 = std::chrono::steady_clock::now();
-
-  // 0. The context lookup: verified instead of the drafter's chain on a long verbatim match (auto), or
-  // only recorded and scored later (shadow).
-  LookupProposal lp;
-  if (opts_.lookup_mode > 0) {
-    std::vector<int> seq(s_->history);
-    seq.push_back(anchor);
-    lp = lookup_propose(seq, E);
-  }
-  const bool use_lookup = opts_.lookup_mode == 2 && !lp.tokens.empty() && lp.match >= opts_.lookup_min_match;
-  std::vector<int> rows(1, anchor);
-  std::vector<std::vector<double>> q;
-  if (use_lookup) {
-    rows.insert(rows.end(), lp.tokens.begin(), lp.tokens.end());
-    E = static_cast<int>(lp.tokens.size());
-  }
+  StepPlan sp;
+  sp.s = s_;
+  sp.p = &p;
+  sp.anchor = anchor;
+  plan_begin(sp, B);
   if (graph) {  // the position every graph of this step reads
     pin_->pos = s_->pos;
     check(cudaMemcpyAsync(pos_dev_, &pin_->pos, sizeof(int), cudaMemcpyHostToDevice, stream_), "position");
   }
-
-  // 1. Draft, and walk the selector's lattice (SGLang's sample_path).
-  if (!use_lookup) {
-  draft_propose(anchor, B, graph);
-  const int* cand_host = pin_->cand;
-  const float* scores_host = pin_->scores;
-  rows.resize(B);
-  q.assign(E, std::vector<double>(K16, 0.0));
-  int prev = 0;
-  for (int e = 0; e < E; ++e) {
-    const float* s = scores_host + (size_t(e) * K16 + (e == 0 ? 0 : prev)) * K16;
-    int pick = 0;
-    if (greedy) {
-      for (int k = 1; k < K16; ++k)
-        if (s[k] > s[pick]) pick = k;  // ties to the lower index
-      q[e][pick] = 1.0;
-    } else {
-      const double T = std::max(double(p.temperature), 1e-5);
-      double mx = s[0];
-      for (int k = 1; k < K16; ++k) mx = std::max(mx, double(s[k]));
-      double sum = 0;
-      for (int k = 0; k < K16; ++k) sum += q[e][k] = std::exp((s[k] - mx) / T);
-      for (double& v : q[e]) v /= sum;
-      const double u = uni(s_->rng);
-      double cum = 0;
-      pick = K16 - 1;
-      for (int k = 0; k < K16; ++k) {
-        cum += q[e][k];
-        if (u < cum) {
-          pick = k;
-          break;
-        }
-      }
-    }
-    rows[e + 1] = cand_host[size_t(e) * K16 + pick];
-    prev = pick;
-  }
-  }
-  const int V = E + 1;  // rows verified
+  if (!sp.use_lookup) plan_draft(sp, B, graph);
+  const int V = sp.V, K = sp.K;  // rows verified, top K per row
   auto t1 = std::chrono::steady_clock::now();
   s_->spec.draft_seconds += std::chrono::duration<double>(t1 - t0).count();
 
   // 2. Verify, with each row's top K (the argmax when greedy) on the GPU.
-  const int K = greedy ? 1 : p.top_k;
-  std::copy(rows.begin(), rows.end(), pin_->rows);
+  std::copy(sp.rows.begin(), sp.rows.end(), pin_->rows);
   if (graph) {
     cudaGraphExec_t& g = s_->verify_graphs[K];
     run_graph(g, "verify", [&] { verify_launch(V, K); });
@@ -417,37 +497,12 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
     verify_launch(V, K);
   }
   check(cudaStreamSynchronize(stream_), "verify");
-  // On the host, after the step (graph or not): no verified row may be NaN or inf (core/sampling.hpp).
-  require_finite_topk({pin_->topk_vals, size_t(V) * K}, {pin_->topk_ids, size_t(V) * K}, model_->config().vocab);
-
-  // 3. Accept.
-  int accepted = 0, next = 0;
-  if (greedy) {
-    const int* am = pin_->topk_ids;
-    while (accepted < E && rows[accepted + 1] == am[accepted]) ++accepted;
-    next = am[accepted];
-  } else {
-    const float* vals = pin_->topk_vals;
-    const int* ids = pin_->topk_ids;
-    auto q_of = [&](int e, int token) {  // the draft's probability of `token` at drafted position e
-      if (use_lookup) return token == rows[e + 1] ? 1.0 : 0.0;  // a deterministic proposal
-      double qt = 0;
-      const int* cand = pin_->cand + size_t(e) * K16;
-      for (int k = 0; k < K16; ++k)
-        if (cand[k] == token) qt += q[e][k];
-      return qt;
-    };
-    std::vector<Dist> P(V);
-    for (int i = 0; i < V; ++i) P[i] = target_dist(vals + size_t(i) * K, ids + size_t(i) * K, K, p);
-    const auto [acc, tok] = accept_sampled(P, std::vector<int>(rows.begin() + 1, rows.end()), q_of, s_->rng);
-    accepted = acc;
-    next = tok;
-  }
+  plan_accept(sp, pin_->topk_vals, pin_->topk_ids);  // 3. accept
   auto t2 = std::chrono::steady_clock::now();
   s_->spec.verify_seconds += std::chrono::duration<double>(t2 - t1).count();
 
   // 4. Commit the anchor and the accepted drafts.
-  const int n = accepted + 1;
+  const int n = sp.accepted + 1;
   if (row_logits) {  // the rows the returned tokens were chosen from: row i chose rows[i + 1], row accepted chose next
     const size_t vocab = model_->config().vocab;
     row_logits->resize(size_t(n) * vocab);
@@ -458,35 +513,138 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   }
   if (graph) {
     if (s_->commit_graphs.size() < size_t(V) + 1) s_->commit_graphs.resize(size_t(V) + 1, nullptr);
-    run_graph(s_->commit_graphs[n], "commit", [&] { commit_launch(n); });
+    run_graph(s_->commit_graphs[n], "commit", [&] { commit_launch(0, n); });
   } else {
-    commit_launch(n);
+    commit_launch(0, n);
   }
-  s_->history.insert(s_->history.end(), rows.begin(), rows.begin() + n);
+  s_->history.insert(s_->history.end(), sp.rows.begin(), sp.rows.begin() + n);
   s_->pos += n;
   check(cudaStreamSynchronize(stream_), "commit");
   s_->spec.commit_seconds += seconds_since(t2);
-  s_->spec.steps += 1;
-  s_->spec.drafted += E;
-  s_->spec.accepted += accepted;
-  s_->spec.accept_hist[accepted] += 1;
-  if (use_lookup) {
-    s_->spec.lookup_steps += 1;
-    s_->spec.lookup_accepted += accepted;
-  } else if (opts_.lookup_mode == 1 && !lp.tokens.empty()) {
-    const int bucket = lp.match >= 32 ? 4 : lp.match >= 16 ? 3 : lp.match >= 8 ? 2 : lp.match >= 4 ? 1 : 0;
-    s_->shadow.push_back({s_->pos - n, std::move(lp.tokens), lp.match, accepted, bucket});
-  }
-  if (!use_lookup && opts_.lookup_mode == 1) {
-    s_->spec.shadow_total_steps += 1;
-    s_->spec.shadow_dflash_all += accepted;
-    if (s_->shadow.empty() || s_->shadow.back().pos != s_->pos - n) s_->spec.shadow_best += accepted;  // no proposal
-  }
-  score_shadow(*s_, false);
+  plan_count(sp);
 
-  std::vector<int> out(rows.begin() + 1, rows.begin() + n);
-  out.push_back(next);
+  std::vector<int> out(sp.rows.begin() + 1, sp.rows.begin() + n);
+  out.push_back(sp.next);
   return out;
+}
+
+bool Engine::can_batch(int session, const SamplingParams& p) const {
+  const Session& s = sessions_.at(session);
+  return can_speculate(p) && opts_.max_context - s.pos >= opts_.draft_block;
+}
+
+void Engine::verify_batch_launch(std::span<StepPlan> plans, int V) {
+  const ModelConfig& c = model_->config();
+  std::vector<Seg> segs;
+  for (const StepPlan& sp : plans) segs.push_back({sp.s, sp.row0, sp.V});
+  forward_rows(pin_->rows, V, Pass::Verify, -1, segs);
+  // Each sequence's top K over its own rows (K differs between a greedy and a sampled one), at 64 values per row
+  // from its first row on, so the regions never overlap.
+  for (const StepPlan& sp : plans) {
+    const size_t at = size_t(sp.row0) * 64, n = size_t(sp.V) * sp.K;
+    kernels::topk_rows(logits_dev_ + size_t(sp.row0) * c.vocab, sp.V, c.vocab, sp.K, topk_scratch_, vals_dev_ + at,
+                       ids_out_dev_ + at, stream_);
+    check(cudaMemcpyAsync(pin_->topk_vals + at, vals_dev_ + at, n * sizeof(float), cudaMemcpyDeviceToHost, stream_),
+          "topk");
+    check(cudaMemcpyAsync(pin_->topk_ids + at, ids_out_dev_ + at, n * sizeof(int), cudaMemcpyDeviceToHost, stream_),
+          "topk");
+  }
+}
+
+void Engine::speculate_batch(std::span<SeqStep> seqs) {
+  if (seqs.empty()) return;
+  for (const SeqStep& q : seqs) {
+    if (q.session < 0 || q.session >= sessions() || !q.params) throw std::runtime_error("speculate_batch: bad entry");
+    if (!can_batch(q.session, *q.params)) throw std::runtime_error("speculate_batch: a sequence cannot join the batch");
+    for (const SeqStep& o : seqs)
+      if (&o != &q && o.session == q.session) throw std::runtime_error("speculate_batch: a session twice");
+  }
+  if (seqs.size() == 1) {  // a batch of one is the one-row step (graphs and all)
+    SeqStep& q = seqs[0];
+    select_session(q.session);
+    try {
+      q.out = speculate(q.anchor, *q.params, q.row_logits);
+    } catch (const NonFiniteLogits&) {
+      q.error = std::current_exception();
+      reset_session();
+    }
+    return;
+  }
+  const int B = opts_.draft_block;
+  const size_t vocab = model_->config().vocab;
+  auto t0 = std::chrono::steady_clock::now();
+  // 0-1. Per sequence: its proposal, and the drafter's block over its own context ring (eager: graphs for the
+  // batch path are stage 4).
+  std::vector<StepPlan> plans(seqs.size());
+  int V = 0;
+  for (size_t i = 0; i < seqs.size(); ++i) {
+    StepPlan& sp = plans[i];
+    select_session(seqs[i].session);
+    sp.s = s_;
+    sp.p = seqs[i].params;
+    sp.anchor = seqs[i].anchor;
+    plan_begin(sp, B);
+    if (!sp.use_lookup) plan_draft(sp, B, false);
+    sp.row0 = V;
+    V += sp.V;
+  }
+  if (V > kernels::kMaxStreamRows) throw std::runtime_error("speculate_batch: more rows than kMaxStreamRows");
+  auto t1 = std::chrono::steady_clock::now();
+
+  // 2. One verify over every sequence's rows, then 3. each sequence's accept. A non-finite row fails only its own
+  // sequence: the verify wrote no state of it, its commit is skipped and its session reset.
+  for (const StepPlan& sp : plans) std::copy(sp.rows.begin(), sp.rows.end(), pin_->rows + sp.row0);
+  verify_batch_launch(plans, V);
+  check(cudaStreamSynchronize(stream_), "verify");
+  for (size_t i = 0; i < plans.size(); ++i) {
+    StepPlan& sp = plans[i];
+    const size_t at = size_t(sp.row0) * 64;
+    try {
+      plan_accept(sp, pin_->topk_vals + at, pin_->topk_ids + at);
+    } catch (const NonFiniteLogits&) {
+      seqs[i].error = std::current_exception();
+      sp.failed = true;
+    }
+  }
+  auto t2 = std::chrono::steady_clock::now();
+
+  // 4. Per sequence: its rows' logits when asked, then its commit from its own rows.
+  for (size_t i = 0; i < plans.size(); ++i) {
+    const StepPlan& sp = plans[i];
+    if (sp.failed || !seqs[i].row_logits) continue;
+    const int n = sp.accepted + 1;
+    seqs[i].row_logits->resize(size_t(n) * vocab);
+    check(cudaMemcpyAsync(seqs[i].row_logits->data(), logits_dev_ + size_t(sp.row0) * vocab,
+                          size_t(n) * vocab * sizeof(float), cudaMemcpyDeviceToHost, stream_),
+          "row logits");
+  }
+  for (StepPlan& sp : plans) {
+    if (sp.failed) continue;
+    const int n = sp.accepted + 1;
+    s_ = sp.s;
+    commit_launch(sp.row0, n);
+    sp.s->history.insert(sp.s->history.end(), sp.rows.begin(), sp.rows.begin() + n);
+    sp.s->pos += n;
+  }
+  check(cudaStreamSynchronize(stream_), "commit");
+  const double draft_s = std::chrono::duration<double>(t1 - t0).count();
+  const double verify_s = std::chrono::duration<double>(t2 - t1).count(), commit_s = seconds_since(t2);
+  for (size_t i = 0; i < plans.size(); ++i) {
+    StepPlan& sp = plans[i];
+    if (sp.failed) {
+      s_ = sp.s;
+      reset_session();
+      continue;
+    }
+    // The batch's wall times, charged to each sequence in it (its step period).
+    sp.s->spec.draft_seconds += draft_s;
+    sp.s->spec.verify_seconds += verify_s;
+    sp.s->spec.commit_seconds += commit_s;
+    sp.s->spec.batched_steps += 1;
+    plan_count(sp);
+    seqs[i].out.assign(sp.rows.begin() + 1, sp.rows.begin() + sp.accepted + 1);
+    seqs[i].out.push_back(sp.next);
+  }
 }
 
 void Engine::score_shadow(Session& s, bool all) {
