@@ -17,9 +17,11 @@
 #include <initializer_list>
 #include <utility>
 #include <chrono>
+#include <exception>
 #include <map>
 #include <memory>
 #include <random>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -93,6 +95,10 @@ struct SpecStats {
   std::vector<long> accept_hist = std::vector<long>(33, 0);
   double draft_seconds = 0, verify_seconds = 0, commit_seconds = 0;
   long lookup_steps = 0, lookup_accepted = 0;  // steps that verified the lookup chain, and its accepted tokens
+  // M4 §2: steps this session took inside a batch (speculate_batch with two or more sequences). A batched step's
+  // draft, verify and commit times are the batch's wall times, charged to each sequence in it, so a session's
+  // seconds per step read as its own step period.
+  long batched_steps = 0;
   // Shadow scoring, per bucket of match length (3, 4-7, 8-15, 16-31, 32+): steps with a proposal, the
   // tokens the proposal would have had accepted (its agreement with what was generated next), and the
   // drafter's accepted tokens on the same steps. `shadow_best` adds up the better of the two per step.
@@ -162,6 +168,24 @@ class Engine {
   // row-invariant rows path makes bit for bit what plain decoding gives). Null by default: nothing is
   // copied off the device beyond each row's top K.
   std::vector<int> speculate(int anchor, const SamplingParams& p, std::vector<float>* row_logits = nullptr);
+  // A batch of speculative steps (M4 §2, stage 3): one step for each of several sessions, their verify rows
+  // concatenated in one forward pass ([a1, d1 ..] of the first, then [a2, d2 ..] of the second); the drafter, the
+  // state-bearing kernels (attention and its KV writes, the DeltaNet conv and recurrence), the lattice walk, the
+  // accept rule and the commit run per sequence. The rows path is row-invariant, so each sequence's tokens,
+  // state, steps and accepted drafts are bit for bit what speculate() gives it alone. Runs eagerly (graphs for
+  // the batch path are stage 4). Each entry must be can_batch(); their rows must fit kMaxStreamRows.
+  struct SeqStep {
+    int session = -1;
+    int anchor = 0;                          // as speculate()'s
+    const SamplingParams* params = nullptr;  // as speculate()'s
+    std::vector<float>* row_logits = nullptr;
+    std::vector<int> out;      // as speculate() returns: the accepted drafts, then the next token
+    std::exception_ptr error;  // a non-finite row (NonFiniteLogits): nothing committed, the session reset
+  };
+  // Whether session i's next speculative step can join a batch: speculation possible for p and room for a full
+  // draft block (a shorter block or a plain step runs alone, M4 §2).
+  bool can_batch(int session, const SamplingParams& p) const;
+  void speculate_batch(std::span<SeqStep> seqs);
   // The active session's speculation counters (each session counts its own steps, M4 §3), its lookup
   // shadow records scored as far as known.
   const SpecStats& spec_stats() {
@@ -226,6 +250,7 @@ class Engine {
   uint64_t state_hash();
 
  private:
+  struct Session;
   enum class Pass { Prefill, Decode, Verify };
   // Appends M tokens at position pos_ (a verify writes their KV but leaves pos_ and the recurrent state
   // to commit()). Prefill and Decode leave the logits after the last token in logits_; Verify leaves the
@@ -233,6 +258,14 @@ class Engine {
   // keep_at (prefill only, 0 < keep_at < M): also keep the DeltaNet and conv state after the first keep_at
   // tokens in snap_ (the end-of-prompt state at a multiple of 32, without a separate pass for the tail).
   void forward(const int* ids, int M, Pass pass, int keep_at = -1);
+  // The same over the rows of several sessions (M4 §2): segment i is rows [row0, row0 + rows) of ids, in session
+  // s at its own position. The row-wise kernels run once over all M rows; the state-bearing ones once per
+  // segment. More than one segment only for Verify; forward() is one segment, the active session's.
+  struct Seg {
+    Session* s;
+    int row0, rows;
+  };
+  void forward_rows(const int* ids, int M, Pass pass, int keep_at, std::span<const Seg> segs);
   // The rows path's linear layers take x through an FP16 copy; `x_ready` reuses the previous call's copy
   // (the same x feeding several matrices).
   void linear_fp4(const Fp4Weight& w, const float* x, int M, float* y, bool x_ready = false);
@@ -280,7 +313,9 @@ class Engine {
   void truncate_history(int n);  // forget the tokens from position n on, and every state past them
 
   // Speculation (speculate.cpp).
-  void commit(int n);                                 // advance the recurrent state over a verify's first n rows
+  // Advance the active session's recurrent state over a verify's rows row0 .. row0 + n - 1 (its anchor and
+  // accepted drafts; row0 is the sequence's first row in a batch).
+  void commit(int row0, int n);
   // Target features -> the drafter's context KV at positions pos0 .. pos0 + rows - 1.
   void draft_materialize(int rows, kernels::DevPos pos0, int cap_row0);
   void draft_propose(int anchor, int B, bool graph);  // the drafter's block, top-16 candidates and lattice
@@ -290,7 +325,16 @@ class Engine {
   // each can be captured into a CUDA graph. Their inputs and outputs on the host side are pin_'s buffers.
   void draft_launch(int B);         // pin_->draft_ids -> pin_->cand, pin_->scores
   void verify_launch(int V, int K);  // pin_->rows -> each row's top K in pin_->topk_vals / topk_ids
-  void commit_launch(int n);        // the anchor and n - 1 accepted drafts into the recurrent state and drafter KV
+  void commit_launch(int row0, int n);  // the anchor and n - 1 accepted drafts into the recurrent state and drafter KV
+  // One sequence's part of a speculative step on the host (speculate.cpp): its proposal, the drafted rows and
+  // the draft's distribution, then the accept.
+  struct StepPlan;
+  void plan_begin(StepPlan& sp, int B);                        // seed, lookup proposal
+  void plan_draft(StepPlan& sp, int B, bool graph);            // the drafter's block and the lattice walk
+  void plan_accept(StepPlan& sp, const float* vals, const int* ids);  // rows' top K -> accepted, next
+  void plan_count(StepPlan& sp);                               // the session's counters and shadow records
+  // The batch's verify: every plan's rows (pin_->rows) in one pass, then each sequence's top K at its rows.
+  void verify_batch_launch(std::span<StepPlan> plans, int V);
 
   // CUDA graphs of the step (M3). The variable part of a step is the accepted count, which only the commit
   // depends on, so there is one commit graph per count; the draft and verify graphs have fixed shapes
