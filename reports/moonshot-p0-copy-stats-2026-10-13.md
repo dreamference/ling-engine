@@ -188,7 +188,9 @@ P0's gate (draft §5): long copies must add **≥20% tokens per millisecond on a
 - **The fluid model.** It ignores block granularity and the drafter's warm-up after a copy step, and treats a copy step's cost as c times a production step whatever the run length. A copy step needs no drafter pass (~11 ms of a ~116 ms step, M1 §5), so c below 1 is possible for short copies.
 - **S3 and S4 are partial.** S3 is a proxy (what other agents read before editing); a checkout at the base commit was not available. S4 uses the first occurrence in another task only, over ~1,000 sessions, not a user's months of history in one repository.
 
-## 6. The GPU half: script and steps (not yet run)
+## 6. The GPU half: script and steps
+
+**Run on 2026-10-13 (A and B; C not run):** [moonshot-p0-rowsweep-2026-10-13.md](moonshot-p0-rowsweep-2026-10-13.md). c(64) ≈ 1.3–1.5 against a production step (1.33 by the prefill path, 1.48 extrapolated, at ~32K): "between" under the rule below, the edit-span feature marginal.
 
 `bench/rowsweep.py` measures, on node-b with nothing else on the GPU:
 
