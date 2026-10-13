@@ -6,7 +6,7 @@
 //            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N]]
 //            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16] [--graph-check] [--seed N]
 //            [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N]]
-//            [--batch-check]
+//            [--batch-check] [--copy 0|1|2] [--copy-min N] [--copy-max N] [--copy-ngram N]
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -52,6 +52,13 @@
 // round. Per sequence the tokens, the state, the steps and the accepted drafts must equal the prompt decoded
 // alone (speculatively, from a cold engine, under the same seed). With --graphs the runs alone and the batch both
 // replay step graphs (the batch path's own since stage 4).
+//
+// --copy 0|1|2 (moonshot P1; default 0) turns on the long-copy proposer: 1 replace (a copy of at least --copy-min
+// matching tokens, default 16, is verified instead of the drafter's chain), 2 extend (the copy's continuation is
+// appended to the drafter's chain when the chain is the copy's start); --copy-max N (default 31) caps the copied
+// chain, --copy-ngram N (default 8) is the index's n-gram. Every check above runs with it as given (--spec-check,
+// --graph-check, --prefix-check, --chunk-check, --interleave-check); --batch-check compares a batch, which never
+// copies, with runs alone, which do, so it is run without --copy.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -78,6 +85,7 @@ int main(int argc, char** argv) {
   std::string draft;
   int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256;
   bool interleave_check = false, batch_check = false;
+  int copy = 0, copy_min = 16, copy_max = 31, copy_ngram = 8;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -116,6 +124,10 @@ int main(int argc, char** argv) {
     else if (a == "--interleave-check") interleave_check = true;
     else if (a == "--batch-check") batch_check = true;
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
+    else if (a == "--copy") copy = std::stoi(next());
+    else if (a == "--copy-min") copy_min = std::stoi(next());
+    else if (a == "--copy-max") copy_max = std::stoi(next());
+    else if (a == "--copy-ngram") copy_ngram = std::stoi(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
@@ -155,6 +167,10 @@ int main(int argc, char** argv) {
     opts.draft_block = block;
     opts.lookup_mode = lookup;
     opts.lookup_min_match = lookup_min;
+    opts.copy_mode = copy;
+    opts.copy_min_match = copy_min;
+    opts.copy_max_tokens = copy_max;
+    opts.copy_ngram = copy_ngram;
     opts.boundary_token = tok.token_id("<|im_end|>");
     opts.step_graphs = graphs;
     opts.pdl = pdl;
@@ -620,6 +636,9 @@ int main(int argc, char** argv) {
         if (st.lookup_steps)
           std::fprintf(stderr, "lookup: %ld steps verified its chain, %.2f tokens/step\n", st.lookup_steps,
                        double(st.lookup_accepted + st.lookup_steps) / st.lookup_steps);
+        if (st.copy_steps)
+          std::fprintf(stderr, "copy: %ld steps held copied tokens, %ld offered, %ld accepted (%.1f per copy step)\n",
+                       st.copy_steps, st.copy_drafted, st.copy_accepted, double(st.copy_accepted) / st.copy_steps);
         if (st.shadow_total_steps) {
           std::fprintf(stderr, "lookup shadow: drafter alone %.2f accepted/step, best of both %.2f\n",
                        double(st.shadow_dflash_all) / st.shadow_total_steps, double(st.shadow_best) / st.shadow_total_steps);
