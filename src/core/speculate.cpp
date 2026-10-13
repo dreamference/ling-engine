@@ -24,7 +24,7 @@
 //   - the position: the kernels that depend on it read it from pos_dev_ (kernels::DevPos), which the host
 //     writes before each step's graphs run;
 //   - the anchor and the drafted tokens: page-locked host buffers (pin_) copied by the graphs' memcpy nodes;
-//   - the accepted count, which only the commit depends on: one commit graph per count (at most 32);
+//   - the accepted count, which only the commit depends on: one commit graph per count (at most 64);
 //   - the attention's key ranges (its grid): the verify graph launches every range up to max_context, and a
 //     range past the rows' last key exits at once with an empty partial the combine skips;
 //   - sampling parameters: the verify graph is keyed by top-K, everything else is on the host.
@@ -37,9 +37,10 @@
 // by the order of its sessions (they bake each one's pointers and the row split) and read each sequence's position
 // from pos_dev_[i]; each sequence's commit graph is its session's, keyed by its slot and accepted count.
 //
-// Long copies (moonshot P1, EngineOptions::copy_mode, off by default): the copy proposer (copy_proposer.hpp) finds
-// the session's earlier occurrence of its last tokens and offers the continuation, up to 31 tokens while the rows
-// path stops at 32 rows. Replace verifies [anchor, copy] instead of the drafter's chain and skips the drafter's
+// Long copies (moonshot P1, EngineOptions::copy_mode, off by default): the copy proposer (copy_proposer.hpp,
+// copy_views.hpp) finds the session's earlier occurrence of its last tokens (in its history, or in the emission views
+// of its tool outputs, or after a hunk header in edit mode) and offers the continuation, up to 63 tokens: the rows
+// path verifies up to kMaxVerifyRows = 64 rows, row-invariant. Replace verifies [anchor, copy] instead of the drafter's chain and skips the drafter's
 // pass; extend appends the copy's continuation to the drafter's chain when the drafter's whole chain equals the
 // copy's first tokens. Copied tokens are deterministic proposals (q = 1 in the rejection rule), and the drafted
 // ones keep the drafter's q, so the accept is the one above. A one-sequence step only; the verify graph is keyed
@@ -134,7 +135,8 @@ void Engine::alloc_drafter() {
   const ModelConfig& c = model_->config();
   const DraftConfig& d = draft_->config();
   if (d.hidden != c.hidden) throw std::runtime_error("drafter hidden size does not match the target");
-  const int H = c.hidden, R = std::max(opts_.prefill_chunk, kernels::kMaxStreamRows), B = kernels::kMaxStreamRows;
+  const int H = c.hidden, R = std::max(opts_.prefill_chunk, kernels::kMaxVerifyRows), B = kernels::kMaxStreamRows;
+  const int VR = kernels::kMaxVerifyRows;  // a verify's rows (a long copy's), for its kept inputs and its top K
   const int dq = d.heads * d.head_dim, dkv = d.kv_heads * d.head_dim, nfeat = static_cast<int>(d.target_layers.size());
   feature_layer_.assign(c.layers, -1);
   for (int i = 0; i < nfeat; ++i) {
@@ -146,7 +148,7 @@ void Engine::alloc_drafter() {
   cap_ = alloc<__nv_bfloat16>(size_t(R) * cap_stride_);
   // Each session's context KV is a ring (M4 §1): the window, kRingSlack positions of slack, and a commit's rows.
   constexpr int kRingSlack = 6144;
-  ring_ = d.sliding_window + kRingSlack + kernels::kMaxStreamRows;
+  ring_ = d.sliding_window + kRingSlack + kernels::kMaxVerifyRows;
   for (Session& s : sessions_)
     for (int l = 0; l < d.layers; ++l) {
       s.dkc.push_back(alloc<__nv_bfloat16>(size_t(ring_) * dkv));
@@ -169,21 +171,22 @@ void Engine::alloc_drafter() {
   dcand_ = alloc<int>(size_t(B) * d.selector_top_k);
   dhp_ = alloc<float>(size_t(B) * d.selector_rank);
   dscores_ = alloc<float>(size_t(B) * d.selector_top_k * d.selector_top_k);
-  topk_scratch_ = alloc<float>(kernels::topk_scratch_floats(B, 64));
-  vals_dev_ = alloc<float>(size_t(B) * 64);
-  ids_out_dev_ = alloc<int>(size_t(B) * 64);
+  topk_scratch_ = alloc<float>(kernels::topk_scratch_floats(VR, 64));
+  vals_dev_ = alloc<float>(size_t(VR) * 64);
+  ids_out_dev_ = alloc<int>(size_t(VR) * 64);
   if (d.selector_top_k > 16) throw std::runtime_error("drafter selector_top_k > 16");
   const int C = c.lin_conv_channels();
   for (size_t i = 0; i < s_->gdn.size(); ++i) {
-    v_pre_.push_back(alloc<float>(size_t(B) * C));
-    v_post_.push_back(alloc<float>(size_t(B) * C));
-    v_g_.push_back(alloc<float>(size_t(B) * c.lin_v_heads));
-    v_beta_.push_back(alloc<float>(size_t(B) * c.lin_v_heads));
+    v_pre_.push_back(alloc<float>(size_t(VR) * C));
+    v_post_.push_back(alloc<float>(size_t(VR) * C));
+    v_g_.push_back(alloc<float>(size_t(VR) * c.lin_v_heads));
+    v_beta_.push_back(alloc<float>(size_t(VR) * c.lin_v_heads));
   }
   conv_tmp_ = alloc<float>(size_t(C) * (c.conv_kernel - 1));
   set_draft_block(opts_.draft_block);
   set_copy(opts_.copy_mode, opts_.copy_min_match, opts_.copy_max_tokens);
   if (opts_.copy_ngram < 1) throw std::runtime_error("copy n-gram must be at least 1");
+  if (opts_.copy_views > (kCopyViewDiff | kCopyViewJson)) throw std::runtime_error("copy views: a mask of 1 (diff) and 2 (json)");
 }
 
 void Engine::set_copy(int mode, int min_match, int max_tokens) {
@@ -444,9 +447,12 @@ void Engine::verify_launch(int V, int K) {
 
 void Engine::commit_launch(int row0, int n) {
   NvtxRange range("commit");
-  quantized_ = false;  // at most 32 rows: the rows path, whatever the last forward() left (see draft_launch)
+  quantized_ = false;  // at most 64 rows: the rows path, whatever the last forward() left (see draft_launch)
   commit(row0, n);
-  draft_materialize(n, dpos(), row0);  // the verify's target features of those rows
+  // The verify's target features of those rows into the drafter's context, 32 rows at a time: the same kernels, so
+  // the same bits, as a commit of at most 32 rows (a long copy's commit runs to 64).
+  for (int off = 0; off < n; off += kernels::kMaxStreamRows)
+    draft_materialize(std::min(kernels::kMaxStreamRows, n - off), dpos(off), row0 + off);
 }
 
 void Engine::plan_begin(StepPlan& sp, int B, bool single) {
@@ -465,13 +471,15 @@ void Engine::plan_begin(StepPlan& sp, int B, bool single) {
   // 0b. The copy proposer (moonshot P1), over the session's history and the anchor; its chain fits the rows
   // path and the context.
   if (single && opts_.copy_mode > 0) {
-    CopyParams cp;
-    cp.min_match = opts_.copy_min_match;
-    cp.max_tokens = std::min({opts_.copy_max_tokens, kernels::kMaxStreamRows - 1, opts_.max_context - s.pos - 1});
-    sp.copy_max = cp.max_tokens;
-    s.copy.configure(opts_.copy_ngram);
-    s.copy.sync(s.history, std::span<const int>(&sp.anchor, 1));
-    sp.cp = s.copy.propose(cp);
+    CopyConfig cfg;
+    cfg.ngram = opts_.copy_ngram;
+    cfg.views = opts_.copy_views;
+    cfg.edit = opts_.copy_edit;
+    cfg.params.min_match = opts_.copy_min_match;
+    cfg.params.max_tokens =
+        std::min({opts_.copy_max_tokens, kernels::kMaxVerifyRows - 1, opts_.max_context - s.pos - 1});
+    sp.copy_max = cfg.params.max_tokens;
+    sp.cp = s.copy.propose(s.history, std::span<const int>(&sp.anchor, 1), cfg, codec_.valid() ? &codec_ : nullptr);
   }
   // Replace only with a chain longer than the drafter's (a copy cut short by the history's end is left to it).
   sp.use_copy = opts_.copy_mode == 1 && static_cast<int>(sp.cp.tokens.size()) > sp.E;
@@ -587,6 +595,9 @@ void Engine::plan_count(StepPlan& sp) {
     s.spec.copy_steps += 1;
     s.spec.copy_drafted += sp.copied;
     s.spec.copy_accepted += std::max(0, accepted - sp.copy_from);
+    const int from = static_cast<int>(sp.cp.from);
+    s.spec.copy_steps_by[from] += 1;
+    s.spec.copy_accepted_by[from] += std::max(0, accepted - sp.copy_from);
   }
   // The lookup's shadow scoring compares it with the drafter's chain alone, so a step with copied tokens is left out.
   const bool drafter_only = !sp.use_lookup && sp.copied == 0;
@@ -637,7 +648,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   // 2. Verify, with each row's top K (the argmax when greedy) on the GPU.
   std::copy(sp.rows.begin(), sp.rows.end(), pin_->rows);
   if (graph) {
-    cudaGraphExec_t& g = s_->verify_graphs[K * 64 + V];  // V is the block's B unless the chain holds a copy
+    cudaGraphExec_t& g = s_->verify_graphs[K * 128 + V];  // V is the block's B unless the chain holds a copy
     run_graph(g, "verify", [&] { verify_launch(V, K); });
   } else {
     verify_launch(V, K);
@@ -671,6 +682,20 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
 
   std::vector<int> out(sp.rows.begin() + 1, sp.rows.begin() + n);
   out.push_back(sp.next);
+  return out;
+}
+
+std::vector<float> Engine::verify_logits(const std::vector<int>& rows) {
+  if (!draft_) throw std::runtime_error("verify_logits: needs the drafter (its verify buffers)");
+  const int V = static_cast<int>(rows.size());
+  if (V < 1 || V > kernels::kMaxVerifyRows) throw std::runtime_error("verify_logits: 1 to 64 rows");
+  if (s_->pos + V > opts_.max_context) throw std::runtime_error("verify_logits: past max_context");
+  std::copy(rows.begin(), rows.end(), pin_->rows);
+  forward(pin_->rows, V, Pass::Verify);
+  std::vector<float> out(size_t(V) * model_->config().vocab);
+  check(cudaMemcpyAsync(out.data(), logits_dev_, out.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_),
+        "verify logits");
+  check(cudaStreamSynchronize(stream_), "verify logits");
   return out;
 }
 

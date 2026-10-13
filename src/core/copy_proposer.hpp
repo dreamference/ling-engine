@@ -18,7 +18,9 @@ namespace ling {
 struct CopyParams {
   int min_match = 16;      // propose only when the corpus agrees with the query for at least this many tokens
   int max_tokens = 31;     // the longest proposal (the verify's rows minus the anchor's)
-  int max_candidates = 16; // earlier occurrences of the query's last n-gram examined, most recent first
+  // Earlier occurrences of the query's last n-gram examined, most recent first. Code repeats short n-grams often, and
+  // the views hold every line of a tool output four times, so 16 missed the right occurrence; 64 costs microseconds.
+  int max_candidates = 64;
   int match_cap = 256;     // how far back the agreement is measured
   // > 0: the proposal is at most max(min_tokens, alpha * match) tokens (SuffixDecoding's and AgSpec's length
   // rule); 0: as long as the continuation and max_tokens allow (P0's "realistic proposer").
@@ -26,11 +28,16 @@ struct CopyParams {
   int min_tokens = 1;
 };
 
+// Where a proposal came from (CopySession, copy_views.hpp): the session's own tokens (S1), an emission view of a tool
+// output (S2), or edit mode's hunk anchor.
+enum class CopySource { History = 0, View = 1, Edit = 2 };
+
 struct CopyProposal {
   std::vector<int> tokens;  // the proposed continuation (empty: none)
   int match = 0;            // the agreement before it: tokens of the query that equal the corpus at that occurrence
   int source = -1;          // the corpus position the proposal starts at
   int candidates = 0;       // occurrences examined
+  CopySource from = CopySource::History;
 };
 
 // An index of every n-gram of a token sequence (the corpus) that has at least one token after it: a hash of
@@ -50,15 +57,17 @@ class CopyIndex {
   const std::vector<int>& tokens() const { return tokens_; }
 
   // Brings the corpus to exactly a ++ b: keeps the common prefix with what is indexed, undoes the entries past
-  // it (newest first), and appends the rest. A step's cost is the prefix comparison plus the new tokens.
-  void sync(std::span<const int> a, std::span<const int> b = {});
+  // it (newest first), and appends the rest. A step's cost is the prefix comparison plus the new tokens. Returns
+  // the length of the prefix kept.
+  size_t sync(std::span<const int> a, std::span<const int> b = {});
   void append(std::span<const int> t);
   void truncate(size_t n);
 
   // The continuation of the earlier occurrence of `query`'s last n tokens that agrees with `query` furthest
   // back (ties: the most recent), read from the corpus. The corpus may be the query itself (the session's own
   // history followed by the anchor): an occurrence always has a token after it, so it is never the query's
-  // own end.
+  // own end. A negative corpus token is a separator (between the views of a side corpus): no n-gram that holds
+  // one matches a query, and a continuation stops before it.
   CopyProposal propose(std::span<const int> query, const CopyParams& p) const;
   CopyProposal propose(const CopyParams& p) const { return propose(tokens_, p); }
 

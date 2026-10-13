@@ -30,7 +30,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "core/copy_proposer.hpp"
+#include "core/copy_views.hpp"
 #include "core/drafter.hpp"
 #include "core/kernels.cuh"
 #include "core/model.hpp"
@@ -55,11 +55,17 @@ struct EngineOptions {
   // equals the copy's first tokens, the chain is extended with the copy's continuation. Either way the verify
   // decides, so the output is unchanged (greedy token for token, sampled in distribution). A one-sequence step
   // only (speculate()); a batched step never copies (moonshot P4's batch rule). copy_max_tokens is capped at
-  // kMaxStreamRows - 1 = 31 until the rows path verifies 64 rows. Takes precedence over lookup_mode 2.
+  // kMaxVerifyRows - 1 = 63 (the rows path verifies up to 64 rows exactly). Takes precedence over lookup_mode 2.
   int copy_mode = 0;
   int copy_min_match = 16;
-  int copy_max_tokens = 31;
+  int copy_max_tokens = 63;
   int copy_ngram = 8;  // the n-gram the index is keyed by (the shortest agreement it can find)
+  // S2, emission views (a mask; core/copy_views.hpp): 1 every tool output's lines prefixed with ' ', '-' and '+' (diff
+  // and apply_patch lines), 2 JSON-escaped; each view indexed beside the history. Off by default.
+  unsigned copy_views = 0;
+  // Edit mode: right after a hunk header (apply_patch's `@@ <line>`, a unified `@@ -L,n +L,m @@`), copy the file's
+  // ' '-prefixed lines from the place the header names. Builds the ' ' view of every tool output. Off by default.
+  bool copy_edit = false;
   // Prefix checkpoints: DeltaNet and conv states kept at chosen prompt positions (the end of the first two
   // messages, i.e. after `boundary_token`, and multiples of prefill_chunk up to checkpoint_limit), so a later
   // prompt that shares the prefix resumes there. Each costs ~157 MB; 0 turns them off.
@@ -105,12 +111,14 @@ struct SpecStats {
   long steps = 0;
   long drafted = 0;   // drafted tokens offered to the verify
   long accepted = 0;  // drafted tokens accepted
-  std::vector<long> accept_hist = std::vector<long>(33, 0);
+  std::vector<long> accept_hist = std::vector<long>(kernels::kMaxVerifyRows + 1, 0);
   double draft_seconds = 0, verify_seconds = 0, commit_seconds = 0;
   long lookup_steps = 0, lookup_accepted = 0;  // steps that verified the lookup chain, and its accepted tokens
   // Moonshot P1: steps whose chain held copied tokens (replace: the whole chain; extend: the drafter's chain and the
   // copy's continuation after it), the copied tokens offered, and those accepted.
   long copy_steps = 0, copy_drafted = 0, copy_accepted = 0;
+  // The same split by where the copy came from: the history (S1), an emission view (S2), edit mode's hunk anchor.
+  long copy_steps_by[3] = {}, copy_accepted_by[3] = {};
   // M4 §2: steps this session took inside a batch (speculate_batch with two or more sequences). A batched step's
   // draft, verify and commit times are the batch's wall times, charged to each sequence in it, so a session's
   // seconds per step read as its own step period.
@@ -226,6 +234,14 @@ class Engine {
   }
   // The copy proposer's settings (EngineOptions::copy_*), between steps.
   void set_copy(int mode, int min_match, int max_tokens);
+  // The tokenizer's side of the copy proposer's emission views and edit mode (copy_views, copy_edit): without it
+  // they stay off. ling-serve and ling-run set it from their tokenizer.
+  void set_copy_codec(TextCodec codec) { codec_ = std::move(codec); }
+  // Test hook (ling-run --rows-check): one verify pass over `rows` (the anchor first, at most kMaxVerifyRows) at the
+  // active session's position, returning every row's logits (rows.size() x vocab floats). Nothing is committed: the
+  // history, the recurrent state and the drafter's context stay as they were (the rows' KV lands past the position,
+  // where the next pass overwrites it). Needs the drafter (its verify buffers).
+  std::vector<float> verify_logits(const std::vector<int>& rows);
   int draft_block() const { return opts_.draft_block; }
   void set_draft_block(int b);
   // Whether speculative steps run as CUDA graphs (false when asked for but unavailable: see step_graphs).
@@ -299,7 +315,7 @@ class Engine {
   void linear_fp8_residual(const Fp8Weight& w, const float* x, int M, bool x_ready = false);
   // The prefill path (quantized activations, prefill_gemm.cu) or the rows path (stream_gemm.cu)?
   bool quantized(int M) const { return quantized_ || M > kRowsMax; }
-  static constexpr int kRowsMax = 32;  // kernels::kMaxStreamRows
+  static constexpr int kRowsMax = kernels::kMaxVerifyRows;  // a verify of up to 64 rows (moonshot P1's long copies)
   static constexpr int kAttnSlice = 256;
   static constexpr int kResumeAlign = 32;  // kept states sit at multiples of this (the DeltaNet's chunk)  // prefill attention: queries per call (bounds the partials' scratch)
   bool quantized_ = false;                // set by forward(): the pass is a prefill
@@ -397,11 +413,11 @@ class Engine {
     int pos;
     int seq_pos[kernels::kMaxSeqs];  // a batched step's positions, per sequence
     int draft_ids[kernels::kMaxStreamRows];  // the drafter's block: the anchor, then mask tokens
-    int rows[kernels::kMaxStreamRows];       // the verified rows: the anchor, then the drafted tokens
+    int rows[kernels::kMaxVerifyRows];       // the verified rows: the anchor, then the drafted (or copied) tokens
     int cand[kernels::kMaxStreamRows * 16];
     float scores[kernels::kMaxStreamRows * 16 * 16];
-    float topk_vals[kernels::kMaxStreamRows * 64];
-    int topk_ids[kernels::kMaxStreamRows * 64];
+    float topk_vals[kernels::kMaxVerifyRows * 64];
+    int topk_ids[kernels::kMaxVerifyRows * 64];
   };
   StepPinned* pin_ = nullptr;
 
@@ -449,7 +465,7 @@ class Engine {
   bool ckpt_match(const Checkpoint& k, const std::vector<int>& prompt, const std::vector<uint64_t>& prefix_hash) const;
 
   // A verify's per-layer DeltaNet inputs, kept for commit(): the in-projection before and after the conv,
-  // the decay and the write strength, for up to 32 rows.
+  // the decay and the write strength, for up to kMaxVerifyRows rows.
   std::vector<float*> v_pre_, v_post_, v_g_, v_beta_;
   float* conv_tmp_ = nullptr;
 
@@ -468,7 +484,7 @@ class Engine {
   // The drafter attends to the last sliding_window positions only, so its context KV is a ring of
   // ring_ positions per session, position p at p % ring_ (M4 §1). The slack past the window keeps a resume
   // usable when the session's history ran up to that many tokens past the new prompt (a re-rendered last
-  // output); the extra kMaxStreamRows cover a commit's rows.
+  // output); the extra kMaxVerifyRows cover a commit's rows.
   int ring_ = 0;
   struct ShadowRecord {
     int pos;                  // the anchor's position
@@ -495,10 +511,10 @@ class Engine {
     int pos = 0;
     std::vector<ShadowRecord> shadow;
     SpecStats spec;  // this session's speculative steps
-    CopyIndex copy;  // moonshot P1: the session's tokens indexed for the copy proposer (synced at each step)
+    CopySession copy;  // moonshot P1: the session's tokens, views and edit anchors for the copy proposer
     std::mt19937_64 rng;
     cudaGraphExec_t draft_graph = nullptr;
-    std::map<int, cudaGraphExec_t> verify_graphs;  // by rows and top-K (K * 64 + V; K is 1 when greedy)
+    std::map<int, cudaGraphExec_t> verify_graphs;  // by rows and top-K (K * 128 + V; K is 1 when greedy)
     std::vector<cudaGraphExec_t> commit_graphs;    // by accepted count + 1
     std::map<std::pair<int, int>, cudaGraphExec_t> batch_commit_graphs;  // a batched step's: (slot, count), slot > 0
     // The pool's bookkeeping.
@@ -518,6 +534,7 @@ class Engine {
   void adopt_prefix(const Session& from, int n);
 
   std::vector<float> logits_;
+  TextCodec codec_;  // the copy proposer's tokenizer side (set_copy_codec)
   bool profile_ = false;
   std::map<std::string, double> phase_seconds_;
 };
