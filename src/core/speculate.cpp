@@ -30,6 +30,12 @@
 //   - sampling parameters: the verify graph is keyed by top-K, everything else is on the host.
 // Every kernel computes exactly what its eager launch computes, so graphs change no output bit
 // (--spec-check compares the tokens and the recurrent state with plain decoding).
+//
+// Batches (M4 stages 3 and 4, speculate_batch): several sessions' steps share one verify pass over their concatenated
+// rows; the drafter runs over every sequence's block at once and the state kernels take all sequences in one launch
+// (kernels::SeqBatch), each row computed as its sequence alone computes it (--batch-check). A batch's graphs are keyed
+// by the order of its sessions (they bake each one's pointers and the row split) and read each sequence's position
+// from pos_dev_[i]; each sequence's commit graph is its session's, keyed by its slot and accepted count.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
