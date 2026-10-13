@@ -75,7 +75,7 @@ void CopyIndex::truncate(size_t n) {
   prev_.resize(n);
 }
 
-void CopyIndex::sync(std::span<const int> a, std::span<const int> b) {
+size_t CopyIndex::sync(std::span<const int> a, std::span<const int> b) {
   const size_t total = a.size() + b.size(), m = std::min(tokens_.size(), total);
   const size_t ma = std::min(m, a.size());
   size_t c = std::mismatch(tokens_.begin(), tokens_.begin() + ma, a.begin()).first - tokens_.begin();
@@ -88,6 +88,7 @@ void CopyIndex::sync(std::span<const int> a, std::span<const int> b) {
   } else {
     append(b.subspan(c - a.size()));
   }
+  return c;
 }
 
 CopyProposal CopyIndex::propose(std::span<const int> query, const CopyParams& p) const {
@@ -112,6 +113,8 @@ CopyProposal CopyIndex::propose(std::span<const int> query, const CopyParams& p)
   r.match = best_m;
   if (best < 0 || best_m < p.min_match) return r;
   int len = std::min(size - 1 - best, p.max_tokens);
+  for (int i = 0; i < len; ++i)
+    if (tokens_[best + 1 + i] < 0) len = i;  // a separator ends the continuation
   if (p.alpha > 0) len = std::min(len, std::max(p.min_tokens, static_cast<int>(p.alpha * best_m)));
   if (len <= 0) return r;
   r.source = best + 1;

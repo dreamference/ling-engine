@@ -67,7 +67,8 @@ void gemv_nvfp4(const float* x, int M, const uint8_t* w, const uint8_t* wscale, 
 // y = wscale * x . W^T, W FP8 E4M3 [N][K]. K must be a multiple of 512.
 void gemv_fp8(const float* x, int M, const uint8_t* w, float wscale, float* y, int N, int K,
               cudaStream_t s);
-// y = x . W^T for narrow BF16 matrices and up to 32 rows, row-invariant (the rows path). K % 1024 == 0.
+// y = x . W^T for narrow BF16 matrices and up to kMaxVerifyRows rows (in 32-row pieces), row-invariant (the rows
+// path). K % 1024 == 0.
 // With w2/y2: a second matrix of the same shape and input in the same launch.
 void bf16_rows(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s,
                const __nv_bfloat16* w2 = nullptr, float* y2 = nullptr);
@@ -76,10 +77,16 @@ void bf16_rows_bf16in(const __nv_bfloat16* x, int M, const __nv_bfloat16* w, flo
 // y = x . W^T, W BF16 [N][K].
 void gemv_bf16(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s);
 
-// ---- Weight-streaming GEMM on tensor cores for 1 to 32 rows (stream_gemm.cu): decode, verify, drafter. ----
+// ---- Weight-streaming GEMM on tensor cores for 1 to 64 rows (stream_gemm.cu): decode, verify, drafter. ----
 // Row-invariant: a row's result is bit-for-bit the same whatever M is, so a token verified in a block of
 // 16 gets exactly the numbers it would get decoded alone.
+// kMaxStreamRows bounds the drafter's block, a batched verify and a batch's rows (M4); kMaxVerifyRows bounds one
+// sequence's verify on the rows path (moonshot P1: a long copy of up to 63 tokens after the anchor). Every
+// rows-path kernel is row-invariant up to kMaxVerifyRows: stream_gemm runs 33-64 rows as eight 8-token groups
+// with each element's arithmetic unchanged, bf16_rows in 32-row pieces, and attention, the DeltaNet kernels and
+// the norms take any row count.
 constexpr int kMaxStreamRows = 32;
+constexpr int kMaxVerifyRows = 64;
 // The weights stream_gemm reads are tiled (SPEC.md §8, stage 4): each (16-row tile, 128-value chunk) is
 // one contiguous block in the order the warp's lanes read it, so every load covers 512 contiguous bytes
 // (measured: the row-major pattern reads at 215 GB/s, contiguous blocks at 232). NVFP4 blocks carry
