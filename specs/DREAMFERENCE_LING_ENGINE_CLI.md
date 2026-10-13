@@ -26,6 +26,10 @@ ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-cont
 | `--draft-block N` | `12` | Draft tokens per speculative step. The default follows production, which runs 12 since 2026-10-09 (measured +7% single-stream over the drafter's published block of 16; the owner's decision of 2026-10-10 made 12 the code default too). The M0 reference container on the development machine keeps 16 on purpose. |
 | `--lookup 0\|1\|2` | `1` | The context-lookup draft source ([SPECULATION §10](./DREAMFERENCE_LING_ENGINE_SPECULATION.md)): 0 off, 1 on, 2 shadow mode (counted in `/spec_stats`, not used). |
 | `--lookup-min N` | `8` | The shortest match the lookup accepts. |
+| `--copy 0\|1\|2` | `0` | The long-copy proposer (moonshot P1, [drafts/MOONSHOT §8](./drafts/MOONSHOT-repository-aware-decoding-2026-10-13.md)): 0 off, 1 replace (a copy of the session's earlier text is verified instead of the drafter's chain), 2 extend (appended to the drafter's chain when the chain is the copy's start). One-request steps only; exact either way. |
+| `--copy-min N` | `16` | The shortest agreement with the earlier text a copy is proposed from. |
+| `--copy-max N` | `31` | The longest copied chain (capped at 31 while the verify stops at 32 rows). |
+| `--copy-ngram N` | `8` | The n-gram the copy index is keyed by. |
 | `--pretokenizer production\|checkpoint` | `production` | The pre-tokenizer pattern: production's (how SGLang tokenizes this checkpoint) or the checkpoint's own `tokenizer.json` pattern. Any other value exits 2. |
 | `--prefix-checkpoints N` | `8` | How many shared-prefix state checkpoints the engine keeps ([SESSIONS §11](./DREAMFERENCE_LING_ENGINE_SESSIONS.md)). |
 | `--graphs` | off | Each speculative step's draft, verify and commit run as captured CUDA graphs (M3). Needs a drafter; refused, with a notice, while `LING_PROFILE` or `LING_KSPLIT` is set. |
