@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -144,6 +145,42 @@ const uint8_t* upload_tiled(const TensorView& values, const TensorView* scales, 
   return static_cast<const uint8_t*>(out);
 }
 
+Fp4Upload upload_nvfp4(const TensorView& values, const TensorView& scales, int N, int K, size_t* bytes,
+                       std::vector<void*>& owned) {
+  static const bool codes = [] {
+    const char* e = std::getenv("LING_SCALE_CODES");
+    return !(e && std::atoi(e) == 0);
+  }();
+  uint8_t table[kernels::kScaleCodes], code_of[256];
+  Fp4Upload u;
+  if (!codes || !kernels::scale_code_table(scales.data, scales.bytes, table, code_of)) {
+    u.w = upload_tiled(values, &scales, N, K, bytes);
+    owned.push_back(const_cast<uint8_t*>(u.w));
+    return u;
+  }
+  auto dev = [&](size_t n, const void* host) {
+    void* d = nullptr;
+    check(cudaMalloc(&d, n), "cudaMalloc coded");
+    if (host) check(cudaMemcpy(d, host, n, cudaMemcpyHostToDevice), "upload coded");
+    return static_cast<uint8_t*>(d);
+  };
+  uint8_t* v = dev(values.bytes, values.data);
+  uint8_t* sc = dev(scales.bytes, scales.data);
+  uint8_t* map = dev(256, code_of);
+  uint8_t* blob = dev(kernels::tiled_bytes_nvfp4_coded(N, K), nullptr);
+  uint8_t* raw = dev(scales.bytes, nullptr);
+  uint8_t* tab = dev(kernels::kScaleCodes, table);
+  kernels::retile_nvfp4_coded(v, sc, map, blob, raw, N, K, nullptr);
+  check(cudaDeviceSynchronize(), "retile coded");
+  cudaFree(v), cudaFree(sc), cudaFree(map);
+  owned.push_back(blob), owned.push_back(raw), owned.push_back(tab);
+  *bytes += kernels::tiled_bytes_nvfp4_coded(N, K) + scales.bytes + kernels::kScaleCodes;
+  u.w = blob;
+  u.table = tab;
+  u.scales = raw;
+  return u;
+}
+
 Fp4Weight Model::fp4(const Checkpoint& ck, const std::string& prefix) {
   Fp4Weight w;
   const TensorView& t = ck.get(prefix + ".weight");
@@ -151,8 +188,8 @@ Fp4Weight Model::fp4(const Checkpoint& ck, const std::string& prefix) {
   if (t.dtype != "U8" || s.dtype != "F8_E4M3") throw std::runtime_error(prefix + ": not NVFP4");
   w.N = static_cast<int>(t.shape[0]);
   w.K = static_cast<int>(t.shape[1] * 2);
-  w.w = upload_tiled(t, &s, w.N, w.K, &bytes_);
-  allocations_.push_back(const_cast<uint8_t*>(w.w));
+  const Fp4Upload u = upload_nvfp4(t, s, w.N, w.K, &bytes_, allocations_);
+  w.w = u.w, w.table = u.table, w.scales = u.scales;
   w.scale2 = scalar(ck, prefix + ".weight_scale_2");
   w.in_scale = scalar(ck, prefix + ".input_scale");
   return w;

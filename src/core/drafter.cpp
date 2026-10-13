@@ -79,8 +79,8 @@ DraftModel::DraftModel(const std::string& dir) {
     if (t.dtype != "U8" || sc.dtype != "F8_E4M3") throw std::runtime_error(prefix + ": not NVFP4");
     w.N = static_cast<int>(t.shape[0]);
     w.K = static_cast<int>(t.shape[1] * 2);
-    w.w = upload_tiled(t, &sc, w.N, w.K, &bytes_);
-    allocations_.push_back(const_cast<uint8_t*>(w.w));
+    const Fp4Upload u = upload_nvfp4(t, sc, w.N, w.K, &bytes_, allocations_);
+    w.w = u.w, w.table = u.table, w.scales = u.scales;
     const TensorView& s2 = ck.get(prefix + ".weight_scale_2");
     if (s2.dtype != "F32" || s2.bytes != 4) throw std::runtime_error(prefix + ".weight_scale_2 is not an F32 scalar");
     std::memcpy(&w.scale2, s2.data, 4);

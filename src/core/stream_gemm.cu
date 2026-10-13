@@ -38,6 +38,8 @@ constexpr int kChunk = 128;
 // Bytes of one (16-row tile, 128-value chunk) block: NVFP4 values (16 x 64) then their E4M3 scales
 // (16 x 8); FP8 values (16 x 128).
 constexpr int kTileBytesFp4 = 16 * 64 + 16 * 8, kTileBytesFp8 = 16 * 128;
+// B26: a coded NVFP4 block, the values then 128 6-bit scale codes (kernels.cuh, retile_nvfp4_coded).
+constexpr int kTileBytesFp4Coded = 16 * 64 + 128 * 6 / 8;
 
 __device__ __forceinline__ uint32_t e2m1x2_to_h2(uint32_t byte) {
   uint32_t out;
@@ -76,17 +78,19 @@ struct StreamProblems {
   int N[4];
   int block0[4];
   int count;
+  const uint8_t* table[4];  // CODED: each matrix's scale-code table
 };
 
 // Per lane and chunk: the weights of rows g and g + 8 of every tile.
-template <int TILES, bool FP4>
+template <int TILES, bool FP4, bool CODED>
 struct WeightRegs {
   uint4 v[TILES][2][FP4 ? 1 : 2];
   uint32_t sc[TILES][2];  // NVFP4: the two E4M3 block scales of the lane's 32 values (low byte first)
+  uint32_t cw[TILES][2][CODED ? 2 : 1];  // CODED: the two code words holding the lane's 12 bits of codes
 };
 
-template <int TILES, bool FP4>
-__device__ __forceinline__ void load_weights(WeightRegs<TILES, FP4>& r, const uint8_t* __restrict__ w, int row0,
+template <int TILES, bool FP4, bool CODED>
+__device__ __forceinline__ void load_weights(WeightRegs<TILES, FP4, CODED>& r, const uint8_t* __restrict__ w, int row0,
                                              int N, int K, int chunk, int g, int t) {
   const int chunks = K / kChunk, last_tile = N / 16 - 1;
 #pragma unroll
@@ -94,7 +98,8 @@ __device__ __forceinline__ void load_weights(WeightRegs<TILES, FP4>& r, const ui
     // The tiled layout (retile_*): each (16-row tile, 128-value chunk) is one contiguous block, in the
     // order the lanes read it, so every load instruction of the warp covers 512 contiguous bytes.
     const int tile = min((row0 >> 4) + i, last_tile);
-    const uint8_t* base = w + (static_cast<size_t>(tile) * chunks + chunk) * (FP4 ? kTileBytesFp4 : kTileBytesFp8);
+    const uint8_t* base =
+        w + (static_cast<size_t>(tile) * chunks + chunk) * (FP4 ? (CODED ? kTileBytesFp4Coded : kTileBytesFp4) : kTileBytesFp8);
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
       const int lane_slot = (h * 8 + g) * 4 + t;
@@ -103,7 +108,15 @@ __device__ __forceinline__ void load_weights(WeightRegs<TILES, FP4>& r, const ui
         asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
                      : "=r"(r.v[i][h][0].x), "=r"(r.v[i][h][0].y), "=r"(r.v[i][h][0].z), "=r"(r.v[i][h][0].w)
                      : "l"(p));
-        r.sc[i][h] = *reinterpret_cast<const uint16_t*>(base + 1024 + lane_slot * 2);
+        if constexpr (CODED) {
+          // Slot s's codes are bits 12s .. 12s + 11 of the code words: words 12s / 32 and the next (the last slot's
+          // next word is the following block's first, or the blob's padding; its bits are shifted out).
+          const uint32_t* cwp = reinterpret_cast<const uint32_t*>(base + 1024) + ((12 * lane_slot) >> 5);
+          r.cw[i][h][0] = __ldg(cwp);
+          r.cw[i][h][1] = __ldg(cwp + 1);
+        } else {
+          r.sc[i][h] = *reinterpret_cast<const uint16_t*>(base + 1024 + lane_slot * 2);
+        }
       } else {
 #pragma unroll
         for (int q = 0; q < 2; ++q) {
@@ -121,7 +134,8 @@ __device__ __forceinline__ uint32_t word_of(const uint4& v, int i) {
   return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
 }
 
-template <int NT, int TILES, bool FP4, int PF>  // PF: chunks each warp keeps in flight ahead of the one it computes
+// PF: chunks each warp keeps in flight ahead of the one it computes; CODED (NVFP4 only): 6-bit scale codes (B26).
+template <int NT, int TILES, bool FP4, int PF, bool CODED = false>
 __global__ void __launch_bounds__(kWarps * 32)
     stream_gemm_kernel(const __half* __restrict__ x, const float* __restrict__ xinv, int M, StreamProblems pr, int K,
                        int ksplit, float* __restrict__ part) {
@@ -147,17 +161,25 @@ __global__ void __launch_bounds__(kWarps * 32)
 #pragma unroll
     for (int j = 0; j < NT; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
 
-  WeightRegs<TILES, FP4> buf[PF + 1];  // buf[0]: the chunk being computed; buf[1..PF]: in flight
+  WeightRegs<TILES, FP4, CODED> buf[PF + 1];  // buf[0]: the chunk being computed; buf[1..PF]: in flight
 #pragma unroll
   for (int p = 0; p < PF; ++p)
     if (cbeg + warp + p * kWarps < chunks)
-      load_weights<TILES, FP4>(buf[p], w, row0, N, K, cbeg + warp + p * kWarps, g, t);
+      load_weights<TILES, FP4, CODED>(buf[p], w, row0, N, K, cbeg + warp + p * kWarps, g, t);
+  // CODED: the matrix's table (immutable, like the weights) in shared memory, and each slot's bit offset.
+  __shared__ uint8_t tab[CODED ? kScaleCodes : 1];
+  int code_shift[2] = {0, 0};
+  if constexpr (CODED) {
+    if (threadIdx.x < kScaleCodes) tab[threadIdx.x] = pr.table[pi][threadIdx.x];
+    for (int h = 0; h < 2; ++h) code_shift[h] = (12 * ((h * 8 + g) * 4 + t)) & 31;
+    __syncthreads();
+  }
   // PDL (launch.cuh): the first weight chunks above read only the weights, which never change, so they are
   // in flight while this block waits for the kernel that wrote x and xinv. Nothing else happens before this.
   pdl_begin();
   for (int c = cbeg + warp; c < chunks; c += kWarps) {
-    if (c + PF * kWarps < chunks) load_weights<TILES, FP4>(buf[PF], w, row0, N, K, c + PF * kWarps, g, t);
-    const WeightRegs<TILES, FP4>& cur = buf[0];
+    if (c + PF * kWarps < chunks) load_weights<TILES, FP4, CODED>(buf[PF], w, row0, N, K, c + PF * kWarps, g, t);
+    const WeightRegs<TILES, FP4, CODED>& cur = buf[0];
     // This chunk's activations: 32 halves (16 words) per token for tokens g + 8j.
     uint32_t xw[NT][16];
 #pragma unroll
@@ -184,7 +206,12 @@ __global__ void __launch_bounds__(kWarps * 32)
       for (int i = 0; i < TILES; ++i)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-          const uint32_t s2 = e4m3x2_to_h2(cur.sc[i][h]);  // low half: first 16 values, high: next 16
+          uint32_t pair = cur.sc[i][h];
+          if constexpr (CODED) {  // the two codes -> the two E4M3 scale bytes, exactly the raw blob's
+            const uint32_t f = __funnelshift_r(cur.cw[i][h][0], cur.cw[i][h][1], code_shift[h]);
+            pair = uint32_t(tab[f & 63u]) | (uint32_t(tab[(f >> 6) & 63u]) << 8);
+          }
+          const uint32_t s2 = e4m3x2_to_h2(pair);  // low half: first 16 values, high: next 16
           sc_h2[i][h][0] = (s2 & 0xffffu) | (s2 << 16);
           sc_h2[i][h][1] = (s2 >> 16) | (s2 & 0xffff0000u);
         }
@@ -337,7 +364,7 @@ float* split_buffer(size_t floats) {
   return buf;
 }
 
-template <int NT, int TILES, bool FP4, int PF>
+template <int NT, int TILES, bool FP4, int PF, bool CODED>
 void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
   StreamProblems pr{};
   int blocks = 0;
@@ -346,6 +373,7 @@ void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, in
     pr.gscale[i] = t[i].scale;
     pr.y[i] = t[i].y;
     pr.N[i] = t[i].N;
+    pr.table[i] = t[i].wscale;
     pr.block0[i] = blocks;
     blocks += (t[i].N + TILES * 16 - 1) / (TILES * 16);
   }
@@ -353,7 +381,7 @@ void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, in
   const int ksplit = n == 1 ? choose_ksplit(blocks, K) : 1;
   float* part = ksplit > 1 ? split_buffer(size_t(ksplit) * M * t[0].N) : nullptr;
   const dim3 grid(blocks, ksplit);
-  launch_kernel("stream_gemm", stream_gemm_kernel<NT, TILES, FP4, PF>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K,
+  launch_kernel("stream_gemm", stream_gemm_kernel<NT, TILES, FP4, PF, CODED>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K,
                 ksplit, part);
   if (ksplit > 1)
     launch_kernel("stream_gemm split", split_reduce_kernel, dim3((M * t[0].N + 255) / 256), dim3(256), 0, s, part, ksplit,
@@ -380,18 +408,27 @@ int sg_env(const char* n, int d) {
   return e ? std::atoi(e) : d;
 }
 
-template <int NT, bool FP4, int PF>
+template <int NT, bool FP4, int PF, bool CODED>
 void launch_t(int tiles, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
-  if (tiles == 1) launch<NT, 1, FP4, PF>(x, xinv, M, t, n, K, s);
-  else if (tiles == 2 || NT == 4) launch<NT, 2, FP4, PF>(x, xinv, M, t, n, K, s);  // NT = 4 x 4 tiles: no room
-  else launch<NT, (NT == 4 ? 2 : 4), FP4, PF>(x, xinv, M, t, n, K, s);
+  if (tiles == 1) launch<NT, 1, FP4, PF, CODED>(x, xinv, M, t, n, K, s);
+  else if (tiles == 2 || NT == 4) launch<NT, 2, FP4, PF, CODED>(x, xinv, M, t, n, K, s);  // NT = 4 x 4 tiles: no room
+  else launch<NT, (NT == 4 ? 2 : 4), FP4, PF, CODED>(x, xinv, M, t, n, K, s);
 }
 
 template <int NT, bool FP4>
 void launch_k(int tiles, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
   static const int pf = sg_env("LING_SG_PF", kInFlight);
-  if (pf == 2) launch_t<NT, FP4, 2>(tiles, x, xinv, M, t, n, K, s);
-  else launch_t<NT, FP4, 1>(tiles, x, xinv, M, t, n, K, s);
+  const bool coded = FP4 && t[0].wscale != nullptr;  // dispatch keeps a launch's matrices of one kind
+  if (coded) {
+    if constexpr (FP4) {
+      if (pf == 2) launch_t<NT, FP4, 2, true>(tiles, x, xinv, M, t, n, K, s);
+      else launch_t<NT, FP4, 1, true>(tiles, x, xinv, M, t, n, K, s);
+    }
+  } else if (pf == 2) {
+    launch_t<NT, FP4, 2, false>(tiles, x, xinv, M, t, n, K, s);
+  } else {
+    launch_t<NT, FP4, 1, false>(tiles, x, xinv, M, t, n, K, s);
+  }
 }
 
 template <bool FP4>
@@ -399,6 +436,19 @@ void dispatch(const __half* x, const float* xinv, int M, const StreamTarget* t, 
   if (K % kChunk != 0) throw std::runtime_error("stream_gemm: K must be a multiple of 128");
   if (M < 1 || M > kMaxStreamRows) throw std::runtime_error("stream_gemm: M must be in [1, 32]");
   if (n < 1 || n > 4) throw std::runtime_error("stream_gemm: 1 to 4 matrices per launch");
+  // B26: coded and raw NVFP4 blobs in one call go as two launches (a matrix's result does not depend on its
+  // launch companions, so nothing changes but the launch count; only a checkpoint with a > 64-scale matrix next to
+  // a coded one in one group takes it).
+  if (FP4 && n > 1) {
+    StreamTarget coded[4], raw[4];
+    int nc = 0, nr = 0;
+    for (int i = 0; i < n; ++i) (t[i].wscale ? coded[nc++] : raw[nr++]) = t[i];
+    if (nc > 0 && nr > 0) {
+      dispatch<FP4>(x, xinv, M, coded, nc, K, s);
+      dispatch<FP4>(x, xinv, M, raw, nr, K, s);
+      return;
+    }
+  }
   int total = 0;
   for (int i = 0; i < n; ++i) total += t[i].N;
   static const int tn = sg_env("LING_SG_TN", kTilesNarrow), tw = sg_env("LING_SG_TW", kTilesWide),
@@ -446,12 +496,52 @@ __global__ void retile_fp8_kernel(const uint8_t* __restrict__ w, uint8_t* __rest
   }
 }
 
+// B26: the coded blob. One thread per 16-byte piece of values (the raw blob's pieces at the coded stride), and one
+// thread per block for its codes (24 words of two 6-bit codes per lane slot) and its raw scales.
+__global__ void retile_nvfp4_coded_values_kernel(const uint8_t* __restrict__ w, uint8_t* __restrict__ out, int N, int K) {
+  const int chunks = K / kChunk;
+  const size_t blocks = static_cast<size_t>(N / 16) * chunks;
+  for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < blocks * 64;
+       i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    const size_t blk = i / 64;
+    const int slot = static_cast<int>(i % 64), t = slot % 4, r = slot / 4;
+    const int tile = static_cast<int>(blk / chunks), chunk = static_cast<int>(blk % chunks);
+    const size_t n = static_cast<size_t>(tile) * 16 + (r % 8) + 8 * (r / 8);
+    *reinterpret_cast<uint4*>(out + blk * kTileBytesFp4Coded + slot * 16) =
+        *reinterpret_cast<const uint4*>(w + n * (K / 2) + chunk * (kChunk / 2) + t * 16);
+  }
+}
+
+__global__ void retile_nvfp4_coded_scales_kernel(const uint8_t* __restrict__ s, const uint8_t* __restrict__ code_of,
+                                                 uint8_t* __restrict__ out, uint8_t* __restrict__ raw, int N, int K) {
+  const int chunks = K / kChunk;
+  const size_t blocks = static_cast<size_t>(N / 16) * chunks;
+  for (size_t blk = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; blk < blocks;
+       blk += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    const int tile = static_cast<int>(blk / chunks), chunk = static_cast<int>(blk % chunks);
+    uint32_t words[24] = {};
+    for (int slot = 0; slot < 64; ++slot) {
+      const int t = slot % 4, r = slot / 4;
+      const size_t n = static_cast<size_t>(tile) * 16 + (r % 8) + 8 * (r / 8);
+      const uint8_t s0 = s[n * (K / 16) + chunk * (kChunk / 16) + t * 2], s1 = s[n * (K / 16) + chunk * (kChunk / 16) + t * 2 + 1];
+      raw[blk * 128 + slot * 2] = s0;
+      raw[blk * 128 + slot * 2 + 1] = s1;
+      const uint32_t f = uint32_t(code_of[s0]) | (uint32_t(code_of[s1]) << 6);  // 12 bits
+      const int bit = 12 * slot, wi = bit >> 5, sh = bit & 31;
+      words[wi] |= f << sh;
+      if (sh > 20) words[wi + 1] |= f >> (32 - sh);
+    }
+    uint32_t* dst = reinterpret_cast<uint32_t*>(out + blk * kTileBytesFp4Coded + 1024);
+    for (int i = 0; i < 24; ++i) dst[i] = words[i];
+  }
+}
+
 __constant__ float kE2M1[16] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
 
 // Tiled layout -> BF16 row-major (the prefill path's cuBLAS input), one thread per output pair (NVFP4)
 // or element (FP8).
 __global__ void dequant_tiled_nvfp4_kernel(const uint8_t* __restrict__ tw, float scale2, __nv_bfloat16* __restrict__ out,
-                                           int N, int K) {
+                                           int N, int K, const uint8_t* __restrict__ raw) {
   const int chunks = K / kChunk;
   const size_t pairs = static_cast<size_t>(N) * K / 2;
   for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < pairs;
@@ -459,10 +549,11 @@ __global__ void dequant_tiled_nvfp4_kernel(const uint8_t* __restrict__ tw, float
     const int n = static_cast<int>(i / (K / 2)), k = static_cast<int>(i % (K / 2)) * 2;
     const int tile = n / 16, r = n % 16, g = r % 8, h = r / 8, chunk = k / kChunk, kk = k % kChunk, t = kk / 32;
     const int slot = (h * 8 + g) * 4 + t;
-    const uint8_t* base = tw + (static_cast<size_t>(tile) * chunks + chunk) * kTileBytesFp4;
+    const size_t blk = static_cast<size_t>(tile) * chunks + chunk;
+    const uint8_t* base = tw + blk * (raw ? kTileBytesFp4Coded : kTileBytesFp4);
     const uint8_t b = base[slot * 16 + (kk % 32) / 2];
     __nv_fp8_e4m3 sc;
-    sc.__x = base[1024 + slot * 2 + (kk % 32) / 16];
+    sc.__x = raw ? raw[blk * 128 + slot * 2 + (kk % 32) / 16] : base[1024 + slot * 2 + (kk % 32) / 16];
     const float s = static_cast<float>(sc) * scale2;
     out[static_cast<size_t>(n) * K + k] = __float2bfloat16(kE2M1[b & 0xf] * s);
     out[static_cast<size_t>(n) * K + k + 1] = __float2bfloat16(kE2M1[b >> 4] * s);
@@ -495,6 +586,37 @@ void check_shape(int N, int K, const char* what) {
 
 size_t tiled_bytes_nvfp4(int N, int K) { return static_cast<size_t>(N) * K / 2 + static_cast<size_t>(N) * K / 16; }
 size_t tiled_bytes_fp8(int N, int K) { return static_cast<size_t>(N) * K; }
+size_t tiled_bytes_nvfp4_coded(int N, int K) {
+  return static_cast<size_t>(N / 16) * (K / kChunk) * kTileBytesFp4Coded + 16;
+}
+
+bool scale_code_table(const uint8_t* scales, size_t n, uint8_t (&table)[kScaleCodes], uint8_t (&code_of)[256]) {
+  size_t count[256] = {};
+  for (size_t i = 0; i < n; ++i) ++count[scales[i]];
+  int distinct = 0;
+  for (int v = 0; v < 256; ++v) distinct += count[v] > 0;
+  if (distinct > kScaleCodes) return false;
+  for (int i = 0; i < kScaleCodes; ++i) table[i] = 0;
+  for (int v = 0; v < 256; ++v) code_of[v] = 0xff;
+  int next = 0;
+  for (int v = 0; v < 256; ++v)
+    if (count[v]) {
+      code_of[v] = static_cast<uint8_t>(next);
+      table[next++] = static_cast<uint8_t>(v);
+    }
+  return true;
+}
+
+void retile_nvfp4_coded(const uint8_t* w, const uint8_t* wscale, const uint8_t* code_of_dev, uint8_t* out,
+                        uint8_t* raw_scales, int N, int K, cudaStream_t s) {
+  check_shape(N, K, "retile_nvfp4_coded");
+  cudaMemsetAsync(out, 0, tiled_bytes_nvfp4_coded(N, K), s);
+  retile_nvfp4_coded_values_kernel<<<grid_of(static_cast<size_t>(N / 16) * (K / kChunk) * 64), 256, 0, s>>>(w, out, N, K);
+  retile_nvfp4_coded_scales_kernel<<<grid_of(static_cast<size_t>(N / 16) * (K / kChunk)), 256, 0, s>>>(
+      wscale, code_of_dev, out, raw_scales, N, K);
+  const cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess) throw std::runtime_error(std::string("retile_nvfp4_coded: ") + cudaGetErrorString(e));
+}
 
 void retile_nvfp4(const uint8_t* w, const uint8_t* wscale, uint8_t* out, int N, int K, cudaStream_t s) {
   check_shape(N, K, "retile_nvfp4");
@@ -510,8 +632,9 @@ void retile_fp8(const uint8_t* w, uint8_t* out, int N, int K, cudaStream_t s) {
   if (e != cudaSuccess) throw std::runtime_error(std::string("retile_fp8: ") + cudaGetErrorString(e));
 }
 
-void dequant_tiled_nvfp4(const uint8_t* tw, float scale2, __nv_bfloat16* out, int N, int K, cudaStream_t s) {
-  dequant_tiled_nvfp4_kernel<<<grid_of(static_cast<size_t>(N) * K / 2), 256, 0, s>>>(tw, scale2, out, N, K);
+void dequant_tiled_nvfp4(const uint8_t* tw, float scale2, __nv_bfloat16* out, int N, int K, cudaStream_t s,
+                         const uint8_t* raw_scales) {
+  dequant_tiled_nvfp4_kernel<<<grid_of(static_cast<size_t>(N) * K / 2), 256, 0, s>>>(tw, scale2, out, N, K, raw_scales);
   const cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) throw std::runtime_error(std::string("dequant_tiled_nvfp4: ") + cudaGetErrorString(e));
 }
@@ -533,8 +656,7 @@ void to_half_rows(const float* x, int M, int K, __half* out, float* xinv, cudaSt
 
 void stream_gemm_nvfp4(const __half* x, const float* xinv, int M, const uint8_t* w, const uint8_t* wscale,
                        float scale2, float* y, int N, int K, cudaStream_t s) {
-  (void)wscale;  // the scales live inside the tiled blob
-  const StreamTarget t{w, nullptr, scale2, y, N};
+  const StreamTarget t{w, wscale, scale2, y, N};  // wscale: the code table of a coded blob, or nullptr
   dispatch<true>(x, xinv, M, &t, 1, K, s);
 }
 
