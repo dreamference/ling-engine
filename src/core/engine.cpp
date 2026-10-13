@@ -263,6 +263,9 @@ SpecStats Engine::spec_stats_total() const {
     t.commit_seconds += a.commit_seconds;
     t.lookup_steps += a.lookup_steps;
     t.lookup_accepted += a.lookup_accepted;
+    t.copy_steps += a.copy_steps;
+    t.copy_drafted += a.copy_drafted;
+    t.copy_accepted += a.copy_accepted;
     t.batched_steps += a.batched_steps;
     for (int b = 0; b < 5; ++b) {
       t.shadow_steps[b] += a.shadow_steps[b];
