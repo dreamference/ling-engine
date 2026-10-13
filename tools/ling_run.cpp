@@ -50,8 +50,8 @@
 // prefilled, then batched with the rows in the order [A, B] and in the order [B, A]; and one sequence prefilling
 // in chunks of --prefill-chunk-contended tokens while the other decodes alone, then the two batched, each way
 // round. Per sequence the tokens, the state, the steps and the accepted drafts must equal the prompt decoded
-// alone (speculatively, from a cold engine, under the same seed). The batch path runs eagerly; with --graphs the
-// runs alone (and a sequence's steps outside the batch) use step graphs.
+// alone (speculatively, from a cold engine, under the same seed). With --graphs the runs alone and the batch both
+// replay step graphs (the batch path's own since stage 4).
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
