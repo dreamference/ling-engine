@@ -68,11 +68,11 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   q_ = alloc<float>(M * qsize);
   gate_ = alloc<float>(M * qsize);
   attn_ = alloc<float>(M * qsize);
-  attn_scratch_ = alloc<float>(kernels::attention_rows_scratch_floats(std::max(kAttnSlice, kernels::kMaxStreamRows),
+  attn_scratch_ = alloc<float>(kernels::attention_rows_scratch_floats(std::max(kAttnSlice, kernels::kMaxVerifyRows),
                                                                       c.heads, c.head_dim, opts_.max_context));
-  logits_dev_ = alloc<float>(size_t(kernels::kMaxStreamRows) * c.vocab);
-  xh_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * std::max(c.intermediate, std::max(c.hidden, std::max(C, qsize))));
-  xinv_ = alloc<float>(kernels::kMaxStreamRows);
+  logits_dev_ = alloc<float>(size_t(kernels::kMaxVerifyRows) * c.vocab);
+  xh_ = alloc<__half>(size_t(kernels::kMaxVerifyRows) * std::max(c.intermediate, std::max(c.hidden, std::max(C, qsize))));
+  xinv_ = alloc<float>(kernels::kMaxVerifyRows);
   x_bf16_ = alloc<__nv_bfloat16>(M * std::max(c.intermediate, std::max(c.hidden, C)));
   const size_t widest = std::max<size_t>(c.intermediate, std::max(c.hidden, std::max(C, 2 * qsize)));
   xq_ = alloc<uint8_t>(M * widest);         // FP8 activations, or NVFP4 in the first half
@@ -150,7 +150,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   if (commit_overlap_) {
     check(cudaStreamCreateWithFlags(&commit_stream_, cudaStreamNonBlocking), "commit stream");
     check(cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming), "commit event");
-    commit_core_ = alloc<float>(size_t(kernels::kMaxStreamRows) * Vs);
+    commit_core_ = alloc<float>(size_t(kernels::kMaxVerifyRows) * Vs);
     std::fprintf(stderr, "commit beside the next draft\n");
   }
 }
@@ -286,6 +286,10 @@ SpecStats Engine::spec_stats_total() const {
     t.copy_steps += a.copy_steps;
     t.copy_drafted += a.copy_drafted;
     t.copy_accepted += a.copy_accepted;
+    for (int k = 0; k < 3; ++k) {
+      t.copy_steps_by[k] += a.copy_steps_by[k];
+      t.copy_accepted_by[k] += a.copy_accepted_by[k];
+    }
     t.batched_steps += a.batched_steps;
     for (int b = 0; b < 5; ++b) {
       t.shadow_steps[b] += a.shadow_steps[b];
@@ -533,7 +537,7 @@ bool Engine::norm_rows(const float* x, const __nv_bfloat16* w, float* out, int M
 }
 
 void Engine::linear_bf16(const Bf16Weight& w, const float* x, int M, float* y) {
-  if (M <= kernels::kMaxStreamRows) {  // the weights read once for every row, row-invariant
+  if (M <= kernels::kMaxVerifyRows) {  // the weights read once per 32 rows, row-invariant
     kernels::bf16_rows(x, M, w.w, y, w.N, w.K, stream_);
     return;
   }
@@ -573,7 +577,7 @@ void Engine::forward(const int* ids, int M, Pass pass, int keep_at) {
 void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::span<const Seg> segs) {
   join_commit();  // a no-op inside a verify's capture: speculate joins before the verify
   const ModelConfig& c = model_->config();
-  const bool rows = M <= kernels::kMaxStreamRows, verify = pass == Pass::Verify;
+  const bool rows = M <= kernels::kMaxVerifyRows, verify = pass == Pass::Verify;
   if (segs.empty() || (segs.size() > 1 && !verify)) throw std::runtime_error("forward: several sequences only in a verify");
   int seg_rows = 0;
   for (const Seg& g : segs) {
@@ -599,7 +603,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   // A prompt's tokens take the prefill path whatever the chunk's size, so the state a prompt leaves does
   // not depend on how its prefill was split or where it resumed (the prefix checkpoints rely on it).
   quantized_ = pass == Pass::Prefill;
-  if (verify && !rows) throw std::runtime_error("verify: at most 32 rows");
+  if (verify && !rows) throw std::runtime_error("verify: at most 64 rows");
   NvtxRange range(verify ? "verify" : M == 1 ? "decode" : "prefill_chunk");
   const int H = c.hidden, I = c.intermediate, C = c.lin_conv_channels(), Vs = c.lin_value_size();
   const int qsize = c.heads * c.head_dim;

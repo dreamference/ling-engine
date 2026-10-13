@@ -20,6 +20,8 @@
 
 #include "core/accept.hpp"
 #include "core/copy_proposer.hpp"
+#include "core/copy_views.hpp"
+#include "tokenizer/tokenizer.hpp"
 
 namespace {
 
@@ -92,6 +94,9 @@ bool check_proposals() {
   p.match_cap = 20;
   r = propose_seq(rep, 3, p);
   ok &= r.match == 20 && r.tokens.size() == 10;
+  // A negative token is a separator: the continuation stops before it (the views' side corpus).
+  r = propose_seq({1, 2, 3, 4, 5, -1, 9, 1, 2, 3}, 3, p);
+  ok &= r.tokens == std::vector<int>({4, 5});
   return report("copy proposals", ok);
 }
 
@@ -238,28 +243,27 @@ std::vector<int> agent_text(std::mt19937_64& rng, int* context_len) {
 // Decodes the text after its context the way Engine::speculate does, with a toy target whose greedy choice at
 // every position is the text's token there (any target gives the same argmax for a row whatever else is in
 // the verify: the rows path is row-invariant), and a toy drafter that gets the next few tokens right.
-// mode 0: drafter only; 1 replace; 2 extend. Returns the tokens decoded; *steps the steps taken.
-std::vector<int> decode_greedy(const std::vector<int>& text, int context_len, int mode, int block, long* steps,
-                               long* copied_accepted) {
+// mode 0: drafter only; 1 replace; 2 extend. The copy proposals come from a CopySession with `cfg` (and `codec`
+// for views and edit mode), synced to the history and the anchor as plan_begin syncs it.
+struct DecodeStats {
+  long steps = 0, copied_accepted = 0;
+  long by_source[3] = {};  // copied tokens accepted, by CopySource
+};
+
+std::vector<int> decode_greedy(const std::vector<int>& text, int context_len, int mode, int block, const ling::CopyConfig& cfg,
+                               const ling::TextCodec* codec, DecodeStats* st) {
   std::mt19937_64 rng(11);
   std::vector<int> history(text.begin(), text.begin() + context_len);
-  CopyIndex idx(8);
-  CopyParams cp;
-  cp.min_match = 16;
-  cp.max_tokens = 31;
+  ling::CopySession session;
   int anchor = text[context_len];  // chosen from the prefill's logits
   std::vector<int> out = {anchor};
-  *steps = 0;
-  *copied_accepted = 0;
+  *st = DecodeStats{};
   const int L = static_cast<int>(text.size());
   while (static_cast<int>(history.size()) + 1 < L) {
     const int pos = static_cast<int>(history.size());  // the anchor's position
     const int E = block - 1;
     CopyProposal prop;
-    if (mode > 0) {
-      idx.sync(history, std::span<const int>(&anchor, 1));
-      prop = idx.propose(cp);
-    }
+    if (mode > 0) prop = session.propose(history, std::span<const int>(&anchor, 1), cfg, codec);
     std::vector<int> drafts;
     int copy_from = INT32_MAX;
     if (mode == 1 && static_cast<int>(prop.tokens.size()) > E) {
@@ -275,7 +279,7 @@ std::vector<int> decode_greedy(const std::vector<int>& text, int context_len, in
         drafts.push_back(e < right ? truth : truth + 1);
       }
       if (mode == 2) {
-        const int add = ling::extend_with_copy(drafts, prop.tokens, cp.max_tokens);
+        const int add = ling::extend_with_copy(drafts, prop.tokens, cfg.params.max_tokens);
         if (add > 0) copy_from = E;
       }
     }
@@ -289,11 +293,21 @@ std::vector<int> decode_greedy(const std::vector<int>& text, int context_len, in
     out.insert(out.end(), drafts.begin(), drafts.begin() + accepted);
     out.push_back(next);
     anchor = next;
-    *steps += 1;
-    if (accepted > copy_from) *copied_accepted += accepted - copy_from;
+    st->steps += 1;
+    if (accepted > copy_from) {
+      st->copied_accepted += accepted - copy_from;
+      st->by_source[static_cast<int>(prop.from)] += accepted - copy_from;
+    }
   }
   out.resize(std::min(out.size(), size_t(L - context_len)));
   return out;
+}
+
+ling::CopyConfig history_only() {
+  ling::CopyConfig c;
+  c.params.min_match = 16;
+  c.params.max_tokens = 63;
+  return c;
 }
 
 bool check_greedy_exact() {
@@ -303,19 +317,290 @@ bool check_greedy_exact() {
     int context_len = 0;
     const std::vector<int> text = agent_text(rng, &context_len);
     const std::vector<int> expect(text.begin() + context_len, text.end());
-    long steps[3], copied[3];
+    DecodeStats st[3];
     for (int mode = 0; mode < 3; ++mode) {
-      const std::vector<int> got = decode_greedy(text, context_len, mode, 12, &steps[mode], &copied[mode]);
+      const std::vector<int> got = decode_greedy(text, context_len, mode, 12, history_only(), nullptr, &st[mode]);
       ok &= got == expect;
     }
     const double n = double(expect.size());
     std::printf("  seed %llu: %zu output tokens; tokens/step drafter %.2f, replace %.2f, extend %.2f "
                 "(copied tokens accepted: replace %ld, extend %ld)\n",
-                static_cast<unsigned long long>(seed), expect.size(), n / steps[0], n / steps[1], n / steps[2],
-                copied[1], copied[2]);
-    ok &= steps[1] < steps[0] && steps[2] < steps[0] && copied[1] > 0 && copied[2] > 0;
+                static_cast<unsigned long long>(seed), expect.size(), n / st[0].steps, n / st[1].steps, n / st[2].steps,
+                st[1].copied_accepted, st[2].copied_accepted);
+    ok &= st[1].steps < st[0].steps && st[2].steps < st[0].steps && st[1].copied_accepted > 0 && st[2].copied_accepted > 0;
   }
-  return report("greedy: output token for token with copies (replace, extend), fewer steps", ok);
+  return report("greedy: output token for token with copies (replace, extend, up to 63), fewer steps", ok);
+}
+
+// ---- Emission views and edit mode (S2, D2/D3 of 2026-10-13) ----
+
+bool check_transforms() {
+  bool ok = true;
+  ok &= ling::diff_view("a\nb\n", ' ') == " a\n b\n";
+  ok &= ling::diff_view("a\n\nb", '-') == "-a\n-\n-b";
+  ok &= ling::diff_view("", '+').empty();
+  ok &= ling::json_view("say \"hi\"\\\n\tx\x01") == "say \\\"hi\\\"\\\\\\n\\tx\\u0001";
+  ok &= ling::json_view("caf\xc3\xa9") == "caf\xc3\xa9";  // UTF-8 as is
+  ling::HunkHeader h;
+  ok &= ling::parse_hunk_header("@@ -12,7 +12,8 @@ def foo():", &h) && h.unified && h.old_line == 12 && h.anchor == "def foo():";
+  ok &= ling::parse_hunk_header("@@ -3 +3,2 @@", &h) && h.unified && h.old_line == 3 && h.anchor.empty();
+  ok &= ling::parse_hunk_header("@@ class Foo:\r", &h) && !h.unified && h.anchor == "class Foo:";
+  ok &= ling::parse_hunk_header("@@", &h) && !h.unified && h.anchor.empty();
+  ok &= !ling::parse_hunk_header(" @@ x", &h) && !ling::parse_hunk_header("-@@", &h);
+  ok &= ling::parse_hunk_header("@@ -x +1 @@", &h) && !h.unified && h.anchor == "-x +1 @@";  // not unified: an anchor
+  return report("views: diff and JSON transforms, hunk headers", ok);
+}
+
+// A byte-level codec: a token per byte, and four marker tokens. Every line starts on a token boundary.
+constexpr int kOpen = 300, kClose = 301, kCallOpen = 302, kCallClose = 303;
+ling::TextCodec byte_codec() {
+  ling::TextCodec c;
+  c.token_bytes = [](int t) { return t < 256 ? std::string(1, static_cast<char>(t)) : std::string("<m>"); };
+  c.encode = [](const std::string& s) {
+    std::vector<int> v;
+    for (unsigned char ch : s) v.push_back(ch);
+    return v;
+  };
+  c.tool_response_open = kOpen;
+  c.tool_response_close = kClose;
+  c.tool_call_open = kCallOpen;
+  c.tool_call_close = kCallClose;
+  return c;
+}
+
+void put(std::vector<int>& v, const std::string& s) {
+  for (unsigned char ch : s) v.push_back(ch);
+}
+
+// A Python-like file with `n` functions; line numbers are 1-based in unified headers.
+std::string py_file(std::mt19937_64& rng, int n) {
+  std::string f;
+  for (int i = 1; i <= n; ++i) {
+    f += "def f" + std::to_string(i) + "(x, scale=" + std::to_string(rng() % 90 + 10) + "):\n";
+    f += "    y = x * scale + " + std::to_string(rng() % 1000) + "  # step " + std::to_string(i) + "\n";
+    f += "    if y > " + std::to_string(rng() % 5000) + ":\n";
+    f += "        return compute_result(y - " + std::to_string(rng() % 77) + ", label=\"f" + std::to_string(i) + "\")\n";
+    f += "    return y\n\n";
+  }
+  return f;
+}
+
+std::vector<std::string> lines_of(const std::string& s) {
+  std::vector<std::string> v;
+  size_t b = 0;
+  while (b <= s.size()) {
+    const size_t e = s.find('\n', b);
+    v.push_back(s.substr(b, e == std::string::npos ? std::string::npos : e - b));
+    if (e == std::string::npos) break;
+    b = e + 1;
+  }
+  return v;
+}
+
+// The session so far: a request, a tool call that reads `path`, its output (the file), then the start of an answer.
+std::vector<int> session_with_file(const std::string& path, const std::string& file, const std::string& answer) {
+  std::vector<int> h;
+  put(h, "user: fix the scaling in " + path + "\nassistant: ");
+  h.push_back(kCallOpen);
+  put(h, "\n<function=exec_command>\n<parameter=cmd>\ncat " + path + "\n</parameter>\n</function>\n");
+  h.push_back(kCallClose);
+  put(h, "\nuser: ");
+  h.push_back(kOpen);
+  put(h, "\n" + file + "\n");
+  h.push_back(kClose);
+  put(h, "\nassistant: ");
+  put(h, answer);
+  return h;
+}
+
+std::vector<int> bytes_of(const std::string& s, size_t n) {
+  std::vector<int> v;
+  for (size_t i = 0; i < s.size() && i < n; ++i) v.push_back(static_cast<unsigned char>(s[i]));
+  return v;
+}
+
+bool check_views_and_edit() {
+  std::mt19937_64 rng(3);
+  const std::string file = py_file(rng, 12);
+  const std::vector<std::string> L = lines_of(file);
+  const ling::TextCodec codec = byte_codec();
+  ling::CopyConfig all = history_only();
+  all.views = ling::kCopyViewDiff | ling::kCopyViewJson;
+  all.edit = true;
+  bool ok = true;
+  auto ask = [&](const std::string& answer, const ling::CopyConfig& cfg, const ling::TextCodec* c) {
+    std::vector<int> h = session_with_file("src/mod.py", file, answer);
+    const int anchor = h.back();
+    h.pop_back();
+    ling::CopySession s;
+    return s.propose(h, std::span<const int>(&anchor, 1), cfg, c);
+  };
+  // '-' view: removed lines quoted with their prefix. The history alone continues the raw line (no '-' after the
+  // newline); the view continues with "\n-" and the next line.
+  {
+    const std::string answer = "*** Begin Patch\n*** Update File: src/mod.py\n-" + L[6] + "\n-" + L[7].substr(0, 20);
+    const CopyProposal v = ask(answer, all, &codec), h = ask(answer, history_only(), nullptr);
+    const std::string want = ling::diff_view(file, '-').substr(ling::diff_view(file, '-').find(L[7]) + 20);
+    ok &= v.from == ling::CopySource::View && v.tokens == bytes_of(want, 63);
+    ok &= h.tokens.empty() || h.tokens != v.tokens;
+    if (!ok) std::printf("  '-' view failed\n");
+  }
+  // JSON view: the file as an escaped string argument.
+  {
+    const std::string js = ling::json_view(file);
+    const size_t cut = js.find("f3(") + 40;
+    const CopyProposal v = ask("{\"input\": \"" + js.substr(0, cut), all, &codec);
+    ok &= v.from == ling::CopySource::View && v.tokens == bytes_of(js.substr(cut), 63);
+    if (!(v.from == ling::CopySource::View)) std::printf("  json view failed\n");
+  }
+  // Edit mode, apply_patch's anchor: right after "@@ def f5(...):\n", the lines after that line, ' '-prefixed.
+  const std::string sp = ling::diff_view(file, ' ');
+  auto view_from_line = [&](size_t line) {
+    size_t at = 0;
+    for (size_t i = 0; i < line; ++i) at = sp.find('\n', at) + 1;
+    return sp.substr(at);
+  };
+  size_t f5 = 0;
+  while (L[f5].rfind("def f5(", 0) != 0) ++f5;
+  {
+    const CopyProposal e = ask("*** Begin Patch\n*** Update File: src/mod.py\n@@ " + L[f5] + "\n", all, &codec);
+    ok &= e.from == ling::CopySource::Edit && e.tokens == bytes_of(view_from_line(f5 + 1), 63);
+    if (!(e.from == ling::CopySource::Edit)) std::printf("  edit (apply_patch anchor) failed\n");
+  }
+  // Edit mode, unified: "@@ -L,n +L,m @@" jumps to line L of the file the patch's header names (read by `cat`).
+  {
+    const CopyProposal e = ask("--- a/src/mod.py\n+++ b/src/mod.py\n@@ -20,4 +20,5 @@\n", all, &codec);
+    ok &= e.from == ling::CopySource::Edit && e.tokens == bytes_of(view_from_line(19), 63);
+    // A file no tool output read, but a heading: the heading's line, then the line after it.
+    const CopyProposal h = ask("--- a/other.py\n+++ b/other.py\n@@ -20,4 +20,5 @@ " + L[f5] + "\n", all, &codec);
+    ok &= h.from == ling::CopySource::Edit && h.tokens == bytes_of(view_from_line(f5 + 1), 63);
+    // Neither: no jump (the views and the history still propose as usual).
+    const CopyProposal n = ask("--- a/other.py\n+++ b/other.py\n@@ -20,4 +20,5 @@\n", all, &codec);
+    ok &= n.from != ling::CopySource::Edit;
+    if (!(e.from == ling::CopySource::Edit && h.from == ling::CopySource::Edit)) std::printf("  edit (unified) failed\n");
+  }
+  // Off by default: without the flags (or without a codec) nothing comes from views or edit mode.
+  {
+    const CopyProposal e = ask("@@ " + L[f5] + "\n", history_only(), &codec);
+    const CopyProposal n = ask("@@ " + L[f5] + "\n", all, nullptr);
+    ok &= e.from == ling::CopySource::History && n.from == ling::CopySource::History;
+  }
+  return report("views ('-', JSON) and edit mode (apply_patch anchor, unified line, heading) propose the right text", ok);
+}
+
+// A random session over the byte codec: text, tool calls and outputs (files), and answers that quote them with
+// prefixes, JSON escaping and hunk headers.
+std::vector<int> random_session(std::mt19937_64& rng, int parts) {
+  std::vector<std::string> files;
+  std::vector<int> h;
+  for (int p = 0; p < parts; ++p) {
+    const int kind = static_cast<int>(rng() % 4);
+    if (kind == 0 || files.empty()) {
+      files.push_back(py_file(rng, 2 + static_cast<int>(rng() % 3)));
+      const std::string path = "src/m" + std::to_string(files.size()) + ".py";
+      const std::vector<int> s = session_with_file(path, files.back(), "");
+      h.insert(h.end(), s.begin(), s.end());
+    } else {
+      const std::string& f = files[rng() % files.size()];
+      const std::vector<std::string> L = lines_of(f);
+      const size_t a = rng() % L.size();
+      std::string out;
+      if (kind == 1) out = "@@ " + L[a] + "\n" + ling::diff_view(f.substr(f.find(L[a])), ' ').substr(0, 200);
+      else if (kind == 2) out = "@@ -" + std::to_string(a + 1) + ",3 +" + std::to_string(a + 1) + ",4 @@\n-" + L[a] + "\n+new\n";
+      else out = "\"" + ling::json_view(f).substr(0, 150) + "\"";
+      put(h, out);
+    }
+  }
+  return h;
+}
+
+bool same_proposal(const CopyProposal& a, const CopyProposal& b) {
+  return a.tokens == b.tokens && a.match == b.match && a.source == b.source && a.from == b.from;
+}
+
+bool check_session_incremental() {
+  std::mt19937_64 rng(17);
+  const ling::TextCodec codec = byte_codec();
+  ling::CopyConfig cfg = history_only();
+  cfg.params.min_match = 6;
+  cfg.views = ling::kCopyViewDiff | ling::kCopyViewJson;
+  cfg.edit = true;
+  bool ok = true;
+  ling::CopySession inc;
+  std::vector<int> seq;
+  for (int op = 0; op < 300 && ok; ++op) {
+    const int kind = static_cast<int>(rng() % 3);
+    if (kind == 0 || seq.size() < 100) {  // grow by a piece of a session
+      const std::vector<int> more = random_session(rng, 1);
+      seq.insert(seq.end(), more.begin(), more.end());
+    } else if (kind == 1) {  // cut anywhere (inside a tool output too) and regrow differently
+      seq.resize(seq.size() - std::min<size_t>(seq.size(), rng() % 400));
+      const std::vector<int> more = random_session(rng, 1);
+      seq.insert(seq.end(), more.begin(), more.end());
+    } else {  // a few steps, token by token
+      for (int i = 0; i < 20 && !seq.empty(); ++i) seq.push_back(static_cast<int>('a' + rng() % 3));
+    }
+    for (int q = 0; q < 3 && seq.size() > 2; ++q) {  // ask at the end and at a few earlier cut points
+      const size_t at = q == 0 ? seq.size() - 1 : 1 + rng() % (seq.size() - 1);
+      const std::span<const int> h(seq.data(), at);
+      const int anchor = seq[at];
+      const CopyProposal x = inc.propose(h, std::span<const int>(&anchor, 1), cfg, &codec);
+      ling::CopySession fresh;
+      const CopyProposal y = fresh.propose(h, std::span<const int>(&anchor, 1), cfg, &codec);
+      ok &= same_proposal(x, y) && inc.view_index().tokens() == fresh.view_index().tokens();
+    }
+  }
+  return report("session state (history, views, edit anchors): incremental equals fresh under cuts inside tool outputs", ok);
+}
+
+// An answer that rewrites parts of the files it read: apply_patch hunks with context, removed and added lines.
+std::string patch_answer(std::mt19937_64& rng, const std::string& path, const std::string& file, int hunks) {
+  const std::vector<std::string> L = lines_of(file);
+  std::string out = "*** Begin Patch\n*** Update File: " + path + "\n";
+  for (int k = 0; k < hunks; ++k) {
+    size_t a = 0;
+    do a = rng() % (L.size() - 12);
+    while (L[a].rfind("def ", 0) != 0);
+    out += "@@ " + L[a] + "\n";
+    for (size_t i = a + 1; i < a + 3; ++i) out += " " + L[i] + "\n";
+    out += "-" + L[a + 3] + "\n+" + L[a + 3] + "  # checked\n";
+    for (size_t i = a + 4; i < a + 10; ++i) out += " " + L[i] + "\n";
+  }
+  return out + "*** End Patch\n";
+}
+
+bool check_greedy_views() {
+  bool ok = true;
+  const ling::TextCodec codec = byte_codec();
+  for (uint64_t seed : {5, 6}) {
+    std::mt19937_64 rng(seed);
+    const std::string file = py_file(rng, 30);
+    std::vector<int> text = session_with_file("src/mod.py", file, "");
+    const int context_len = static_cast<int>(text.size());
+    put(text, patch_answer(rng, "src/mod.py", file, 6));
+    const std::vector<int> expect(text.begin() + context_len, text.end());
+    ling::CopyConfig views = history_only();
+    views.views = ling::kCopyViewDiff | ling::kCopyViewJson;
+    ling::CopyConfig edit = views;
+    edit.edit = true;
+    ling::CopyConfig edit_only = history_only();
+    edit_only.edit = true;
+    DecodeStats h, v, eo, e, ex;
+    ok &= decode_greedy(text, context_len, 1, 12, history_only(), &codec, &h) == expect;
+    ok &= decode_greedy(text, context_len, 1, 12, views, &codec, &v) == expect;
+    ok &= decode_greedy(text, context_len, 1, 12, edit_only, &codec, &eo) == expect;
+    ok &= decode_greedy(text, context_len, 1, 12, edit, &codec, &e) == expect;
+    ok &= decode_greedy(text, context_len, 2, 12, edit, &codec, &ex) == expect;
+    const double n = double(expect.size());
+    std::printf("  seed %llu: %zu tokens of patch; replace tokens/step: history %.2f, + views %.2f, + edit alone %.2f, "
+                "+ views + edit %.2f; extend + views + edit %.2f (copied accepted by history/view/edit: edit alone "
+                "%ld/%ld/%ld, views + edit %ld/%ld/%ld)\n",
+                static_cast<unsigned long long>(seed), expect.size(), n / h.steps, n / v.steps, n / eo.steps, n / e.steps,
+                n / ex.steps, eo.by_source[0], eo.by_source[1], eo.by_source[2], e.by_source[0], e.by_source[1],
+                e.by_source[2]);
+    ok &= v.steps < h.steps && v.by_source[1] > 0 && eo.steps < h.steps && eo.by_source[2] > 0;
+  }
+  return report("greedy: patches decoded token for token with views and edit mode, in fewer steps", ok);
 }
 
 // Sampled exactness of mixed chains: a toy target whose next-token distribution depends only on the position is
@@ -420,6 +705,65 @@ bool check_sampled(int mode, int Ed, int C, uint64_t seed) {
   return ok;
 }
 
+
+// With the real Qwen tokenizer (the path to tokenizer.json as the first argument; skipped without it): the views and
+// edit mode must line up with how the model's own patch tokenizes, which a byte codec cannot show. A session renders
+// as the chat template renders it (a tool call that reads a file, its output, then an apply_patch call with hunks),
+// is tokenized once as a whole, and decoded greedily with each source.
+bool check_real_tokenizer(const char* path) {
+  ling::Tokenizer tok(path, ling::kProductionPretokenizer);
+  ling::TextCodec codec;
+  codec.token_bytes = [&tok](int id) { return tok.token_bytes(id); };
+  codec.encode = [&tok](const std::string& s) { return tok.encode(s); };
+  codec.tool_response_open = tok.token_id("<tool_response>");
+  codec.tool_response_close = tok.token_id("</tool_response>");
+  codec.tool_call_open = tok.token_id("<tool_call>");
+  codec.tool_call_close = tok.token_id("</tool_call>");
+  if (!codec.valid() || codec.tool_call_open < 0) return report("real tokenizer: markers found", false);
+  bool ok = true;
+  for (uint64_t seed : {7, 8}) {
+    std::mt19937_64 rng(seed);
+    const std::string file = py_file(rng, 40);
+    const std::string prompt =
+        "<|im_start|>user\nFix the scaling in src/mod.py.<|im_end|>\n<|im_start|>assistant\n<tool_call>\n"
+        "<function=exec_command>\n<parameter=cmd>\ncat src/mod.py\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
+        "<|im_start|>user\n<tool_response>\n" + file + "\n</tool_response><|im_end|>\n<|im_start|>assistant\n";
+    const std::string answer = "<tool_call>\n<function=apply_patch>\n<parameter=input>\n" +
+                               patch_answer(rng, "src/mod.py", file, 6) + "</parameter>\n</function>\n</tool_call><|im_end|>";
+    const std::vector<int> text = tok.encode(prompt + answer), head = tok.encode(prompt);
+    if (!std::equal(head.begin(), head.end(), text.begin())) return report("real tokenizer: prompt tokens are a prefix", false);
+    const int context_len = static_cast<int>(head.size());
+    const std::vector<int> expect(text.begin() + context_len, text.end());
+    ling::CopyConfig views = history_only();
+    views.views = ling::kCopyViewDiff | ling::kCopyViewJson;
+    ling::CopyConfig edit = views;
+    edit.edit = true;
+    DecodeStats d, h, v, e, ex;
+    auto t0 = std::chrono::steady_clock::now();
+    ok &= decode_greedy(text, context_len, 0, 12, history_only(), &codec, &d) == expect;
+    ok &= decode_greedy(text, context_len, 1, 12, history_only(), &codec, &h) == expect;
+    ok &= decode_greedy(text, context_len, 1, 12, views, &codec, &v) == expect;
+    ok &= decode_greedy(text, context_len, 1, 12, edit, &codec, &e) == expect;
+    ok &= decode_greedy(text, context_len, 2, 12, edit, &codec, &ex) == expect;
+    // The cost of building the views once (four views of the file, tokenized).
+    ling::CopySession s;
+    const std::span<const int> hist(text.data(), context_len);
+    const int anchor = text[context_len];
+    auto t1 = std::chrono::steady_clock::now();
+    s.propose(hist, std::span<const int>(&anchor, 1), edit, &codec);
+    const double build_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+    (void)t0;
+    const double n = double(expect.size());
+    std::printf("  seed %llu: %zu tokens of output, file %zu bytes; tokens/step: drafter %.2f; replace: history %.2f, "
+                "+ views %.2f, + edit %.2f; extend + edit %.2f; accepted copied by history/view/edit (replace + edit) "
+                "%ld/%ld/%ld; views built in %.1f ms (%ld view tokens)\n",
+                static_cast<unsigned long long>(seed), expect.size(), file.size(), n / d.steps, n / h.steps, n / v.steps,
+                n / e.steps, n / ex.steps, e.by_source[0], e.by_source[1], e.by_source[2], build_ms, s.stats().view_tokens);
+    ok &= v.by_source[1] > 0 && e.by_source[2] > 0 && v.steps < h.steps;
+  }
+  return report("real tokenizer: views and edit mode line up with the model's own patch tokens", ok);
+}
+
 bool check_cost() {
   // A 64K-token history: 2K-token files read in, then rewritten with edits, and steps of ~5 tokens.
   std::mt19937_64 rng(5);
@@ -473,7 +817,7 @@ bool check_cost() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   bool ok = check_proposals();
   ok &= check_incremental();
   ok &= check_extend();
@@ -482,7 +826,13 @@ int main() {
   ok &= check_sampled(1, 0, 6, 22);
   ok &= check_sampled(2, 1, 3, 23);
   ok &= check_sampled(2, 2, 5, 27);
+  ok &= check_transforms();
+  ok &= check_views_and_edit();
+  ok &= check_session_incremental();
+  ok &= check_greedy_views();
   ok &= check_cost();
+  if (argc > 1) ok &= check_real_tokenizer(argv[1]);
+  else std::printf("real tokenizer: skipped (pass tokenizer.json's path)\n");
   std::printf(ok ? "all copy tests passed\n" : "COPY TESTS FAILED\n");
   return ok ? 0 : 1;
 }

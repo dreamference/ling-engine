@@ -547,7 +547,7 @@ __global__ void attn_prepare_seqs_kernel(const float* __restrict__ q_gate, const
                     gate, kc.p[sq], vc.p[sq], hs, ps);
 }
 
-// ---- Rows-path attention on tensor cores (decode and verify, M <= 32). ----
+// ---- Rows-path attention on tensor cores (decode and verify, M <= 64; any M is row-invariant). ----
 // One block takes all query rows of one KV head (row r = position m * 6 + head g, up to 96 rows: 16
 // positions) and one fixed range of attention_chunk() keys, in tiles staged in shared memory.
 // S = Q K^T and O += P V run as BF16 m16n8k16 MMAs with FP32 accumulation, one warp per 16 rows, and
@@ -1000,17 +1000,27 @@ void gemv_bf16(const float* x, int M, const __nv_bfloat16* w, float* y, int N, i
   LING_LAUNCH_CHECK("gemv_bf16");
 }
 
+// More than 32 rows (a long copy's verify and commit, moonshot P1) run as 32-row pieces: a row's result does not
+// depend on the rows beside it, so the pieces give every row the bits one launch would.
 void bf16_rows(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s,
                const __nv_bfloat16* w2, float* y2) {
-  if (M < 1 || M > 32 || K % (kBf16RowsThreads * 8) != 0) throw std::runtime_error("bf16_rows: M <= 32, K % 1024 == 0");
-  launch_kernel("bf16_rows", bf16_rows_kernel<float>, dim3(w2 ? 2 * N : N), dim3(kBf16RowsThreads), 0, s, x, M, w, y,
-                w2, y2, N, K);
+  if (M < 1 || M > kMaxVerifyRows || K % (kBf16RowsThreads * 8) != 0)
+    throw std::runtime_error("bf16_rows: M <= 64, K % 1024 == 0");
+  for (int m0 = 0; m0 < M; m0 += 32) {
+    const int m = std::min(32, M - m0);
+    launch_kernel("bf16_rows", bf16_rows_kernel<float>, dim3(w2 ? 2 * N : N), dim3(kBf16RowsThreads), 0, s,
+                  x + size_t(m0) * K, m, w, y + size_t(m0) * N, w2, y2 ? y2 + size_t(m0) * N : nullptr, N, K);
+  }
 }
 
 void bf16_rows_bf16in(const __nv_bfloat16* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s) {
-  if (M < 1 || M > 32 || K % (kBf16RowsThreads * 8) != 0) throw std::runtime_error("bf16_rows: M <= 32, K % 1024 == 0");
-  launch_kernel("bf16_rows_bf16in", bf16_rows_kernel<__nv_bfloat16>, dim3(N), dim3(kBf16RowsThreads), 0, s, x, M, w,
-                y, nullptr, nullptr, N, K);
+  if (M < 1 || M > kMaxVerifyRows || K % (kBf16RowsThreads * 8) != 0)
+    throw std::runtime_error("bf16_rows: M <= 64, K % 1024 == 0");
+  for (int m0 = 0; m0 < M; m0 += 32) {
+    const int m = std::min(32, M - m0);
+    launch_kernel("bf16_rows_bf16in", bf16_rows_kernel<__nv_bfloat16>, dim3(N), dim3(kBf16RowsThreads), 0, s,
+                  x + size_t(m0) * K, m, w, y + size_t(m0) * N, nullptr, nullptr, N, K);
+  }
 }
 
 void dequant_nvfp4(const uint8_t* w, const uint8_t* wscale, float scale2, __nv_bfloat16* out, int N, int K,
