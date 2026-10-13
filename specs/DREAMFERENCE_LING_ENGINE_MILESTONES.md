@@ -56,7 +56,7 @@ BF16 prefill intermediates may be built behind a switch now. They are: `--prefil
 
 Items 2 and 3 restore the roadmap's "M4 · Product" scope: images were in the roadmap's M4 and were dropped when M4 was narrowed to sessions and batches; structured output is new to M4. Why this order: the functional gaps against production that matter for Mightling's own use are images and structured output; the rest (more than two streams, a paged and shared prefix cache, the mixed prefill+decode batch, `n` > 1) matters for serving many users. The functional gaps close before more speed work beyond the single-step savings of item 1, so drafts/M4's stage 6 and the mixed batch are outside this order.
 
-After M5, not scheduled (the owner's decision, night of 2026-10-12): one model across both GB10s by two-node tensor parallelism, estimated at 1.5–1.8× on decode and to be measured first ([BACKLOG §19.21](./DREAMFERENCE_LING_ENGINE_BACKLOG.md), [drafts/two-node-tp-2026-10-12.md](./drafts/two-node-tp-2026-10-12.md)).
+Last in the engine plan (the owner's decision of 2026-10-13; "after M5, not scheduled" since the night of 2026-10-12): one model across both GB10s by two-node tensor parallelism, after every one-node improvement is settled (M4 and the step savings, M4's stage 5, images and structured output, M2's tree speculation, M5, the moonshot's phases and every other single-node BACKLOG item), when the owner will take it up; estimated at 1.5–1.8× on decode and to be measured first ([BACKLOG §19.21](./DREAMFERENCE_LING_ENGINE_BACKLOG.md), [drafts/two-node-tp-2026-10-12.md](./drafts/two-node-tp-2026-10-12.md)).
 
 ## 15. Risks and open questions
 
