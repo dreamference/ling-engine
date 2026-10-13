@@ -230,6 +230,8 @@ Proposals are chains, not trees; trees come in P3, with M2. There are two modes,
 
 ### 8.5 What P0's GPU half settles for P1
 
+*A and B ran on 2026-10-13 ([reports/moonshot-p0-rowsweep-2026-10-13.md](../../reports/moonshot-p0-rowsweep-2026-10-13.md)): a production step is 101/107/117 ms at ~8K/32K/56K; the rows path adds 1.1–1.3 ms per row from 16 to 32; c(64) ≈ 1.3–1.5, c(128) ≈ 1.4–2.2; a K=64 copy step breaks even at about 11–16 accepted tokens. C was not run.*
+
 `bench/rowsweep.py`'s A, B and C steps no longer decide whether the 64-row verify is built (D4: built). They set P1's parameters.
 
 - **c(K), what a copy step costs against a production step:**
