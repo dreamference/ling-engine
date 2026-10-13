@@ -1,6 +1,7 @@
-// The tensor-core streaming GEMM (1-32 rows) and the row top-K: accuracy against a host reference,
+// The tensor-core streaming GEMM (1-64 rows) and the row top-K: accuracy against a host reference,
 // bit-for-bit row invariance across M (what makes greedy speculation reproduce plain decoding), and
-// bandwidth on the model's own matrix shapes.
+// bandwidth on the model's own matrix shapes. Moonshot P1 (2026-10-13) extended every rows-path check to 64 rows
+// (kMaxVerifyRows): stream_gemm's eight-group launch, bf16_rows in pieces, attention over 64 query rows.
 //
 //   ling-stream-tests            correctness only
 //   ling-stream-tests --bench    plus timings
@@ -57,7 +58,7 @@ bool test_gemm() {
   std::mt19937 rng(11);
   std::uniform_int_distribution<int> byte(0, 255), scale_byte(0x28, 0x48);
   std::normal_distribution<float> normal(0.f, 1.f);
-  const int N = 528, K = 2048, MMAX = ling::kernels::kMaxStreamRows;
+  const int N = 528, K = 2048, MMAX = ling::kernels::kMaxVerifyRows;
   std::vector<uint8_t> w4(size_t(N) * K / 2), s4(size_t(N) * K / 16), w8(size_t(N) * K);
   for (auto& b : w4) b = byte(rng);
   for (auto& b : s4) b = scale_byte(rng);
@@ -115,7 +116,7 @@ bool test_gemm() {
       }
     run(fp4, dx, MMAX, K, xh, xinv, fp4 ? dw4 : dw8, ds4, fp4 ? gs4 : gs8, dy, N);
     const std::vector<float> full = download(dy, size_t(MMAX) * N);
-    for (int M : {1, 2, 7, 8, 9, 15, 16, 17, 24, 32}) {
+    for (int M : {1, 2, 7, 8, 9, 15, 16, 17, 24, 32, 33, 40, 48, 63, 64}) {
       run(fp4, dx, M, K, xh, xinv, fp4 ? dw4 : dw8, ds4, fp4 ? gs4 : gs8, dy, N);
       const std::vector<float> got = download(dy, size_t(M) * N);
       double worst = 0;
@@ -129,7 +130,7 @@ bool test_gemm() {
       const bool same = std::memcmp(got.data(), full.data(), got.size() * sizeof(float)) == 0;
       const bool good = worst < 2e-3 && same;
       ok &= good;
-      std::printf("stream_gemm %-5s M=%-2d err/rms %.2e, rows identical to M=32: %s %s\n", fp4 ? "nvfp4" : "fp8", M,
+      std::printf("stream_gemm %-5s M=%-2d err/rms %.2e, rows identical to M=64: %s %s\n", fp4 ? "nvfp4" : "fp8", M,
                   worst, same ? "yes" : "NO", good ? "ok" : "FAIL");
     }
   }
@@ -160,13 +161,14 @@ bool test_gemm() {
   return ok;
 }
 
-// Row invariance on a wide matrix too (N >= 8192 takes the wide launch shapes, B16): every M's rows are bit for bit
-// the M = 32 launch's, NVFP4 and FP8, single and as two matrices in one launch.
+// A matrix wide enough for the two-tile launch (N >= 8192) at M <= 32: the 33-64-row launch takes one tile per block,
+// and its rows must still be bit for bit the narrower launches' (and so a one-row decode's). Run it also under
+// LING_KSPLIT=2, where the split-K choice must not follow M.
 bool test_gemm_wide() {
-  std::mt19937 rng(12);
+  std::mt19937 rng(23);
   std::uniform_int_distribution<int> byte(0, 255), scale_byte(0x28, 0x48);
   std::normal_distribution<float> normal(0.f, 1.f);
-  const int N = 8448, K = 1024, MMAX = ling::kernels::kMaxStreamRows;
+  const int N = 8448, K = 1024, MMAX = ling::kernels::kMaxVerifyRows;
   std::vector<uint8_t> w4(size_t(N) * K / 2), s4(size_t(N) * K / 16), w8(size_t(N) * K);
   for (auto& b : w4) b = byte(rng);
   for (auto& b : s4) b = scale_byte(rng);
@@ -175,7 +177,7 @@ bool test_gemm_wide() {
     while ((b & 0x7f) == 0x7f);
   }
   std::vector<float> x(size_t(MMAX) * K);
-  for (float& v : x) v = normal(rng);
+  for (auto& v : x) v = normal(rng);
   uint8_t *rw4 = upload(w4), *ds4 = upload(s4), *rw8 = upload(w8), *dw4, *dw8;
   cudaMalloc(&dw4, ling::kernels::tiled_bytes_nvfp4(N, K));
   cudaMalloc(&dw8, ling::kernels::tiled_bytes_fp8(N, K));
@@ -189,19 +191,18 @@ bool test_gemm_wide() {
   cudaMalloc(&dy, size_t(MMAX) * N * sizeof(float));
   bool ok = true;
   for (bool fp4 : {true, false}) {
-    run(fp4, dx, MMAX, K, xh, xinv, fp4 ? dw4 : dw8, ds4, 0.5f, dy, N);
+    run(fp4, dx, MMAX, K, xh, xinv, fp4 ? dw4 : dw8, ds4, 0.3f, dy, N);
     const std::vector<float> full = download(dy, size_t(MMAX) * N);
-    bool same = true;
-    for (int M : {1, 8, 9, 12, 16, 17, 24}) {
-      run(fp4, dx, M, K, xh, xinv, fp4 ? dw4 : dw8, ds4, 0.5f, dy, N);
+    for (int M : {1, 8, 9, 12, 16, 17, 24, 32, 33, 64}) {
+      run(fp4, dx, M, K, xh, xinv, fp4 ? dw4 : dw8, ds4, 0.3f, dy, N);
       const std::vector<float> got = download(dy, size_t(M) * N);
-      same &= std::memcmp(got.data(), full.data(), got.size() * sizeof(float)) == 0;
+      const bool same = std::memcmp(got.data(), full.data(), got.size() * sizeof(float)) == 0;
+      ok &= same;
+      std::printf("stream_gemm wide %-5s N=%d M=%-2d rows identical to M=64: %s\n", fp4 ? "nvfp4" : "fp8", N, M,
+                  same ? "yes ok" : "NO FAIL");
     }
-    ok &= same;
-    std::printf("stream_gemm %-5s wide (N=%d) rows identical to M=32 for M = 1 .. 24: %s\n", fp4 ? "nvfp4" : "fp8", N,
-                same ? "yes ok" : "NO FAIL");
   }
-  cudaFree(dw4), cudaFree(dw8), cudaFree(rw4), cudaFree(ds4), cudaFree(rw8), cudaFree(dx), cudaFree(xh), cudaFree(xinv),
+  cudaFree(dw4), cudaFree(ds4), cudaFree(dw8), cudaFree(rw4), cudaFree(rw8), cudaFree(dx), cudaFree(xh), cudaFree(xinv),
       cudaFree(dy);
   return ok;
 }
@@ -209,7 +210,7 @@ bool test_gemm_wide() {
 bool test_bf16_rows() {
   std::mt19937 rng(9);
   std::normal_distribution<float> normal(0.f, 1.f);
-  const int N = 48, K = 5120, MMAX = 32;
+  const int N = 48, K = 5120, MMAX = ling::kernels::kMaxVerifyRows;
   std::vector<__nv_bfloat16> w(size_t(N) * K);
   for (auto& v : w) v = __float2bfloat16(normal(rng) * 0.05f);
   std::vector<float> x(size_t(MMAX) * K);
@@ -221,7 +222,7 @@ bool test_bf16_rows() {
   ling::kernels::bf16_rows(dx, MMAX, dw, dy, N, K, nullptr);
   const std::vector<float> full = download(dy, size_t(MMAX) * N);
   bool ok = true;
-  for (int M : {1, 5, 16, 32}) {
+  for (int M : {1, 5, 16, 32, 33, 48, 64}) {
     ling::kernels::bf16_rows(dx, M, dw, dy, N, K, nullptr);
     const std::vector<float> got = download(dy, size_t(M) * N);
     double worst = 0;
@@ -234,7 +235,7 @@ bool test_bf16_rows() {
     const bool same = std::memcmp(got.data(), full.data(), got.size() * sizeof(float)) == 0;
     const bool good = worst < 1e-4 && same;
     ok &= good;
-    std::printf("bf16_rows M=%-2d max rel err %.2e, rows identical to M=32: %s %s\n", M, worst, same ? "yes" : "NO",
+    std::printf("bf16_rows M=%-2d max rel err %.2e, rows identical to M=64: %s %s\n", M, worst, same ? "yes" : "NO",
                 good ? "ok" : "FAIL");
   }
   cudaFree(dw), cudaFree(dx), cudaFree(dy);
@@ -246,7 +247,7 @@ bool test_bf16_rows() {
 bool test_attention_rows() {
   std::mt19937 rng(13);
   std::normal_distribution<float> normal(0.f, 1.f);
-  const int Hq = 24, Hkv = 4, D = 256, P = 2900, MMAX = 32, ctx = P + MMAX;
+  const int Hq = 24, Hkv = 4, D = 256, P = 2900, MMAX = ling::kernels::kMaxVerifyRows, ctx = P + MMAX;
   std::vector<__nv_bfloat16> kc(size_t(ctx) * Hkv * D), vc(kc.size());
   for (auto& v : kc) v = __float2bfloat16(normal(rng));
   for (auto& v : vc) v = __float2bfloat16(normal(rng));
@@ -261,7 +262,7 @@ bool test_attention_rows() {
   const std::vector<float> full = download(out, size_t(MMAX) * Hq * D);
   bool ok = true;
   double worst = 0;
-  for (int m : {0, 7, 31})
+  for (int m : {0, 7, 31, 47, 63})
     for (int h = 0; h < Hq; h += 5) {
       const int kvh = h / 6, pos = P + m;
       std::vector<double> sc(pos + 1);
@@ -294,8 +295,11 @@ bool test_attention_rows() {
   ling::kernels::attention_rows(dq, dk, dv, P, 16, Hq, Hkv, D, scratch, out, nullptr);
   const std::vector<float> sixteen = download(out, size_t(16) * Hq * D);
   same &= std::memcmp(sixteen.data(), full.data(), sixteen.size() * sizeof(float)) == 0;
+  ling::kernels::attention_rows(dq, dk, dv, P, 32, Hq, Hkv, D, scratch, out, nullptr);
+  const std::vector<float> thirty_two = download(out, size_t(32) * Hq * D);
+  same &= std::memcmp(thirty_two.data(), full.data(), thirty_two.size() * sizeof(float)) == 0;
   ok &= same;
-  std::printf("attention_rows rows identical across M = 1, 16, 32: %s\n", same ? "yes ok" : "NO FAIL");
+  std::printf("attention_rows rows identical across M = 1, 16, 32, 64: %s\n", same ? "yes ok" : "NO FAIL");
   // As a step graph launches it: the position read on the device (the host's value deliberately wrong),
   // every key range up to a fixed context. Must be bit for bit the eager launch.
   {
