@@ -36,8 +36,17 @@
 // (kernels::SeqBatch), each row computed as its sequence alone computes it (--batch-check). A batch's graphs are keyed
 // by the order of its sessions (they bake each one's pointers and the row split) and read each sequence's position
 // from pos_dev_[i]; each sequence's commit graph is its session's, keyed by its slot and accepted count.
+//
+// Long copies (moonshot P1, EngineOptions::copy_mode, off by default): the copy proposer (copy_proposer.hpp) finds
+// the session's earlier occurrence of its last tokens and offers the continuation, up to 31 tokens while the rows
+// path stops at 32 rows. Replace verifies [anchor, copy] instead of the drafter's chain and skips the drafter's
+// pass; extend appends the copy's continuation to the drafter's chain when the drafter's whole chain equals the
+// copy's first tokens. Copied tokens are deterministic proposals (q = 1 in the rejection rule), and the drafted
+// ones keep the drafter's q, so the accept is the one above. A one-sequence step only; the verify graph is keyed
+// by its rows as well as its top K, so a copy step replays graphs too.
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
@@ -108,6 +117,12 @@ struct Engine::StepPlan {
   bool greedy = true, use_lookup = false;
   int E = 0, V = 0, K = 1, row0 = 0;
   LookupProposal lp;
+  // The copy proposer (moonshot P1): its proposal, the longest chain it may make, whether it replaced the drafter's
+  // chain, the first drafted position that is copied (q = 1 from there on) and how many copied tokens the chain holds.
+  CopyProposal cp;
+  int copy_max = 0;
+  bool use_copy = false;
+  int copy_from = INT_MAX, copied = 0;
   std::vector<int> rows;                // the anchor, then the drafted (or looked-up) tokens
   std::vector<std::vector<double>> q;   // the draft's distribution over its candidates, per drafted position
   std::vector<int> cand;                // the drafter's candidates [E][K16] (pin_ holds one sequence's at a time)
@@ -167,6 +182,16 @@ void Engine::alloc_drafter() {
   }
   conv_tmp_ = alloc<float>(size_t(C) * (c.conv_kernel - 1));
   set_draft_block(opts_.draft_block);
+  set_copy(opts_.copy_mode, opts_.copy_min_match, opts_.copy_max_tokens);
+  if (opts_.copy_ngram < 1) throw std::runtime_error("copy n-gram must be at least 1");
+}
+
+void Engine::set_copy(int mode, int min_match, int max_tokens) {
+  if (mode < 0 || mode > 2) throw std::runtime_error("copy mode must be 0 (off), 1 (replace) or 2 (extend)");
+  if (max_tokens < 1) throw std::runtime_error("copy max tokens must be at least 1");
+  opts_.copy_mode = mode;
+  opts_.copy_min_match = min_match;
+  opts_.copy_max_tokens = max_tokens;
 }
 
 bool Engine::can_speculate(const SamplingParams& p) const {
@@ -446,7 +471,7 @@ void Engine::commit_state_async(int row0, int n, bool graph) {
   commit_pending_ = true;
 }
 
-void Engine::plan_begin(StepPlan& sp, int B) {
+void Engine::plan_begin(StepPlan& sp, int B, bool single) {
   Session& s = *sp.s;
   const SamplingParams& p = *sp.p;
   sp.greedy = p.temperature <= 0.f;
@@ -459,9 +484,27 @@ void Engine::plan_begin(StepPlan& sp, int B) {
     seq.push_back(sp.anchor);
     sp.lp = lookup_propose(seq, sp.E);
   }
-  sp.use_lookup = opts_.lookup_mode == 2 && !sp.lp.tokens.empty() && sp.lp.match >= opts_.lookup_min_match;
+  // 0b. The copy proposer (moonshot P1), over the session's history and the anchor; its chain fits the rows
+  // path and the context.
+  if (single && opts_.copy_mode > 0) {
+    CopyParams cp;
+    cp.min_match = opts_.copy_min_match;
+    cp.max_tokens = std::min({opts_.copy_max_tokens, kernels::kMaxStreamRows - 1, opts_.max_context - s.pos - 1});
+    sp.copy_max = cp.max_tokens;
+    s.copy.configure(opts_.copy_ngram);
+    s.copy.sync(s.history, std::span<const int>(&sp.anchor, 1));
+    sp.cp = s.copy.propose(cp);
+  }
+  // Replace only with a chain longer than the drafter's (a copy cut short by the history's end is left to it).
+  sp.use_copy = opts_.copy_mode == 1 && static_cast<int>(sp.cp.tokens.size()) > sp.E;
+  sp.use_lookup = !sp.use_copy && opts_.lookup_mode == 2 && !sp.lp.tokens.empty() &&
+                  sp.lp.match >= opts_.lookup_min_match;
   sp.rows.assign(1, sp.anchor);
-  if (sp.use_lookup) {
+  if (sp.use_copy) {
+    sp.rows.insert(sp.rows.end(), sp.cp.tokens.begin(), sp.cp.tokens.end());
+    sp.E = sp.copied = static_cast<int>(sp.cp.tokens.size());
+    sp.copy_from = 0;
+  } else if (sp.use_lookup) {
     sp.rows.insert(sp.rows.end(), sp.lp.tokens.begin(), sp.lp.tokens.end());
     sp.E = static_cast<int>(sp.lp.tokens.size());
   }
@@ -473,6 +516,18 @@ void Engine::plan_draft(StepPlan& sp, int B, bool graph) {
   // 1. Draft (the active session must be sp.s), and walk the selector's lattice (SGLang's sample_path).
   draft_propose(sp.anchor, B, graph);
   plan_walk(sp, B, pin_->cand, pin_->scores);
+  // Extend (moonshot P1): the copy's continuation after the drafter's chain, when the chain is the copy's start.
+  if (opts_.copy_mode == 2 && !sp.cp.tokens.empty()) {
+    std::vector<int> chain(sp.rows.begin() + 1, sp.rows.end());
+    const int add = extend_with_copy(chain, sp.cp.tokens, sp.copy_max);
+    if (add > 0) {
+      sp.rows.insert(sp.rows.end(), chain.begin() + sp.E, chain.end());
+      sp.copy_from = sp.E;
+      sp.copied = add;
+      sp.E += add;
+      sp.V = sp.E + 1;
+    }
+  }
 }
 
 void Engine::plan_walk(StepPlan& sp, int B, const int* cand, const float* scores_host) {
@@ -520,15 +575,16 @@ void Engine::plan_accept(StepPlan& sp, const float* vals, const int* ids) {
   require_finite_topk({vals, size_t(V) * K}, {ids, size_t(V) * K}, model_->config().vocab);
   // 3. Accept.
   if (sp.greedy) {  // K = 1: ids holds each row's argmax
-    int accepted = 0;
-    while (accepted < E && sp.rows[accepted + 1] == ids[accepted]) ++accepted;
+    const auto [accepted, next] = accept_greedy(std::span<const int>(sp.rows.data() + 1, E), ids);
     sp.accepted = accepted;
-    sp.next = ids[accepted];
+    sp.next = next;
     return;
   }
   const int K16 = draft_->config().selector_top_k;
   auto q_of = [&](int e, int token) {  // the draft's probability of `token` at drafted position e
-    if (sp.use_lookup) return token == sp.rows[e + 1] ? 1.0 : 0.0;  // a deterministic proposal
+    // A deterministic proposal: the lookup's chain, or a copied token (the whole chain in replace, the tokens after
+    // the drafter's in extend).
+    if (sp.use_lookup || e >= sp.copy_from) return token == sp.rows[e + 1] ? 1.0 : 0.0;
     double qt = 0;
     const int* cand = sp.cand.data() + size_t(e) * K16;
     for (int k = 0; k < K16; ++k)
@@ -549,15 +605,22 @@ void Engine::plan_count(StepPlan& sp) {
   s.spec.drafted += sp.E;
   s.spec.accepted += accepted;
   s.spec.accept_hist[accepted] += 1;
+  if (sp.copied > 0) {
+    s.spec.copy_steps += 1;
+    s.spec.copy_drafted += sp.copied;
+    s.spec.copy_accepted += std::max(0, accepted - sp.copy_from);
+  }
+  // The lookup's shadow scoring compares it with the drafter's chain alone, so a step with copied tokens is left out.
+  const bool drafter_only = !sp.use_lookup && sp.copied == 0;
   if (sp.use_lookup) {
     s.spec.lookup_steps += 1;
     s.spec.lookup_accepted += accepted;
-  } else if (opts_.lookup_mode == 1 && !sp.lp.tokens.empty()) {
+  } else if (drafter_only && opts_.lookup_mode == 1 && !sp.lp.tokens.empty()) {
     const int m = sp.lp.match;
     const int bucket = m >= 32 ? 4 : m >= 16 ? 3 : m >= 8 ? 2 : m >= 4 ? 1 : 0;
     s.shadow.push_back({s.pos - n, std::move(sp.lp.tokens), m, accepted, bucket});
   }
-  if (!sp.use_lookup && opts_.lookup_mode == 1) {
+  if (drafter_only && opts_.lookup_mode == 1) {
     s.spec.shadow_total_steps += 1;
     s.spec.shadow_dflash_all += accepted;
     if (s.shadow.empty() || s.shadow.back().pos != s.pos - n) s.spec.shadow_best += accepted;  // no proposal
@@ -583,12 +646,12 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   sp.s = s_;
   sp.p = &p;
   sp.anchor = anchor;
-  plan_begin(sp, B);
+  plan_begin(sp, B, true);
   if (graph) {  // the position every graph of this step reads
     pin_->pos = s_->pos;
     check(cudaMemcpyAsync(pos_dev_, &pin_->pos, sizeof(int), cudaMemcpyHostToDevice, stream_), "position");
   }
-  if (!sp.use_lookup) plan_draft(sp, B, graph);
+  if (!sp.use_lookup && !sp.use_copy) plan_draft(sp, B, graph);
   const int V = sp.V, K = sp.K;  // rows verified, top K per row
   auto t1 = std::chrono::steady_clock::now();
   s_->spec.draft_seconds += std::chrono::duration<double>(t1 - t0).count();
@@ -597,7 +660,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   std::copy(sp.rows.begin(), sp.rows.end(), pin_->rows);
   join_commit();  // the previous step's DeltaNet replay, beside this step's draft until here
   if (graph) {
-    cudaGraphExec_t& g = s_->verify_graphs[K];
+    cudaGraphExec_t& g = s_->verify_graphs[K * 64 + V];  // V is the block's B unless the chain holds a copy
     run_graph(g, "verify", [&] { verify_launch(V, K); });
   } else {
     verify_launch(V, K);
@@ -691,7 +754,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     sp.s = &sessions_[seqs[i].session];
     sp.p = seqs[i].params;
     sp.anchor = seqs[i].anchor;
-    plan_begin(sp, B);
+    plan_begin(sp, B, false);
     any_lookup = any_lookup || sp.use_lookup;
     order[i] = seqs[i].session;
   }
