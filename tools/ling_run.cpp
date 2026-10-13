@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
   int attn_prefetch = 2;
   std::string draft;
   int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256;
-  bool interleave_check = false, batch_check = false;
+  bool interleave_check = false, batch_check = false, batch_bench = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -115,6 +115,7 @@ int main(int argc, char** argv) {
     else if (a == "--chunk-check") chunk_check = std::stoi(next());
     else if (a == "--interleave-check") interleave_check = true;
     else if (a == "--batch-check") batch_check = true;
+    else if (a == "--batch-bench") batch_check = batch_bench = true;
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
@@ -393,6 +394,24 @@ int main(int argc, char** argv) {
       };
       for (size_t pi = 0; pi + 1 < prompts.size(); pi += 2) {
         const std::vector<int>* P[2] = {&prompts[pi], &prompts[pi + 1]};
+        if (batch_bench) {  // timing only: the pair greedy, rows [A, B], every step batched while both run
+          engine.reset_all();
+          Seq q[2];
+          q[0].sp.temperature = q[1].sp.temperature = 0.f;
+          q[0].sp.seed = q[1].sp.seed = 1;
+          start(q[0], 0, *P[0]);
+          start(q[1], 1, *P[1]);
+          run_batch({&q[0], &q[1]});
+          const ling::SpecStats& s = engine.session_spec_stats(q[0].session);
+          const ling::SpecStats& o = engine.session_spec_stats(q[1].session);
+          std::printf("batch bench pair %zu: A %zu out, %ld steps (%ld batched); B %zu out, %ld steps (%ld batched); "
+                      "A's step %.1f ms; B's %.1f ms (draft %.1f, verify %.1f, commit %.1f)\n",
+                      pi / 2, q[0].out.size(), s.steps, s.batched_steps, q[1].out.size(), o.steps, o.batched_steps,
+                      1e3 * (s.draft_seconds + s.verify_seconds + s.commit_seconds) / s.steps,
+                      1e3 * (o.draft_seconds + o.verify_seconds + o.commit_seconds) / o.steps,
+                      1e3 * o.draft_seconds / o.steps, 1e3 * o.verify_seconds / o.steps, 1e3 * o.commit_seconds / o.steps);
+          continue;
+        }
         for (int sampled = 0; sampled < 2; ++sampled) {
           ling::SamplingParams sp;
           sp.temperature = sampled ? (temperature > 0.f ? temperature : 1.f) : 0.f;
