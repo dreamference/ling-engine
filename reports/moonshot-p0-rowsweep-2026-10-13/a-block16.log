@@ -1,0 +1,53 @@
+build/ling-run --model /home/kladko/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4/snapshots/52d1adc5f38aa5ebf099c29ed7025ba34cfbb854 --draft /home/kladko/.cache/huggingface/hub/models--maurienne-ai--Qwen3.8-27B-DFlash2-NVFP4-RTNcal/snapshots/bd7a934213c47a9e7ef69eef36bb3325f47fd1f1 --block 16 --spec --temperature 0 --max-tokens 192 --max-context 65536 --prompts-file /home/kladko/rowsweep-2026-10-13/prompts-a.jsonl --graphs --pdl
+drafter: 1.55 GB, block 16
+step graphs on
+programmatic dependent launch on
+loaded 20.2 GB of weights in 41.4 s
+prefill: 7235 tokens in 2.824 s (2562 tok/s)
+ layer, per precision group, per GEMM shape, choose the kernel and its tile sizes from the measured table in [[section 14](./DREAMFERENCE_LING_ENGINE_VALIDATION.md)](#14-kernel-plan-measured-on-the-machine).
+5. Compile the kernels and capture the CUDA graphs: one per decode shape (one row, two rows, …, `--batch` rows, with and without a drafter row), one per prefill chunk shape.
+6. Plan the memory: the weight blob, the KV pool, the activation scratch, the graph pools, the drafter's weights and its KV.
+7. Write the manifest: the precision map, the kernel table, the graph list, the memory plan, the checkpoint hash, the machine's CUDA and driver versions.
+
+The runtime's component groups:
+
+- **The HTTP layer** (`src/serve/`): the OpenAIdecode: 192 tokens in 7.737 s (24.81 tok/s)
+spec: 75 steps, 2.56 tokens/step, 103.2 ms/step (draft 10.5, verify 89.4, commit 3.2)
+lookup shadow: drafter alone 1.56 accepted/step, best of both 1.56
+  match 3         3 steps: lookup 0.00, drafter 2.00 accepted/step
+  match 8-15      1 steps: lookup 0.00, drafter 3.00 accepted/step
+prefill: 30971 tokens in 14.516 s (2134 tok/s)
+
+ NVFP4 checkpoint carries,decode: 7 tokens in 0.218 s (32.04 tok/s)
+spec: 2 steps, 3.00 tokens/step, 109.1 ms/step (draft 10.8, verify 94.9, commit 3.3)
+lookup shadow: drafter alone 2.00 accepted/step, best of both 2.00
+prefill: 55999 tokens in 31.728 s (1765 tok/s)
+
+_none_chat`decode: 4 tokens in 0.236 s (16.93 tok/s)
+spec: 2 steps, 1.50 tokens/step, 118.0 ms/step (draft 10.7, verify 104.0, commit 3.2)
+lookup shadow: drafter alone 0.50 accepted/step, best of both 0.50
+prefill: 7235 tokens in 2.748 s (2632 tok/s)
+
+ layer, per precision group, per GEMM shape, choose the kernel and its tile sizes from the measured table in [[section 14](./DREAMFERENCE_LING_ENGINE_VALIDATION.md)](#14-kernel-plan-measured-on-the-machine).
+5. Compile the kernels and capture the CUDA graphs: one per decode shape (one row, two rows, …, `--batch` rows, with and without a drafter row), one per prefill chunk shape.
+6. Plan the memory: the weight blob, the KV pool, the activation scratch, the graph pools, the drafter's weights and its KV.
+7. Write the manifest: the precision map, the kernel table, the graph list, the memory plan, the checkpoint hash, the machine's CUDA and driver versions.
+
+The runtime's component groups:
+
+- **The HTTP layer** (`src/serve/`): the OpenAIdecode: 192 tokens in 7.751 s (24.77 tok/s)
+spec: 75 steps, 2.56 tokens/step, 103.3 ms/step (draft 10.5, verify 89.7, commit 3.2)
+lookup shadow: drafter alone 1.56 accepted/step, best of both 1.56
+  match 3         3 steps: lookup 0.00, drafter 2.00 accepted/step
+  match 8-15      1 steps: lookup 0.00, drafter 3.00 accepted/step
+prefill: 30971 tokens in 14.581 s (2124 tok/s)
+
+ NVFP4 checkpoint carries,decode: 7 tokens in 0.217 s (32.26 tok/s)
+spec: 2 steps, 3.00 tokens/step, 108.4 ms/step (draft 10.8, verify 94.4, commit 3.2)
+lookup shadow: drafter alone 2.00 accepted/step, best of both 2.00
+prefill: 55999 tokens in 31.953 s (1753 tok/s)
+
+_none_chat`decode: 4 tokens in 0.238 s (16.84 tok/s)
+spec: 2 steps, 1.50 tokens/step, 118.7 ms/step (draft 10.9, verify 104.8, commit 3.1)
+lookup shadow: drafter alone 0.50 accepted/step, best of both 0.50
+

@@ -1,0 +1,11 @@
+build/ling-run --model /home/kladko/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4/snapshots/52d1adc5f38aa5ebf099c29ed7025ba34cfbb854 --chunk-check 96 --max-context 65536 --prompts-file /home/kladko/rowsweep-2026-10-13/prompts-b.jsonl --graphs --pdl
+step graphs off: no drafter, or LING_PROFILE or LING_KSPLIT is set
+programmatic dependent launch on
+loaded 20.2 GB of weights in 47.4 s
+prompt 0: 3620 tokens, 2 chunks (1.32 s) against 39 chunks of 96 (5.04 s): state identical, next token identical, continuation 0 tokens 0 steps 0 accepted against 0 steps 0 accepted: identical
+prompt 1: 10971 tokens, 6 chunks (4.26 s) against 118 chunks of 96 (15.60 s): state identical, next token identical, continuation 0 tokens 0 steps 0 accepted against 0 steps 0 accepted: identical
+prompt 2: 22770 tokens, 12 chunks (9.95 s) against 245 chunks of 96 (33.60 s): state identical, next token identical, continuation 0 tokens 0 steps 0 accepted against 0 steps 0 accepted: identical
+prompt 3: 39547 tokens, 20 chunks (19.80 s) against 423 chunks of 96 (60.82 s): state identical, next token identical, continuation 0 tokens 0 steps 0 accepted against 0 steps 0 accepted: identical
+prompt 4: 48515 tokens, 24 chunks (26.02 s) against 517 chunks of 96 (76.24 s): state identical, next token identical, continuation 0 tokens 0 steps 0 accepted against 0 steps 0 accepted: identical
+prompt 5: 63228 tokens, 31 chunks (37.65 s) against 670 chunks of 96 (102.48 s): state identical, next token identical, continuation 0 tokens 0 steps 0 accepted against 0 steps 0 accepted: identical
+chunk check passed
