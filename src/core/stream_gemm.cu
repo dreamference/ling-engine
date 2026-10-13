@@ -1,4 +1,4 @@
-// Weight-streaming GEMM for 1 to 32 rows on tensor cores (decode, verify and the drafter).
+// Weight-streaming GEMM for 1 to 64 rows on tensor cores (decode, verify and the drafter).
 //
 // y[M][N] = gscale * x[M][K] . W[N][K]^T with W in NVFP4 (packed [N][K/2], E4M3 block scales [N][K/16])
 // or FP8 E4M3 ([N][K]), and x converted once to FP16 with a power-of-two scale per row.
@@ -11,6 +11,11 @@
 // same order, and the warps' partial sums are added in a fixed order, whatever M is. A row's result is
 // therefore bit-for-bit the same in a 1-row decode and in a 16- or 32-row verify, which is what makes
 // greedy speculative decoding produce exactly the tokens of plain decoding.
+//
+// 33 to 64 rows (moonshot P1's long copies) run with NT = 8 token groups and one tile per block (the reduction's
+// shared memory for two tiles would pass 48 KB): each element is still accumulated over the same chunks, steps and
+// warps in the same order, and the split-K choice is the one the M <= 32 launch of the same matrices makes, so the
+// rows stay bit for bit those of a one-row decode.
 //
 // Layout: a block is 8 warps over the same TILES x 16 weight rows; warp w takes K chunks w, w + 8, ...
 // of 128 values. In a chunk lane (g = lane / 4, t = lane % 4) loads 32 consecutive K values of rows g
@@ -337,8 +342,17 @@ float* split_buffer(size_t floats) {
   return buf;
 }
 
+int blocks_of(const StreamTarget* t, int n, int tiles) {
+  int blocks = 0;
+  for (int i = 0; i < n; ++i) blocks += (t[i].N + tiles * 16 - 1) / (tiles * 16);
+  return blocks;
+}
+
+// `ksplit_tiles`: the tiles per block the split-K choice is made for (the M <= 32 launch's), so that it never
+// depends on M.
 template <int NT, int TILES, bool FP4, int PF>
-void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
+void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s,
+            int ksplit_tiles) {
   StreamProblems pr{};
   int blocks = 0;
   for (int i = 0; i < n; ++i) {
@@ -350,7 +364,7 @@ void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, in
     blocks += (t[i].N + TILES * 16 - 1) / (TILES * 16);
   }
   pr.count = n;
-  const int ksplit = n == 1 ? choose_ksplit(blocks, K) : 1;
+  const int ksplit = n == 1 ? choose_ksplit(blocks_of(t, n, ksplit_tiles), K) : 1;
   float* part = ksplit > 1 ? split_buffer(size_t(ksplit) * M * t[0].N) : nullptr;
   const dim3 grid(blocks, ksplit);
   launch_kernel("stream_gemm", stream_gemm_kernel<NT, TILES, FP4, PF>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K,
@@ -381,32 +395,38 @@ int sg_env(const char* n, int d) {
 }
 
 template <int NT, bool FP4, int PF>
-void launch_t(int tiles, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
-  if (tiles == 1) launch<NT, 1, FP4, PF>(x, xinv, M, t, n, K, s);
-  else if (tiles == 2 || NT == 4) launch<NT, 2, FP4, PF>(x, xinv, M, t, n, K, s);  // NT = 4 x 4 tiles: no room
-  else launch<NT, (NT == 4 ? 2 : 4), FP4, PF>(x, xinv, M, t, n, K, s);
+void launch_t(int tiles, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s,
+              int kt) {
+  if (tiles == 1) launch<NT, 1, FP4, PF>(x, xinv, M, t, n, K, s, kt);
+  else if (tiles == 2 || NT == 4) launch<NT, 2, FP4, PF>(x, xinv, M, t, n, K, s, kt);  // NT = 4 x 4 tiles: no room
+  else launch<NT, (NT == 4 ? 2 : 4), FP4, PF>(x, xinv, M, t, n, K, s, kt);
 }
 
 template <int NT, bool FP4>
-void launch_k(int tiles, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
+void launch_k(int tiles, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s,
+              int kt) {
   static const int pf = sg_env("LING_SG_PF", kInFlight);
-  if (pf == 2) launch_t<NT, FP4, 2>(tiles, x, xinv, M, t, n, K, s);
-  else launch_t<NT, FP4, 1>(tiles, x, xinv, M, t, n, K, s);
+  if (pf == 2) launch_t<NT, FP4, 2>(tiles, x, xinv, M, t, n, K, s, kt);
+  else launch_t<NT, FP4, 1>(tiles, x, xinv, M, t, n, K, s, kt);
 }
 
 template <bool FP4>
 void dispatch(const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
   if (K % kChunk != 0) throw std::runtime_error("stream_gemm: K must be a multiple of 128");
-  if (M < 1 || M > kMaxStreamRows) throw std::runtime_error("stream_gemm: M must be in [1, 32]");
+  if (M < 1 || M > kMaxVerifyRows) throw std::runtime_error("stream_gemm: M must be in [1, 64]");
   if (n < 1 || n > 4) throw std::runtime_error("stream_gemm: 1 to 4 matrices per launch");
   int total = 0;
   for (int i = 0; i < n; ++i) total += t[i].N;
   static const int tn = sg_env("LING_SG_TN", kTilesNarrow), tw = sg_env("LING_SG_TW", kTilesWide),
                    tn4 = sg_env("LING_SG_TN4", kTilesNarrow4), tw4 = sg_env("LING_SG_TW4", kTilesWide4);
   const bool narrow = total < 8192;
-  if (M <= 8) launch_k<1, FP4>(narrow ? tn : tw, x, xinv, M, t, n, K, s);
-  else if (M <= 16) launch_k<2, FP4>(narrow ? tn : tw, x, xinv, M, t, n, K, s);
-  else launch_k<4, FP4>(narrow ? tn4 : tw4, x, xinv, M, t, n, K, s);
+  const int kt = narrow ? kTilesNarrow : kTilesWide;  // the split-K choice's tiles, the same at every M
+  // 33-64 rows (moonshot P1's verify): eight 8-token groups, one tile per block (two would pass 48 KB of shared
+  // memory in the reduction), one chunk in flight.
+  if (M > kMaxStreamRows) launch<8, 1, FP4, 1>(x, xinv, M, t, n, K, s, kt);
+  else if (M <= 8) launch_k<1, FP4>(narrow ? tn : tw, x, xinv, M, t, n, K, s, kt);
+  else if (M <= 16) launch_k<2, FP4>(narrow ? tn : tw, x, xinv, M, t, n, K, s, kt);
+  else launch_k<4, FP4>(narrow ? tn4 : tw4, x, xinv, M, t, n, K, s, kt);
   const cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) throw std::runtime_error(std::string("stream_gemm: ") + cudaGetErrorString(e));
 }

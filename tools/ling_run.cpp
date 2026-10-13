@@ -6,7 +6,8 @@
 //            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N]]
 //            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16] [--graph-check] [--seed N]
 //            [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N]]
-//            [--batch-check] [--copy 0|1|2] [--copy-min N] [--copy-max N] [--copy-ngram N]
+//            [--batch-check] [--copy 0|1|2] [--copy-min N] [--copy-max N] [--copy-ngram N] [--copy-views MASK]
+//            [--copy-edit] [--rows-check N]
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -55,14 +56,22 @@
 //
 // --copy 0|1|2 (moonshot P1; default 0) turns on the long-copy proposer: 1 replace (a copy of at least --copy-min
 // matching tokens, default 16, is verified instead of the drafter's chain), 2 extend (the copy's continuation is
-// appended to the drafter's chain when the chain is the copy's start); --copy-max N (default 31) caps the copied
-// chain, --copy-ngram N (default 8) is the index's n-gram. Every check above runs with it as given (--spec-check,
-// --graph-check, --prefix-check, --chunk-check, --interleave-check); --batch-check compares a batch, which never
-// copies, with runs alone, which do, so it is run without --copy.
+// appended to the drafter's chain when the chain is the copy's start); --copy-max N (default 63) caps the copied
+// chain, --copy-ngram N (default 8) is the index's n-gram; --copy-views MASK (1 the ' '/'-'/'+' line views of tool
+// outputs, 2 the JSON-escaped view, 3 both; default 0) and --copy-edit (hunk-anchored edit mode) add the other
+// sources. Every check above runs with it as given (--spec-check, --graph-check, --prefix-check, --chunk-check,
+// --interleave-check); --batch-check compares a batch, which never copies, with runs alone, which do, so it is run
+// without --copy.
+//
+// --rows-check N (moonshot P1; needs --draft) checks the verify of up to 64 rows: each prompt is prefilled from scratch
+// and decoded greedily N tokens one step at a time, keeping every step's logits; then, from the same prefill, one
+// verify pass over [anchor, the first n - 1 of those tokens] for n = 1, 2, 12, 16, 31, 32, 33, 40, 48, 63, 64 (up to N)
+// must give every row's logits bit for bit the one-row step's, and leave the state unchanged.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -73,6 +82,21 @@
 #include "core/engine.hpp"
 #include "tokenizer/chat_template.hpp"
 #include "tokenizer/tokenizer.hpp"
+
+namespace {
+
+// The copy proposer's tokenizer side (EngineOptions::copy_views, copy_edit), from `tok`.
+ling::TextCodec copy_codec(const ling::Tokenizer& tok) {
+  ling::TextCodec c;
+  c.token_bytes = [&tok](int id) { return tok.token_bytes(id); };
+  c.encode = [&tok](const std::string& s) { return tok.encode(s); };
+  c.tool_response_open = tok.token_id("<tool_response>");
+  c.tool_response_close = tok.token_id("</tool_response>");
+  c.tool_call_open = tok.token_id("<tool_call>");
+  c.tool_call_close = tok.token_id("</tool_call>");
+  return c;
+}
+}  // namespace
 
 int main(int argc, char** argv) {
   std::string model, text, chat, ids_arg, prompts_file;
@@ -85,7 +109,8 @@ int main(int argc, char** argv) {
   std::string draft;
   int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256;
   bool interleave_check = false, batch_check = false, batch_bench = false;
-  int copy = 0, copy_min = 16, copy_max = 31, copy_ngram = 8;
+  int copy = 0, copy_min = 16, copy_max = 63, copy_ngram = 8, copy_views = 0, rows_check = 0;
+  bool copy_edit = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -129,6 +154,9 @@ int main(int argc, char** argv) {
     else if (a == "--copy-min") copy_min = std::stoi(next());
     else if (a == "--copy-max") copy_max = std::stoi(next());
     else if (a == "--copy-ngram") copy_ngram = std::stoi(next());
+    else if (a == "--copy-views") copy_views = std::stoi(next());
+    else if (a == "--copy-edit") copy_edit = true;
+    else if (a == "--rows-check") rows_check = std::stoi(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
@@ -172,6 +200,8 @@ int main(int argc, char** argv) {
     opts.copy_min_match = copy_min;
     opts.copy_max_tokens = copy_max;
     opts.copy_ngram = copy_ngram;
+    opts.copy_views = static_cast<unsigned>(copy_views);
+    opts.copy_edit = copy_edit;
     opts.boundary_token = tok.token_id("<|im_end|>");
     opts.step_graphs = graphs;
     opts.pdl = pdl;
@@ -180,6 +210,7 @@ int main(int argc, char** argv) {
     opts.prefill_bf16 = prefill_bf16;
     opts.sessions = sessions;
     ling::Engine engine(model, opts);
+    engine.set_copy_codec(copy_codec(tok));  // ling-run is single-threaded: the one tokenizer is shared
     auto t1 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "loaded %.1f GB of weights in %.1f s\n", engine.model().device_bytes() / 1e9,
                  std::chrono::duration<double>(t1 - t0).count());
@@ -570,6 +601,37 @@ int main(int argc, char** argv) {
       ling::SamplingParams sp;
       sp.temperature = temperature;
       sp.seed = seed;
+      if (rows_check > 0) {
+        if (!engine.has_drafter()) throw std::runtime_error("--rows-check needs --draft");
+        ling::SamplingParams gp;
+        gp.temperature = 0.f;
+        const int N = std::min(rows_check, ling::kernels::kMaxVerifyRows);
+        const size_t vocab = engine.config().vocab;
+        engine.reset();
+        std::vector<float> logits = engine.prefill(prompt, nullptr, true);
+        std::vector<int> toks = {engine.sample(logits, gp, engine.history())};
+        std::vector<std::vector<float>> plain;  // the logits after each token, one-row steps
+        for (int i = 0; i < N; ++i) {
+          plain.push_back(engine.step(toks.back()));
+          toks.push_back(engine.sample(plain.back(), gp, engine.history()));
+        }
+        engine.reset();
+        engine.prefill(prompt, nullptr, true);
+        const uint64_t h0 = engine.state_hash();
+        for (int n : {1, 2, 12, 16, 31, 32, 33, 40, 48, 63, 64}) {
+          if (n > N) break;
+          const std::vector<float> rows = engine.verify_logits(std::vector<int>(toks.begin(), toks.begin() + n));
+          int bad = -1;
+          for (int i = 0; i < n && bad < 0; ++i)
+            if (std::memcmp(rows.data() + size_t(i) * vocab, plain[i].data(), vocab * sizeof(float)) != 0) bad = i;
+          const bool kept = engine.state_hash() == h0;
+          failures += (bad >= 0) + !kept;
+          std::printf("prompt %zu tokens, one verify of %2d rows: %s, state %s\n", prompt.size(), n,
+                      bad < 0 ? "every row bit for bit the one-row step's" : "a row DIFFERS", kept ? "unchanged" : "CHANGED");
+          if (bad >= 0) std::printf("  first differing row %d\n", bad);
+        }
+        continue;
+      }
       if (graph_check) {
         for (int sampled = 0; sampled < 2; ++sampled) {
           ling::SamplingParams gp;
@@ -622,9 +684,11 @@ int main(int argc, char** argv) {
         const bool same = plain == fast, state = h_spec == h_plain;
         failures += !same + !state;
         std::printf("prompt %zu tokens: plain %zu tokens %.2f tok/s | spec %zu tokens %.2f tok/s, %ld steps, %.2f "
-                    "tokens/step | tokens %s, state %s\n",
+                    "tokens/step, %ld copy steps (history/view/edit %ld/%ld/%ld), %ld copied tokens accepted | tokens "
+                    "%s, state %s\n",
                     prompt.size(), plain.size(), plain.size() / t_plain, fast.size(), fast.size() / t_spec, st.steps,
-                    st.steps ? double(st.accepted + st.steps) / st.steps : 0.0, same ? "identical" : "DIFFER",
+                    st.steps ? double(st.accepted + st.steps) / st.steps : 0.0, st.copy_steps, st.copy_steps_by[0],
+                    st.copy_steps_by[1], st.copy_steps_by[2], st.copy_accepted, same ? "identical" : "DIFFER",
                     state ? "identical" : "DIFFERS");
         if (!same) {
           size_t i = 0;
@@ -676,6 +740,10 @@ int main(int argc, char** argv) {
     }
     if (spec_check) {
       std::printf(failures ? "SPEC CHECK FAILED\n" : "spec check passed\n");
+      return failures ? 1 : 0;
+    }
+    if (rows_check > 0) {
+      std::printf(failures ? "ROWS CHECK FAILED\n" : "rows check passed\n");
       return failures ? 1 : 0;
     }
   } catch (const std::exception& e) {
