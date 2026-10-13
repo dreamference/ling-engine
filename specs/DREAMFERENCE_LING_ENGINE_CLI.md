@@ -13,6 +13,7 @@ ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-cont
            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N]
            [--prefill-bf16] [--sessions N] [--session-protect-seconds S]
            [--batch N] [--prefill-chunk-contended N]
+           [--copy 0|1|2] [--copy-min N] [--copy-max N] [--copy-ngram N] [--copy-views MASK] [--copy-edit]
 ```
 
 | Flag | Default | What it does |
@@ -24,12 +25,14 @@ ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-cont
 | `--max-context N` | `65536` | The context length: `max_model_len` in `/v1/models`, the limit of `context_length_exceeded`, and the size of the KV and state allocations. |
 | `--draft DIR` | none | The DFlash2 drafter's checkpoint. Without it every request decodes plainly. |
 | `--draft-block N` | `12` | Draft tokens per speculative step. The default follows production, which runs 12 since 2026-10-09 (measured +7% single-stream over the drafter's published block of 16; the owner's decision of 2026-10-10 made 12 the code default too). The M0 reference container on the development machine keeps 16 on purpose. |
-| `--lookup 0\|1\|2` | `1` | The context-lookup draft source ([SPECULATION §10](./DREAMFERENCE_LING_ENGINE_SPECULATION.md)): 0 off, 1 on, 2 shadow mode (counted in `/spec_stats`, not used). |
+| `--lookup 0\|1\|2` | `1` | The context-lookup draft source ([SPECULATION §10](./DREAMFERENCE_LING_ENGINE_SPECULATION.md)): 0 off; 1 shadow (proposed and scored afterwards against what was generated, counted in `/spec_stats`, never verified); 2 auto (verified instead of the drafter's chain when the match is at least `--lookup-min` tokens, the drafter's pass skipped). (Corrected 2026-10-13: this row had 1 and 2 the other way round; `EngineOptions::lookup_mode` is the source.) |
 | `--lookup-min N` | `8` | The shortest match the lookup accepts. |
 | `--copy 0\|1\|2` | `0` | The long-copy proposer (moonshot P1, [drafts/MOONSHOT §8](./drafts/MOONSHOT-repository-aware-decoding-2026-10-13.md)): 0 off, 1 replace (a copy of the session's earlier text is verified instead of the drafter's chain), 2 extend (appended to the drafter's chain when the chain is the copy's start). One-request steps only; exact either way. |
 | `--copy-min N` | `16` | The shortest agreement with the earlier text a copy is proposed from. |
-| `--copy-max N` | `31` | The longest copied chain (capped at 31 while the verify stops at 32 rows). |
+| `--copy-max N` | `63` | The longest copied chain (at most 63: one sequence's verify takes up to 64 rows on the exact rows path). |
 | `--copy-ngram N` | `8` | The n-gram the copy index is keyed by. |
+| `--copy-views MASK` | `0` | Emission views of every tool output, indexed beside the history: 1 the lines prefixed with ` `, `-` and `+` (diff and `apply_patch` lines), 2 JSON-escaped, 3 both. Tokenized on the engine thread by a tokenizer instance of their own. |
+| `--copy-edit` | off | Edit mode: right after a hunk header (`apply_patch`'s `@@ <line>`, a unified `@@ -L,n +L,m @@`), the copy jumps to that place in the file a tool output showed and proposes its ` `-prefixed lines. |
 | `--pretokenizer production\|checkpoint` | `production` | The pre-tokenizer pattern: production's (how SGLang tokenizes this checkpoint) or the checkpoint's own `tokenizer.json` pattern. Any other value exits 2. |
 | `--prefix-checkpoints N` | `8` | How many shared-prefix state checkpoints the engine keeps ([SESSIONS §11](./DREAMFERENCE_LING_ENGINE_SESSIONS.md)). |
 | `--graphs` | off | Each speculative step's draft, verify and commit run as captured CUDA graphs (M3). Needs a drafter; refused, with a notice, while `LING_PROFILE` or `LING_KSPLIT` is set. |
@@ -56,6 +59,8 @@ ling-run --model DIR (--text T | --chat T | --ids 1,2,3 | --prompts-file F)
          [--batch-check]
          [--graphs] [--graph-check] [--pdl] [--attn-bulk] [--attn-prefetch N]
          [--prefill-bf16]
+         [--copy 0|1|2] [--copy-min N] [--copy-max N] [--copy-ngram N] [--copy-views MASK] [--copy-edit]
+         [--rows-check N]
 ```
 
 Loads the model and generates from a prompt; prints the text, the timings and, asked to, the token ids, for checking against a reference server (`bench/validate_v0.py`, `bench/agreement/`).
@@ -74,6 +79,8 @@ Loads the model and generates from a prompt; prints the text, the timings and, a
 | `--ids-out`, `--prompt-ids-out` | off | Print the generated ids, or the prompt's ids, one list per prompt. |
 | `--draft DIR`, `--block N`, `--lookup`, `--lookup-min` | none, `12`, `1`, `8` | The drafter and its settings, as `ling-serve`'s `--draft`, `--draft-block`, `--lookup`, `--lookup-min`. |
 | `--spec` | off | Decode speculatively with the drafter. |
+| `--copy`, `--copy-min`, `--copy-max`, `--copy-ngram`, `--copy-views`, `--copy-edit` | `0`, `16`, `63`, `8`, `0`, off | The long-copy proposer, as for `ling-serve`; every check below runs with it as given (`--batch-check` without it: a batch never copies). |
+| `--rows-check N` | off | With `--draft`: one verify pass of n rows (n = 1, 2, 12, 16, 31, 32, 33, 40, 48, 63, 64, up to N) against N one-row greedy steps from the same prefill; every row's logits must be bit for bit the step's, and the state unchanged (moonshot P1's 64-row verify). |
 | `--spec-check` | off | Greedy only: decode each prompt plainly, then speculatively, and check that the tokens are identical and that the recurrent state after the speculative run equals a plain run's over the same tokens, bit for bit. Prints `spec check passed` or `SPEC CHECK FAILED`. |
 | `--prefix-check` | off | Prefill each prompt after the one before it (resuming from a kept state or a prefix checkpoint), then again from scratch, and check that the DeltaNet and conv state and the next token agree (M2). With `--draft`, also decode 64 tokens speculatively (greedy) after each prefill and check that the tokens, the state, the steps and the accepted drafts agree (the drafter's context ring after a resume, M4). |
 | `--sessions N` | `1` | With `--prefix-check`: N resident sessions, each prompt bound to one as `ling-serve` binds a request, so each resumes from its own session's state, the shared checkpoint store, or another session's KV (M4 stage 1). |

@@ -46,7 +46,7 @@ Every source returns a chain (later a tree) of proposed tokens with a score, thr
 | **S1 Session** | The resident session's whole token history: system prompt, every turn's input and tool output, every output | Engine, per resident session (M4's sessions make this natural: it persists across turns, unlike a per-request corpus, which AgSpec measured at 39–51% less acceptance) | Incrementally, as tokens are prefilled and accepted |
 | **S2 Emission views** | For every file body that appears in the context (a tool output from reading a file), the token sequences the agent would emit when quoting it: lines prefixed with a space and with `-` (unified diff and `apply_patch` context and removed lines), the body JSON-escaped (a function-tool argument: the form `apply_patch` takes as a function tool, which night 5 tests on production), and as-is (a whole-file write) | Engine, beside S1 | Detected from the rendered context (a tool output that is a file read); each view tokenized as it would be emitted, so token boundaries match |
 | **S3 Workspace** | Repository files the session has *not* read, and the repository's identifiers | Client → engine through `ling.lookup_corpus` ([API §8](../DREAMFERENCE_LING_ENGINE_API.md)); uploaded once per session and named by hash afterwards, cached by `prompt_cache_key` | The `ling` launcher, which runs where the repository is: `ling-code`'s symbol index for identifiers; file bodies on demand, size-capped |
-| **S4 Personal history** | The user's own past outputs (all sessions, partitioned by repository), as SuffixDecoding's global tree | Engine host memory, LRU-capped (SuffixDecoding: ~6 GB for 572M tokens); written to disk under the user's home, never elsewhere | Online, after each finished request |
+| **S4 Personal history** | The user's own past outputs (all sessions, partitioned by repository), as SuffixDecoding's global tree. No "last 16–32 sessions" window: in DAS, larger windows ("all" included) gave higher acceptance, and 16–32 won only on lookup speed and on staleness under RL training, while our served model does not change. Keep as much history per repository as lookup cost and memory allow (the Together survey, dgxcoder `specs/research/together-ai-survey-2026-10-13.md` §8.1, noted 2026-10-13) | Engine host memory, capped by size per repository, least recently used out first (SuffixDecoding: ~6 GB for 572M tokens); written to disk under the user's home, never elsewhere | Online, after each finished request |
 | **S5 Model** | DFlash2 (with the sparse head, §19.19, and the drafter tuned on the user's sessions, §19.20) | GPU, as today | — |
 
 S1–S4 are CPU structures (suffix automaton per session, suffix tree for S4): microseconds per step, off the GPU's critical path; the proposer runs during the previous step's verify.
@@ -91,7 +91,7 @@ A chain is exact and simple: pick the best single proposal per step (by expected
 | --- | --- | --- | --- |
 | **P0: measure, no build** | From recorded agent sessions (night transcripts, M0's replay sets, SWE-bench trajectories): the length distribution of runs that continue a match in S1, S2, S3 (the session's repository) and S4 (earlier sessions), per output class; oracle acceptance with K_max 15, 32, 64, 128; and the verify's cost per row bucket (16–128) at 8k, 32k and 64k context, one and two streams, on node-b | CPU for the corpus analysis; ~2 GPU hours for the row sweep | The oracle says long copies would add ≥ 20% tokens per millisecond on agent sessions over DFlash2 alone (M1's +4% was capped at 15 tokens; this decides whether the cap was the reason). **Dropped by the owner on 2026-10-13: GO** (below the table) |
 | **P1: S1 + S2, chains, edit mode** | Suffix automaton per resident session with emission views; edit-mode anchoring; long-copy verify to 64 rows; cost-model K_max | Engine | On the replay: edit spans ≥ 2× tokens/s against DFlash2 alone; whole sessions ≥ +7%, output byte-identical (restated by the owner on 2026-10-13, the low end of P0's measured +7–13%; was ≥ +20%) |
-| **P2: S3 + S4** | The `ling.lookup_corpus` extension end to end; the personal history tree | Engine + launcher | Acceptance beyond P1 on held-out sessions of a repository the user works in repeatedly |
+| **P2: S3 + S4** | The `ling.lookup_corpus` extension end to end; the personal history tree, partitioned by repository and as large as lookup cost and memory allow (no session-count window, §3.1) | Engine + launcher | Acceptance beyond P1 on held-out sessions of a repository the user works in repeatedly |
 | **P3: trees** | Copy branches inside M2's tree (GDN tree verification) | Engine (with M2) | Beyond the best single chain |
 | **P4: 128-row copies and the batch rule** | Longer copies at batch 1, the K_max rule at batch 2 | Engine | Tokens per millisecond at both batch sizes |
 
@@ -112,36 +112,55 @@ A chain is exact and simple: pick the best single proposal per step (by expected
 
 It extends [BACKLOG §19.20](../DREAMFERENCE_LING_ENGINE_BACKLOG.md) (more tokens per step: lookup per output class, edits, the repository corpus) and uses [API §8](../DREAMFERENCE_LING_ENGINE_API.md) (speed-only extensions). P0 is cheap and can run whenever node-b has two free GPU hours; P1 belongs after M4's batching stages, beside M2, whose tree verification P3 shares. Nothing here changes the order the owner set on 2026-10-12 until P0's numbers are in.
 
-## 8. P1 as planned (2026-10-13, branch `moonshot/p1`)
+## 8. P1 as built (2026-10-13, branch `moonshot/p1`)
 
-*Status: the CPU half is built on `moonshot/p1`, not merged. It contains the proposer, its wiring into the speculative step behind `--copy` (off by default), and tests that run on the CPU. Nothing has run on the GPU. The GPU checks are written and wait for a free GPU (§8.6). §8.7 lists the choices left to the owner.*
+*Status: the CPU half is built on `moonshot/p1`, not merged. It contains:*
+- *the proposer with all three of P1's sources;*
+- *the exact 64-row verify;*
+- *their wiring behind `--copy`, which is off by default;*
+- *tests that run on the CPU.*
+
+*Nothing has run on the GPU. The GPU checks and the gate replay are written and wait for P1's GPU slot, which comes after the step-savings block (§8.6, §8.8). The owner decided the open choices the same day (§8.7): run both modes on the gate replay, build the 64-row verify, and build the views and edit mode.*
 
 ### 8.1 Where proposals come from
 
-- **S1 only in this build.** The corpus is the resident session's history plus the step's anchor: the system prompt, every turn's input and tool outputs, the earlier outputs, and this request's output so far. M4's sessions persist across turns, so the corpus spans the whole session, as AgSpec recommends.
-- **The structure** is `CopyIndex` (`src/core/copy_proposer.hpp`), one per session:
-  - It hashes every 8-gram that has a next token and keeps, per hash, the most recent end position, chained to the earlier ends with the same hash.
-  - It is not a suffix automaton. It has the same constant-time lookup per step, plus two properties the engine needs. When a new turn re-renders the tail, the truncation is an exact undo, newest entries first. And the index's state is a function of the tokens alone, so a resumed or interleaved session proposes exactly what a fresh one would.
+Three sources feed one session state, `CopySession` (`src/core/copy_views.hpp`), which keeps one per resident session. Each source sits behind its own flag, and all are off by default.
+
+**S1, the session's own tokens (`--copy`).**
+- **What it indexes:** the resident session's history plus the step's anchor. That is the system prompt, every turn's input and tool outputs, the earlier outputs, and this request's output so far. M4's sessions persist across turns, so the corpus spans the whole session.
+- **The structure:** `CopyIndex` (`src/core/copy_proposer.hpp`) hashes every 8-gram that has a next token to its most recent end position, and chains it to the earlier ends with the same hash.
+  - When a new turn re-renders the tail, the truncation is an exact undo, newest entries first.
+  - The index's state is a function of the tokens alone, so a resumed or interleaved session proposes exactly what a fresh one would.
 - **Selection:**
-  - Among the 16 most recent occurrences of the last 8 tokens, it takes the one that agrees with the output furthest back (up to 256 tokens). Ties go to the most recent.
-  - A proposal is made only when that agreement is at least 16 tokens. This is P0's realistic proposer, whose ≥32 variant measured worse.
-  - The proposal is the occurrence's continuation, up to K_max.
+  - Among the 64 most recent occurrences of the last 8 tokens, it takes the one that agrees with the output furthest back (up to 256 tokens). Ties go to the most recent.
+  - The budget was 16 at first. The views hold every line of a file four times, and code repeats short n-grams, so 16 missed the right occurrence in the tests; 64 still costs microseconds.
+  - A proposal is made only when the agreement is at least 16 tokens. This is P0's realistic proposer, whose ≥32 variant measured worse.
+  - The proposal is the continuation, up to K_max = 63 tokens.
   - A length rule `clip(α·m, …)` is implemented but off (α = 0), because P0 found the full length best.
-- **Cost on node-b's CPU** (a 64K-token history):
-  - 27 µs per step for sync and proposal (median; p99 30 µs). Most of it is the comparison that confirms the history only grew.
-  - 3.3 ms to index 60K tokens from scratch.
-  - 0.07 ms when a turn re-renders its last 400 tokens.
-- **S2 (emission views): not built.**
-  - P0 measured +0.1 to +0.3 points from S2.
-  - The JSON view never occurs with this chat template.
-  - The diff view matters only for `apply_patch`, which is 0.3% of the output.
-  - Adding S2 later is cheap: `CopyIndex::propose(query, …)` answers a query against any corpus, so a view (or S3's corpus) is a second index asked with the session's tail. Decision D2 below.
-- **S3 and S4** stay in P2, as planned.
-- **Edit mode (§3.3): no separate mechanism.** The matcher re-synchronizes on its own:
-  - A rejection is an edit.
-  - While the model writes new text, the last 8 tokens find nothing and the drafter drafts.
-  - Once the output's last 16 tokens match the file again, copying resumes from there.
-  - P0's realistic proposer (+6.8%) is this anchor-free behaviour. Explicit `@@` anchoring would need span detection at the tokenizer level inside the engine (decision D3).
+
+**S2, emission views (`--copy-views 1|2|3`).**
+- **What it indexes:** every tool output in the history, meaning the text between the `<tool_response>` and `</tool_response>` tokens, which are single tokens in this tokenizer. Each output is re-tokenized as a whole span in the forms the agent writes it back in:
+  - mask 1: every line prefixed with ` `, `-` and `+` (diff and `apply_patch` context, removed and added lines);
+  - mask 2: JSON-escaped (a string argument).
+- **Where it lives:** the views form a side corpus with a separator between views, indexed like S1 and queried with the session's own tail. The longer agreement of S1 and S2 wins, and S1 wins a tie.
+- **Bookkeeping:**
+  - Views are built once per tool output, incrementally.
+  - A truncation that cuts an output drops its views, newest first.
+  - The views stay a function of the history alone.
+- **Tokenizer:** ling-serve gives them a tokenizer instance of their own on the engine thread, because the shared one's cache is not safe across threads.
+- **Cost:** P0 measured +0.1 to +0.3 points from S2 on SWE-bench sessions, and the JSON view never occurs with this chat template. They are built on the owner's decision of 2026-10-13. The gate replay's per-source counters will show what they add.
+
+**Edit mode (`--copy-edit`, §3.3).**
+- **When it triggers:** at the step where the output has just written a hunk header line. Then the copy jumps to the place in the file the header names, and proposes the file's ` `-prefixed lines from there.
+- **How it finds the place:**
+  - `apply_patch`'s `@@ <a line of the file>`: the line after it, in the newest tool output that holds that line.
+  - A unified `@@ -L,n +L,m @@`: line L of the file that the patch's header names (`+++ b/P`, `--- a/P`, `*** Update File: P`), in the newest tool output whose tool call mentions that path (a `cat` of the file).
+  - A unified header with a heading but no known file: the heading's line, as for `apply_patch`.
+- **Alignment:** a target line is used only when it starts on a token boundary of the ` ` view. Lines after an empty line can fall inside a `"\n \n"` token, and those are skipped.
+- **Interaction with views:** edit mode builds the ` ` view for its jumps. With views off, that view serves the jumps only, so the two flags measure separately.
+- **Between headers:** the matcher re-synchronizes on its own. A rejection is an edit, the drafter drafts the new text, and copying resumes once 16 tokens agree again.
+
+**Not in P1:** S3 (repository files through `ling.lookup_corpus`) and S4 (the user's other sessions) stay in P2, as planned.
 
 ### 8.2 How a copy meets the DFlash2 drafter
 
@@ -152,99 +171,109 @@ Proposals are chains, not trees; trees come in P3, with M2. There are two modes,
 - The risk: a copy that fails early wastes the step. P0's realistic proposer had 15% of its copy steps accept nothing at K=64.
 
 **Extend (2).**
-- The drafter drafts as it always does. When its whole chain equals the copy's first block − 1 tokens, the copy's continuation is appended, up to K_max.
+- The drafter drafts as it always does. When its whole chain equals the copy's first block − 1 tokens, the copy's continuation is appended, up to 63 in all.
 - A failed extension costs only the extra verify rows.
-- It copies only where the drafter already agrees. That makes it a realistic stand-in for P0's "gated" proposer, which copies only where the copy beats the drafter (+12% at K=64, with an oracle gate).
+- It copies only where the drafter already agrees. That makes it a realistic stand-in for P0's "gated" proposer (+12% at K=64, with an oracle gate).
 
 **Limits and wiring:**
-- **K_max is 31 tokens (32 rows)**, the rows path's limit (`kMaxStreamRows`). The 64-row verify is GPU work (§8.5, D4). At K=32, P0's realistic replace gains +4.9% at c = 1, against +6.8% at K=64. So the +7% gate needs either the 64-row verify or extend doing better than the realistic replace.
+- **K_max is 63 tokens, so 64 rows (D4):**
+  - One sequence's verify now runs up to `kMaxVerifyRows` = 64 rows on the exact rows path.
+  - The drafter's block, a batch's rows and a batched verify stay bounded by `kMaxStreamRows` = 32.
 - **Batches:** a batched step never copies (P4's batch rule). Copies happen in one-sequence steps (`speculate()`), which is every step while one request runs.
-- **Graphs:** each session's verify graph is now keyed by rows and top-K, instead of top-K alone, so a copy step also replays graphs. The draft graph is unchanged, and the commit graphs are still keyed by the accepted count.
-- **The lookup:** copying takes precedence over `--lookup 2`. The lookup's shadow scoring leaves out steps that hold copied tokens, because it compares the lookup with the drafter alone.
-- **Counters:** `/spec_stats` reports `copy_steps`, `copy_drafted` and `copy_accepted`, and `ling-run` prints them.
+- **Graphs:** each session's verify graph is keyed by rows and top-K (K·128 + V), so a copy step also replays graphs. Commit graphs are keyed by the accepted count, up to 64.
+- **The lookup:** copying takes precedence over `--lookup 2`. The lookup's shadow scoring leaves out steps that hold copied tokens.
+- **Counters:** `/spec_stats` reports `copy_steps`, `copy_drafted` and `copy_accepted`, and `copy_steps_by_source` and `copy_accepted_by_source` (history, view, edit). `ling-run --spec-check` prints them, and `bench/replay/spec_report.py` reports them.
 
 ### 8.3 Exactness
 
-- **Greedy: byte-identical.**
-  - Every row is verified on the rows path (≤ 32 rows), which is row-invariant: each row's logits are bit for bit what plain decoding computes. So the accepted tokens are plain greedy's, for the same reason today's speculation is exact. `--spec-check` compares the tokens and the recurrent state.
-  - A 64-row verify must keep this property. The prefill path's quantized GEMM is not row-invariant, so it cannot verify copies.
-- **Sampled: the target's distribution.**
-  - The rejection rule (`accept.cpp`) is unchanged. A copied token is a deterministic proposal (q = 1 on it), as the lookup's tokens are.
+- **Greedy: byte-identical.** Every row is verified on the rows path, now up to 64 rows. Each rows-path kernel computes a row from that row's inputs alone, in an order that does not depend on how many rows share the launch. So every row's logits are bit for bit what a one-row decode step computes, and the accepted tokens are plain greedy's. What makes 33–64 rows keep this:
+  - **`stream_gemm`:** 33–64 rows run as eight 8-token groups (`NT` = 8) with one 16-row tile per block, because two tiles' reduction would pass 48 KB of shared memory. Each output element is still accumulated over the same chunks, MMA steps and warps, in the same order. The split-K choice is the one the ≤32-row launch of the same matrices makes, so even under `LING_KSPLIT` it does not follow M. ptxas: 150–156 registers and no spills, fewer than the existing 32-row two-tile variant's 186.
+  - **`bf16_rows`** (the DeltaNet's a/b projections) runs 33–64 rows as 32-row pieces. A row's result never depended on its neighbours.
+  - **Attention** (already used with 256-row slices), the DeltaNet conv and recurrence, the norms, top-K and the commit take any row count. The step's buffers (`pin_`, the verify's kept DeltaNet inputs, the logits, the top-K) are sized for 64 rows. The drafter's ring has 64 rows of slack.
+  - **A commit of more than 32 rows** writes the drafter's context in 32-row pieces, with the same kernels as a ≤32-row commit. A prefill's 33–64-token tail keeps its cuBLAS path, so the drafter's context after a prefill is unchanged (`--chunk-check`).
+  - **The prefill path's quantized GEMM** is still never used for a verify: it is not row-invariant.
+- **Sampled: the target's distribution.** The rejection rule (`accept.cpp`) is unchanged.
+  - A copied token is a deterministic proposal (q = 1 on it), whatever its source.
   - In extend, the drafted tokens keep the drafter's q, and the appended copy is a deterministic function of the drafted prefix, which the rule allows.
-  - The proposal is computed from the history alone, before the drafter samples.
-- **Seeded sampling: reproducible.**
-  - The same seed and the same flags give the same bytes, because the index depends only on the history. Prefill splits, resumes, interleaving and graphs therefore cannot change a proposal.
-  - Turning copies on changes which random draws are made, so the seeded sample changes, exactly as `--lookup 2` or a different block does today. The distribution does not change.
-  - "Byte-identical" in P1's gate therefore means the greedy comparison, as for every earlier speculation change.
+  - Every proposal is computed from the history alone, before the drafter samples.
+- **Seeded sampling: reproducible.** The same seed and the same flags give the same bytes, because the history's index, the views and the edit anchors depend only on the history. Turning copies on changes which random draws are made, so the seeded sample changes, exactly as `--lookup 2` or a different block does today. "Byte-identical" in P1's gate therefore means the greedy comparison.
 
 ### 8.4 Built and tested on the CPU
 
 **Code:**
-- `src/core/copy_proposer.{hpp,cpp}`: the index and `extend_with_copy`.
-- `accept_greedy` in `accept.cpp`, so the engine and the CPU simulation share one accept rule.
-- `speculate.cpp`: `plan_begin` makes the copy proposal; `plan_draft` extends the chain; `plan_accept` uses q = 1 from the first copied position.
-- `EngineOptions::copy_*`, and the flags `--copy`, `--copy-min`, `--copy-max` and `--copy-ngram` on `ling-run` and `ling-serve`.
-- `ling_spec_host`, a CUDA-free library holding lookup, accept and copy, so the host tests build without the kernels.
+- `src/core/copy_proposer.*`: the index, `extend_with_copy`, and separators.
+- `src/core/copy_views.*`: the views, hunk-header parsing, edit mode, and the session state.
+- `accept_greedy` in `accept.cpp`, shared by the engine and the CPU simulation.
+- `speculate.cpp`: the proposal in `plan_begin`, the extension in `plan_draft`, and q = 1 from the first copied position in `plan_accept`.
+- The 64-row rows path: `kernels.cuh`'s `kMaxVerifyRows`, `stream_gemm.cu`, `kernels.cu`'s `bf16_rows`, and the engine's buffers.
+- `Engine::verify_logits`, the test hook for `--rows-check`.
+- The flags `--copy`, `--copy-min`, `--copy-max`, `--copy-ngram`, `--copy-views` and `--copy-edit` on `ling-run` and `ling-serve`, and `--rows-check` on `ling-run`.
+- `ling_spec_host`, which holds lookup, accept, copy and views without CUDA.
 
-**`ling-copy-tests`** (all pass, under 1 s):
-- Proposals: longest agreement over most recent, the gates, the caps, the α rule, a side corpus.
-- Incremental against fresh: random appends, truncations, regrowths and two-span syncs at n = 1, 3 and 8 must propose exactly what an index built in one go proposes.
+**`ling-copy-tests [tokenizer.json]`** (all pass, ~8 s with the real tokenizer):
+- Proposals: longest agreement, gates, caps, the α rule, a side corpus, separators.
+- The index built incrementally equals one built in one go.
 - Extend's chain.
-- Greedy end to end: a toy target over agent-like text (files read, then rewritten with edits) is decoded with the engine's step logic. The output must equal the text token for token in all three modes.
-  - Toy tokens per step: drafter 5.1, replace 11.7–12.7, extend 6.4–6.6.
-  - These are a check that copies happen, not a forecast: about 70% of the toy text is copyable, against 14% of real output in runs of 64 or more.
-- Sampled: a chi-square test of the joint output distribution for replace chains of 3 and 6 tokens and for extend chains (1 drafted + 2 copied; 2 drafted + 3 copied). The test asserts that copied positions are actually reached, and a deliberately wrong q fails every case (checked by hand).
-- Cost (§8.1).
+- Greedy end to end on agent-like text, token for token, with chains up to 63.
+- Chi-square tests of the sampled output for replace and extend chains. They assert that copied positions are reached, and a deliberately wrong q fails each one.
+- The view transforms and hunk headers.
+- Views and edit mode propose the exact text: the `-` view, the JSON view, `apply_patch` anchors, unified line numbers, and a heading fallback. Nothing comes from them when they are off.
+- The whole session state built incrementally equals one built fresh, with cuts inside tool outputs.
+- Greedy `apply_patch` answers decoded token for token with views and edit mode.
+- Cost: 27 µs per step on a 64K history.
+- **With the real Qwen3.8 tokenizer:** a session rendered by the chat template (a `cat` tool call, its output, an `apply_patch` answer), tokenized as a whole, is decoded token for token by each source, and views and edit mode do contribute copied tokens, so their token boundaries line up with the model's own patch. On two synthetic sessions (~890 output tokens each):
+  - tokens per step: drafter 5.1; replace with S1 alone 4.9–5.3; with views 7.6–7.7; with views and edit 7.9–8.0; extend with every source 6.0–6.3;
+  - building the views of a 5.5 KB file takes 8.7 ms (10K view tokens).
+  - These numbers come from a synthetic file and a toy drafter, so they check the mechanism and are not a forecast.
 
-**Existing host tests** (`ling-spec-tests`, `ling-sampling-tests`, `ling-api-tests`) still pass, and the whole tree builds (`ling-run`, `ling-serve`, the kernel tests).
+**Existing host tests** pass, and the whole tree builds. The GPU tests in `tests/stream_tests.cu` are extended to 64 rows and not run: `stream_gemm` against a host reference and bit for bit across M up to 64, a matrix wide enough for the two-tile launch, `bf16_rows`, and attention.
 
 ### 8.5 What P0's GPU half settles for P1
 
-`bench/rowsweep.py`'s A, B and C steps set P1's parameters.
+`bench/rowsweep.py`'s A, B and C steps no longer decide whether the 64-row verify is built (D4: built). They set P1's parameters.
 
 - **c(K), what a copy step costs against a production step:**
-  - The source: A measures 16, 24 and 32 rows; A's slope and B's upper bound give 64 and 128; all at ~8K, ~32K and ~56K context.
-  - **It decides whether the 64-row rows path is built (D4).** P0's realistic replace gains +6.8% at c = 1, +4.0% at 1.2 and +0.1% at 1.5 (K=64). So build it if c(64) ≤ ~1.2 at the contexts sessions run at; stop at 32 rows if c(64) ≥ 1.5.
-  - **It sets K_max per context length:** the largest row bucket whose accepted tokens per millisecond beats the next smaller one (§3.4).
-- **C, the drafter's accepted drafts at block 12 on copied spans** (per match bucket: 8–15, 16–31, 32+):
-  - **It sets the minimum copy length for replace.** Copy at agreement m only where the copy's expected accepted run beats the drafter's bucket rate times c(K). If the drafter makes ≥ 10 tokens per step on 16–31 matches, raise `--copy-min` to 32 for replace; at ≤ 8.5 keep 16.
-  - **It sizes extend's reach.** Extend pays off where the drafter accepts its whole block on copied spans, so the share of full blocks in the 32+ bucket bounds it. `/spec_stats` does not split the accept histogram by bucket, so the first `--copy 2` replay measures it directly (`copy_steps` over `steps`).
-- **Verify block sizes:** the drafter's block stays at 12 (production's). Copy chains use 32 rows now, then 48 or 64 if c allows.
-
-**After the GPU half, the order:**
-1. `bench/copy_exact.sh` (§8.6).
-2. M0's main-set replay with `ling-serve --copy 0`, `--copy 1` and `--copy 2`, measuring tokens per millisecond per session and comparing the greedy outputs byte for byte with `--copy 0`. That replay is P1's gate (whole sessions ≥ +7%), with edit spans read separately by output class.
-3. The 64-row verify, if c(64) allows.
+  - The source: A measures 16, 24 and 32 rows; A's slope and B's upper bound give 48 and 64; all at ~8K, ~32K and ~56K context. Once P1's branch is on the GPU, `ling-run --rows-check` and `--spec` with `--copy` measure the 33–64-row verify directly.
+  - It sets `--copy-max`, i.e. K_max per context length: the largest row bucket whose accepted tokens per millisecond beats the next smaller one (§3.4).
+  - P0's realistic replace gains +6.8% at c = 1, +4.0% at 1.2 and +0.1% at 1.5 (K=64).
+- **C, the drafter's accepted drafts at block 12 on copied spans** (per match bucket):
+  - It sets `--copy-min` for replace: copy at agreement m only where the copy's expected accepted run beats the drafter's bucket rate times c(K). If the drafter makes ≥ 10 tokens per step on 16–31 matches, raise it to 32; at ≤ 8.5 keep 16.
+  - It sizes extend's reach: extend pays where the drafter accepts its whole block on copied spans.
+- **Verify block sizes:** the drafter's block stays at 12 (production's); copy chains use up to 64 rows.
 
 ### 8.6 GPU checks written, not run
 
-`bench/copy_exact.sh` (ling-run, behind `flock ~/gpu.lock`, one model on the machine). Prompts come from `bench/copy_prompts.py`: this repository's files with a small edit asked for, so the greedy answers are mostly long copies.
+**`bench/copy_exact.sh [BUILD] [which…]`** (behind `flock ~/gpu.lock`, one model on the machine). Prompts come from `bench/copy_prompts.py`: this repository's files with a small edit asked for, every other one shown as a `cat` tool output with an `apply_patch` answer asked for.
+- **`kernels`:** `ling-stream-tests`, also under `LING_KSPLIT=2`, plus `ling-kernel-tests` and `ling-prefill-tests`.
+- **`rows`:** `ling-run --rows-check 64`, with and without `--pdl --attn-bulk`. One verify of n ≤ 64 rows against n one-row steps must match every row's logits bit for bit and leave the state unchanged.
+- **`regress`:** `--spec-check` and `--batch-check` without `--copy`.
+- **`spec`:** `--spec-check --copy 1|2`, with S1 alone and with every source, eager and with `--graphs --pdl`.
+- **`graph`:** `--graph-check --copy 1|2` with every source.
+- **`prefix`, `chunk`, `interleave`:** `--prefix-check`, `--chunk-check 256` and `--interleave-check`, each with `--copy 2` and every source.
+- **`batch`:** `--batch-check` without `--copy`.
+- **Still to write:** `tests/server` against a `ling-serve --copy 2 --copy-views 3 --copy-edit`.
 
-- **`regress`:** today's `--spec-check` and `--batch-check` without `--copy`. The default path must be unchanged, including the verify graphs' new key.
-- **`spec`:** `--spec-check --copy 1|2`, eager and with `--graphs --pdl`, on the copy prompts and on the M3 set (greedy tokens and recurrent state equal to plain decoding).
-- **`graph`:** `--graph-check --copy 1|2` (graphs against eager, greedy and sampled; the verify graphs of copy steps' row counts).
-- **`prefix`, `chunk`, `interleave`:** `--prefix-check --sessions 2`, `--chunk-check 256` and `--interleave-check --sessions 2`, each with `--copy 2`. These check that the index gives the same proposals after resumes, chunked prefills and interleaving (same steps, same accepted drafts).
-- **`batch`:** `--batch-check` without `--copy`. A batch never copies, so with `--copy` the runs alone would copy and their steps would differ by design.
-- **Not yet written:** the existing GPU test binaries (`ling-kernel-tests`, `ling-stream-tests`, `ling-prefill-tests`) need re-running as a regression (no kernel changed), and `tests/server` against a `ling-serve --copy 2`.
+### 8.7 Decided by the owner (2026-10-13)
 
-### 8.7 Open for the owner
+- **D1, the mode:** run both on the gate replay and keep the faster by tokens per millisecond (§8.8).
+- **D2, emission views:** built (diff ` `/`-`/`+` and JSON), behind `--copy-views`, off by default.
+- **D3, edit mode:** built (`@@` anchors, unified line numbers), behind `--copy-edit`, off by default.
+- **D4, the 64-row verify:** built regardless of P0's cost measurement, on the exact rows path. The copy cap is 63.
 
-- **D1. The default mode for the gate replay.**
-  - (a) replace;
-  - (b) extend;
-  - (c) both: replace on agreement ≥ 64, extend below.
-  - *Recommended: run (a) and (b) on the replay and choose by tokens per millisecond.* Expectation: extend is the safer default, because its loss is bounded by the extra rows' cost, which A measures. Replace can do more on long runs but pays for its early failures. (c) is cheap to add once the per-bucket numbers exist.
-- **D2. S2 (emission views) in P1.**
-  - (a) leave it out;
-  - (b) the ` `/`-` diff view only;
-  - (c) all three views, as §5 planned.
-  - *Recommended: (a).* P0 measured +0.1 to +0.3 points in total. Revisit with night 5's `apply_patch` transcripts through `bench/copy_stats.py`.
-- **D3. Explicit edit mode (`@@` anchoring, §3.3).**
-  - (a) none: the matcher's re-synchronization covers it;
-  - (b) build it now.
-  - *Recommended: (a) until the replay's edit classes show copies the matcher misses.* (b) needs span detection at the tokenizer level inside the engine.
-- **D4. Verifies beyond 32 rows.**
-  - (a) extend the rows path to 64 rows: the stream GEMM's M tile, the row-invariant attention for 64 query rows, the step buffers and the commit's saved inputs. This keeps exactness bit for bit.
-  - (b) stay at 32 rows.
-  - (The prefill path is excluded: it is not row-invariant.)
-  - *Recommended: (a) if c(64) ≤ ~1.2× a production step; otherwise (b).* At K=32 the realistic replace is at +4.9%, short of the gate.
+### 8.8 The gate runbook
+
+In P1's GPU slot (after the step-savings block), with m0-prod8000 stopped and a line in the chat, then restarted after:
+
+1. **Build** `moonshot/p1` at `nice -n 19 -j4`.
+2. **Check exactness:** `bench/copy_exact.sh ~/ling-engine-p1/build`. Every check must pass before any timing counts. A failure stops here: it is an exactness bug.
+3. **Measure c(K) and C:** P0's GPU half (`bench/rowsweep.py`), if it has not run yet. It sets `--copy-min` and `--copy-max` for step 4.
+4. **Run the gate replay:** `bench/copy_gate.sh ~/ling-engine-p1/build TOOLS TOOLS_INDEX MAIN_SET`.
+   - It runs M0's main set greedily against three servers in turn: `--copy 0`, `--copy 1 --copy-views 3 --copy-edit`, `--copy 2 --copy-views 3 --copy-edit`.
+   - `ARMS="copy0 copy1 copy2 copy1h copy2h"` adds the S1-only arms, to show what the views and edit mode add.
+5. **Read the verdict:** `bench/copy_gate_report.py` gives, per arm:
+   - decode tokens per millisecond, on the whole replay and per session, against `--copy 0`;
+   - the outputs compared request by request (SHA-256 of each streamed output, recorded by `replay.py`);
+   - the copy counters by source.
+   - **D1:** of the two modes, the faster one that keeps every output byte-identical.
+   - **P1's gate:** whole sessions ≥ +7% with the output byte-identical. Edit spans are read separately by output class.
+6. **Then:** the chosen mode and parameters become the defaults the replay supports. Nothing is turned on in production before the owner's decision.
