@@ -172,8 +172,10 @@ class Engine {
   // concatenated in one forward pass ([a1, d1 ..] of the first, then [a2, d2 ..] of the second); the drafter, the
   // state-bearing kernels (attention and its KV writes, the DeltaNet conv and recurrence), the lattice walk, the
   // accept rule and the commit run per sequence. The rows path is row-invariant, so each sequence's tokens,
-  // state, steps and accepted drafts are bit for bit what speculate() gives it alone. Runs eagerly (graphs for
-  // the batch path are stage 4). Each entry must be can_batch(); their rows must fit kMaxStreamRows.
+  // state, steps and accepted drafts are bit for bit what speculate() gives it alone. Stage 4: the drafter runs
+  // over every sequence's block at once and the state kernels in one launch each (kernels::SeqBatch), and with
+  // step graphs on the draft, the verify and each sequence's commit replay as CUDA graphs. Each entry must be
+  // can_batch(); their rows must fit kMaxStreamRows.
   struct SeqStep {
     int session = -1;
     int anchor = 0;                          // as speculate()'s
@@ -331,10 +333,24 @@ class Engine {
   struct StepPlan;
   void plan_begin(StepPlan& sp, int B);                        // seed, lookup proposal
   void plan_draft(StepPlan& sp, int B, bool graph);            // the drafter's block and the lattice walk
+  // The lattice walk over the drafter's candidates and scores for this sequence (E rows of each).
+  void plan_walk(StepPlan& sp, int B, const int* cand, const float* scores);
   void plan_accept(StepPlan& sp, const float* vals, const int* ids);  // rows' top K -> accepted, next
   void plan_count(StepPlan& sp);                               // the session's counters and shadow records
   // The batch's verify: every plan's rows (pin_->rows) in one pass, then each sequence's top K at its rows.
   void verify_batch_launch(std::span<StepPlan> plans, int V);
+  // The drafter over the blocks of every plan's session at once (M4 stage 4): pin_->draft_ids (B rows per
+  // sequence) -> pin_->cand and pin_->scores (E = B - 1 rows per sequence, in order).
+  void draft_batch_launch(std::span<StepPlan> plans, int B);
+  // The batch path's graphs (M4 stage 4), per order of sessions in the batch: they bake the sessions' cache, state
+  // and ring pointers and the row split. The draft graph has one shape (B rows per sequence); the verify graphs
+  // are keyed by each sequence's top K; each sequence's commit graph is its session's, keyed by its slot in the
+  // batch and its accepted count (slot 0 is the one-row step's own commit graph).
+  struct BatchGraphs {
+    cudaGraphExec_t draft = nullptr;
+    std::map<std::vector<int>, cudaGraphExec_t> verify;
+  };
+  std::map<std::vector<int>, BatchGraphs> batch_graphs_;
 
   // CUDA graphs of the step (M3). The variable part of a step is the accepted count, which only the commit
   // depends on, so there is one commit graph per count; the draft and verify graphs have fixed shapes
@@ -343,9 +359,12 @@ class Engine {
   bool graphs_ = false;          // step graphs in use (opts_.step_graphs and nothing preventing them)
   bool graphs_allowed_ = false;  // nothing prevents them (a drafter, no LING_PROFILE or LING_KSPLIT)
   bool use_dev_pos_ = false;  // set while capturing: dpos() points the kernels at pos_dev_
+  // pos_dev_[i]: the position of the batch's i-th sequence (the one-row step uses [0]); dpos() reads slot
+  // dpos_slot_ (a batched sequence's commit: its slot in the batch).
   int* pos_dev_ = nullptr;
+  int dpos_slot_ = 0;
   kernels::DevPos dpos(int off = 0) const {
-    return use_dev_pos_ ? kernels::DevPos(s_->pos + off, pos_dev_, off) : kernels::DevPos(s_->pos + off);
+    return use_dev_pos_ ? kernels::DevPos(s_->pos + off, pos_dev_ + dpos_slot_, off) : kernels::DevPos(s_->pos + off);
   }
   // The graphs themselves are per session (Session::draft_graph ...): they bake the session's cache and
   // state pointers into their kernels' arguments.
@@ -358,6 +377,7 @@ class Engine {
   // host addresses when they run, so these must stay put and must not be pageable.
   struct StepPinned {
     int pos;
+    int seq_pos[kernels::kMaxSeqs];  // a batched step's positions, per sequence
     int draft_ids[kernels::kMaxStreamRows];  // the drafter's block: the anchor, then mask tokens
     int rows[kernels::kMaxStreamRows];       // the verified rows: the anchor, then the drafted tokens
     int cand[kernels::kMaxStreamRows * 16];
@@ -461,6 +481,7 @@ class Engine {
     cudaGraphExec_t draft_graph = nullptr;
     std::map<int, cudaGraphExec_t> verify_graphs;  // by top-K (1 when greedy)
     std::vector<cudaGraphExec_t> commit_graphs;    // by accepted count + 1
+    std::map<std::pair<int, int>, cudaGraphExec_t> batch_commit_graphs;  // a batched step's: (slot, count), slot > 0
     // The pool's bookkeeping.
     bool owned = false;  // a session has been bound to the slot
     std::string key;     // the prompt_cache_key it was bound with ("" without one)

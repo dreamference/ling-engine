@@ -29,6 +29,29 @@ struct DevPos {
 __device__ __forceinline__ int pos_value(const DevPos& p) { return p.dev ? *p.dev + p.off : p.host; }
 #endif
 
+// Several sequences' rows in one launch (M4 stage 4, the batched verify and drafter): sequence i owns rows
+// [row0[i], row0[i + 1]) of the launch, at positions pos(i) + (row - row0[i]). Passed by value, so a launch captured
+// into a CUDA graph keeps the row split; the positions come from pos_dev (written before each replay) when set.
+constexpr int kMaxSeqs = 4;
+struct SeqBatch {
+  int n = 0;
+  int row0[kMaxSeqs + 1] = {};
+  int pos[kMaxSeqs] = {};          // the host's positions (eager launches; also the launch geometry)
+  const int* pos_dev = nullptr;    // a captured graph: sequence i's position is pos_dev[i]
+};
+template <typename T>
+struct SeqPtrs {
+  T* p[kMaxSeqs] = {};
+};
+#ifdef __CUDACC__
+__device__ __forceinline__ int seq_of(const SeqBatch& b, int row) {
+  int s = 0;
+  while (s + 1 < b.n && row >= b.row0[s + 1]) ++s;
+  return s;
+}
+__device__ __forceinline__ int seq_pos(const SeqBatch& b, int s) { return b.pos_dev ? b.pos_dev[s] : b.pos[s]; }
+#endif
+
 // Programmatic dependent launch (launch.cuh) for the rows path's kernels (decode, verify, drafter, commit):
 // off by default. Set before launching; it applies to every later launch, captured or not.
 void set_pdl(bool on);
@@ -124,6 +147,24 @@ void narrow_bf16_bf16in(const __nv_bfloat16* x, int M, const __nv_bfloat16* wa, 
 // gated_rmsnorm_fp8 over the recurrence's BF16 output and the BF16 z projection.
 void gated_rmsnorm_fp8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* z, const __nv_bfloat16* w, int rows, int D,
                             float eps, float input_scale, uint8_t* q, cudaStream_t s);
+
+// ---- The batched verify's state kernels (M4 stage 4): one launch over several sequences, each row computed
+// exactly as the per-sequence launch computes it (ling-stream-tests compares them bit for bit). ----
+// attn_prepare over every row of b, each into its sequence's caches at its sequence's position.
+void attn_prepare_seqs(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
+                       const __nv_bfloat16* k_norm, const SeqBatch& b, int Hq, int Hkv, int D, int rot, float theta,
+                       float eps, float* q, float* gate, SeqPtrs<__nv_bfloat16> kc, SeqPtrs<__nv_bfloat16> vc,
+                       cudaStream_t s);
+// attention_rows over every row of b (q and out [rows][Hq][D]), each sequence over its own caches.
+void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
+                         const SeqBatch& b, int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s,
+                         int fixed_ctx = 0);
+// The verify's conv: each sequence's rows of mixed from its own window (read, not written).
+void gdn_conv_seqs(float* mixed, SeqPtrs<const float> state, const __nv_bfloat16* w, const SeqBatch& b, int C,
+                   cudaStream_t s);
+// The verify's recurrence: each sequence's rows from its own state (read, not written).
+void gdn_recurrent_seqs(const float* mixed, const float* g, const float* beta, SeqPtrs<const float> state, float* out,
+                        const SeqBatch& b, int H, int HV, cudaStream_t s);
 
 // RMSNorm (as rmsnorm) that also writes the FP16 copy and scales to_half_rows would make from its output.
 void rmsnorm_half(const float* x, const __nv_bfloat16* w, float* out, __half* xh, float* xinv, int rows, int H, float eps,
@@ -253,6 +294,13 @@ void draft_store_kv(const float* k, const float* v, int rows, int kv_size, DevPo
 // rings kc/vc (position p in row p % ring, ring > window_left).
 void draft_attention(const float* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, int ring, const float* kb,
                      const float* vb, DevPos L, int B, int window_left, int Hq, int Hkv, float* out, cudaStream_t s);
+// The drafter over several sequences' blocks at once (M4 stage 4): draft_qk_rope with each row at its sequence's
+// position, and draft_attention with each sequence's queries over its own ring and its own block (b's rows).
+void draft_qk_rope_seqs(float* x, int heads, int row_stride, const __nv_bfloat16* norm, const SeqBatch& b, float theta,
+                        float eps, cudaStream_t s);
+void draft_attention_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc, int ring,
+                          const float* kb, const float* vb, const SeqBatch& b, int window_left, int Hq, int Hkv,
+                          float* out, cudaStream_t s);
 // DFlash2's two-tap grouped dynamic convolution over a block (side 0 wraps a sublayer's input, 1 its output).
 void grouped_conv(const float* h, const float* coef, const __nv_bfloat16* base, int side, float* out, int rows,
                   int C, int groups, int block, cudaStream_t s);
