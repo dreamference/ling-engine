@@ -34,6 +34,11 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
 find_package(ICU REQUIRED COMPONENTS uc)
 
+# Speculation's host side with no CUDA: the context lookup, the copy proposer (moonshot P1) and the accept rules,
+# so their tests build and run without the kernels.
+add_library(ling_spec_host STATIC src/core/lookup.cpp src/core/accept.cpp src/core/copy_proposer.cpp)
+target_include_directories(ling_spec_host PUBLIC src)
+
 # The engine core: weights, kernels, the forward pass and sampling.
 add_library(ling_core STATIC
   src/core/safetensors.cpp
@@ -45,14 +50,12 @@ add_library(ling_core STATIC
   src/core/draft_kernels.cu
   src/core/drafter.cpp
   src/core/speculate.cpp
-  src/core/lookup.cpp
-  src/core/accept.cpp
   src/core/sampling.cpp
   src/core/model.cu
   src/core/engine.cpp
 )
 target_include_directories(ling_core PUBLIC src)
-target_link_libraries(ling_core PUBLIC CUDA::cudart CUDA::cublas CUDA::nvtx3 nlohmann_json::nlohmann_json)
+target_link_libraries(ling_core PUBLIC ling_spec_host CUDA::cudart CUDA::cublas CUDA::nvtx3 nlohmann_json::nlohmann_json)
 set_target_properties(ling_core PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
 # The tokenizer: byte-level BPE with Qwen's pre-tokenizer pattern (PCRE2) and NFC (ICU).
@@ -106,6 +109,9 @@ add_test(NAME prefill COMMAND ling-prefill-tests)
 add_executable(ling-spec-tests tests/spec_tests.cpp)
 target_link_libraries(ling-spec-tests PRIVATE ling_core)
 add_test(NAME spec COMMAND ling-spec-tests)
+add_executable(ling-copy-tests tests/copy_tests.cpp)
+target_link_libraries(ling-copy-tests PRIVATE ling_spec_host)
+add_test(NAME copy COMMAND ling-copy-tests)
 add_executable(ling-sampling-tests tests/sampling_tests.cpp)
 target_link_libraries(ling-sampling-tests PRIVATE ling_core)
 add_test(NAME sampling COMMAND ling-sampling-tests)

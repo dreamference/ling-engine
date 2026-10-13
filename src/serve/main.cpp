@@ -6,6 +6,12 @@
 //              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
+//              [--copy 0|1|2] [--copy-min N] [--copy-max N] [--copy-ngram N]
+//
+// --copy 0|1|2 (moonshot P1; default 0, off) turns on the long-copy proposer for one-request steps: 1 replace, 2
+// extend (EngineOptions::copy_mode); --copy-min N (default 16) is the shortest match it copies from, --copy-max N
+// (default 31) the longest copied chain, --copy-ngram N (default 8) its index's n-gram. Exact either way; counted
+// in /spec_stats as copy_steps, copy_drafted and copy_accepted.
 //
 // --sessions N (default 2; M4 §1) keeps N resident sessions, each with its own KV cache and state, so N
 // agent tasks that alternate keep their histories warm. A request runs in the session it extends (its
@@ -97,6 +103,8 @@ struct Metrics {
               {"accept_histogram", spec.accept_hist}, {"draft_seconds", spec.draft_seconds},
               {"verify_seconds", spec.verify_seconds}, {"commit_seconds", spec.commit_seconds},
               {"lookup_steps", spec.lookup_steps}, {"lookup_accepted", spec.lookup_accepted},
+              {"copy_steps", spec.copy_steps}, {"copy_drafted", spec.copy_drafted},
+              {"copy_accepted", spec.copy_accepted},
               {"batched_steps", spec.batched_steps},
               {"shadow_total_steps", spec.shadow_total_steps}, {"shadow_dflash_all", spec.shadow_dflash_all},
               {"shadow_best", spec.shadow_best}};
@@ -1234,6 +1242,7 @@ int main(int argc, char** argv) {
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256;
+  int copy = 0, copy_min = 16, copy_max = 31, copy_ngram = 8;
   double protect_seconds = 30;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -1265,6 +1274,10 @@ int main(int argc, char** argv) {
     else if (a == "--session-protect-seconds") protect_seconds = std::stod(next());
     else if (a == "--batch") batch = std::stoi(next());
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
+    else if (a == "--copy") copy = std::stoi(next());
+    else if (a == "--copy-min") copy_min = std::stoi(next());
+    else if (a == "--copy-max") copy_max = std::stoi(next());
+    else if (a == "--copy-ngram") copy_ngram = std::stoi(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
@@ -1299,6 +1312,10 @@ int main(int argc, char** argv) {
   opts.draft_block = draft_block;
   opts.lookup_mode = lookup;
   opts.lookup_min_match = lookup_min;
+  opts.copy_mode = copy;
+  opts.copy_min_match = copy_min;
+  opts.copy_max_tokens = copy_max;
+  opts.copy_ngram = copy_ngram;
   opts.prefix_checkpoints = checkpoints;
   opts.boundary_token = tok.token_id("<|im_end|>");
   opts.step_graphs = graphs;
