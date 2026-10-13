@@ -732,8 +732,12 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
   // iteration commits one cp.async group (empty past the range), so wait_group NS - 2 always means
   // "tile i has landed". With BULK, stage s's tiles complete phases 0, 1, 0, ... of bar[s] instead.
   const int ntiles = (khi - klo + TK - 1) / TK;
-  __shared__ __align__(8) uint64_t bar[BULK ? NS : 1];
+  // The barriers only with BULK: the cp.async kernel then has no static shared memory, so three 32-key stages
+  // (exactly the 99 KB a block may have) fit.
+  uint64_t* bar = nullptr;
   if constexpr (BULK) {
+    __shared__ __align__(8) uint64_t bar_s[NS];
+    bar = bar_s;
     // Zero the stages once (rows past the range are never copied), make those generic-proxy writes
     // visible to the bulk copies about to overwrite them, and set up one barrier per stage (one arrival:
     // warp 0's lane 0, with the tile's byte count).
@@ -1130,10 +1134,28 @@ size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx) {
 // 32-key tiles, double-buffered. Measured at 24K context, 16 rows, realistic data: 0.57 ms per layer;
 // 16-key tiles with 3-5 stages were no faster.
 constexpr int kAttnRows = 96, kAttnTk = 32, kAttnNs = 2;
+int g_attn_ns = -1;  // B07 experiment: stages of the cp.async ring (2 or 3); LING_ATTN_NS sets the first value
+bool g_attn_ns3_ok = true;
+int attn_ns() {
+  if (g_attn_ns < 0) {
+    const char* e = std::getenv("LING_ATTN_NS");
+    g_attn_ns = e ? std::atoi(e) : 3;
+  }
+  return g_attn_ns == 3 && !g_attn_ns3_ok ? 2 : g_attn_ns;
+}
+void set_attention_stages(int n) { g_attn_ns = n; }
 
 void prepare_kernels() {
   static bool configured = false;
   if (configured) return;
+  // Three stages take the whole 99 KB a block may have: where the device allows less, they stay off.
+  if (cudaFuncSetAttribute(attention_mma_kernel<kAttnRows, kAttnTk, 3, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           static_cast<int>(mma_smem(kAttnTk, 3))) != cudaSuccess ||
+      cudaFuncSetAttribute(attention_mma_seqs_kernel<kAttnRows, kAttnTk, 3, false>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, 3))) != cudaSuccess) {
+    cudaGetLastError();
+    g_attn_ns3_ok = false;
+  }
   check(cudaFuncSetAttribute(attention_mma_kernel<kAttnRows, kAttnTk, kAttnNs, false>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
         "attention_rows smem");
@@ -1158,9 +1180,11 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
   constexpr int rows = kAttnRows, tk = kAttnTk, ns = kAttnNs;
   prepare_kernels();
   const int R = M * 6;
+  const bool ns3 = !g_attn_bulk && attn_ns() == 3;
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows",
-                    g_attn_bulk ? attention_mma_kernel<rows, tk, ns, true> : attention_mma_kernel<rows, tk, ns, false>,
-                    dim3((R + rows - 1) / rows, Hkv, splits), dim3(rows * 2), mma_smem(tk, ns), s, q, kcache, vcache,
+                    ns3 ? attention_mma_kernel<rows, tk, 3, false>
+                    : g_attn_bulk ? attention_mma_kernel<rows, tk, ns, true> : attention_mma_kernel<rows, tk, ns, false>,
+                    dim3((R + rows - 1) / rows, Hkv, splits), dim3(rows * 2), mma_smem(tk, ns3 ? 3 : ns), s, q, kcache, vcache,
                     pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel, dim3(M * Hq), dim3(D),
                     0, s, scratch, splits, D, out);
@@ -1183,9 +1207,11 @@ void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtr
   AttnBlocks blocks{};
   for (int i = 0; i < b.n; ++i) blocks.blk0[i + 1] = blocks.blk0[i] + ((b.row0[i + 1] - b.row0[i]) * 6 + rows - 1) / rows;
   prepare_kernels();
+  const bool ns3 = !g_attn_bulk && attn_ns() == 3;
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_seqs",
-                    g_attn_bulk ? attention_mma_seqs_kernel<rows, tk, ns, true> : attention_mma_seqs_kernel<rows, tk, ns, false>,
-                    dim3(blocks.blk0[b.n], Hkv, splits), dim3(rows * 2), mma_smem(tk, ns), s, q, kc, vc, b, blocks, Hq, Hkv,
+                    ns3 ? attention_mma_seqs_kernel<rows, tk, 3, false>
+                    : g_attn_bulk ? attention_mma_seqs_kernel<rows, tk, ns, true> : attention_mma_seqs_kernel<rows, tk, ns, false>,
+                    dim3(blocks.blk0[b.n], Hkv, splits), dim3(rows * 2), mma_smem(tk, ns3 ? 3 : ns), s, q, kc, vc, b, blocks, Hq, Hkv,
                     splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel,
                     dim3(b.row0[b.n] * Hq), dim3(D), 0, s, scratch, splits, D, out);
