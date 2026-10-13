@@ -30,6 +30,12 @@
 //   - sampling parameters: the verify graph is keyed by top-K, everything else is on the host.
 // Every kernel computes exactly what its eager launch computes, so graphs change no output bit
 // (--spec-check compares the tokens and the recurrent state with plain decoding).
+//
+// Batches (M4 stages 3 and 4, speculate_batch): several sessions' steps share one verify pass over their concatenated
+// rows; the drafter runs over every sequence's block at once and the state kernels take all sequences in one launch
+// (kernels::SeqBatch), each row computed as its sequence alone computes it (--batch-check). A batch's graphs are keyed
+// by the order of its sessions (they bake each one's pointers and the row split) and read each sequence's position
+// from pos_dev_[i]; each sequence's commit graph is its session's, keyed by its slot and accepted count.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -92,6 +98,22 @@ Dist target_dist(const float* vals, const int* ids, int K, const SamplingParams&
 }
 
 }  // namespace
+
+// One sequence's part of a speculative step on the host: what speculate() kept in locals, so a batch can hold
+// one per sequence.
+struct Engine::StepPlan {
+  Session* s = nullptr;
+  const SamplingParams* p = nullptr;
+  int anchor = 0;
+  bool greedy = true, use_lookup = false;
+  int E = 0, V = 0, K = 1, row0 = 0;
+  LookupProposal lp;
+  std::vector<int> rows;                // the anchor, then the drafted (or looked-up) tokens
+  std::vector<std::vector<double>> q;   // the draft's distribution over its candidates, per drafted position
+  std::vector<int> cand;                // the drafter's candidates [E][K16] (pin_ holds one sequence's at a time)
+  int accepted = 0, next = 0;
+  bool failed = false;
+};
 
 void Engine::alloc_drafter() {
   const ModelConfig& c = model_->config();
@@ -169,7 +191,14 @@ void Engine::clear_graphs() {
     for (cudaGraphExec_t g : s.commit_graphs)
       if (g) cudaGraphExecDestroy(g);
     s.commit_graphs.clear();
+    for (auto& [k, g] : s.batch_commit_graphs) cudaGraphExecDestroy(g);
+    s.batch_commit_graphs.clear();
   }
+  for (auto& [order, bg] : batch_graphs_) {
+    if (bg.draft) cudaGraphExecDestroy(bg.draft);
+    for (auto& [k, g] : bg.verify) cudaGraphExecDestroy(g);
+  }
+  batch_graphs_.clear();
 }
 
 cudaGraphExec_t Engine::capture(const std::function<void()>& body) {
@@ -302,6 +331,73 @@ void Engine::draft_launch(int B) {
         "draft scores");
 }
 
+void Engine::draft_batch_launch(std::span<StepPlan> plans, int B) {
+  NvtxRange range("draft");
+  quantized_ = false;  // the rows path (see draft_launch)
+  const ModelConfig& c = model_->config();
+  const DraftConfig& d = draft_->config();
+  const int n = static_cast<int>(plans.size()), R = n * B, H = d.hidden, E = B - 1, dq = d.heads * d.head_dim;
+  const int dkv = d.kv_heads * d.head_dim, K16 = d.selector_top_k;
+  // Every sequence's block of B rows, one after the other; sequence i at its own position (pos_dev_[i] in a graph).
+  kernels::SeqBatch sb;
+  sb.n = n;
+  for (int i = 0; i < n; ++i) {
+    sb.row0[i + 1] = (i + 1) * B;
+    sb.pos[i] = plans[i].s->pos;
+  }
+  if (use_dev_pos_) sb.pos_dev = pos_dev_;
+  check(cudaMemcpyAsync(ids_dev_, pin_->draft_ids, R * sizeof(int), cudaMemcpyHostToDevice, stream_), "draft ids");
+  kernels::embed(model_->embed(), ids_dev_, R, H, dres_, stream_);
+  for (int l = 0; l < d.layers; ++l) {
+    const DraftLayer& L = draft_->layers()[l];
+    kernels::SeqPtrs<const __nv_bfloat16> kc, vc;
+    for (int i = 0; i < n; ++i) {
+      kc.p[i] = plans[i].s->dkc[l];
+      vc.p[i] = plans[i].s->dvc[l];
+    }
+    // draft_launch's layer over R rows: the per-row kernels once, the grouped conv block-wise (its second tap
+    // never crosses a block), RoPE and attention per sequence through sb.
+    if (l > 0) kernels::add_inplace(dres_, dout_, R * H, stream_);
+    kernels::rmsnorm(dres_, L.input_norm, dh_, R, H, d.eps, false, stream_);
+    linear_bf16_cublas(L.attn_kproj, dh_, R, dcoef_);
+    kernels::grouped_conv(dh_, dcoef_, L.attn_base, 0, dh2_, R, H, d.conv_groups, B, stream_);
+    linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, R);
+    kernels::draft_qk_rope_seqs(dq_, d.heads, dq, L.q_norm, sb, d.rope_theta, d.eps, stream_);
+    kernels::draft_qk_rope_seqs(dk_, d.kv_heads, dkv, L.k_norm, sb, d.rope_theta, d.eps, stream_);
+    kernels::draft_attention_seqs(dq_, kc, vc, ring_, dk_, dv_, sb, d.sliding_window - 1, d.heads, d.kv_heads, dattn_,
+                                  stream_);
+    linear_fp4(L.o, dattn_, R, dh2_);
+    kernels::grouped_conv(dh2_, dcoef_, L.attn_base, 1, dout_, R, H, d.conv_groups, B, stream_);
+    kernels::add_inplace(dres_, dout_, R * H, stream_);
+    kernels::rmsnorm(dres_, L.post_norm, dh_, R, H, d.eps, false, stream_);
+    linear_bf16_cublas(L.mlp_kproj, dh_, R, dcoef_);
+    kernels::grouped_conv(dh_, dcoef_, L.mlp_base, 0, dh2_, R, H, d.conv_groups, B, stream_);
+    linear_fp4_multi({{&L.gate, dg_}, {&L.up, du_}}, dh2_, R);
+    kernels::silu_mul(dg_, du_, dg_, R * d.intermediate, stream_);
+    linear_fp4(L.down, dg_, R, dh2_);
+    kernels::grouped_conv(dh2_, dcoef_, L.mlp_base, 1, dout_, R, H, d.conv_groups, B, stream_);
+  }
+  kernels::add_inplace(dres_, dout_, R * H, stream_);
+  // Each sequence's drafted positions 1 .. B - 1, gathered to rows i * E .. of dh_ by its final norm; then the LM
+  // head, the top 16 and the selector's projection over all n * E rows, and each sequence's lattice from its anchor.
+  for (int i = 0; i < n; ++i)
+    kernels::rmsnorm(dres_ + (size_t(i) * B + 1) * H, draft_->norm(), dh_ + size_t(i) * E * H, E, H, d.eps, false,
+                     stream_);
+  linear_fp4(model_->lm_head(), dh_, n * E, dlogits_);
+  kernels::topk_rows(dlogits_, n * E, c.vocab, K16, topk_scratch_, dunary_, dcand_, stream_);
+  linear_bf16_cublas(draft_->selector_projection(), dh_, n * E, dhp_);
+  const int rank = d.selector_rank;
+  for (int i = 0; i < n; ++i)
+    kernels::selector_lattice(dhp_ + size_t(i) * E * rank, dcand_ + size_t(i) * E * K16, dunary_ + size_t(i) * E * K16,
+                              draft_->predecessor_codebook(), draft_->successor_codebook(), pin_->draft_ids[i * B], E,
+                              dscores_ + size_t(i) * E * K16 * K16, stream_, ids_dev_ + i * B);
+  check(cudaMemcpyAsync(pin_->cand, dcand_, size_t(n) * E * K16 * sizeof(int), cudaMemcpyDeviceToHost, stream_),
+        "draft candidates");
+  check(cudaMemcpyAsync(pin_->scores, dscores_, size_t(n) * E * K16 * K16 * sizeof(float), cudaMemcpyDeviceToHost,
+                        stream_),
+        "draft scores");
+}
+
 void Engine::draft_propose(int anchor, int B, bool graph) {
   pin_->draft_ids[0] = anchor;
   for (int i = 1; i < B; ++i) pin_->draft_ids[i] = draft_->config().mask_token;
@@ -328,22 +424,6 @@ void Engine::commit_launch(int row0, int n) {
   draft_materialize(n, dpos(), row0);  // the verify's target features of those rows
 }
 
-// One sequence's part of a speculative step on the host: what speculate() kept in locals, so a batch can hold
-// one per sequence.
-struct Engine::StepPlan {
-  Session* s = nullptr;
-  const SamplingParams* p = nullptr;
-  int anchor = 0;
-  bool greedy = true, use_lookup = false;
-  int E = 0, V = 0, K = 1, row0 = 0;
-  LookupProposal lp;
-  std::vector<int> rows;                // the anchor, then the drafted (or looked-up) tokens
-  std::vector<std::vector<double>> q;   // the draft's distribution over its candidates, per drafted position
-  std::vector<int> cand;                // the drafter's candidates [E][K16] (pin_ holds one sequence's at a time)
-  int accepted = 0, next = 0;
-  bool failed = false;
-};
-
 void Engine::plan_begin(StepPlan& sp, int B) {
   Session& s = *sp.s;
   const SamplingParams& p = *sp.p;
@@ -369,12 +449,15 @@ void Engine::plan_begin(StepPlan& sp, int B) {
 
 void Engine::plan_draft(StepPlan& sp, int B, bool graph) {
   // 1. Draft (the active session must be sp.s), and walk the selector's lattice (SGLang's sample_path).
+  draft_propose(sp.anchor, B, graph);
+  plan_walk(sp, B, pin_->cand, pin_->scores);
+}
+
+void Engine::plan_walk(StepPlan& sp, int B, const int* cand, const float* scores_host) {
   const SamplingParams& p = *sp.p;
   const int K16 = draft_->config().selector_top_k, E = sp.E;
   std::uniform_real_distribution<double> uni(0.0, 1.0);
-  draft_propose(sp.anchor, B, graph);
-  sp.cand.assign(pin_->cand, pin_->cand + size_t(E) * K16);
-  const float* scores_host = pin_->scores;
+  sp.cand.assign(cand, cand + size_t(E) * K16);
   sp.rows.resize(B);
   sp.q.assign(E, std::vector<double>(K16, 0.0));
   int prev = 0;
@@ -570,21 +653,53 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     }
     return;
   }
-  const int B = opts_.draft_block;
+  const int B = opts_.draft_block, n = static_cast<int>(seqs.size());
+  if (n > kernels::kMaxSeqs) throw std::runtime_error("speculate_batch: more sequences than kMaxSeqs");
   const size_t vocab = model_->config().vocab;
+  const int K16 = draft_->config().selector_top_k, E = B - 1;
   auto t0 = std::chrono::steady_clock::now();
-  // 0-1. Per sequence: its proposal, and the drafter's block over its own context ring (eager: graphs for the
-  // batch path are stage 4).
-  std::vector<StepPlan> plans(seqs.size());
-  int V = 0;
-  for (size_t i = 0; i < seqs.size(); ++i) {
+  // 0. Per sequence: its seed and its lookup proposal.
+  std::vector<StepPlan> plans(n);
+  bool any_lookup = false;
+  std::vector<int> order(n);
+  for (int i = 0; i < n; ++i) {
     StepPlan& sp = plans[i];
-    select_session(seqs[i].session);
-    sp.s = s_;
+    sp.s = &sessions_[seqs[i].session];
     sp.p = seqs[i].params;
     sp.anchor = seqs[i].anchor;
     plan_begin(sp, B);
-    if (!sp.use_lookup) plan_draft(sp, B, false);
+    any_lookup = any_lookup || sp.use_lookup;
+    order[i] = seqs[i].session;
+  }
+  // 1. The drafter over every sequence's block at once (stage 4), then each sequence's lattice walk; a batch with a
+  // lookup chain (whose rows replace the drafter's) drafts per sequence, eagerly, as stage 3 did. With step graphs
+  // the batch's draft, verify and commits replay as graphs keyed by the order of its sessions.
+  const bool together = !any_lookup;
+  const bool graph = graphs_ && together;
+  BatchGraphs* bg = graph ? &batch_graphs_[order] : nullptr;
+  if (graph) {  // the positions every graph of this step reads
+    for (int i = 0; i < n; ++i) pin_->seq_pos[i] = plans[i].s->pos;
+    check(cudaMemcpyAsync(pos_dev_, pin_->seq_pos, n * sizeof(int), cudaMemcpyHostToDevice, stream_), "positions");
+  }
+  if (together) {
+    for (int i = 0; i < n; ++i) {
+      pin_->draft_ids[i * B] = plans[i].anchor;
+      for (int j = 1; j < B; ++j) pin_->draft_ids[i * B + j] = draft_->config().mask_token;
+    }
+    if (graph) run_graph(bg->draft, "draft", [&] { draft_batch_launch(plans, B); });
+    else draft_batch_launch(plans, B);
+    check(cudaStreamSynchronize(stream_), "draft");
+    for (int i = 0; i < n; ++i)
+      plan_walk(plans[i], B, pin_->cand + size_t(i) * E * K16, pin_->scores + size_t(i) * E * K16 * K16);
+  } else {
+    for (StepPlan& sp : plans) {
+      if (sp.use_lookup) continue;
+      s_ = sp.s;
+      plan_draft(sp, B, false);
+    }
+  }
+  int V = 0;
+  for (StepPlan& sp : plans) {
     sp.row0 = V;
     V += sp.V;
   }
@@ -594,7 +709,13 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   // 2. One verify over every sequence's rows, then 3. each sequence's accept. A non-finite row fails only its own
   // sequence: the verify wrote no state of it, its commit is skipped and its session reset.
   for (const StepPlan& sp : plans) std::copy(sp.rows.begin(), sp.rows.end(), pin_->rows + sp.row0);
-  verify_batch_launch(plans, V);
+  if (graph) {
+    std::vector<int> ks(n);
+    for (int i = 0; i < n; ++i) ks[i] = plans[i].K;
+    run_graph(bg->verify[ks], "verify", [&] { verify_batch_launch(plans, V); });
+  } else {
+    verify_batch_launch(plans, V);
+  }
   check(cudaStreamSynchronize(stream_), "verify");
   for (size_t i = 0; i < plans.size(); ++i) {
     StepPlan& sp = plans[i];
@@ -612,19 +733,40 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   for (size_t i = 0; i < plans.size(); ++i) {
     const StepPlan& sp = plans[i];
     if (sp.failed || !seqs[i].row_logits) continue;
-    const int n = sp.accepted + 1;
-    seqs[i].row_logits->resize(size_t(n) * vocab);
+    const int k = sp.accepted + 1;
+    seqs[i].row_logits->resize(size_t(k) * vocab);
     check(cudaMemcpyAsync(seqs[i].row_logits->data(), logits_dev_ + size_t(sp.row0) * vocab,
-                          size_t(n) * vocab * sizeof(float), cudaMemcpyDeviceToHost, stream_),
+                          size_t(k) * vocab * sizeof(float), cudaMemcpyDeviceToHost, stream_),
           "row logits");
   }
-  for (StepPlan& sp : plans) {
+  for (int i = 0; i < n; ++i) {
+    StepPlan& sp = plans[i];
     if (sp.failed) continue;
-    const int n = sp.accepted + 1;
+    const int k = sp.accepted + 1;
     s_ = sp.s;
-    commit_launch(sp.row0, n);
-    sp.s->history.insert(sp.s->history.end(), sp.rows.begin(), sp.rows.begin() + n);
-    sp.s->pos += n;
+    if (graph) {
+      // Slot i's commit reads its position from pos_dev_[i] and its rows from row i * B; slot 0's is the one-row
+      // step's own commit graph (the same rows, the same position slot).
+      cudaGraphExec_t* g = nullptr;
+      if (i == 0) {
+        if (s_->commit_graphs.size() < size_t(B) + 1) s_->commit_graphs.resize(size_t(B) + 1, nullptr);
+        g = &s_->commit_graphs[k];
+      } else {
+        g = &s_->batch_commit_graphs[{i, k}];
+      }
+      dpos_slot_ = i;
+      try {
+        run_graph(*g, "commit", [&] { commit_launch(sp.row0, k); });
+      } catch (...) {
+        dpos_slot_ = 0;
+        throw;
+      }
+      dpos_slot_ = 0;
+    } else {
+      commit_launch(sp.row0, k);
+    }
+    sp.s->history.insert(sp.s->history.end(), sp.rows.begin(), sp.rows.begin() + k);
+    sp.s->pos += k;
   }
   check(cudaStreamSynchronize(stream_), "commit");
   const double draft_s = std::chrono::duration<double>(t1 - t0).count();

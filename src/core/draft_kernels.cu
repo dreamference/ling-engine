@@ -20,11 +20,11 @@ constexpr int kDD = 128;  // drafter head dim
 
 // Per-head RMSNorm (plain weight) and NeoX RoPE over the whole head, in place. One block per (row, head),
 // one thread per dim.
-__global__ void draft_qk_rope_kernel(float* __restrict__ x, int row_stride, const __nv_bfloat16* __restrict__ w,
-                                     DevPos pos0, float theta, float eps) {
-  pdl_begin();  // first statement: see launch.cuh
+__device__ __forceinline__ void draft_qk_rope_body(float* __restrict__ x, int row_stride,
+                                                   const __nv_bfloat16* __restrict__ w, int r, int pos, float theta,
+                                                   float eps) {
   __shared__ float red[4], xs[kDD];
-  const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+  const int h = blockIdx.y, d = threadIdx.x;
   float* p = x + static_cast<size_t>(r) * row_stride + h * kDD;
   const float v = p[d];
   float ss = warp_sum(v * v);
@@ -36,8 +36,22 @@ __global__ void draft_qk_rope_kernel(float* __restrict__ x, int row_stride, cons
   const int half = kDD / 2, i = d % half;
   const float inv_freq = powf(theta, -2.f * i / kDD);
   float sn, cs;
-  sincosf(static_cast<float>(pos_value(pos0) + r) * inv_freq, &sn, &cs);
+  sincosf(static_cast<float>(pos) * inv_freq, &sn, &cs);
   p[d] = d < half ? xs[d] * cs - xs[d + half] * sn : xs[d] * cs + xs[d - half] * sn;
+}
+
+__global__ void draft_qk_rope_kernel(float* __restrict__ x, int row_stride, const __nv_bfloat16* __restrict__ w,
+                                     DevPos pos0, float theta, float eps) {
+  pdl_begin();  // first statement: see launch.cuh
+  const int r = blockIdx.x;
+  draft_qk_rope_body(x, row_stride, w, r, pos_value(pos0) + r, theta, eps);
+}
+
+__global__ void draft_qk_rope_seqs_kernel(float* __restrict__ x, int row_stride, const __nv_bfloat16* __restrict__ w,
+                                          SeqBatch b, float theta, float eps) {
+  pdl_begin();  // first statement: see launch.cuh
+  const int r = blockIdx.x, sq = seq_of(b, r);
+  draft_qk_rope_body(x, row_stride, w, r, seq_pos(b, sq) + r - b.row0[sq], theta, eps);
 }
 
 __global__ void draft_store_kv_kernel(const float* __restrict__ k, const float* __restrict__ v, int kv_size,
@@ -55,14 +69,14 @@ __global__ void draft_store_kv_kernel(const float* __restrict__ k, const float* 
 // Non-causal attention of the block's B queries over the context cache (a sliding window ending before the
 // block) and over the block itself. One block per (query row, KV head); 8 warps walk the keys with an online
 // softmax and are merged at the end. Lane l owns dims 4l .. 4l + 3.
+// Query row j of a block of B rows at positions L .. L + B - 1 (q, kb, vb and out start at the block's first row).
 template <int G>
-__global__ void __launch_bounds__(256)
-    draft_attention_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
-                           const __nv_bfloat16* __restrict__ vc, int ring, const float* __restrict__ kb,
-                           const float* __restrict__ vb, DevPos L_arg, int window_left, int Hkv, float* __restrict__ out) {
-  pdl_begin();  // first statement: see launch.cuh
+__device__ __forceinline__ void draft_attention_body(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
+                                                     const __nv_bfloat16* __restrict__ vc, int ring,
+                                                     const float* __restrict__ kb, const float* __restrict__ vb, int L,
+                                                     int window_left, int Hkv, float* __restrict__ out, int j, int B) {
   __shared__ float wm[8][G], wl[8][G], wacc[8][kDD];
-  const int j = blockIdx.x, kvh = blockIdx.y, B = gridDim.x, L = pos_value(L_arg);
+  const int kvh = blockIdx.y;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int Hq = Hkv * G;
   const int lo = max(0, L + j - window_left);
@@ -142,6 +156,31 @@ __global__ void __launch_bounds__(256)
       out[(static_cast<size_t>(j) * Hq + kvh * G + g) * kDD + d] = A / Ls;
     }
   }
+}
+
+template <int G>
+__global__ void __launch_bounds__(256)
+    draft_attention_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
+                           const __nv_bfloat16* __restrict__ vc, int ring, const float* __restrict__ kb,
+                           const float* __restrict__ vb, DevPos L_arg, int window_left, int Hkv, float* __restrict__ out) {
+  pdl_begin();  // first statement: see launch.cuh
+  draft_attention_body<G>(q, kc, vc, ring, kb, vb, pos_value(L_arg), window_left, Hkv, out, blockIdx.x, gridDim.x);
+}
+
+// Several sequences' blocks in one launch (M4 stage 4): row jg belongs to sequence seq_of(jg), whose block is its
+// rows of b, over its own ring at its own position.
+template <int G>
+__global__ void __launch_bounds__(256)
+    draft_attention_seqs_kernel(const float* __restrict__ q, SeqPtrs<const __nv_bfloat16> kc,
+                                SeqPtrs<const __nv_bfloat16> vc, int ring, const float* __restrict__ kb,
+                                const float* __restrict__ vb, SeqBatch b, int window_left, int Hkv,
+                                float* __restrict__ out) {
+  pdl_begin();  // first statement: see launch.cuh
+  const int jg = blockIdx.x, sq = seq_of(b, jg);
+  const size_t r0 = b.row0[sq], Hq = static_cast<size_t>(Hkv) * G;
+  draft_attention_body<G>(q + r0 * Hq * kDD, kc.p[sq], vc.p[sq], ring, kb + r0 * Hkv * kDD, vb + r0 * Hkv * kDD,
+                          seq_pos(b, sq), window_left, Hkv, out + r0 * Hq * kDD, jg - b.row0[sq],
+                          b.row0[sq + 1] - b.row0[sq]);
 }
 
 // DFlash2's grouped dynamic convolution over the block (SGLang's _grouped_conv): per channel c of group
@@ -226,6 +265,21 @@ void draft_attention(const float* q, const __nv_bfloat16* kc, const __nv_bfloat1
   if (ring <= window_left) throw std::runtime_error("draft_attention: the ring is shorter than the window");
   launch_kernel("draft_attention", draft_attention_kernel<4>, dim3(B, Hkv), dim3(256), 0, s, q, kc, vc, ring, kb, vb,
                 L, window_left, Hkv, out);
+}
+
+void draft_qk_rope_seqs(float* x, int heads, int row_stride, const __nv_bfloat16* norm, const SeqBatch& b, float theta,
+                        float eps, cudaStream_t s) {
+  launch_kernel("draft_qk_rope_seqs", draft_qk_rope_seqs_kernel, dim3(b.row0[b.n], heads), dim3(kDD), 0, s, x,
+                row_stride, norm, b, theta, eps);
+}
+
+void draft_attention_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc, int ring,
+                          const float* kb, const float* vb, const SeqBatch& b, int window_left, int Hq, int Hkv,
+                          float* out, cudaStream_t s) {
+  if (Hq != 4 * Hkv) throw std::runtime_error("draft_attention: built for 4 query heads per KV head");
+  if (ring <= window_left) throw std::runtime_error("draft_attention: the ring is shorter than the window");
+  launch_kernel("draft_attention_seqs", draft_attention_seqs_kernel<4>, dim3(b.row0[b.n], Hkv), dim3(256), 0, s, q, kc,
+                vc, ring, kb, vb, b, window_left, Hkv, out);
 }
 
 void grouped_conv(const float* h, const float* coef, const __nv_bfloat16* base, int side, float* out, int rows,
