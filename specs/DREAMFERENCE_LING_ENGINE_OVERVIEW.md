@@ -72,7 +72,7 @@ Goals:
 Non-goals:
 
 - Running any other model, including Qwen3.8-Flash-Next or Qwen3.6-27B. A new checkpoint with different shapes means recompiling.
-- Multi-node inference across two Sparks over ConnectX-7, in the first release. (A second paired Spark is a second engine and a second lane, as Mightling already does.) Two-node tensor parallelism is a design note for after M5, not scheduled: [BACKLOG §19.21](./DREAMFERENCE_LING_ENGINE_BACKLOG.md).
+- Multi-node inference across two Sparks over ConnectX-7, in the first release. (A second paired Spark is a second engine and a second lane, as Mightling already does.) Two-node tensor parallelism is a design note for the end of the engine plan, after every one-node improvement is settled (the owner's decision of 2026-10-13): [BACKLOG §19.21](./DREAMFERENCE_LING_ENGINE_BACKLOG.md).
 - Training or fine-tuning the target model. Fine-tuning or retraining the DFlash2 drafter is in scope.
 - New quantization research. We start from the precision map of the checkpoint Mightling serves and only decide which tensors move from FP8 to NVFP4. Two lower-byte formats were considered and are deliberately left out of the targets ([section 5.3](./DREAMFERENCE_LING_ENGINE_MODEL.md)): 2:4 structured sparsity and ~3-bit weights.
 - Video input and contexts beyond the native 262k tokens, in the first release.
