@@ -362,13 +362,33 @@ bool test_attention_rows() {
       const bool psame = std::memcmp(plain.data(), pref.data(), plain.size() * sizeof(float)) == 0;
       ok &= psame;
       std::printf("attention_rows with L2 prefetch identical (24K, head-major): %s\n", psame ? "yes ok" : "NO FAIL");
+      // B07: three cp.async stages (the whole 99 KB) against two, bit for bit, with and without the prefetch.
+      ling::kernels::set_kv_layout(size_t(big) * D, D);
+      for (int pf : {0, 2}) {
+        ling::kernels::set_attention_prefetch(pf);
+        for (int M : {1, 12, 16}) {
+          ling::kernels::set_attention_stages(2);
+          ling::kernels::attention_rows(dq, bk, bv, 24576, M, Hq, Hkv, D, bs, out, nullptr);
+          const std::vector<float> two = download(out, size_t(M) * Hq * D);
+          ling::kernels::set_attention_stages(3);
+          ling::kernels::attention_rows(dq, bk, bv, 24576, M, Hq, Hkv, D, bs, out, nullptr);
+          const std::vector<float> three = download(out, size_t(M) * Hq * D);
+          const bool same3 = std::memcmp(two.data(), three.data(), two.size() * sizeof(float)) == 0;
+          ok &= same3;
+          std::printf("attention_rows 3 stages identical to 2 (24K, M=%d, prefetch %d): %s\n", M, pf, same3 ? "yes ok" : "NO FAIL");
+        }
+      }
+      ling::kernels::set_attention_stages(-1);
+      ling::kernels::set_attention_prefetch(0);
+      ling::kernels::set_kv_layout(0, 0);
     }
     for (int layout = 0; layout < (std::getenv("LING_NO_TIMING") ? 0 : 3); ++layout) {
       if (layout >= 1) ling::kernels::set_kv_layout(size_t(big) * D, D);  // head-major, as the engine uses
       ling::kernels::set_attention_prefetch(layout == 2 ? 2 : 0);
-      for (int bulk = 0; bulk < 2; ++bulk) {
+      for (int bulk = 0; bulk < 3; ++bulk) {  // 2: cp.async with three stages (B07)
         ling::kernels::set_attention_bulk(bulk == 1);
-        for (int M : {1, 16}) {
+        ling::kernels::set_attention_stages(bulk == 2 ? 3 : 2);
+        for (int M : {1, 12, 16}) {
           cudaEventRecord(a);
           for (int i = 0; i < 20; ++i) ling::kernels::attention_rows(dq, bk, bv, 24576, M, Hq, Hkv, D, bs, out, nullptr);
           cudaEventRecord(b);
@@ -376,11 +396,12 @@ bool test_attention_rows() {
           float ms = 0;
           cudaEventElapsedTime(&ms, a, b);
           std::printf("attention_rows 24K context, %s KV, %s, M=%-2d: %.3f ms per layer (%.0f GB/s of KV)\n",
-                      layout == 0 ? "interleaved " : layout == 1 ? "head-major  " : "head-major+L2 prefetch", bulk ? "bulk   " : "cp.async", M, ms / 20,
+                      layout == 0 ? "interleaved " : layout == 1 ? "head-major  " : "head-major+L2 prefetch", bulk == 1 ? "bulk   " : bulk == 2 ? "cp.async 3 stages" : "cp.async", M, ms / 20,
                       2.0 * 24576 * Hkv * D * 2 / (ms / 20 * 1e-3) / 1e9);
         }
       }
       ling::kernels::set_attention_bulk(false);
+      ling::kernels::set_attention_stages(-1);
     }
     ling::kernels::set_attention_prefetch(0);
     ling::kernels::set_kv_layout(0, 0);
@@ -576,6 +597,61 @@ void bench_groups() {
   std::printf("\n");
 }
 
+// B07: the verify attention's timing at the workload's context, per stage count and prefetch distance (random KV,
+// head-major, 27K keys, 200 launches per point, best of three passes, the configurations interleaved).
+void bench_attn() {
+  const int Hq = 24, Hkv = 4, D = 256, ctx = 27648 + 32;
+  std::mt19937 rng(5);
+  std::normal_distribution<float> normal(0.f, 1.f);
+  __nv_bfloat16 *bk, *bv;
+  float *bs, *dq, *out;
+  cudaMalloc(&bk, size_t(ctx) * Hkv * D * 2);
+  cudaMalloc(&bv, size_t(ctx) * Hkv * D * 2);
+  {
+    std::vector<__nv_bfloat16> h(size_t(ctx) * Hkv * D);
+    for (auto& v : h) v = __float2bfloat16(normal(rng));
+    cudaMemcpy(bk, h.data(), h.size() * 2, cudaMemcpyHostToDevice);
+    for (auto& v : h) v = __float2bfloat16(normal(rng));
+    cudaMemcpy(bv, h.data(), h.size() * 2, cudaMemcpyHostToDevice);
+  }
+  std::vector<float> q(size_t(32) * Hq * D);
+  for (float& v : q) v = normal(rng);
+  dq = upload(q);
+  cudaMalloc(&out, size_t(32) * Hq * D * sizeof(float));
+  cudaMalloc(&bs, ling::kernels::attention_rows_scratch_floats(32, Hq, D, ctx) * sizeof(float));
+  ling::kernels::set_kv_layout(size_t(ctx) * D, D);
+  cudaEvent_t a, b;
+  cudaEventCreate(&a), cudaEventCreate(&b);
+  struct Cfg { int ns, pf; };
+  const Cfg cfgs[] = {{2, 2}, {3, 2}, {2, 3}, {3, 1}, {3, 3}, {3, 4}};
+  for (int M : {1, 12, 16}) {
+    float best[6];
+    for (float& v : best) v = 1e30f;
+    for (int pass = 0; pass < 3; ++pass)
+      for (int c = 0; c < 6; ++c) {
+        ling::kernels::set_attention_stages(cfgs[c].ns);
+        ling::kernels::set_attention_prefetch(cfgs[c].pf);
+        ling::kernels::attention_rows(dq, bk, bv, 27648, M, Hq, Hkv, D, bs, out, nullptr);
+        cudaEventRecord(a);
+        for (int i = 0; i < 200; ++i) ling::kernels::attention_rows(dq, bk, bv, 27648, M, Hq, Hkv, D, bs, out, nullptr);
+        cudaEventRecord(b);
+        cudaEventSynchronize(b);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, a, b);
+        best[c] = std::min(best[c], ms / 200);
+      }
+    std::printf("bench attn 27K M=%-2d", M);
+    for (int c = 0; c < 6; ++c)
+      std::printf("  ns%d pf%d %.3f ms (%3.0f GB/s)", cfgs[c].ns, cfgs[c].pf, best[c],
+                  2.0 * 27648 * Hkv * D * 2 / (best[c] * 1e-3) / 1e9);
+    std::printf("\n");
+  }
+  ling::kernels::set_attention_stages(-1);
+  ling::kernels::set_attention_prefetch(0);
+  ling::kernels::set_kv_layout(0, 0);
+  cudaFree(bk), cudaFree(bv), cudaFree(bs), cudaFree(dq), cudaFree(out);
+}
+
 }  // namespace
 
 // M4 stage 4: each state kernel over two sequences in one launch (kernels::SeqBatch) against its launch per
@@ -761,6 +837,10 @@ bool test_batched_state_kernels() {
 
 int main(int argc, char** argv) {
   if (const char* e = std::getenv("LING_PDL")) ling::kernels::set_pdl(std::atoi(e) != 0);
+  if (argc > 1 && std::string(argv[1]) == "--bench-attn") {  // timings only (B07)
+    bench_attn();
+    return cudaDeviceSynchronize() == cudaSuccess ? 0 : 1;
+  }
   if (argc > 1 && std::string(argv[1]) == "--bench-groups") {  // timings only (B16 sweeps)
     bench_groups();
     return cudaDeviceSynchronize() == cudaSuccess ? 0 : 1;
