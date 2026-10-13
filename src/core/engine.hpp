@@ -30,6 +30,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "core/copy_proposer.hpp"
 #include "core/drafter.hpp"
 #include "core/kernels.cuh"
 #include "core/model.hpp"
@@ -47,6 +48,18 @@ struct EngineOptions {
   // least lookup_min_match tokens long, and the drafter's pass is skipped).
   int lookup_mode = 1;
   int lookup_min_match = 8;
+  // Moonshot P1: the long-copy proposer (core/copy_proposer.hpp; specs/drafts/MOONSHOT-repository-aware-decoding-
+  // 2026-10-13.md §8), over each session's own tokens. 0 off (the default); 1 replace: on a match of at least
+  // copy_min_match tokens the copy's continuation (up to copy_max_tokens) is verified instead of the drafter's
+  // chain, and the drafter's pass is skipped; 2 extend: the drafter drafts as always and, when its whole chain
+  // equals the copy's first tokens, the chain is extended with the copy's continuation. Either way the verify
+  // decides, so the output is unchanged (greedy token for token, sampled in distribution). A one-sequence step
+  // only (speculate()); a batched step never copies (moonshot P4's batch rule). copy_max_tokens is capped at
+  // kMaxStreamRows - 1 = 31 until the rows path verifies 64 rows. Takes precedence over lookup_mode 2.
+  int copy_mode = 0;
+  int copy_min_match = 16;
+  int copy_max_tokens = 31;
+  int copy_ngram = 8;  // the n-gram the index is keyed by (the shortest agreement it can find)
   // Prefix checkpoints: DeltaNet and conv states kept at chosen prompt positions (the end of the first two
   // messages, i.e. after `boundary_token`, and multiples of prefill_chunk up to checkpoint_limit), so a later
   // prompt that shares the prefix resumes there. Each costs ~157 MB; 0 turns them off.
@@ -100,6 +113,9 @@ struct SpecStats {
   std::vector<long> accept_hist = std::vector<long>(33, 0);
   double draft_seconds = 0, verify_seconds = 0, commit_seconds = 0;
   long lookup_steps = 0, lookup_accepted = 0;  // steps that verified the lookup chain, and its accepted tokens
+  // Moonshot P1: steps whose chain held copied tokens (replace: the whole chain; extend: the drafter's chain and the
+  // copy's continuation after it), the copied tokens offered, and those accepted.
+  long copy_steps = 0, copy_drafted = 0, copy_accepted = 0;
   // M4 §2: steps this session took inside a batch (speculate_batch with two or more sequences). A batched step's
   // draft, verify and commit times are the batch's wall times, charged to each sequence in it, so a session's
   // seconds per step read as its own step period.
@@ -213,6 +229,8 @@ class Engine {
     opts_.lookup_mode = mode;
     opts_.lookup_min_match = min_match;
   }
+  // The copy proposer's settings (EngineOptions::copy_*), between steps.
+  void set_copy(int mode, int min_match, int max_tokens);
   int draft_block() const { return opts_.draft_block; }
   void set_draft_block(int b);
   // Whether speculative steps run as CUDA graphs (false when asked for but unavailable: see step_graphs).
@@ -349,7 +367,7 @@ class Engine {
   // One sequence's part of a speculative step on the host (speculate.cpp): its proposal, the drafted rows and
   // the draft's distribution, then the accept.
   struct StepPlan;
-  void plan_begin(StepPlan& sp, int B);                        // seed, lookup proposal
+  void plan_begin(StepPlan& sp, int B, bool single);  // seed, lookup and copy proposals (copy: `single` steps only)
   void plan_draft(StepPlan& sp, int B, bool graph);            // the drafter's block and the lattice walk
   // The lattice walk over the drafter's candidates and scores for this sequence (E rows of each).
   void plan_walk(StepPlan& sp, int B, const int* cand, const float* scores);
@@ -496,9 +514,10 @@ class Engine {
     int pos = 0;
     std::vector<ShadowRecord> shadow;
     SpecStats spec;  // this session's speculative steps
+    CopyIndex copy;  // moonshot P1: the session's tokens indexed for the copy proposer (synced at each step)
     std::mt19937_64 rng;
     cudaGraphExec_t draft_graph = nullptr;
-    std::map<int, cudaGraphExec_t> verify_graphs;  // by top-K (1 when greedy)
+    std::map<int, cudaGraphExec_t> verify_graphs;  // by rows and top-K (K * 64 + V; K is 1 when greedy)
     std::vector<cudaGraphExec_t> commit_graphs;    // by accepted count + 1
     std::map<std::pair<int, int>, cudaGraphExec_t> batch_commit_graphs;  // a batched step's: (slot, count), slot > 0
     // With commit_overlap, commit_graphs and batch_commit_graphs hold the drafter's context KV only, and these the

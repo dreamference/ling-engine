@@ -3,6 +3,7 @@
 
 #include <functional>
 #include <random>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -18,6 +19,10 @@ using Dist = std::vector<std::pair<int, double>>;  // (token, probability), prob
 // P directly would give.
 std::pair<int, int> accept_sampled(const std::vector<Dist>& P, const std::vector<int>& drafts,
                                    const std::function<double(int, int)>& q, std::mt19937_64& rng);
+
+// Greedy acceptance: draft i survives while it equals argmax[i], the target's argmax after row i (row 0 is the
+// anchor's). Returns (accepted drafts, next token = argmax[accepted]); argmax holds drafts.size() + 1 rows.
+std::pair<int, int> accept_greedy(std::span<const int> drafts, const int* argmax);
 
 // Draws from a distribution (the last token if rounding leaves u above the total).
 int draw(const Dist& d, std::mt19937_64& rng);

@@ -15,6 +15,12 @@ int draw(const Dist& d, std::mt19937_64& rng) {
   return d.back().first;
 }
 
+std::pair<int, int> accept_greedy(std::span<const int> drafts, const int* argmax) {
+  int accepted = 0;
+  while (accepted < static_cast<int>(drafts.size()) && drafts[accepted] == argmax[accepted]) ++accepted;
+  return {accepted, argmax[accepted]};
+}
+
 std::pair<int, int> accept_sampled(const std::vector<Dist>& P, const std::vector<int>& drafts,
                                    const std::function<double(int, int)>& q, std::mt19937_64& rng) {
   std::uniform_real_distribution<double> uni(0.0, 1.0);
