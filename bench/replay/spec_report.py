@@ -29,6 +29,11 @@ def main():
     if d.get("lookup_steps"):
         out["lookup_steps"] = d["lookup_steps"]
         out["lookup_tokens_per_step"] = (d["lookup_accepted"] + d["lookup_steps"]) / d["lookup_steps"]
+    if d.get("copy_steps"):  # moonshot P1's copy proposer (by source: history, view, edit)
+        for k in ("copy_steps", "copy_drafted", "copy_accepted", "copy_steps_by_source", "copy_accepted_by_source"):
+            if k in d:
+                out[k] = d[k]
+        out["copy_accepted_per_copy_step"] = d["copy_accepted"] / d["copy_steps"]
     if d.get("shadow_total_steps"):
         n = d["shadow_total_steps"]
         out["shadow"] = {

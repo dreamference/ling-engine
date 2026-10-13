@@ -15,11 +15,13 @@ Usage:
 --dump-bodies writes every request body (one JSON object per line) instead of sending it, so the
 prompt-rendering test (bench/render/) sees exactly the requests a replay sends.
 
-Per request it records: input and cached tokens, output tokens, time to first token, total time
-and decode tokens/s. Around the run it reads /metrics, so accepted tokens per verify step come
+Per request it records: input and cached tokens, output tokens, time to first token, total time,
+decode tokens/s and a SHA-256 of the streamed output (its deltas in order), so the greedy outputs of two
+servers can be compared without the text leaving the run (bench/copy_gate.sh). Around the run it reads /metrics, so accepted tokens per verify step come
 from the server's own counters. Prompt contents never leave this machine.
 """
 import argparse
+import hashlib
 import http.client
 import json
 import random
@@ -97,6 +99,7 @@ def send(url, body):
     t_first = None
     rid = None
     n_deltas = 0
+    digest = hashlib.sha256()  # every delta in order: outputs compared across servers without keeping them
     usage = None
     buf = b""
     while True:
@@ -119,6 +122,8 @@ def send(url, body):
                 t = j.get("type", "")
                 if t.endswith(".delta"):
                     n_deltas += 1
+                    if isinstance(j.get("delta"), str):
+                        digest.update(t.encode() + b"\0" + j["delta"].encode() + b"\0")
                     if t_first is None:
                         t_first = time.perf_counter()
                 elif t == "response.created":
@@ -127,7 +132,7 @@ def send(url, body):
                     usage = (j.get("response") or {}).get("usage")
     t1 = time.perf_counter()
     return {"t_total": t1 - t0, "ttft": (t_first - t0) if t_first else None, "deltas": n_deltas,
-            "usage": usage, "rid": rid}
+            "usage": usage, "rid": rid, "out_sha256": digest.hexdigest()}
 
 
 def main():
