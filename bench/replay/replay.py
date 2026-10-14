@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import zlib
 
 
 def parse_rollout(path):
@@ -145,6 +146,9 @@ def main():
     ap.add_argument("--seed", type=int, default=8)
     ap.add_argument("--concurrency", type=int, default=1)
     ap.add_argument("--greedy", action="store_true")
+    ap.add_argument("--sampling-seed", type=int, default=0,
+                    help="send each request a seed fixed by this value, its session and its index, so sampled "
+                         "output (and acceptance) is the same in every run and on every exact build (0: unseeded)")
     ap.add_argument("--effort", default="none", help="reasoning effort; puffin sends none")
     ap.add_argument("--max-out", type=int, default=0, help="override the recorded output cap")
     ap.add_argument("--label", default="")
@@ -171,7 +175,7 @@ def main():
             s = min(int(a.start), len(reqs) - w)
         jobs.append((p, instr, reqs, list(range(s, s + w))))
 
-    def body_of(p, instr, rq):
+    def body_of(p, instr, rq, i=0):
         rec_out = int(rq["usage"].get("output_tokens") or 0)
         body = {
             "model": a.model, "instructions": instr,
@@ -183,6 +187,9 @@ def main():
         }
         if a.greedy:
             body["temperature"] = 0.0
+        if a.sampling_seed:
+            key = f"{a.sampling_seed}:{p.split('/')[-1]}:{i}".encode()
+            body["seed"] = 1 + zlib.crc32(key) % (2**31 - 1)
         return body
 
     if a.dump_bodies:
@@ -191,7 +198,7 @@ def main():
                 for k, i in enumerate(idxs):
                     f.write(json.dumps({"session": p.split("/")[-1], "req": i, "cold": k == 0,
                                         "rec_in": reqs[i]["usage"].get("input_tokens"),
-                                        "body": body_of(p, instr, reqs[i])}) + "\n")
+                                        "body": body_of(p, instr, reqs[i], i)}) + "\n")
         return 0
 
     out = open(a.out, "w")
@@ -209,7 +216,7 @@ def main():
             for k, i in enumerate(idxs):
                 rq = reqs[i]
                 rec_out = int(rq["usage"].get("output_tokens") or 0)
-                res = send(a.url, body_of(p, instr, rq))
+                res = send(a.url, body_of(p, instr, rq, i))
                 rec = {"label": a.label, "worker": wid, "session": p.split("/")[-1], "req": i,
                        "cold": k == 0, "t_wall": time.time(),
                        "rec_in": rq["usage"].get("input_tokens"),
