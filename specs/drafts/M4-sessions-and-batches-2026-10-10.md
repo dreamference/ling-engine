@@ -234,6 +234,20 @@ The two-stream tokens/s fell with the sampled acceptance of that run (4.87 again
 
 The sweep behind the choice (`LING_SG_TN`, `LING_SG_TW`, `LING_SG_TN4`, `LING_SG_TW4`, `LING_SG_PF` override it): two tiles on the narrow matrices at 17-32 rows alone took the batched step from 129 to 123 ms and left the one-row step as it was; two tiles at 1-16 rows too took the one-row step to 103.2 ms; with two chunks in flight 102.0. Four tiles per block, L2 evict-first and 256-byte prefetch hints on the weight loads, and four tiles on the wide matrices all measured within noise of these.
 
+**The replays from here on are seeded.** B16's two-stream pair above differed in acceptance (4.87 against 5.28 tokens per step) because `bench/replay/replay.py` sent no seed: each request sampled from a fresh random seed, so two runs were two workloads. `--sampling-seed` (`3f1ef55`) gives every request a seed fixed by the run's value, its session and its index; the engine reseeds per request, and batched and interleaved sequences sample as they do alone, so seeded output repeats across runs and exact builds. Rerun that way (seed 1013, alternating, two runs each): main 33.0 and 32.6 tokens/s per stream at 152.8 and 154.2 ms, B16 34.1 and 34.1 at 147.5 and 147.3 ms, with main's second run and both B16 runs producing the same 17,531 tokens in the same 3,490 passes (5.02 tokens per step). Main's first run differed in one request of 144 (88 against 136 tokens): at two streams timing decides which slot a request takes and whether it resumes or re-prefills, the drafter's context after a prefill comes from another GEMM path than after a commit, and under sampled acceptance a different proposal gives different (equally exact) tokens. A comparison is reported at equal acceptance when output tokens and passes match.
+
+**B07, the verify attention's stages: not merged (branch `steps/b07`, `bc322da`).** At the workload's context the kernel already reads its KV at the plain-read rate (27K keys, 12 rows: 0.518 ms per layer, 219 GB/s; M3 §4's plain read ~225). The one exact lever left, a third 32-key `cp.async` stage (the whole 99 KB a block may have; bit-identical), measured 0.517 ms alone, 102.35 against 102.1 ms in the one-stream step and 122.25 against 124.1 ms in the batched step: slower at two streams. B07's other levers (a 12-way split merged in the kernel, 16-key tiles) change the online softmax's grouping and were measured no faster in M2/M3.
+
+**The commit beside the next draft: merged (`a984166`).** The commit's DeltaNet replay runs on a second stream beside the next step's draft, which reads none of that state; the next verify waits for it, and every other pass, state copy, reset and hash joins first. The same kernels on the same inputs: the same-as-main comparison is identical, and `--spec-check`, the one gate that compares against plain decoding (which never overlaps), passes. The replay slows the draft beside it (10.0 to 10.9 ms) but leaves the commit 1.7 ms instead of 3.8. A higher priority for the step's stream measured within noise and is not used.
+
+| | B16 (main) | The commit beside the draft |
+| --- | --- | --- |
+| The step in place, one stream (two runs) | 102.2, 102.0 ms (draft 9.8, commit 3.8) | 101.2, 101.0 ms (draft 10.9, commit 1.7) |
+| The batched step in place, two streams | 122.3, 122.1 ms | 120.4, 120.7 ms |
+| Replay, one stream (seeded) | 48.6 tokens/s at 102.6 ms per step | 49.2 tokens/s at 101.4 ms (the same 17,527 tokens in the same 3,514 passes, 4.99 tokens per step) |
+| Replay, two streams, per stream (seeded, back to back) | 34.0 tokens/s at 147.8 ms | 34.3 tokens/s at 146.3 ms (the same 17,531 tokens in the same 3,490 passes, 5.02 tokens per step) |
+| Gates | | all passed: the 19 `ling-run` checks, the unit tests, same as main; `tests/server` 58 passed, 3 xfailed |
+
 ## 7. Questions for the owner, answered
 
 All eight were answered by the owner on 2026-10-10; each answer follows its question. The next step is the build order of section 6.
