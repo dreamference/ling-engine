@@ -77,6 +77,11 @@ struct EngineOptions {
   // state, drafter context ring, history and RNG, all allocated here. Requests run one at a time in the
   // active session (select it with activate_session); the prefix checkpoints are shared by all of them.
   int sessions = 1;
+  // M4's step savings (reports/M3.md §7 item 4): a speculative step's commit replays the DeltaNet and conv state
+  // over the accepted rows on a second stream, beside the next step's draft (which reads none of that state), and
+  // the next verify waits for it. The same kernels on the same inputs, so the same bits. LING_COMMIT_OVERLAP=0/1
+  // overrides.
+  bool commit_overlap = true;
 };
 
 struct EngineStats {
@@ -317,7 +322,20 @@ class Engine {
   // Speculation (speculate.cpp).
   // Advance the active session's recurrent state over a verify's rows row0 .. row0 + n - 1 (its anchor and
   // accepted drafts; row0 is the sequence's first row in a batch).
-  void commit(int row0, int n);
+  void commit(int row0, int n, cudaStream_t st, float* out);
+  // The commit beside the next draft (EngineOptions::commit_overlap): the DeltaNet replay runs on commit_stream_
+  // and records commit_done_; join_commit() makes stream_ wait for it. Everything that reads or writes the
+  // recurrent state, the verify's saved inputs or commit_core_ on stream_ (every forward pass, the state copies,
+  // resets and hashes) joins first; the draft and the drafter's context KV (draft_materialize) do not need to.
+  bool commit_overlap_ = false;
+  bool commit_pending_ = false;
+  cudaStream_t commit_stream_ = nullptr;
+  cudaEvent_t commit_done_ = nullptr;
+  float* commit_core_ = nullptr;  // the replay's recurrence output, which nothing reads (core_ belongs to stream_)
+  void join_commit();
+  // The commit's two halves: the DeltaNet replay (on commit_stream_ when overlapped) and the drafter's context KV.
+  void commit_state_launch(int row0, int n, cudaStream_t st);
+  void commit_state_async(int row0, int n, bool graph);  // the replay on commit_stream_, then commit_done_
   // Target features -> the drafter's context KV at positions pos0 .. pos0 + rows - 1.
   void draft_materialize(int rows, kernels::DevPos pos0, int cap_row0);
   void draft_propose(int anchor, int B, bool graph);  // the drafter's block, top-16 candidates and lattice
@@ -370,8 +388,9 @@ class Engine {
   // state pointers into their kernels' arguments.
   // Runs `body` as the graph in `slot` (captured on first use), or eagerly when graphs are off. A failed
   // capture turns graphs off for the engine's lifetime, says why, and runs `body` eagerly.
-  void run_graph(cudaGraphExec_t& slot, const char* what, const std::function<void()>& body);
-  cudaGraphExec_t capture(const std::function<void()>& body);
+  void run_graph(cudaGraphExec_t& slot, const char* what, const std::function<void()>& body,
+                 cudaStream_t st = nullptr);  // st: the stream to capture and launch on (stream_ by default)
+  cudaGraphExec_t capture(const std::function<void()>& body, cudaStream_t st);
   void clear_graphs();
   // Page-locked host buffers for every copy inside a step: a graph's memcpy nodes read and write fixed
   // host addresses when they run, so these must stay put and must not be pageable.
@@ -482,6 +501,9 @@ class Engine {
     std::map<int, cudaGraphExec_t> verify_graphs;  // by top-K (1 when greedy)
     std::vector<cudaGraphExec_t> commit_graphs;    // by accepted count + 1
     std::map<std::pair<int, int>, cudaGraphExec_t> batch_commit_graphs;  // a batched step's: (slot, count), slot > 0
+    // With commit_overlap, commit_graphs and batch_commit_graphs hold the drafter's context KV only, and these the
+    // DeltaNet replay on commit_stream_, keyed by (first row, count).
+    std::map<std::pair<int, int>, cudaGraphExec_t> state_commit_graphs;
     // The pool's bookkeeping.
     bool owned = false;  // a session has been bound to the slot
     std::string key;     // the prompt_cache_key it was bound with ("" without one)
