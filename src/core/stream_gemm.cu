@@ -38,8 +38,9 @@ constexpr int kChunk = 128;
 // Bytes of one (16-row tile, 128-value chunk) block: NVFP4 values (16 x 64) then their E4M3 scales
 // (16 x 8); FP8 values (16 x 128).
 constexpr int kTileBytesFp4 = 16 * 64 + 16 * 8, kTileBytesFp8 = 16 * 128;
-// B26: a coded NVFP4 block, the values then 128 6-bit scale codes (kernels.cuh, retile_nvfp4_coded).
-constexpr int kTileBytesFp4Coded = 16 * 64 + 128 * 6 / 8;
+// B26: a coded NVFP4 blob is every block's 1,024 value bytes (aligned, as the raw blob's 1,152-byte blocks are), then
+// every block's 96 code bytes (kernels.cuh, retile_nvfp4_coded).
+constexpr int kValueBytesFp4 = 16 * 64, kCodeBytesFp4 = 128 * 6 / 8;
 
 __device__ __forceinline__ uint32_t e2m1x2_to_h2(uint32_t byte) {
   uint32_t out;
@@ -98,8 +99,9 @@ __device__ __forceinline__ void load_weights(WeightRegs<TILES, FP4, CODED>& r, c
     // The tiled layout (retile_*): each (16-row tile, 128-value chunk) is one contiguous block, in the
     // order the lanes read it, so every load instruction of the warp covers 512 contiguous bytes.
     const int tile = min((row0 >> 4) + i, last_tile);
-    const uint8_t* base =
-        w + (static_cast<size_t>(tile) * chunks + chunk) * (FP4 ? (CODED ? kTileBytesFp4Coded : kTileBytesFp4) : kTileBytesFp8);
+    const size_t blk = static_cast<size_t>(tile) * chunks + chunk;
+    const uint8_t* base = w + blk * (FP4 ? (CODED ? kValueBytesFp4 : kTileBytesFp4) : kTileBytesFp8);
+    const uint8_t* codes = CODED ? w + static_cast<size_t>(N / 16) * chunks * kValueBytesFp4 + blk * kCodeBytesFp4 : nullptr;
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
       const int lane_slot = (h * 8 + g) * 4 + t;
@@ -113,8 +115,8 @@ __device__ __forceinline__ void load_weights(WeightRegs<TILES, FP4, CODED>& r, c
           // 64 + L: two loads per tile, as the raw blob's two 16-bit scale loads.
           if (h == 0) {
             const int L = g * 4 + t;
-            r.cw[i][0] = *reinterpret_cast<const uint16_t*>(base + 1024 + 2 * L);
-            r.cw[i][1] = base[1024 + 64 + L];
+            r.cw[i][0] = *reinterpret_cast<const uint16_t*>(codes + 2 * L);
+            r.cw[i][1] = codes[64 + L];
           }
         } else {
           r.sc[i][h] = *reinterpret_cast<const uint16_t*>(base + 1024 + lane_slot * 2);
@@ -508,7 +510,7 @@ __global__ void retile_nvfp4_coded_values_kernel(const uint8_t* __restrict__ w, 
     const int slot = static_cast<int>(i % 64), t = slot % 4, r = slot / 4;
     const int tile = static_cast<int>(blk / chunks), chunk = static_cast<int>(blk % chunks);
     const size_t n = static_cast<size_t>(tile) * 16 + (r % 8) + 8 * (r / 8);
-    *reinterpret_cast<uint4*>(out + blk * kTileBytesFp4Coded + slot * 16) =
+    *reinterpret_cast<uint4*>(out + blk * kValueBytesFp4 + slot * 16) =
         *reinterpret_cast<const uint4*>(w + n * (K / 2) + chunk * (kChunk / 2) + t * 16);
   }
 }
@@ -520,7 +522,7 @@ __global__ void retile_nvfp4_coded_scales_kernel(const uint8_t* __restrict__ s, 
   for (size_t blk = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; blk < blocks;
        blk += static_cast<size_t>(gridDim.x) * blockDim.x) {
     const int tile = static_cast<int>(blk / chunks), chunk = static_cast<int>(blk % chunks);
-    uint8_t* dst = out + blk * kTileBytesFp4Coded + 1024;
+    uint8_t* dst = out + blocks * kValueBytesFp4 + blk * kCodeBytesFp4;
     uint32_t f[64];
     for (int slot = 0; slot < 64; ++slot) {
       const int t = slot % 4, r = slot / 4;
@@ -553,7 +555,7 @@ __global__ void dequant_tiled_nvfp4_kernel(const uint8_t* __restrict__ tw, float
     const int tile = n / 16, r = n % 16, g = r % 8, h = r / 8, chunk = k / kChunk, kk = k % kChunk, t = kk / 32;
     const int slot = (h * 8 + g) * 4 + t;
     const size_t blk = static_cast<size_t>(tile) * chunks + chunk;
-    const uint8_t* base = tw + blk * (raw ? kTileBytesFp4Coded : kTileBytesFp4);
+    const uint8_t* base = tw + blk * (raw ? kValueBytesFp4 : kTileBytesFp4);
     const uint8_t b = base[slot * 16 + (kk % 32) / 2];
     __nv_fp8_e4m3 sc;
     sc.__x = raw ? raw[blk * 128 + slot * 2 + (kk % 32) / 16] : base[1024 + slot * 2 + (kk % 32) / 16];
@@ -590,7 +592,7 @@ void check_shape(int N, int K, const char* what) {
 size_t tiled_bytes_nvfp4(int N, int K) { return static_cast<size_t>(N) * K / 2 + static_cast<size_t>(N) * K / 16; }
 size_t tiled_bytes_fp8(int N, int K) { return static_cast<size_t>(N) * K; }
 size_t tiled_bytes_nvfp4_coded(int N, int K) {
-  return static_cast<size_t>(N / 16) * (K / kChunk) * kTileBytesFp4Coded + 16;
+  return static_cast<size_t>(N / 16) * (K / kChunk) * (kValueBytesFp4 + kCodeBytesFp4);
 }
 
 bool scale_code_table(const uint8_t* scales, size_t n, uint8_t (&table)[kScaleCodes], uint8_t (&code_of)[256]) {
