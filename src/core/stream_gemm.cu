@@ -86,7 +86,7 @@ template <int TILES, bool FP4, bool CODED>
 struct WeightRegs {
   uint4 v[TILES][2][FP4 ? 1 : 2];
   uint32_t sc[TILES][2];  // NVFP4: the two E4M3 block scales of the lane's 32 values (low byte first)
-  uint32_t cw[TILES][2][CODED ? 2 : 1];  // CODED: the two code words holding the lane's 12 bits of codes
+  uint32_t cw[TILES][CODED ? 2 : 1];  // CODED: the lane's code bytes for both of its slots (low bytes, high nibbles)
 };
 
 template <int TILES, bool FP4, bool CODED>
@@ -109,11 +109,13 @@ __device__ __forceinline__ void load_weights(WeightRegs<TILES, FP4, CODED>& r, c
                      : "=r"(r.v[i][h][0].x), "=r"(r.v[i][h][0].y), "=r"(r.v[i][h][0].z), "=r"(r.v[i][h][0].w)
                      : "l"(p));
         if constexpr (CODED) {
-          // Slot s's codes are bits 12s .. 12s + 11 of the code words: words 12s / 32 and the next (the last slot's
-          // next word is the following block's first, or the blob's padding; its bits are shifted out).
-          const uint32_t* cwp = reinterpret_cast<const uint32_t*>(base + 1024) + ((12 * lane_slot) >> 5);
-          r.cw[i][h][0] = __ldg(cwp);
-          r.cw[i][h][1] = __ldg(cwp + 1);
+          // Lane L's two slots (L and L + 32) in one 16-bit word of low bytes at 2L and one byte of high nibbles at
+          // 64 + L: two loads per tile, as the raw blob's two 16-bit scale loads.
+          if (h == 0) {
+            const int L = g * 4 + t;
+            r.cw[i][0] = *reinterpret_cast<const uint16_t*>(base + 1024 + 2 * L);
+            r.cw[i][1] = base[1024 + 64 + L];
+          }
         } else {
           r.sc[i][h] = *reinterpret_cast<const uint16_t*>(base + 1024 + lane_slot * 2);
         }
@@ -168,10 +170,9 @@ __global__ void __launch_bounds__(kWarps * 32)
       load_weights<TILES, FP4, CODED>(buf[p], w, row0, N, K, cbeg + warp + p * kWarps, g, t);
   // CODED: the matrix's table (immutable, like the weights) in shared memory, and each slot's bit offset.
   __shared__ uint8_t tab[CODED ? kScaleCodes : 1];
-  int code_shift[2] = {0, 0};
+
   if constexpr (CODED) {
     if (threadIdx.x < kScaleCodes) tab[threadIdx.x] = pr.table[pi][threadIdx.x];
-    for (int h = 0; h < 2; ++h) code_shift[h] = (12 * ((h * 8 + g) * 4 + t)) & 31;
     __syncthreads();
   }
   // PDL (launch.cuh): the first weight chunks above read only the weights, which never change, so they are
@@ -208,7 +209,7 @@ __global__ void __launch_bounds__(kWarps * 32)
         for (int h = 0; h < 2; ++h) {
           uint32_t pair = cur.sc[i][h];
           if constexpr (CODED) {  // the two codes -> the two E4M3 scale bytes, exactly the raw blob's
-            const uint32_t f = __funnelshift_r(cur.cw[i][h][0], cur.cw[i][h][1], code_shift[h]);
+            const uint32_t f = ((cur.cw[i][0] >> (8 * h)) & 0xffu) | (((cur.cw[i][1] >> (4 * h)) & 0xfu) << 8);
             pair = uint32_t(tab[f & 63u]) | (uint32_t(tab[(f >> 6) & 63u]) << 8);
           }
           const uint32_t s2 = e4m3x2_to_h2(pair);  // low half: first 16 values, high: next 16
@@ -519,20 +520,22 @@ __global__ void retile_nvfp4_coded_scales_kernel(const uint8_t* __restrict__ s, 
   for (size_t blk = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; blk < blocks;
        blk += static_cast<size_t>(gridDim.x) * blockDim.x) {
     const int tile = static_cast<int>(blk / chunks), chunk = static_cast<int>(blk % chunks);
-    uint32_t words[24] = {};
+    uint8_t* dst = out + blk * kTileBytesFp4Coded + 1024;
+    uint32_t f[64];
     for (int slot = 0; slot < 64; ++slot) {
       const int t = slot % 4, r = slot / 4;
       const size_t n = static_cast<size_t>(tile) * 16 + (r % 8) + 8 * (r / 8);
       const uint8_t s0 = s[n * (K / 16) + chunk * (kChunk / 16) + t * 2], s1 = s[n * (K / 16) + chunk * (kChunk / 16) + t * 2 + 1];
       raw[blk * 128 + slot * 2] = s0;
       raw[blk * 128 + slot * 2 + 1] = s1;
-      const uint32_t f = uint32_t(code_of[s0]) | (uint32_t(code_of[s1]) << 6);  // 12 bits
-      const int bit = 12 * slot, wi = bit >> 5, sh = bit & 31;
-      words[wi] |= f << sh;
-      if (sh > 20) words[wi + 1] |= f >> (32 - sh);
+      f[slot] = uint32_t(code_of[s0]) | (uint32_t(code_of[s1]) << 6);  // 12 bits: the first scale's code low
     }
-    uint32_t* dst = reinterpret_cast<uint32_t*>(out + blk * kTileBytesFp4Coded + 1024);
-    for (int i = 0; i < 24; ++i) dst[i] = words[i];
+    // Lane L's slots L and L + 32: their low bytes at 2L, 2L + 1, their high nibbles in byte 64 + L.
+    for (int L = 0; L < 32; ++L) {
+      dst[2 * L] = static_cast<uint8_t>(f[L] & 0xffu);
+      dst[2 * L + 1] = static_cast<uint8_t>(f[L + 32] & 0xffu);
+      dst[64 + L] = static_cast<uint8_t>((f[L] >> 8) | ((f[L + 32] >> 8) << 4));
+    }
   }
 }
 
