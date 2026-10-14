@@ -116,6 +116,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   if (!opts_.draft_dir.empty()) {
     draft_ = std::make_unique<DraftModel>(opts_.draft_dir);
     alloc_drafter();
+    if (!opts_.sparse_head_dir.empty()) alloc_sparse_head(model_dir);
     std::fprintf(stderr, "drafter: %.2f GB, block %d\n", draft_->device_bytes() / 1e9, opts_.draft_block);
   }
   if (sessions_.size() > 1) std::fprintf(stderr, "sessions: %zu resident\n", sessions_.size());

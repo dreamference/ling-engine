@@ -82,6 +82,12 @@ struct EngineOptions {
   // the next verify waits for it. The same kernels on the same inputs, so the same bits. LING_COMMIT_OVERLAP=0/1
   // overrides.
   bool commit_overlap = true;
+  // BACKLOG §19.19: the drafter's context-aware sparse head. Empty: the full head (the default until its acceptance
+  // gate passes). Otherwise a directory with model.safetensors holding `us` (the head's rank-256 left factor times
+  // its singular values, BF16 [vocab][256]), `vt` (the right factor, BF16 [256][hidden]) and `fixed` (I32, the rows
+  // always scored), written by bench/sparse_head/build.py. sparse_head_dynamic: the rows chosen per step besides.
+  std::string sparse_head_dir;
+  int sparse_head_dynamic = 16384;
 };
 
 struct EngineStats {
@@ -340,6 +346,10 @@ class Engine {
   void draft_materialize(int rows, kernels::DevPos pos0, int cap_row0);
   void draft_propose(int anchor, int B, bool graph);  // the drafter's block, top-16 candidates and lattice
   void alloc_drafter();
+  void alloc_sparse_head(const std::string& model_dir);
+  // The drafter's head over its E rows of dh_: dunary_ and dcand_ (top K16 values and token ids per row), from the
+  // full head or the sparse one (BACKLOG §19.19).
+  void draft_head(int E);
 
   // The three parts of a speculative step as launch sequences with no host synchronization inside, so
   // each can be captured into a CUDA graph. Their inputs and outputs on the host side are pin_'s buffers.
@@ -464,6 +474,15 @@ class Engine {
   float *dout_ = nullptr, *dcoef_ = nullptr, *dq_ = nullptr, *dg_ = nullptr, *du_ = nullptr, *dattn_ = nullptr;
   float *dlogits_ = nullptr, *dunary_ = nullptr, *dhp_ = nullptr, *dscores_ = nullptr;
   int* dcand_ = nullptr;
+  // The sparse head (BACKLOG §19.19): its factors, the fixed rows' mask, the target head in the checkpoint's layout
+  // (gathered by row), and the step's selection.
+  bool sparse_head_ = false;
+  int sh_rank_ = 0, sh_cap_ = 0;
+  __nv_bfloat16 *sh_us_ = nullptr, *sh_vt_ = nullptr;
+  uint8_t *sh_fixed_ = nullptr, *sh_values_ = nullptr, *sh_scales_ = nullptr;
+  float* sh_p_ = nullptr;
+  void* sh_scratch_ = nullptr;
+  int *sh_rows_ = nullptr, *sh_nrows_ = nullptr;
   float *topk_scratch_ = nullptr, *vals_dev_ = nullptr;
   int* ids_out_dev_ = nullptr;
   // The drafter attends to the last sliding_window positions only, so its context KV is a ring of

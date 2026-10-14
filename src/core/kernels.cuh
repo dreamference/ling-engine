@@ -189,6 +189,19 @@ struct StreamTarget {
 };
 void stream_gemm_multi(bool nvfp4, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K,
                        cudaStream_t s);
+// The drafter's sparse head (BACKLOG §19.19): y[M][cap] = scale2 * x . W[rows[i]]^T for i < *nrows, -inf after, W an
+// NVFP4 matrix in the checkpoint's layout (values [N][K/2], scales [N][K/16]). Each element's arithmetic is the
+// tiled stream_gemm's, so a selected row's logit is bit for bit the full head's. cap % 32 == 0.
+void stream_gemm_gather_nvfp4(const __half* x, const float* xinv, int M, const uint8_t* w, const uint8_t* wscale,
+                              float scale2, const int* rows, const int* nrows, int cap, float* y, int K, cudaStream_t s);
+// The sparse head's selection (sparse_head.cu): approx[n] = max over the M rows of p[m] . us[n] (p [M][R] FP32, us
+// [N][R] BF16, R = 256); then rows = the fixed rows and the `dynamic` best of the others (ties to the lower id),
+// in id order, *nrows their count (at most cap). `scratch` holds sparse_head_scratch_bytes(N).
+size_t sparse_head_scratch_bytes(int N);
+void sparse_head_select(const float* p, int M, const __nv_bfloat16* us, int N, int R, const uint8_t* fixed_mask,
+                        int dynamic, int cap, void* scratch, int* rows, int* nrows, cudaStream_t s);
+// ids[i] = rows[ids[i]] for the M x K top-K indices (the sparse head's columns back to token ids).
+void sparse_head_ids(const int* rows, int* ids, int n, cudaStream_t s);
 
 // Top-K (K <= 64) of each row of x [rows][V]: values descending, ties to the lower index (so entry 0 is
 // what std::max_element returns). `scratch` needs topk_scratch_floats(rows, K) floats.

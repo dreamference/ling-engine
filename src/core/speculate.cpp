@@ -40,6 +40,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 #include <nvtx3/nvToolsExt.h>
@@ -47,6 +49,7 @@
 #include "core/engine.hpp"
 #include "core/kernels.cuh"
 #include "core/accept.hpp"
+#include "core/safetensors.hpp"
 #include "core/lookup.hpp"
 
 namespace ling {
@@ -167,6 +170,65 @@ void Engine::alloc_drafter() {
   }
   conv_tmp_ = alloc<float>(size_t(C) * (c.conv_kernel - 1));
   set_draft_block(opts_.draft_block);
+}
+
+void Engine::alloc_sparse_head(const std::string& model_dir) {
+  const ModelConfig& c = model_->config();
+  const int V = c.vocab, H = c.hidden;
+  ling::Checkpoint sh(opts_.sparse_head_dir);
+  const TensorView &us = sh.get("us"), &vt = sh.get("vt"), &fixed = sh.get("fixed");
+  if (us.dtype != "BF16" || us.shape.size() != 2 || us.shape[0] != V || vt.dtype != "BF16" || vt.shape.size() != 2 ||
+      vt.shape[1] != H || vt.shape[0] != us.shape[1] || fixed.dtype != "I32")
+    throw std::runtime_error("sparse head: unexpected tensors in " + opts_.sparse_head_dir);
+  sh_rank_ = static_cast<int>(us.shape[1]);
+  auto put = [&](const TensorView& t) {
+    uint8_t* d = alloc<uint8_t>(t.bytes);
+    check(cudaMemcpy(d, t.data, t.bytes, cudaMemcpyHostToDevice), "sparse head upload");
+    return d;
+  };
+  sh_us_ = reinterpret_cast<__nv_bfloat16*>(put(us));
+  sh_vt_ = reinterpret_cast<__nv_bfloat16*>(put(vt));
+  std::vector<uint8_t> mask(V, 0);
+  const int nf = static_cast<int>(fixed.numel());
+  for (int i = 0; i < nf; ++i) {
+    int id;
+    std::memcpy(&id, fixed.data + 4 * size_t(i), 4);
+    if (id >= 0 && id < V) mask[id] = 1;
+  }
+  sh_fixed_ = alloc<uint8_t>(V);
+  check(cudaMemcpy(sh_fixed_, mask.data(), V, cudaMemcpyHostToDevice), "sparse head mask");
+  // The target head's rows as the checkpoint stores them, for the gathered GEMM.
+  ling::Checkpoint ck(model_dir);
+  sh_values_ = put(ck.get("lm_head.weight"));
+  sh_scales_ = put(ck.get("lm_head.weight_scale"));
+  sh_cap_ = (nf + opts_.sparse_head_dynamic + 256 + 31) / 32 * 32;  // ties at the threshold are all taken
+  sh_p_ = alloc<float>(size_t(kernels::kMaxStreamRows) * sh_rank_);
+  sh_scratch_ = alloc<uint8_t>(kernels::sparse_head_scratch_bytes(V));
+  sh_rows_ = alloc<int>(V);
+  sh_nrows_ = alloc<int>(1);
+  sparse_head_ = true;
+  std::fprintf(stderr, "drafter head: sparse, %d fixed + %d chosen rows per step (rank %d), at most %d\n", nf,
+               opts_.sparse_head_dynamic, sh_rank_, sh_cap_);
+}
+
+void Engine::draft_head(int E) {
+  const ModelConfig& c = model_->config();
+  const DraftConfig& d = draft_->config();
+  const int K16 = d.selector_top_k;
+  if (!sparse_head_) {
+    linear_fp4(model_->lm_head(), dh_, E, dlogits_);
+    kernels::topk_rows(dlogits_, E, c.vocab, K16, topk_scratch_, dunary_, dcand_, stream_);
+    return;
+  }
+  // The rank-256 scores choose the rows; their exact logits (the full head's bits) give the top 16.
+  kernels::bf16_rows(dh_, E, sh_vt_, sh_p_, sh_rank_, d.hidden, stream_);
+  kernels::sparse_head_select(sh_p_, E, sh_us_, c.vocab, sh_rank_, sh_fixed_, opts_.sparse_head_dynamic, sh_cap_,
+                              sh_scratch_, sh_rows_, sh_nrows_, stream_);
+  kernels::to_half_rows(dh_, E, d.hidden, xh_, xinv_, stream_);
+  kernels::stream_gemm_gather_nvfp4(xh_, xinv_, E, sh_values_, sh_scales_, model_->lm_head().scale2, sh_rows_, sh_nrows_,
+                                    sh_cap_, dlogits_, d.hidden, stream_);
+  kernels::topk_rows(dlogits_, E, sh_cap_, K16, topk_scratch_, dunary_, dcand_, stream_);
+  kernels::sparse_head_ids(sh_rows_, dcand_, E * K16, stream_);
 }
 
 bool Engine::can_speculate(const SamplingParams& p) const {
@@ -324,8 +386,7 @@ void Engine::draft_launch(int B) {
   // Drafted positions 1 .. B - 1: the final norm, the target's LM head (no target final norm), the top 16,
   // the selector's projection and lattice (its first predecessor, the anchor, read from ids_dev_[0]).
   kernels::rmsnorm(dres_ + H, draft_->norm(), dh_, E, H, d.eps, false, stream_);
-  linear_fp4(model_->lm_head(), dh_, E, dlogits_);
-  kernels::topk_rows(dlogits_, E, c.vocab, K16, topk_scratch_, dunary_, dcand_, stream_);
+  draft_head(E);
   linear_bf16_cublas(draft_->selector_projection(), dh_, E, dhp_);
   kernels::selector_lattice(dhp_, dcand_, dunary_, draft_->predecessor_codebook(), draft_->successor_codebook(),
                             pin_->draft_ids[0], E, dscores_, stream_, ids_dev_);
@@ -388,8 +449,7 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B) {
   for (int i = 0; i < n; ++i)
     kernels::rmsnorm(dres_ + (size_t(i) * B + 1) * H, draft_->norm(), dh_ + size_t(i) * E * H, E, H, d.eps, false,
                      stream_);
-  linear_fp4(model_->lm_head(), dh_, n * E, dlogits_);
-  kernels::topk_rows(dlogits_, n * E, c.vocab, K16, topk_scratch_, dunary_, dcand_, stream_);
+  draft_head(n * E);
   linear_bf16_cublas(draft_->selector_projection(), dh_, n * E, dhp_);
   const int rank = d.selector_rank;
   for (int i = 0; i < n; ++i)
@@ -409,6 +469,20 @@ void Engine::draft_propose(int anchor, int B, bool graph) {
   if (graph) run_graph(s_->draft_graph, "draft", [&] { draft_launch(B); });
   else draft_launch(B);
   check(cudaStreamSynchronize(stream_), "draft");
+  // BACKLOG §19.19's offline input: LING_DUMP_DRAFT_H=FILE appends each step's drafted rows' final hidden states
+  // (E x hidden floats, the LM head's input) and their top-16 candidates (E x 16 ints).
+  static FILE* dump = [] { const char* f = std::getenv("LING_DUMP_DRAFT_H"); return f ? std::fopen(f, "ab") : nullptr; }();
+  static long dump_left = [] { const char* n = std::getenv("LING_DUMP_DRAFT_H_STEPS"); return n ? std::atol(n) : 1L << 40; }();
+  if (dump && dump_left-- > 0) {
+    const int E = B - 1, H = draft_->config().hidden, K16 = draft_->config().selector_top_k;
+    std::vector<float> h(size_t(E) * H);
+    check(cudaMemcpy(h.data(), dh_, h.size() * sizeof(float), cudaMemcpyDeviceToHost), "dump");
+    const int hdr[3] = {E, H, K16};
+    std::fwrite(hdr, sizeof(int), 3, dump);
+    std::fwrite(h.data(), sizeof(float), h.size(), dump);
+    std::fwrite(pin_->cand, sizeof(int), size_t(E) * K16, dump);
+    std::fflush(dump);
+  }
 }
 
 void Engine::verify_launch(int V, int K) {
