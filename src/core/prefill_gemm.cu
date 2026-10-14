@@ -35,7 +35,7 @@ namespace {
 constexpr int kBM = 128, kThreads = 256;
 constexpr int kRowBytes = 64;  // per row per stage
 constexpr int kTileBytesFp4 = 16 * 64 + 16 * 8, kTileBytesFp8 = 16 * 128;
-constexpr int kTileBytesFp4Coded = 16 * 64 + 128 * 6 / 8;  // B26: values, then 6-bit scale codes (stream_gemm.cu)
+constexpr int kValueBytesFp4 = 16 * 64;  // B26: a coded blob's value blocks (its codes follow them all, stream_gemm.cu)
 
 // A block computes kBM tokens x BN weight rows; 8 warps, 2 along M x 4 along N, each 64 x BN / 4.
 template <int BN, int STAGES>
@@ -163,7 +163,7 @@ struct Loader {
       const uint8_t* w = weight_row<BN, SWIGLU>(p, n0, r, row);
       const int tile = row >> 4, rr = row & 15;
       if constexpr (FP4) {
-        bstride[j] = (w == p.w ? p.wsf : p.wsf2) ? kTileBytesFp4Coded : kTileBytesFp4;
+        bstride[j] = (w == p.w ? p.wsf : p.wsf2) ? kValueBytesFp4 : kTileBytesFp4;
         b[j] = w + static_cast<size_t>(tile) * chunks * bstride[j] + (rr * 4 + u) * 16;
       } else {
         // FP8 tiled block: piece ((h * 2 + q) * 8 + g) * 4 + t holds row g + 8h, values [32t + 16q, +16).

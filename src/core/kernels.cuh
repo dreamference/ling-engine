@@ -89,18 +89,18 @@ size_t tiled_bytes_fp8(int N, int K);
 void retile_nvfp4(const uint8_t* w, const uint8_t* wscale, uint8_t* out, int N, int K, cudaStream_t s);
 void retile_fp8(const uint8_t* w, uint8_t* out, int N, int K, cudaStream_t s);
 // B26, the NVFP4 scales as 6-bit codes: a tensor whose block scales take at most 64 distinct E4M3 values (every
-// matrix of the target but one, and the drafter's) stores each (tile, chunk) block as its 1,024 value bytes and
-// 96 bytes of codes (a lane slot's two 6-bit codes are 12 bits, the first scale's low: lane L's slots L and L + 32
-// keep their low bytes at 2L and 2L + 1 and their high nibbles in byte 64 + L, so a lane reads one 16-bit word and
-// one byte per tile, as many loads as the raw scales), 1,120 bytes instead of 1,152, with the tensor's 64-entry
-// table (code -> E4M3 byte) beside it; the streaming GEMM looks each code up in shared memory, so the scales it
-// multiplies by are bit for bit the checkpoint's (lossless).
+// matrix of the target but one, and the drafter's) stores every (tile, chunk) block's 1,024 value bytes, then every
+// block's 96 bytes of codes (a lane slot's two 6-bit codes are 12 bits, the first scale's low: lane L's slots L and
+// L + 32 keep their low bytes at 2L and 2L + 1 and their high nibbles in byte 64 + L, so a lane reads one 16-bit
+// word and one byte per tile, as many loads as the raw scales; the value blocks stay 128-byte aligned), 1,120 bytes
+// per block instead of 1,152, with the tensor's 64-entry table (code -> E4M3 byte) beside it; the streaming GEMM
+// looks each code up in shared memory, so the scales it multiplies by are bit for bit the checkpoint's (lossless).
 // The prefill GEMM reads the raw scales from a separate copy (`scales`: 128 bytes per block, in the raw blob's
 // order), which only the prefill path touches.
 constexpr int kScaleCodes = 64;
 // The code of every scale byte (0xff: unused) and the table, or false when the scales take more than 64 values.
 bool scale_code_table(const uint8_t* scales, size_t n, uint8_t (&table)[kScaleCodes], uint8_t (&code_of)[256]);
-size_t tiled_bytes_nvfp4_coded(int N, int K);  // with 16 bytes of padding (a lane's second code word)
+size_t tiled_bytes_nvfp4_coded(int N, int K);
 void retile_nvfp4_coded(const uint8_t* w, const uint8_t* wscale, const uint8_t* code_of_dev, uint8_t* out,
                         uint8_t* raw_scales, int N, int K, cudaStream_t s);
 // Tiled weights -> BF16 row-major [N][K] (the prefill path's cuBLAS input).
