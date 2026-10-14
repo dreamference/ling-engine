@@ -76,6 +76,7 @@ int main(int argc, char** argv) {
   uint64_t seed = 0;
   int attn_prefetch = 2;
   std::string draft;
+  int block_batch = 0;
   int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256;
   bool interleave_check = false, batch_check = false, batch_bench = false;
   for (int i = 1; i < argc; ++i) {
@@ -99,6 +100,7 @@ int main(int argc, char** argv) {
     else if (a == "--prompt-ids-out") prompt_ids_out = true;
     else if (a == "--draft") draft = next();
     else if (a == "--block") block = std::stoi(next());
+    else if (a == "--block-batch") block_batch = std::stoi(next());
     else if (a == "--spec") spec = true;
     else if (a == "--lookup") lookup = std::stoi(next());
     else if (a == "--lookup-min") lookup_min = std::stoi(next());
@@ -154,6 +156,7 @@ int main(int argc, char** argv) {
     opts.max_context = max_context;
     opts.draft_dir = draft;
     opts.draft_block = block;
+    opts.draft_block_batch = block_batch;
     opts.lookup_mode = lookup;
     opts.lookup_min_match = lookup_min;
     opts.boundary_token = tok.token_id("<|im_end|>");
