@@ -637,7 +637,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
 
 bool Engine::can_batch(int session, const SamplingParams& p) const {
   const Session& s = sessions_.at(session);
-  return can_speculate(p) && opts_.max_context - s.pos >= opts_.draft_block;
+  return can_speculate(p) && opts_.max_context - s.pos >= std::max(opts_.draft_block, batch_block());
 }
 
 void Engine::verify_batch_launch(std::span<StepPlan> plans, int V) {
@@ -677,7 +677,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     }
     return;
   }
-  const int B = opts_.draft_block, n = static_cast<int>(seqs.size());
+  const int B = batch_block(), n = static_cast<int>(seqs.size());
   if (n > kernels::kMaxSeqs) throw std::runtime_error("speculate_batch: more sequences than kMaxSeqs");
   const size_t vocab = model_->config().vocab;
   const int K16 = draft_->config().selector_top_k, E = B - 1;

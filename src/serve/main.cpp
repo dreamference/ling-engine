@@ -418,7 +418,7 @@ class Scheduler {
     std::vector<Running*> b;
     if (!batchable(r)) return b;
     b.push_back(&r);
-    const int fit = kernels::kMaxStreamRows / ctx_.engine->draft_block();
+    const int fit = kernels::kMaxStreamRows / ctx_.engine->batch_block();
     for (const auto& o : running_)
       if (o.get() != &r && static_cast<int>(b.size()) < fit && batchable(*o)) b.push_back(o.get());
     return b;
@@ -453,7 +453,7 @@ class Scheduler {
     {
       std::lock_guard<std::mutex> m(ctx_.metrics.mu);
       ctx_.metrics.batched_steps += 1;
-      ctx_.metrics.batch_rows = static_cast<int>(batch.size()) * eng.draft_block();  // a full block each
+      ctx_.metrics.batch_rows = static_cast<int>(batch.size()) * eng.batch_block();  // a full block each
     }
     for (size_t i = 0; i < batch.size(); ++i) {
       Running& r = *batch[i];
@@ -1230,6 +1230,7 @@ class Factory : public proxygen::RequestHandlerFactory {
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "0.0.0.0", name;
+  int draft_block_batch = 0;
   int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
@@ -1251,6 +1252,7 @@ int main(int argc, char** argv) {
     else if (a == "--max-context") max_context = std::stoi(next());
     else if (a == "--draft") draft_dir = next();
     else if (a == "--draft-block") draft_block = std::stoi(next());
+    else if (a == "--draft-block-batch") draft_block_batch = std::stoi(next());
     else if (a == "--lookup") lookup = std::stoi(next());
     else if (a == "--lookup-min") lookup_min = std::stoi(next());
     else if (a == "--pretokenizer") pretokenizer = next();
@@ -1271,7 +1273,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--draft-block-batch N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]\n";
     return 2;
   }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
@@ -1297,6 +1299,7 @@ int main(int argc, char** argv) {
   opts.max_context = max_context;
   opts.draft_dir = draft_dir;
   opts.draft_block = draft_block;
+  opts.draft_block_batch = draft_block_batch;
   opts.lookup_mode = lookup;
   opts.lookup_min_match = lookup_min;
   opts.prefix_checkpoints = checkpoints;
