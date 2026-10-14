@@ -145,9 +145,27 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   prefill_bf16_ = opts_.prefill_bf16;
   if (const char* e = std::getenv("LING_PREFILL_BF16")) prefill_bf16_ = std::atoi(e) != 0;
   if (prefill_bf16_) std::fprintf(stderr, "prefill: BF16 DeltaNet intermediates (not the exact path)\n");
+  commit_overlap_ = opts_.commit_overlap && draft_ != nullptr;
+  if (const char* e = std::getenv("LING_COMMIT_OVERLAP")) commit_overlap_ = draft_ != nullptr && std::atoi(e) != 0;
+  if (commit_overlap_) {
+    check(cudaStreamCreateWithFlags(&commit_stream_, cudaStreamNonBlocking), "commit stream");
+    check(cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming), "commit event");
+    commit_core_ = alloc<float>(size_t(kernels::kMaxStreamRows) * Vs);
+    std::fprintf(stderr, "commit beside the next draft\n");
+  }
+}
+
+void Engine::join_commit() {
+  if (!commit_pending_) return;
+  // A wait on an event recorded outside a capture cannot be captured: every captured body runs with nothing
+  // pending (speculate joins before the verify; the draft and the drafter's context KV never join).
+  if (use_dev_pos_) throw std::runtime_error("join_commit inside a step graph's capture");
+  check(cudaStreamWaitEvent(stream_, commit_done_, 0), "join commit");
+  commit_pending_ = false;
 }
 
 Engine::~Engine() {
+  if (commit_stream_) cudaStreamSynchronize(commit_stream_);
   clear_graphs();
   if (pin_) cudaFreeHost(pin_);
   if (profile_) {
@@ -155,6 +173,8 @@ Engine::~Engine() {
   }
   for (void* p : buffers_) cudaFree(p);
   if (cublas_) cublasDestroy(cublas_);
+  if (commit_done_) cudaEventDestroy(commit_done_);
+  if (commit_stream_) cudaStreamDestroy(commit_stream_);
   if (stream_) cudaStreamDestroy(stream_);
 }
 
@@ -283,6 +303,7 @@ int Engine::sessions_resident() const {
 }
 
 void Engine::adopt_prefix(const Session& from, int n) {
+  join_commit();
   const ModelConfig& c = model_->config();
   // Head-major caches: each KV head's positions [0, n) are one contiguous run, max_context positions apart.
   const size_t row = size_t(c.head_dim) * sizeof(__nv_bfloat16), pitch = size_t(opts_.max_context) * row;
@@ -312,6 +333,7 @@ void Engine::adopt_prefix(const Session& from, int n) {
 }
 
 void Engine::reset_state() {
+  join_commit();
   const ModelConfig& c = model_->config();
   for (float* s : s_->gdn)
     check(cudaMemsetAsync(s, 0, size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim * sizeof(float), stream_), "reset");
@@ -330,6 +352,7 @@ uint64_t Engine::state_hash() {
     const unsigned char* b = reinterpret_cast<const unsigned char*>(host.data());
     for (size_t i = 0; i < n * sizeof(float); ++i) h = (h ^ b[i]) * 1099511628211ull;
   };
+  join_commit();
   check(cudaStreamSynchronize(stream_), "state_hash");
   for (size_t i = 0; i < s_->gdn.size(); ++i) {
     mix(s_->gdn[i], gdn);
@@ -355,6 +378,7 @@ Engine::StateSlot Engine::alloc_slot() {
 }
 
 void Engine::copy_state(const StateSlot& slot, bool save) {
+  join_commit();
   const ModelConfig& c = model_->config();
   const size_t gdn_bytes = size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim * sizeof(float);
   const size_t conv_bytes = size_t(c.lin_conv_channels()) * (c.conv_kernel - 1) * sizeof(float);
@@ -543,6 +567,7 @@ void Engine::forward(const int* ids, int M, Pass pass, int keep_at) {
 }
 
 void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::span<const Seg> segs) {
+  join_commit();  // a no-op inside a verify's capture: speculate joins before the verify
   const ModelConfig& c = model_->config();
   const bool rows = M <= kernels::kMaxStreamRows, verify = pass == Pass::Verify;
   if (segs.empty() || (segs.size() > 1 && !verify)) throw std::runtime_error("forward: several sequences only in a verify");

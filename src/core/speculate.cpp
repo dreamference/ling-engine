@@ -183,6 +183,7 @@ void Engine::set_step_graphs(bool on) {
 }
 
 void Engine::clear_graphs() {
+  if (commit_stream_) cudaStreamSynchronize(commit_stream_);  // a replay may still run there
   for (Session& s : sessions_) {
     if (s.draft_graph) cudaGraphExecDestroy(s.draft_graph);
     s.draft_graph = nullptr;
@@ -193,6 +194,8 @@ void Engine::clear_graphs() {
     s.commit_graphs.clear();
     for (auto& [k, g] : s.batch_commit_graphs) cudaGraphExecDestroy(g);
     s.batch_commit_graphs.clear();
+    for (auto& [k, g] : s.state_commit_graphs) cudaGraphExecDestroy(g);
+    s.state_commit_graphs.clear();
   }
   for (auto& [order, bg] : batch_graphs_) {
     if (bg.draft) cudaGraphExecDestroy(bg.draft);
@@ -201,22 +204,22 @@ void Engine::clear_graphs() {
   batch_graphs_.clear();
 }
 
-cudaGraphExec_t Engine::capture(const std::function<void()>& body) {
+cudaGraphExec_t Engine::capture(const std::function<void()>& body, cudaStream_t st) {
   cudaGraph_t graph = nullptr;
   // Thread-local: ling-serve's other threads may make CUDA calls while the worker captures.
-  check(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "begin capture");
+  check(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "begin capture");
   use_dev_pos_ = true;
   try {
     body();
   } catch (...) {
     use_dev_pos_ = false;
-    cudaStreamEndCapture(stream_, &graph);  // ends the invalidated capture
+    cudaStreamEndCapture(st, &graph);  // ends the invalidated capture
     if (graph) cudaGraphDestroy(graph);
     cudaGetLastError();
     throw;
   }
   use_dev_pos_ = false;
-  check(cudaStreamEndCapture(stream_, &graph), "end capture");
+  check(cudaStreamEndCapture(st, &graph), "end capture");
   cudaGraphExec_t exec = nullptr;
   const cudaError_t e = cudaGraphInstantiate(&exec, graph, 0);
   cudaGraphDestroy(graph);
@@ -224,10 +227,12 @@ cudaGraphExec_t Engine::capture(const std::function<void()>& body) {
   return exec;
 }
 
-void Engine::run_graph(cudaGraphExec_t& slot, const char* what, const std::function<void()>& body) {
+void Engine::run_graph(cudaGraphExec_t& slot, const char* what, const std::function<void()>& body,
+                       cudaStream_t st) {
+  if (!st) st = stream_;
   if (graphs_ && !slot) {
     try {
-      slot = capture(body);
+      slot = capture(body, st);
     } catch (const std::exception& e) {
       std::fprintf(stderr, "step graphs off: capturing the %s failed: %s\n", what, e.what());
       clear_graphs();
@@ -236,13 +241,13 @@ void Engine::run_graph(cudaGraphExec_t& slot, const char* what, const std::funct
   }
   if (graphs_ && slot) {
     NvtxRange range(what);  // the same names as the eager ranges, so a trace attributes graph kernels alike
-    check(cudaGraphLaunch(slot, stream_), what);
+    check(cudaGraphLaunch(slot, st), what);
     return;
   }
   body();
 }
 
-void Engine::commit(int row0, int n) {
+void Engine::commit(int row0, int n, cudaStream_t st, float* out) {
   const ModelConfig& c = model_->config();
   const size_t C = c.lin_conv_channels(), r0 = row0;
   for (int li = 0; li < c.layers; ++li) {
@@ -251,9 +256,9 @@ void Engine::commit(int row0, int n) {
     const int slot = layer_slot_[li];
     // The conv window advances over the accepted rows' raw inputs, the recurrence over their conv outputs.
     // In a batch the sequence's rows start at row0; the conv runs in place over its own rows only.
-    kernels::gdn_conv(v_pre_[slot] + r0 * C, s_->conv[slot], L.conv, n, c.lin_conv_channels(), stream_);
+    kernels::gdn_conv(v_pre_[slot] + r0 * C, s_->conv[slot], L.conv, n, c.lin_conv_channels(), st);
     kernels::gdn_recurrent(v_post_[slot] + r0 * C, v_g_[slot] + r0 * c.lin_v_heads, v_beta_[slot] + r0 * c.lin_v_heads,
-                           s_->gdn[slot], s_->gdn[slot], core_, n, c.lin_k_heads, c.lin_v_heads, stream_);
+                           s_->gdn[slot], s_->gdn[slot], out, n, c.lin_k_heads, c.lin_v_heads, st);
   }
 }
 
@@ -420,8 +425,25 @@ void Engine::verify_launch(int V, int K) {
 void Engine::commit_launch(int row0, int n) {
   NvtxRange range("commit");
   quantized_ = false;  // at most 32 rows: the rows path, whatever the last forward() left (see draft_launch)
-  commit(row0, n);
+  if (!commit_overlap_) commit(row0, n, stream_, core_);
   draft_materialize(n, dpos(), row0);  // the verify's target features of those rows
+}
+
+void Engine::commit_state_launch(int row0, int n, cudaStream_t st) {
+  NvtxRange range("commit state");
+  commit(row0, n, st, commit_core_);
+}
+
+// The DeltaNet replay of the active session's rows row0 .. row0 + n - 1 on commit_stream_ (graph or not), ordered
+// after the verify that wrote their inputs (the host has synchronized stream_ since) and before the next pass.
+void Engine::commit_state_async(int row0, int n, bool graph) {
+  // Every replay queues on commit_stream_, so a batch's sequences replay in order and commit_done_ (recorded after
+  // the last) covers them all.
+  if (graph) run_graph(s_->state_commit_graphs[{row0, n}], "commit state", [&] { commit_state_launch(row0, n, commit_stream_); },
+                       commit_stream_);
+  else commit_state_launch(row0, n, commit_stream_);
+  check(cudaEventRecord(commit_done_, commit_stream_), "commit event");
+  commit_pending_ = true;
 }
 
 void Engine::plan_begin(StepPlan& sp, int B) {
@@ -573,6 +595,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
 
   // 2. Verify, with each row's top K (the argmax when greedy) on the GPU.
   std::copy(sp.rows.begin(), sp.rows.end(), pin_->rows);
+  join_commit();  // the previous step's DeltaNet replay, beside this step's draft until here
   if (graph) {
     cudaGraphExec_t& g = s_->verify_graphs[K];
     run_graph(g, "verify", [&] { verify_launch(V, K); });
@@ -594,6 +617,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
           "row logits");
     check(cudaStreamSynchronize(stream_), "row logits");
   }
+  if (commit_overlap_) commit_state_async(0, n, graph);
   if (graph) {
     if (s_->commit_graphs.size() < size_t(V) + 1) s_->commit_graphs.resize(size_t(V) + 1, nullptr);
     run_graph(s_->commit_graphs[n], "commit", [&] { commit_launch(0, n); });
@@ -709,6 +733,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   // 2. One verify over every sequence's rows, then 3. each sequence's accept. A non-finite row fails only its own
   // sequence: the verify wrote no state of it, its commit is skipped and its session reset.
   for (const StepPlan& sp : plans) std::copy(sp.rows.begin(), sp.rows.end(), pin_->rows + sp.row0);
+  join_commit();  // the previous step's DeltaNet replays, beside this step's draft until here
   if (graph) {
     std::vector<int> ks(n);
     for (int i = 0; i < n; ++i) ks[i] = plans[i].K;
@@ -744,6 +769,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     if (sp.failed) continue;
     const int k = sp.accepted + 1;
     s_ = sp.s;
+    if (commit_overlap_) commit_state_async(sp.row0, k, graph);
     if (graph) {
       // Slot i's commit reads its position from pos_dev_[i] and its rows from row i * B; slot 0's is the one-row
       // step's own commit graph (the same rows, the same position slot).
