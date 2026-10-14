@@ -215,6 +215,25 @@ What the numbers say. The drafter over 2B rows took 7 ms off the batched step (2
 
 - **Not done.** `bench/serve_smoke.py` at concurrency 2; the debug build on `--batch-check` (compute-sanitizer ran on the batched kernels' bit-equality tests, not on a whole `--batch-check`); the agreement run at concurrency 2, the block-16 comparison at batch 2 and the soak are stage 5's.
 
+### The step savings as built (2026-10-13 on)
+
+The block between stage 4 and stage 5 (section 6, "The order from stage 3 on"), one item at a time, each on its own branch, measured against the main of its day and merged only when every exactness gate passes, the output is the same as main's and it is no slower at one stream and at two. The gates: `--spec-check` (two ways), `--prefix-check` (three ways), `--graph-check` (two ways), `--chunk-check 256`, `--interleave-check` (three ways), `--batch-check` on the four pairs, eager and with `--graphs --pdl` (eight runs), the unit tests and `tests/server`; and, new for this block, the same 5 prompts' 400 tokens (speculative, graphs, PDL, greedy and seeded) compared token for token with main's build. `--rows-check` is on `moonshot/p1` only; it runs once P1 is rebased onto the block. Timing is taken two ways: the step in place, deterministic (`ling-run --spec --graphs --pdl` on M3's 26.8K prompt, 400 greedy tokens: 65 steps, 6.14 tokens per step on every build; and `ling-run --batch-bench`, a greedy pair of ~25K prompts, 1,000 tokens each, 157 batched steps), and the replay (M0's main set at concurrency 1 and 2, production sampling, pooled from the request lines as in stage 4), whose step moves with the sampled acceptance and output lengths by a few percent between runs.
+
+**B16, the weight stream: merged (`b95a8d7`).** What the stage-4 numbers hid: the step's GEMMs, timed per launch group as the engine launches them (`ling-stream-tests --bench-groups`, 17.56 GB per step), already streamed at 233-244 GB/s at 1-16 rows (74.3 ms at 12 rows); M3 §7's "17.6 GB at 215 GB/s" divided the bytes by the whole verify, which holds the attention, the DeltaNet and the small kernels too. So the single-stream estimate of ~6 ms was not in the kernel. The loss was at 17-32 rows, the batched verify of two sequences: a block of one 16-row tile reads all of x for its rows, per chunk NT x 64 activation bytes per lane against 32 weight bytes, so the narrow matrices (N = 5,120: the FFN's down projection, the attention and DeltaNet out-projections) read several times more from L2 than from DRAM and fell to 110-190 GB/s (ffn down 113 GB/s at 24 rows). Two tiles per block halve that; at 12 rows they lift the out-projections too, and two chunks in flight per warp add the rest. Neither changes any element's arithmetic (the same warp sums the same chunks in the same order), so every bit is main's: the same-as-main comparison is identical, greedy and seeded.
+
+| | main (`dd7976e`) | B16 |
+| --- | --- | --- |
+| Step GEMMs per launch group, 12 rows / 24 rows | 74.3 / 84.9 ms | 73.4 / 76.5 ms (ffn down 233 / 146 -> 237 / 230 GB/s) |
+| The step in place, one stream (two runs) | 104.3, 104.5 ms (draft 10.1, verify 90.6, commit 3.7) | 102.2, 101.7 ms (draft 9.8, verify 88.4) |
+| The batched step in place, two streams (`--batch-bench`) | about 129 ms | about 122 ms |
+| Replay, one stream | 47.2 tokens/s at 105.7 ms per step (4.99 tokens per step) | 49.3 tokens/s at 102.1 ms (5.03) |
+| Replay, two streams (per stream) | 33.9 tokens/s at a 156.0 ms period (5.28 tokens per step) | 33.1 tokens/s at a 147.2 ms period (4.87 tokens per step; at main's 5.28, 35.9 tokens/s) |
+| Gates | | all passed: the 19 `ling-run` checks, the unit tests (with a new row-invariance test on a wide matrix), same as main; `tests/server` 58 passed, 3 xfailed (as stage 4) |
+
+The two-stream tokens/s fell with the sampled acceptance of that run (4.87 against 5.28 tokens per step), not with B16: every output bit is main's (the same-as-main comparison, greedy and seeded), and the period, which acceptance moves little, is 8.8 ms shorter.
+
+The sweep behind the choice (`LING_SG_TN`, `LING_SG_TW`, `LING_SG_TN4`, `LING_SG_TW4`, `LING_SG_PF` override it): two tiles on the narrow matrices at 17-32 rows alone took the batched step from 129 to 123 ms and left the one-row step as it was; two tiles at 1-16 rows too took the one-row step to 103.2 ms; with two chunks in flight 102.0. Four tiles per block, L2 evict-first and 256-byte prefetch hints on the weight loads, and four tiles on the wide matrices all measured within noise of these.
+
 ## 7. Questions for the owner, answered
 
 All eight were answered by the owner on 2026-10-10; each answer follows its question. The next step is the build order of section 6.
