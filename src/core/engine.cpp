@@ -363,6 +363,8 @@ uint64_t Engine::state_hash() {
 
 void Engine::set_draft_block(int b) {
   if (b < 2 || b > kernels::kMaxStreamRows) throw std::runtime_error("draft block must be in [2, 32]");
+  if (opts_.draft_block_batch != 0 && (opts_.draft_block_batch < 2 || opts_.draft_block_batch > kernels::kMaxStreamRows / 2))
+    throw std::runtime_error("the batch's draft block must be in [2, 16]");
   if (b != opts_.draft_block) clear_graphs();  // they were captured for the old block
   opts_.draft_block = b;
 }

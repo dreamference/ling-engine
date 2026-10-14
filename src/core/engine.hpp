@@ -42,6 +42,9 @@ struct EngineOptions {
   int prefill_chunk = 2048;  // measured: 647 tokens/s against 582 at 1024 on a 7.7K-token prompt
   std::string draft_dir;     // the DFlash2 drafter's checkpoint; empty: no speculation
   int draft_block = 16;      // rows per verify: the anchor and block - 1 drafted tokens (2 .. 32)
+  // B31: the block of each sequence in a batched step (speculate_batch); 0: draft_block. A batch's rows must fit
+  // kMaxStreamRows, so two sequences take at most 16 each.
+  int draft_block_batch = 0;
   // The context-lookup source: 0 off; 1 shadow (proposed and scored afterwards against what was really
   // generated, never verified); 2 auto (verified instead of the drafter's chain when the match is at
   // least lookup_min_match tokens long, and the drafter's pass is skipped).
@@ -215,6 +218,8 @@ class Engine {
   }
   int draft_block() const { return opts_.draft_block; }
   void set_draft_block(int b);
+  // B31: the block of a batched step (EngineOptions::draft_block_batch, or draft_block when 0).
+  int batch_block() const { return opts_.draft_block_batch > 0 ? opts_.draft_block_batch : opts_.draft_block; }
   // Whether speculative steps run as CUDA graphs (false when asked for but unavailable: see step_graphs).
   bool step_graphs() const { return graphs_; }
   // Turns step graphs on or off between steps (ling-run --graph-check compares the two); `on` has no effect
