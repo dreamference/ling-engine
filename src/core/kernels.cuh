@@ -90,9 +90,11 @@ void retile_nvfp4(const uint8_t* w, const uint8_t* wscale, uint8_t* out, int N, 
 void retile_fp8(const uint8_t* w, uint8_t* out, int N, int K, cudaStream_t s);
 // B26, the NVFP4 scales as 6-bit codes: a tensor whose block scales take at most 64 distinct E4M3 values (every
 // matrix of the target but one, and the drafter's) stores each (tile, chunk) block as its 1,024 value bytes and
-// 96 bytes of codes (two 6-bit codes per lane slot, slot s at bits 12s .. 12s + 11, the first scale low), 1,120
-// bytes instead of 1,152, with the tensor's 64-entry table (code -> E4M3 byte) beside it; the streaming GEMM looks
-// each code up in registers' reach, so the scales it multiplies by are bit for bit the checkpoint's (lossless).
+// 96 bytes of codes (a lane slot's two 6-bit codes are 12 bits, the first scale's low: lane L's slots L and L + 32
+// keep their low bytes at 2L and 2L + 1 and their high nibbles in byte 64 + L, so a lane reads one 16-bit word and
+// one byte per tile, as many loads as the raw scales), 1,120 bytes instead of 1,152, with the tensor's 64-entry
+// table (code -> E4M3 byte) beside it; the streaming GEMM looks each code up in shared memory, so the scales it
+// multiplies by are bit for bit the checkpoint's (lossless).
 // The prefill GEMM reads the raw scales from a separate copy (`scales`: 128 bytes per block, in the raw blob's
 // order), which only the prefill path touches.
 constexpr int kScaleCodes = 64;
