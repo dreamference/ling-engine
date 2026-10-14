@@ -26,6 +26,7 @@
 #include <cuda_fp8.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -76,6 +77,12 @@ struct StreamProblems {
   int N[4];
   int block0[4];
   int count;
+  // GATHER (BACKLOG §19.19, the drafter's sparse head): matrix 0's rows are rows[0 .. *nrows) of a checkpoint-layout
+  // NVFP4 matrix (w: values [rows][K/2], wscale: scales [rows][K/16]); output column i is rows[i]; columns past
+  // *nrows (up to N, the capacity) are -inf.
+  const int* rows = nullptr;
+  const int* nrows = nullptr;
+  const uint8_t* wscale = nullptr;
 };
 
 // Per lane and chunk: the weights of rows g and g + 8 of every tile.
@@ -85,9 +92,27 @@ struct WeightRegs {
   uint32_t sc[TILES][2];  // NVFP4: the two E4M3 block scales of the lane's 32 values (low byte first)
 };
 
-template <int TILES, bool FP4>
+// GATHER: rows g and g + 8 of the 16-row group come from the checkpoint layout at rows grow[0] and grow[1]; a lane
+// loads exactly the bytes the tiled layout puts in its slot (the same 16 value bytes and 2 scale bytes), so the
+// arithmetic after it is the tiled path's.
+template <int TILES, bool FP4, bool GATHER = false>
 __device__ __forceinline__ void load_weights(WeightRegs<TILES, FP4>& r, const uint8_t* __restrict__ w, int row0,
-                                             int N, int K, int chunk, int g, int t) {
+                                             int N, int K, int chunk, int g, int t, const int (*grow)[2] = nullptr,
+                                             const uint8_t* __restrict__ wsc = nullptr) {
+  if constexpr (GATHER) {
+#pragma unroll
+    for (int i = 0; i < TILES; ++i)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const uint8_t* p = w + static_cast<size_t>(grow[i][h]) * (K / 2) + chunk * (kChunk / 2) + t * 16;
+        asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
+                     : "=r"(r.v[i][h][0].x), "=r"(r.v[i][h][0].y), "=r"(r.v[i][h][0].z), "=r"(r.v[i][h][0].w)
+                     : "l"(p));
+        r.sc[i][h] =
+            *reinterpret_cast<const uint16_t*>(wsc + static_cast<size_t>(grow[i][h]) * (K / 16) + chunk * (kChunk / 16) + t * 2);
+      }
+    return;
+  }
   const int chunks = K / kChunk, last_tile = N / 16 - 1;
 #pragma unroll
   for (int i = 0; i < TILES; ++i) {
@@ -121,7 +146,7 @@ __device__ __forceinline__ uint32_t word_of(const uint4& v, int i) {
   return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
 }
 
-template <int NT, int TILES, bool FP4, int PF>  // PF: chunks each warp keeps in flight ahead of the one it computes
+template <int NT, int TILES, bool FP4, int PF, bool GATHER = false>  // PF: chunks each warp keeps in flight ahead of the one it computes
 __global__ void __launch_bounds__(kWarps * 32)
     stream_gemm_kernel(const __half* __restrict__ x, const float* __restrict__ xinv, int M, StreamProblems pr, int K,
                        int ksplit, float* __restrict__ part) {
@@ -148,15 +173,28 @@ __global__ void __launch_bounds__(kWarps * 32)
     for (int j = 0; j < NT; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
 
   WeightRegs<TILES, FP4> buf[PF + 1];  // buf[0]: the chunk being computed; buf[1..PF]: in flight
+  int grow[TILES][2] = {};
+  if constexpr (GATHER) {  // the groups' rows (a row past the count reads row 0 and is masked at the end)
+    pdl_begin();  // the row list is the previous kernel's output: nothing is read before the wait
+    const int nr = *pr.nrows;
+#pragma unroll
+    for (int i = 0; i < TILES; ++i)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int r = row0 + 16 * i + g + 8 * h;
+        grow[i][h] = r < nr ? pr.rows[r] : 0;
+      }
+  }
 #pragma unroll
   for (int p = 0; p < PF; ++p)
     if (cbeg + warp + p * kWarps < chunks)
-      load_weights<TILES, FP4>(buf[p], w, row0, N, K, cbeg + warp + p * kWarps, g, t);
+      load_weights<TILES, FP4, GATHER>(buf[p], w, row0, N, K, cbeg + warp + p * kWarps, g, t, grow, pr.wscale);
   // PDL (launch.cuh): the first weight chunks above read only the weights, which never change, so they are
   // in flight while this block waits for the kernel that wrote x and xinv. Nothing else happens before this.
-  pdl_begin();
+  if constexpr (!GATHER) pdl_begin();
   for (int c = cbeg + warp; c < chunks; c += kWarps) {
-    if (c + PF * kWarps < chunks) load_weights<TILES, FP4>(buf[PF], w, row0, N, K, c + PF * kWarps, g, t);
+    if (c + PF * kWarps < chunks)
+      load_weights<TILES, FP4, GATHER>(buf[PF], w, row0, N, K, c + PF * kWarps, g, t, grow, pr.wscale);
     const WeightRegs<TILES, FP4>& cur = buf[0];
     // This chunk's activations: 32 halves (16 words) per token for tokens g + 8j.
     uint32_t xw[NT][16];
@@ -233,6 +271,10 @@ __global__ void __launch_bounds__(kWarps * 32)
     float sum = 0.f;
 #pragma unroll
     for (int wi = 0; wi < kWarps; ++wi) sum += red[wi][r][n];
+    if constexpr (GATHER) {
+      y[static_cast<size_t>(n) * N + row0 + r] = row0 + r < *pr.nrows ? sum * gscale * xinv[n] : -INFINITY;
+      continue;
+    }
     if (ksplit == 1)
       y[static_cast<size_t>(n) * N + row0 + r] = sum * gscale * xinv[n];
     else
@@ -542,6 +584,34 @@ void stream_gemm_fp8(const __half* x, const float* xinv, int M, const uint8_t* w
                      int K, cudaStream_t s) {
   const StreamTarget t{w, nullptr, wscale, y, N};
   dispatch<false>(x, xinv, M, &t, 1, K, s);
+}
+
+void stream_gemm_gather_nvfp4(const __half* x, const float* xinv, int M, const uint8_t* w, const uint8_t* wscale,
+                              float scale2, const int* rows, const int* nrows, int cap, float* y, int K, cudaStream_t s) {
+  if (K % kChunk != 0 || cap % 32 != 0) throw std::runtime_error("stream_gemm_gather: K % 128 and cap % 32 must be 0");
+  if (M < 1 || M > kMaxStreamRows) throw std::runtime_error("stream_gemm_gather: M must be in [1, 32]");
+  StreamProblems pr{};
+  pr.w[0] = w;
+  pr.gscale[0] = scale2;
+  pr.y[0] = y;
+  pr.N[0] = cap;
+  pr.count = 1;
+  pr.rows = rows;
+  pr.nrows = nrows;
+  pr.wscale = wscale;
+  // Two 16-row groups per block and two chunks in flight (B16's shape for the narrow matrices: the activations are
+  // read once per 32 rows); each output element's arithmetic is the tiled path's either way.
+  if (cap % 32 != 0) throw std::runtime_error("stream_gemm_gather: cap % 32 must be 0");
+  const dim3 grid(cap / 32, 1);
+  float* none = nullptr;
+  if (M <= 8)
+    launch_kernel("stream_gemm_gather", stream_gemm_kernel<1, 2, true, 2, true>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K, 1, none);
+  else if (M <= 16)
+    launch_kernel("stream_gemm_gather", stream_gemm_kernel<2, 2, true, 2, true>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K, 1, none);
+  else
+    launch_kernel("stream_gemm_gather", stream_gemm_kernel<4, 2, true, 2, true>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K, 1, none);
+  const cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess) throw std::runtime_error(std::string("stream_gemm_gather: ") + cudaGetErrorString(e));
 }
 
 void stream_gemm_multi(bool nvfp4, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K,

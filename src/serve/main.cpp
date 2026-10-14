@@ -1230,6 +1230,8 @@ class Factory : public proxygen::RequestHandlerFactory {
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "0.0.0.0", name;
+  std::string draft_head = "full", sparse_head_dir;  // BACKLOG §19.19
+  int sparse_head_dynamic = 16384;
   int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
@@ -1251,6 +1253,9 @@ int main(int argc, char** argv) {
     else if (a == "--max-context") max_context = std::stoi(next());
     else if (a == "--draft") draft_dir = next();
     else if (a == "--draft-block") draft_block = std::stoi(next());
+    else if (a == "--draft-head") draft_head = next();
+    else if (a == "--sparse-head-dir") sparse_head_dir = next();
+    else if (a == "--sparse-head-dynamic") sparse_head_dynamic = std::stoi(next());
     else if (a == "--lookup") lookup = std::stoi(next());
     else if (a == "--lookup-min") lookup_min = std::stoi(next());
     else if (a == "--pretokenizer") pretokenizer = next();
@@ -1271,7 +1276,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--draft-head full|sparse --sparse-head-dir DIR [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]\n";
     return 2;
   }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
@@ -1297,6 +1302,17 @@ int main(int argc, char** argv) {
   opts.max_context = max_context;
   opts.draft_dir = draft_dir;
   opts.draft_block = draft_block;
+  if (draft_head == "sparse") {
+    if (sparse_head_dir.empty()) {
+      std::cerr << "--draft-head sparse needs --sparse-head-dir DIR\n";
+      return 2;
+    }
+    opts.sparse_head_dir = sparse_head_dir;
+    opts.sparse_head_dynamic = sparse_head_dynamic;
+  } else if (draft_head != "full") {
+    std::cerr << "--draft-head is full or sparse\n";
+    return 2;
+  }
   opts.lookup_mode = lookup;
   opts.lookup_min_match = lookup_min;
   opts.prefix_checkpoints = checkpoints;
