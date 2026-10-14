@@ -160,6 +160,52 @@ bool test_gemm() {
   return ok;
 }
 
+// Row invariance on a wide matrix too (N >= 8192 takes the wide launch shapes, B16): every M's rows are bit for bit
+// the M = 32 launch's, NVFP4 and FP8, single and as two matrices in one launch.
+bool test_gemm_wide() {
+  std::mt19937 rng(12);
+  std::uniform_int_distribution<int> byte(0, 255), scale_byte(0x28, 0x48);
+  std::normal_distribution<float> normal(0.f, 1.f);
+  const int N = 8448, K = 1024, MMAX = ling::kernels::kMaxStreamRows;
+  std::vector<uint8_t> w4(size_t(N) * K / 2), s4(size_t(N) * K / 16), w8(size_t(N) * K);
+  for (auto& b : w4) b = byte(rng);
+  for (auto& b : s4) b = scale_byte(rng);
+  for (auto& b : w8) {
+    do b = byte(rng);
+    while ((b & 0x7f) == 0x7f);
+  }
+  std::vector<float> x(size_t(MMAX) * K);
+  for (float& v : x) v = normal(rng);
+  uint8_t *rw4 = upload(w4), *ds4 = upload(s4), *rw8 = upload(w8), *dw4, *dw8;
+  cudaMalloc(&dw4, ling::kernels::tiled_bytes_nvfp4(N, K));
+  cudaMalloc(&dw8, ling::kernels::tiled_bytes_fp8(N, K));
+  ling::kernels::retile_nvfp4(rw4, ds4, dw4, N, K, nullptr);
+  ling::kernels::retile_fp8(rw8, dw8, N, K, nullptr);
+  float* dx = upload(x);
+  __half* xh;
+  float *xinv, *dy;
+  cudaMalloc(&xh, size_t(MMAX) * K * sizeof(__half));
+  cudaMalloc(&xinv, MMAX * sizeof(float));
+  cudaMalloc(&dy, size_t(MMAX) * N * sizeof(float));
+  bool ok = true;
+  for (bool fp4 : {true, false}) {
+    run(fp4, dx, MMAX, K, xh, xinv, fp4 ? dw4 : dw8, ds4, 0.5f, dy, N);
+    const std::vector<float> full = download(dy, size_t(MMAX) * N);
+    bool same = true;
+    for (int M : {1, 8, 9, 12, 16, 17, 24}) {
+      run(fp4, dx, M, K, xh, xinv, fp4 ? dw4 : dw8, ds4, 0.5f, dy, N);
+      const std::vector<float> got = download(dy, size_t(M) * N);
+      same &= std::memcmp(got.data(), full.data(), got.size() * sizeof(float)) == 0;
+    }
+    ok &= same;
+    std::printf("stream_gemm %-5s wide (N=%d) rows identical to M=32 for M = 1 .. 24: %s\n", fp4 ? "nvfp4" : "fp8", N,
+                same ? "yes ok" : "NO FAIL");
+  }
+  cudaFree(dw4), cudaFree(dw8), cudaFree(rw4), cudaFree(ds4), cudaFree(rw8), cudaFree(dx), cudaFree(xh), cudaFree(xinv),
+      cudaFree(dy);
+  return ok;
+}
+
 bool test_bf16_rows() {
   std::mt19937 rng(9);
   std::normal_distribution<float> normal(0.f, 1.f);
@@ -455,6 +501,81 @@ void bench() {
   }
 }
 
+__global__ void fill_random_kernel(uint32_t* p, size_t n, uint32_t seed) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+    uint32_t h = static_cast<uint32_t>(i) * 2654435761u ^ seed;
+    h ^= h >> 15, h *= 2246822519u, h ^= h >> 13, h *= 3266489917u, h ^= h >> 16;
+    p[i] = h & 0x77777777u;  // NVFP4 nibbles and FP8 bytes of moderate size; scales stay finite
+  }
+}
+
+// The step's weight stream, launch for launch as the engine groups it (B16): each group timed over enough
+// copies that L2 never holds the next one, and the step's GEMM total from the per-step launch counts.
+void bench_groups() {
+  struct Group {
+    const char* name;
+    bool fp4;
+    int K, n, count;
+    int N[3];
+  };
+  const Group groups[] = {
+      {"attn q|k|v fp8", false, 5120, 3, 16, {12288, 1024, 1024}}, {"attn o fp8", false, 6144, 1, 16, {5120}},
+      {"gdn in_qkv|z fp8", false, 5120, 2, 48, {10240, 6144}},     {"gdn out fp8", false, 6144, 1, 48, {5120}},
+      {"ffn gate|up fp4", true, 5120, 2, 64, {17408, 17408}},       {"ffn down fp4", true, 17408, 1, 64, {5120}},
+      {"lm head fp4", true, 5120, 1, 1, {248320}},
+  };
+  const int Ms[] = {1, 12, 16, 24, 32};
+  double step_ms[5] = {}, step_gb = 0;
+  for (const Group& gr : groups) {
+    size_t bytes = 0, sizes[3];
+    for (int i = 0; i < gr.n; ++i) bytes += sizes[i] = size_t(gr.N[i]) * gr.K * (gr.fp4 ? 9 : 16) / 16;
+    const int copies = int(std::max<size_t>(2, (1024u << 20) / bytes));
+    uint8_t* w;
+    cudaMalloc(&w, bytes * copies);
+    fill_random_kernel<<<1024, 256>>>(reinterpret_cast<uint32_t*>(w), bytes * copies / 4, 7);
+    float *x, *y[3], *xinv;
+    __half* xh;
+    cudaMalloc(&x, size_t(32) * gr.K * sizeof(float));
+    fill_random_kernel<<<64, 256>>>(reinterpret_cast<uint32_t*>(x), size_t(32) * gr.K, 9);  // finite floats
+    cudaMalloc(&xh, size_t(32) * gr.K * sizeof(__half));
+    cudaMalloc(&xinv, 32 * sizeof(float));
+    for (int i = 0; i < gr.n; ++i) cudaMalloc(&y[i], size_t(32) * gr.N[i] * sizeof(float));
+    ling::kernels::to_half_rows(x, 32, gr.K, xh, xinv, nullptr);
+    cudaEvent_t a, b;
+    cudaEventCreate(&a), cudaEventCreate(&b);
+    std::printf("group %-17s %6.1f MB x%-2d", gr.name, bytes / 1e6, gr.count);
+    step_gb += double(bytes) * gr.count / 1e9;
+    for (int mi = 0; mi < 5; ++mi) {
+      const int M = Ms[mi];
+      const int iters = std::max(40, copies * 4);
+      float best = 1e30f;
+      for (int pass = 0; pass < 3; ++pass) {
+        cudaEventRecord(a);
+        for (int it = 0; it < iters; ++it) {
+          const uint8_t* base = w + bytes * (it % copies);
+          ling::kernels::StreamTarget t[3];
+          size_t off = 0;
+          for (int i = 0; i < gr.n; ++i) t[i] = {base + off, nullptr, 1.f, y[i], gr.N[i]}, off += sizes[i];
+          ling::kernels::stream_gemm_multi(gr.fp4, xh, xinv, M, t, gr.n, gr.K, nullptr);
+        }
+        cudaEventRecord(b);
+        cudaEventSynchronize(b);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, a, b);
+        if (pass > 0) best = std::min(best, ms / iters);
+      }
+      step_ms[mi] += double(best) * gr.count;
+      std::printf("  M=%-2d %4.0f", M, bytes / (best * 1e-3) / 1e9);
+    }
+    std::printf("  GB/s\n");
+    cudaFree(w), cudaFree(x), cudaFree(xh), cudaFree(xinv);
+    for (int i = 0; i < gr.n; ++i) cudaFree(y[i]);
+  }
+  std::printf("step GEMMs (%.2f GB):", step_gb);
+  for (int mi = 0; mi < 5; ++mi) std::printf("  M=%-2d %6.2f ms %4.0f GB/s", Ms[mi], step_ms[mi], step_gb / step_ms[mi] * 1e3);
+  std::printf("\n");
+}
+
 }  // namespace
 
 // M4 stage 4: each state kernel over two sequences in one launch (kernels::SeqBatch) against its launch per
@@ -640,7 +761,12 @@ bool test_batched_state_kernels() {
 
 int main(int argc, char** argv) {
   if (const char* e = std::getenv("LING_PDL")) ling::kernels::set_pdl(std::atoi(e) != 0);
+  if (argc > 1 && std::string(argv[1]) == "--bench-groups") {  // timings only (B16 sweeps)
+    bench_groups();
+    return cudaDeviceSynchronize() == cudaSuccess ? 0 : 1;
+  }
   bool ok = test_gemm();
+  ok &= test_gemm_wide();
   ok &= test_bf16_rows();
   ok &= test_attention_rows();
   ok &= test_topk();

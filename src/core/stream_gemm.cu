@@ -150,7 +150,8 @@ __global__ void __launch_bounds__(kWarps * 32)
   WeightRegs<TILES, FP4> buf[PF + 1];  // buf[0]: the chunk being computed; buf[1..PF]: in flight
 #pragma unroll
   for (int p = 0; p < PF; ++p)
-    if (cbeg + warp + p * kWarps < chunks) load_weights<TILES, FP4>(buf[p], w, row0, N, K, cbeg + warp + p * kWarps, g, t);
+    if (cbeg + warp + p * kWarps < chunks)
+      load_weights<TILES, FP4>(buf[p], w, row0, N, K, cbeg + warp + p * kWarps, g, t);
   // PDL (launch.cuh): the first weight chunks above read only the weights, which never change, so they are
   // in flight while this block waits for the kernel that wrote x and xinv. Nothing else happens before this.
   pdl_begin();
@@ -336,7 +337,7 @@ float* split_buffer(size_t floats) {
   return buf;
 }
 
-template <int NT, int TILES, bool FP4>
+template <int NT, int TILES, bool FP4, int PF>
 void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
   StreamProblems pr{};
   int blocks = 0;
@@ -352,12 +353,45 @@ void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, in
   const int ksplit = n == 1 ? choose_ksplit(blocks, K) : 1;
   float* part = ksplit > 1 ? split_buffer(size_t(ksplit) * M * t[0].N) : nullptr;
   const dim3 grid(blocks, ksplit);
-  // One chunk in flight per warp ahead of the one it computes: 2 and 3 were measured no faster.
-  launch_kernel("stream_gemm", stream_gemm_kernel<NT, TILES, FP4, 1>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K,
+  launch_kernel("stream_gemm", stream_gemm_kernel<NT, TILES, FP4, PF>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K,
                 ksplit, part);
   if (ksplit > 1)
     launch_kernel("stream_gemm split", split_reduce_kernel, dim3((M * t[0].N + 255) / 256), dim3(256), 0, s, part, ksplit,
                   M, t[0].N, t[0].scale, xinv, t[0].y);
+}
+
+// The launch shape per bucket (B16, measured 2026-10-13 in the step with ling-run --spec and --batch-bench, and per
+// launch group with ling-stream-tests --bench-groups). Neither choice changes any element's arithmetic: each output
+// is still accumulated by warp w over chunks w, w + 8, ... in the same order, so these move bytes, not bits.
+//   - Tiles per block. Every block reads the whole of x for its rows: per chunk a lane loads NT x 64 bytes of
+//     activations against 16 or 32 bytes of weights per tile, so with one tile a block's activation reads (from
+//     L2) outweigh its weight stream several times over at 17-32 rows, and the narrow matrices (N = 5,120: the FFN
+//     down projection, the attention and DeltaNet out-projections) fell to 110-190 GB/s at M = 24 and 32 (the
+//     batched verify of two sequences: ffn down 113 GB/s). Two tiles halve the activation reads per weight byte:
+//     ffn down 230 GB/s at M = 24, the batched step about 6 ms shorter. At M <= 16 two tiles on the narrow
+//     matrices gain too (out-projections 211-228 -> 241-244 GB/s at M = 12).
+//   - Chunks in flight per warp (PF): two, now that the narrow launches have half the blocks.
+// LING_SG_TN, LING_SG_TW (tiles at M <= 16 for narrow / wide launches), LING_SG_TN4, LING_SG_TW4 (at M > 16) and
+// LING_SG_PF override them for experiments (TILES 1, 2 or 4, at most 2 at M > 16; PF 1 or 2).
+constexpr int kTilesNarrow = 2, kTilesWide = 2, kTilesNarrow4 = 2, kTilesWide4 = 2, kInFlight = 2;
+
+int sg_env(const char* n, int d) {
+  const char* e = std::getenv(n);
+  return e ? std::atoi(e) : d;
+}
+
+template <int NT, bool FP4, int PF>
+void launch_t(int tiles, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
+  if (tiles == 1) launch<NT, 1, FP4, PF>(x, xinv, M, t, n, K, s);
+  else if (tiles == 2 || NT == 4) launch<NT, 2, FP4, PF>(x, xinv, M, t, n, K, s);  // NT = 4 x 4 tiles: no room
+  else launch<NT, (NT == 4 ? 2 : 4), FP4, PF>(x, xinv, M, t, n, K, s);
+}
+
+template <int NT, bool FP4>
+void launch_k(int tiles, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
+  static const int pf = sg_env("LING_SG_PF", kInFlight);
+  if (pf == 2) launch_t<NT, FP4, 2>(tiles, x, xinv, M, t, n, K, s);
+  else launch_t<NT, FP4, 1>(tiles, x, xinv, M, t, n, K, s);
 }
 
 template <bool FP4>
@@ -367,17 +401,12 @@ void dispatch(const __half* x, const float* xinv, int M, const StreamTarget* t, 
   if (n < 1 || n > 4) throw std::runtime_error("stream_gemm: 1 to 4 matrices per launch");
   int total = 0;
   for (int i = 0; i < n; ++i) total += t[i].N;
-  // Two tiles per warp share each activation fragment; narrow launches keep one so that more blocks
-  // stream at once. (The choice does not change any element's arithmetic.)
-  if (total < 8192) {
-    if (M <= 8) launch<1, 1, FP4>(x, xinv, M, t, n, K, s);
-    else if (M <= 16) launch<2, 1, FP4>(x, xinv, M, t, n, K, s);
-    else launch<4, 1, FP4>(x, xinv, M, t, n, K, s);
-  } else {
-    if (M <= 8) launch<1, 2, FP4>(x, xinv, M, t, n, K, s);
-    else if (M <= 16) launch<2, 2, FP4>(x, xinv, M, t, n, K, s);
-    else launch<4, 2, FP4>(x, xinv, M, t, n, K, s);
-  }
+  static const int tn = sg_env("LING_SG_TN", kTilesNarrow), tw = sg_env("LING_SG_TW", kTilesWide),
+                   tn4 = sg_env("LING_SG_TN4", kTilesNarrow4), tw4 = sg_env("LING_SG_TW4", kTilesWide4);
+  const bool narrow = total < 8192;
+  if (M <= 8) launch_k<1, FP4>(narrow ? tn : tw, x, xinv, M, t, n, K, s);
+  else if (M <= 16) launch_k<2, FP4>(narrow ? tn : tw, x, xinv, M, t, n, K, s);
+  else launch_k<4, FP4>(narrow ? tn4 : tw4, x, xinv, M, t, n, K, s);
   const cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) throw std::runtime_error(std::string("stream_gemm: ") + cudaGetErrorString(e));
 }
