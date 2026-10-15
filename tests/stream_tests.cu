@@ -6,9 +6,11 @@
 //   ling-stream-tests --bench    plus timings
 //   LING_PDL=1 ling-stream-tests  the same with programmatic dependent launch (launch.cuh)
 //   LING_NO_TIMING=1 ling-stream-tests  skips the attention timings (under compute-sanitizer)
+#include <cuda.h>
 #include <cuda_fp8.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -555,9 +557,42 @@ __global__ void fill_random_kernel(uint32_t* p, size_t n, uint32_t seed) {
   }
 }
 
+// BACKLOG §19.24 (B08's trace): LING_BENCH_SMS=N runs the bench on a stream of a green context holding N SMs
+// (cuDevSmResourceSplitByCount), so the groups' bandwidth is what a subset of the GPU reaches. Unset: the default
+// stream, the whole GPU. Returns the stream and prints the SM count the split gave.
+cudaStream_t bench_stream() {
+  const char* e = std::getenv("LING_BENCH_SMS");
+  if (!e || std::atoi(e) <= 0) return nullptr;
+  cudaFree(nullptr);  // the primary context first, so the green context shares its device state
+  CUdevice dev;
+  CUdevResource all, part, rest;
+  unsigned groups = 1;
+  CUdevResourceDesc desc;
+  CUgreenCtx g;
+  CUstream st;
+  auto ok = [](CUresult r, const char* what) {
+    if (r != CUDA_SUCCESS) {
+      const char* m = nullptr;
+      cuGetErrorString(r, &m);
+      std::fprintf(stderr, "green context: %s failed: %s\n", what, m ? m : "?");
+      std::exit(2);
+    }
+  };
+  ok(cuDeviceGet(&dev, 0), "cuDeviceGet");
+  ok(cuDeviceGetDevResource(dev, &all, CU_DEV_RESOURCE_TYPE_SM), "cuDeviceGetDevResource");
+  ok(cuDevSmResourceSplitByCount(&part, &groups, &all, &rest, 0, static_cast<unsigned>(std::atoi(e))),
+     "cuDevSmResourceSplitByCount");
+  ok(cuDevResourceGenerateDesc(&desc, &part, 1), "cuDevResourceGenerateDesc");
+  ok(cuGreenCtxCreate(&g, desc, dev, CU_GREEN_CTX_DEFAULT_STREAM), "cuGreenCtxCreate");
+  ok(cuGreenCtxStreamCreate(&st, g, CU_STREAM_NON_BLOCKING, 0), "cuGreenCtxStreamCreate");
+  std::printf("green context: %u of %u SMs\n", part.sm.smCount, all.sm.smCount);
+  return reinterpret_cast<cudaStream_t>(st);
+}
+
 // The step's weight stream, launch for launch as the engine groups it (B16): each group timed over enough
 // copies that L2 never holds the next one, and the step's GEMM total from the per-step launch counts.
 void bench_groups() {
+  const cudaStream_t bs = bench_stream();
   struct Group {
     const char* name;
     bool fp4;
@@ -606,19 +641,26 @@ void bench_groups() {
       const int iters = std::max(40, copies * 4);
       float best = 1e30f;
       for (int pass = 0; pass < 3; ++pass) {
-        cudaEventRecord(a);
+        // Host-timed around a synchronized queue (an event of the primary context cannot be recorded on a green
+        // context's stream); a launch costs microseconds against the group's ~0.1-3 ms.
+        cudaDeviceSynchronize();
+        const auto t0 = std::chrono::steady_clock::now();
         for (int it = 0; it < iters; ++it) {
           const uint8_t* base = w + bytes * (it % copies);
           ling::kernels::StreamTarget t[3];
           size_t off = 0;
           for (int i = 0; i < gr.n; ++i)
             t[i] = {base + off, gr.fp4 && coded ? dtab : nullptr, 1.f, y[i], gr.N[i]}, off += sizes[i];
-          ling::kernels::stream_gemm_multi(gr.fp4, xh, xinv, M, t, gr.n, gr.K, nullptr);
+          ling::kernels::stream_gemm_multi(gr.fp4, xh, xinv, M, t, gr.n, gr.K, bs);
         }
-        cudaEventRecord(b);
-        cudaEventSynchronize(b);
-        float ms = 0;
-        cudaEventElapsedTime(&ms, a, b);
+        if (bs) cudaStreamSynchronize(bs);
+        cudaDeviceSynchronize();
+        const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+          std::fprintf(stderr, "bench: %s\n", cudaGetErrorString(err));
+          std::exit(2);
+        }
         if (pass > 0) best = std::min(best, ms / iters);
       }
       step_ms[mi] += double(best) * gr.count;
