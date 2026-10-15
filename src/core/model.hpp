@@ -16,6 +16,16 @@ struct TensorView;
 // Uploads a checkpoint's NVFP4 (values and scales) or FP8 matrix and rewrites it on the GPU into the tiled
 // layout; returns the tiled device buffer (the caller frees it) and adds its size to *bytes.
 const uint8_t* upload_tiled(const TensorView& values, const TensorView* scales, int N, int K, size_t* bytes);
+// An NVFP4 matrix with its scales as 6-bit codes when they take at most 64 values (B26, kernels.cuh): the coded
+// blob, its 64-byte table and the raw scales for the prefill path, each a device buffer appended to `owned`; else
+// (or with LING_SCALE_CODES=0) the raw blob of upload_tiled and no table or scales.
+struct Fp4Upload {
+  const uint8_t* w = nullptr;
+  const uint8_t* table = nullptr;
+  const uint8_t* scales = nullptr;
+};
+Fp4Upload upload_nvfp4(const TensorView& values, const TensorView& scales, int N, int K, size_t* bytes,
+                       std::vector<void*>& owned);
 
 struct ModelConfig {
   int hidden = 0;            // 5120
@@ -45,6 +55,8 @@ struct ModelConfig {
 // (values and block scales together, kernels::retile_nvfp4), the order stream_gemm reads.
 struct Fp4Weight {
   const uint8_t* w = nullptr;
+  const uint8_t* table = nullptr;   // B26: the scale-code table of a coded blob (nullptr: raw scales in the blob)
+  const uint8_t* scales = nullptr;  // B26: a coded blob's raw scales, for the prefill GEMM
   float scale2 = 0.f;
   float in_scale = 1.f;  // the activations' global scale (input_scale), for the prefill GEMM
   int N = 0, K = 0;

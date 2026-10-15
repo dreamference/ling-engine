@@ -109,6 +109,7 @@ bool test_quant(std::mt19937& rng) {
 struct Weights {
   std::vector<uint8_t> w, s;  // checkpoint layout: NVFP4 [N][K/2] + [N][K/16], or FP8 [N][K]
   uint8_t* tiled = nullptr;
+  uint8_t *coded = nullptr, *raw = nullptr;  // NVFP4: the B26 coded blob and its raw scales
 };
 
 Weights make_weights(std::mt19937& rng, bool fp4, int N, int K) {
@@ -128,6 +129,17 @@ Weights make_weights(std::mt19937& rng, bool fp4, int N, int K) {
   cudaMalloc(&W.tiled, fp4 ? ling::kernels::tiled_bytes_nvfp4(N, K) : ling::kernels::tiled_bytes_fp8(N, K));
   if (fp4) ling::kernels::retile_nvfp4(dw, ds, W.tiled, N, K, nullptr);
   else ling::kernels::retile_fp8(dw, W.tiled, N, K, nullptr);
+  if (fp4) {  // B26: the same matrix with 6-bit scale codes (the test's scales take 25 values)
+    uint8_t table[ling::kernels::kScaleCodes], code_of[256];
+    if (ling::kernels::scale_code_table(W.s.data(), W.s.size(), table, code_of)) {
+      uint8_t* map = upload(std::vector<uint8_t>(code_of, code_of + 256));
+      cudaMalloc(&W.coded, ling::kernels::tiled_bytes_nvfp4_coded(N, K));
+      cudaMalloc(&W.raw, W.s.size());
+      ling::kernels::retile_nvfp4_coded(dw, ds, map, W.coded, W.raw, N, K, nullptr);
+      cudaDeviceSynchronize();
+      cudaFree(map);
+    }
+  }
   cudaDeviceSynchronize();
   cudaFree(dw);
   if (ds) cudaFree(ds);
@@ -154,6 +166,14 @@ bool test_gemm(std::mt19937& rng, bool fp4, int M, int N, int K, bool accumulate
   else ling::kernels::prefill_gemm_fp8(q, M, W.tiled, alpha, dy, ldy, N, K, accumulate, nullptr);
   const cudaError_t e = cudaDeviceSynchronize();
   const auto y = download(dy, y0.size());
+  bool coded_same = true;
+  if (fp4 && W.coded) {  // B26: the coded blob with its raw scales gives the same bits
+    float* dy2 = upload(y0);
+    ling::kernels::prefill_gemm_nvfp4(q, sf, M, W.coded, alpha, dy2, ldy, N, K, accumulate, nullptr, W.raw);
+    cudaDeviceSynchronize();
+    coded_same = download(dy2, y0.size()) == y;
+    cudaFree(dy2);
+  }
   const auto hq = download(q, fp4 ? size_t(M) * K / 2 : size_t(M) * K);
   const auto hs = fp4 ? download(sf, size_t(M) * K / 16) : std::vector<uint8_t>();
   // Dequantized operands, then the product in double.
@@ -184,15 +204,16 @@ bool test_gemm(std::mt19937& rng, bool fp4, int M, int N, int K, bool accumulate
       worst = std::max(worst, std::fabs(y[i] - ref));
     }
   rms = std::sqrt(rms / (double(M) * N));
-  const bool ok = e == cudaSuccess && worst <= 1e-4 * rms + 1e-6 && untouched == 0;
-  std::printf("prefill_gemm %s M=%-4d N=%-4d K=%-5d%s: max err %.2e of rms %.2e, %zu stray writes %s %s\n",
+  const bool ok = e == cudaSuccess && worst <= 1e-4 * rms + 1e-6 && untouched == 0 && coded_same;
+  std::printf("prefill_gemm %s M=%-4d N=%-4d K=%-5d%s: max err %.2e of rms %.2e, %zu stray writes %s%s %s\n",
               fp4 ? "nvfp4" : "fp8  ", M, N, K, accumulate ? " +=" : "   ", worst, rms, untouched, cudaGetErrorString(e),
-              ok ? "ok" : "FAIL");
+              fp4 ? (coded_same ? ", scale codes identical" : ", scale codes DIFFER") : "", ok ? "ok" : "FAIL");
   cudaFree(dx);
   cudaFree(q);
   if (sf) cudaFree(sf);
   cudaFree(dy);
   cudaFree(W.tiled);
+  if (W.coded) cudaFree(W.coded), cudaFree(W.raw);
   return ok;
 }
 
@@ -293,10 +314,21 @@ bool test_swiglu(std::mt19937& rng, int M, int N, int K) {
   cudaMemset(q2, 0, size_t(M) * N / 2);
   cudaMemset(sf2, 0, size_t(M) * N / 16);
   ling::kernels::prefill_swiglu_nvfp4(q, sf, M, G.tiled, ag, U.tiled, au, N, K, out_in, q2, sf2, nullptr);
-  const cudaError_t e = cudaDeviceSynchronize();
-  const bool ok = e == cudaSuccess && download(q2, size_t(M) * N / 2) == rq && download(sf2, size_t(M) * N / 16) == rs;
-  std::printf("prefill_swiglu M=%-4d N=%-5d K=%-5d: %s %s\n", M, N, K, ok ? "identical to the unfused path" : "DIFFERS",
-              ok ? "ok" : "FAIL");
+  cudaError_t e = cudaDeviceSynchronize();
+  bool ok = e == cudaSuccess && download(q2, size_t(M) * N / 2) == rq && download(sf2, size_t(M) * N / 16) == rs;
+  // B26: the coded blobs (gate coded, up coded; and gate coded beside a raw up) give the same bytes.
+  bool coded = true;
+  for (int mix = 0; mix < 2 && G.coded && U.coded; ++mix) {
+    cudaMemset(q2, 0, size_t(M) * N / 2);
+    cudaMemset(sf2, 0, size_t(M) * N / 16);
+    ling::kernels::prefill_swiglu_nvfp4(q, sf, M, G.coded, ag, mix ? U.tiled : U.coded, au, N, K, out_in, q2, sf2, nullptr,
+                                        G.raw, mix ? nullptr : U.raw);
+    e = cudaDeviceSynchronize();
+    coded &= e == cudaSuccess && download(q2, size_t(M) * N / 2) == rq && download(sf2, size_t(M) * N / 16) == rs;
+  }
+  ok &= coded;
+  std::printf("prefill_swiglu M=%-4d N=%-5d K=%-5d: %s, scale codes %s %s\n", M, N, K,
+              ok ? "identical to the unfused path" : "DIFFERS", coded ? "identical" : "DIFFER", ok ? "ok" : "FAIL");
   for (void* f : {(void*)dx, (void*)q, (void*)sf, (void*)q2, (void*)sf2, (void*)g, (void*)u, (void*)G.tiled, (void*)U.tiled})
     cudaFree(f);
   return ok;
