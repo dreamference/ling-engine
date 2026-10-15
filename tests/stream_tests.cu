@@ -134,7 +134,8 @@ bool test_gemm() {
                   worst, same ? "yes" : "NO", good ? "ok" : "FAIL");
     }
   }
-  // B26: the same NVFP4 matrix with 6-bit scale codes streams to the same bits, at every M, alone and in one launch
+  // B26: the same NVFP4 matrix with 6-bit scale codes streams to the same bits, at every M (33-64 rows: P1's
+  // eight-group launch), alone and in one launch
   // beside its raw copy; its tiled dequantization (with the raw scales) equals the raw blob's.
   {
     uint8_t table[ling::kernels::kScaleCodes], code_of[256];
@@ -144,7 +145,7 @@ bool test_gemm() {
     cudaMalloc(&coded, ling::kernels::tiled_bytes_nvfp4_coded(N, K));
     cudaMalloc(&raw, s4.size());
     ling::kernels::retile_nvfp4_coded(rw4, ds4, map, coded, raw, N, K, nullptr);
-    for (int M : {1, 8, 12, 16, 17, 24, 32}) {
+    for (int M : {1, 8, 12, 16, 17, 24, 32, 33, 48, 64}) {
       ling::kernels::to_half_rows(dx, M, K, xh, xinv, nullptr);
       ling::kernels::stream_gemm_nvfp4(xh, xinv, M, dw4, nullptr, gs4, dy, N, K, nullptr);
       const auto a = download(dy, size_t(M) * N);
@@ -176,7 +177,7 @@ bool test_gemm() {
       cudaFree(ya), cudaFree(yb);
     }
     ok &= same;
-    std::printf("stream_gemm nvfp4 with 6-bit scale codes identical to raw scales (M = 1 .. 32, dequant, mixed launch): %s\n",
+    std::printf("stream_gemm nvfp4 with 6-bit scale codes identical to raw scales (M = 1 .. 64, dequant, mixed launch): %s\n",
                 same ? "yes ok" : "NO FAIL");
     cudaFree(map), cudaFree(dtab), cudaFree(coded), cudaFree(raw);
   }
