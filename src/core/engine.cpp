@@ -455,12 +455,12 @@ void Engine::save_checkpoint(int pos, uint64_t epoch) {
 void Engine::linear_fp4(const Fp4Weight& w, const float* x, int M, float* y, bool x_ready) {
   if (!quantized(M)) {  // the rows path: stream the weights once for every row
     if (!x_ready) kernels::to_half_rows(x, M, w.K, xh_, xinv_, stream_);
-    kernels::stream_gemm_nvfp4(xh_, xinv_, M, w.w, nullptr, w.scale2, y, w.N, w.K, stream_);
+    kernels::stream_gemm_nvfp4(xh_, xinv_, M, w.w, w.table, w.scale2, y, w.N, w.K, stream_);
     return;
   }
   kernels::quant_act_nvfp4(x, M, w.K, w.in_scale, xq_, xsf_, stream_);
   set_xq(w.in_scale, true);
-  kernels::prefill_gemm_nvfp4(xq_, xsf_, M, w.w, w.in_scale * w.scale2, y, w.N, w.N, w.K, false, stream_);
+  kernels::prefill_gemm_nvfp4(xq_, xsf_, M, w.w, w.in_scale * w.scale2, y, w.N, w.N, w.K, false, stream_, w.scales);
 }
 
 void Engine::linear_fp4_multi(std::initializer_list<std::pair<const Fp4Weight*, float*>> ws, const float* x, int M,
@@ -470,14 +470,15 @@ void Engine::linear_fp4_multi(std::initializer_list<std::pair<const Fp4Weight*, 
       if (!(x_ready && xq_is(w->in_scale, true))) kernels::quant_act_nvfp4(x, M, w->K, w->in_scale, xq_, xsf_, stream_);
       set_xq(w->in_scale, true);
       x_ready = true;
-      kernels::prefill_gemm_nvfp4(xq_, xsf_, M, w->w, w->in_scale * w->scale2, y, w->N, w->N, w->K, false, stream_);
+      kernels::prefill_gemm_nvfp4(xq_, xsf_, M, w->w, w->in_scale * w->scale2, y, w->N, w->N, w->K, false, stream_,
+                                  w->scales);
     }
     return;
   }
   kernels::StreamTarget t[4];
   int n = 0, K = 0;
   for (const auto& [w, y] : ws) {
-    t[n++] = {w->w, nullptr, w->scale2, y, w->N};
+    t[n++] = {w->w, w->table, w->scale2, y, w->N};
     K = w->K;
   }
   if (!x_ready) kernels::to_half_rows(x, M, K, xh_, xinv_, stream_);
@@ -785,14 +786,16 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         // Gate and up in one GEMM whose epilogue writes the down projection's NVFP4 input; the down
         // projection adds into the residual.
         kernels::prefill_swiglu_nvfp4(xq_, xsf_, M, L.gate.w, L.gate.in_scale * L.gate.scale2, L.up.w,
-                                      L.up.in_scale * L.up.scale2, I, H, L.down.in_scale, xq2_, xsf2_, stream_);
+                                      L.up.in_scale * L.up.scale2, I, H, L.down.in_scale, xq2_, xsf2_, stream_,
+                                      L.gate.scales, L.up.scales);
         kernels::prefill_gemm_nvfp4(xq2_, xsf2_, M, L.down.w, L.down.in_scale * L.down.scale2, h_, H, H, I, true,
-                                    stream_);
+                                    stream_, L.down.scales);
       } else {  // gate and up quantize differently: separate GEMMs, then silu(gate) * up straight into NVFP4
         linear_fp4_multi({{&L.gate, t1_}, {&L.up, t2_}}, xn_, M, post_half);
         kernels::silu_mul_quant_nvfp4(t1_, t2_, M, I, L.down.in_scale, xq_, xsf_, stream_);
         set_xq(0.f, true);  // not a plain quantization of any one input
-        kernels::prefill_gemm_nvfp4(xq_, xsf_, M, L.down.w, L.down.in_scale * L.down.scale2, h_, H, H, I, true, stream_);
+        kernels::prefill_gemm_nvfp4(xq_, xsf_, M, L.down.w, L.down.in_scale * L.down.scale2, h_, H, H, I, true, stream_,
+                                    L.down.scales);
       }
       mark("mlp");
     }
