@@ -1,0 +1,74 @@
+{
+ "steps": 3295,
+ "accepted_drafts_per_step": 5.099241274658573,
+ "tokens_per_step": 6.099241274658573,
+ "draft_ms": 10.77101707162368,
+ "verify_accept_ms": 88.43795796600911,
+ "commit_ms": 1.6576963056145686,
+ "step_ms_host": 100.86667134324735,
+ "accept_histogram": [
+  374,
+  405,
+  382,
+  282,
+  239,
+  223,
+  202,
+  200,
+  122,
+  137,
+  124,
+  605
+ ],
+ "accept_share": [
+  0.114,
+  0.123,
+  0.116,
+  0.086,
+  0.073,
+  0.068,
+  0.061,
+  0.061,
+  0.037,
+  0.042,
+  0.038,
+  0.184
+ ],
+ "shadow": {
+  "steps": 3295,
+  "drafter_accepted_per_step": 5.099241274658573,
+  "best_of_both_per_step": 5.256449165402125,
+  "by_match": [
+   {
+    "match": "3",
+    "steps": 255,
+    "lookup": 1.35,
+    "drafter": 5.73
+   },
+   {
+    "match": "4-7",
+    "steps": 433,
+    "lookup": 2.18,
+    "drafter": 6.21
+   },
+   {
+    "match": "8-15",
+    "steps": 439,
+    "lookup": 3.57,
+    "drafter": 6.45
+   },
+   {
+    "match": "16-31",
+    "steps": 286,
+    "lookup": 4.84,
+    "drafter": 6.98
+   },
+   {
+    "match": "32+",
+    "steps": 266,
+    "lookup": 6.03,
+    "drafter": 8.27
+   }
+  ]
+ }
+}

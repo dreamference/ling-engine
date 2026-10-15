@@ -1,0 +1,26 @@
+copy0: 144 requests, 0.0651 decode tokens/ms
+copy1: 144 requests (0 errors), 0.0601 decode tokens/ms, x0.924 on the whole replay, per session median x0.936 (min 0.780, max 1.007); outputs identical 144/144; tokens/step 6.78
+    copy_steps: 403
+    copy_drafted: 25336
+    copy_accepted: 6171
+    copy_steps_by_source: [402, 1, 0]
+    copy_accepted_by_source: [6157, 14, 0]
+copy2: 144 requests (0 errors), 0.0658 decode tokens/ms, x1.010 on the whole replay, per session median x1.000 (min 0.761, max 1.043); outputs identical 144/144; tokens/step 6.64
+    copy_steps: 112
+    copy_drafted: 5821
+    copy_accepted: 2742
+    copy_steps_by_source: [112, 0, 0]
+    copy_accepted_by_source: [2742, 0, 0]
+copy1h: 144 requests (0 errors), 0.0604 decode tokens/ms, x0.928 on the whole replay, per session median x0.942 (min 0.787, max 1.008); outputs identical 144/144; tokens/step 6.77
+    copy_steps: 402
+    copy_drafted: 25273
+    copy_accepted: 6157
+    copy_steps_by_source: [402, 0, 0]
+    copy_accepted_by_source: [6157, 0, 0]
+copy2h: 144 requests (0 errors), 0.0659 decode tokens/ms, x1.012 on the whole replay, per session median x1.004 (min 0.991, max 1.108); outputs identical 144/144; tokens/step 6.64
+    copy_steps: 112
+    copy_drafted: 5821
+    copy_accepted: 2742
+    copy_steps_by_source: [112, 0, 0]
+    copy_accepted_by_source: [2742, 0, 0]
+verdict (D1): copy2h is the faster exact arm, x1.012; P1's gate (whole sessions >= +7%, byte-identical) is NOT met
