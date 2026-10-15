@@ -279,3 +279,23 @@ In P1's GPU slot (after the step-savings block), with m0-prod8000 stopped and a 
    - **D1:** of the two modes, the faster one that keeps every output byte-identical.
    - **P1's gate:** whole sessions ≥ +7% with the output byte-identical. Edit spans are read separately by output class.
 6. **Then:** the chosen mode and parameters become the defaults the replay supports. Nothing is turned on in production before the owner's decision.
+
+### 8.9 The gate run (2026-10-15): P1 does not clear its gate
+
+*Run on node-b on branch `steps/p1-on-b26` (P1 rebased onto main with B26; the 33–64-row launch takes B26's coded blobs, checked at 33, 48 and 64 rows in `ling-stream-tests`). Not merged. What comes next for the moonshot is the owner's decision.*
+
+**Exactness: every check passes.** `bench/copy_exact.sh`: `--rows-check 64` bit for bit with and without `--pdl --attn-bulk`; `--spec-check` with `--copy 1` and `--copy 2`, history alone and every source, eager and with graphs, on the copy prompts and M3's set; `--graph-check`, `--prefix-check`, `--chunk-check 256`, `--interleave-check` and `--batch-check` with copies on. The step-savings block's 19 `ling-run` checks, the six unit suites, and the same-as-main comparison (greedy and seeded) pass too. One check fails identically on main and on the earlier P1 build: under `LING_KSPLIT=2`, two matrices in one launch against separate launches, because forced split-K applies to single launches only (a property of the check, not of P1). With copies off the default path runs as main does: seeded replays at one stream 101.2 against 101.2 ms per pass, at two 147.2 against 147.1 (the same tokens in the same passes).
+
+**The gate replay** (`bench/copy_gate.sh`, greedy, M0's main set, one stream, one server per arm; [reports/moonshot-p1-gate-2026-10-15](../../reports/moonshot-p1-gate-2026-10-15/report.txt)). Every arm's 144 outputs are byte-identical to `--copy 0`'s.
+
+| Arm | Decode tokens/ms against copy0 | Per session, median (min-max) | Steps | Tokens per step | Step (host) | Copy steps | Copied tokens accepted |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| copy0 (the drafter alone) | 0.0651 | | 3,295 | 6.10 | 100.9 ms | | |
+| copy1 (replace, every source) | x0.924 | x0.936 (0.780–1.007) | 3,010 | 6.78 | 119.4 ms | 403 | 6,171 of 25,336 |
+| copy2 (extend, every source) | x1.010 | x1.000 (0.761–1.043) | 3,058 | 6.64 | 106.2 ms | 112 | 2,742 of 5,821 |
+| copy1h (replace, history only) | x0.928 | x0.942 (0.787–1.008) | 3,013 | 6.77 | 118.6 ms | 402 | 6,157 |
+| copy2h (extend, history only) | x1.012 | x1.004 (0.991–1.108) | 3,058 | 6.64 | 106.1 ms | 112 | 2,742 |
+
+- **D1:** extend is the faster mode; with history alone, x1.012. **P1's gate (whole sessions ≥ +7%, byte-identical) is not met.**
+- **Views and edit mode** added one copy step (14 tokens) over the whole replay: on M0's sessions the agent's output rarely re-emits tool output in a diff or JSON form at the copy's 16-token agreement.
+- **The step cost.** Extend raises tokens per step by 8.9% and the mean step by 5.2 ms (verify 88.4 to 93.5 ms), more than its 112 copy steps' extra rows alone would explain at P0's c(64); replace's 402 copy steps cost 18.5 ms per step on average. Where the rest of extend's cost goes was not measured.
