@@ -38,13 +38,13 @@ flags_of() {
 for arm in ${ARMS:-copy0 copy1 copy2}; do
   echo "== $arm: $(flags_of $arm)"
   # shellcheck disable=SC2046
-  "$HERE/serve_bg.sh" $PORT "$B" $(flags_of $arm) || exit 1
+  bash "$HERE/serve_bg.sh" $PORT "$B" $(flags_of $arm) || exit 1
   curl -s 127.0.0.1:$PORT/spec_stats > "$OUT/$arm-before.json"
   python3 "$HERE/replay/replay.py" --url http://127.0.0.1:$PORT --tools "$TOOLS" --tools-index "$TOOLS_INDEX" \
     --sessions-file "$SESSIONS" --greedy --label "$arm" --out "$OUT/$arm.jsonl" > "$OUT/$arm.log" 2>&1
   curl -s 127.0.0.1:$PORT/spec_stats > "$OUT/$arm-after.json"
   python3 "$HERE/replay/spec_report.py" "$OUT/$arm-before.json" "$OUT/$arm-after.json" > "$OUT/$arm-spec.json"
-  "$HERE/serve_bg.sh" stop $PORT
+  bash "$HERE/serve_bg.sh" stop $PORT
   sleep 5
 done
 python3 "$HERE/copy_gate_report.py" "$OUT" ${ARMS:-copy0 copy1 copy2} | tee "$OUT/report.txt"
