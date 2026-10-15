@@ -35,6 +35,7 @@ namespace {
 constexpr int kBM = 128, kThreads = 256;
 constexpr int kRowBytes = 64;  // per row per stage
 constexpr int kTileBytesFp4 = 16 * 64 + 16 * 8, kTileBytesFp8 = 16 * 128;
+constexpr int kValueBytesFp4 = 16 * 64;  // B26: a coded blob's value blocks (its codes follow them all, stream_gemm.cu)
 
 // A block computes kBM tokens x BN weight rows; 8 warps, 2 along M x 4 along N, each 64 x BN / 4.
 template <int BN, int STAGES>
@@ -108,6 +109,9 @@ struct GemmArgs {
   // BF16 output (the OUT_BF16 instantiations, --prefill-bf16): y_bf16 [M][ldy] instead of y, never accumulated.
   // Last, so the fields above keep their offsets (the FP32 kernels' SASS is unchanged).
   __nv_bfloat16* y_bf16 = nullptr;
+  // B26: a coded blob's raw scales (128 bytes per (tile, chunk) block), for w and w2; nullptr: the blob carries them.
+  const uint8_t* wsf = nullptr;
+  const uint8_t* wsf2 = nullptr;
 };
 
 // The weight row behind row r of a block's B tile (block n0 = blockIdx.y * BN). Plain: row n0 + r. SwiGLU:
@@ -139,6 +143,8 @@ struct Loader {
   const uint8_t* b[kBPieces];
   const uint8_t* sf = nullptr;
   uint32_t sa[2], sb[kBPieces], ssf = 0;
+  uint32_t bstride[kBPieces];  // NVFP4: each piece's block bytes (a coded blob's or a raw one's, B26)
+  uint32_t sfstride = 0;       // the weight scales' bytes per K block: in the blob, or 128 in a separate copy
   int sf_kind = 0;  // 0 none, 1 activation scales (8 bytes), 2 weight scales (16 bytes)
 
   __device__ Loader(const GemmArgs& p, int m0, int n0) {
@@ -157,7 +163,8 @@ struct Loader {
       const uint8_t* w = weight_row<BN, SWIGLU>(p, n0, r, row);
       const int tile = row >> 4, rr = row & 15;
       if constexpr (FP4) {
-        b[j] = w + static_cast<size_t>(tile) * chunks * kTileBytesFp4 + (rr * 4 + u) * 16;
+        bstride[j] = (w == p.w ? p.wsf : p.wsf2) ? kValueBytesFp4 : kTileBytesFp4;
+        b[j] = w + static_cast<size_t>(tile) * chunks * bstride[j] + (rr * 4 + u) * 16;
       } else {
         // FP8 tiled block: piece ((h * 2 + q) * 8 + g) * 4 + t holds row g + 8h, values [32t + 16q, +16).
         // Stage kt covers half kt & 1 of chunk kt >> 1: units 4 (kt & 1) + u, i.e. t + 2 (kt & 1), 32 bytes on.
@@ -177,7 +184,10 @@ struct Loader {
         int row;
         const uint8_t* w = weight_row<BN, SWIGLU>(p, n0, r, row);
         const int tile = row >> 4, rr = row & 15;
-        sf = w + static_cast<size_t>(tile) * chunks * kTileBytesFp4 + 1024 + rr * 8;
+        const uint8_t* raw = w == p.w ? p.wsf : p.wsf2;
+        sfstride = raw ? 128 : kTileBytesFp4;
+        sf = raw ? raw + static_cast<size_t>(tile) * chunks * 128 + rr * 8
+                 : w + static_cast<size_t>(tile) * chunks * kTileBytesFp4 + 1024 + rr * 8;
         ssf = S::kStageA + S::kStageB + S::kStageSA + r * 8;
       }
     }
@@ -186,15 +196,14 @@ struct Loader {
   // Issues the copies of K stage `kt` (64 bytes per row) into shared-memory stage `slot`.
   __device__ __forceinline__ void load(uint8_t* smem, int slot, int kt) const {
     const uint32_t st = smem_addr(smem) + slot * S::kStageBytes;
-    const size_t boff = FP4 ? static_cast<size_t>(kt) * kTileBytesFp4
-                            : static_cast<size_t>(kt >> 1) * kTileBytesFp8 + (kt & 1) * 32;
+    const size_t boff = FP4 ? 0 : static_cast<size_t>(kt >> 1) * kTileBytesFp8 + (kt & 1) * 32;
 #pragma unroll
     for (int j = 0; j < 2; ++j) cp16(st + sa[j], a[j] + kt * kRowBytes);
 #pragma unroll
-    for (int j = 0; j < kBPieces; ++j) cp16(st + sb[j], b[j] + boff);
+    for (int j = 0; j < kBPieces; ++j) cp16(st + sb[j], b[j] + (FP4 ? static_cast<size_t>(kt) * bstride[j] : boff));
     if constexpr (FP4) {
       if (sf_kind == 1) cp8(st + ssf, sf + kt * 8);
-      else if (sf_kind == 2) cp16(st + ssf, sf + boff);
+      else if (sf_kind == 2) cp16(st + ssf, sf + static_cast<size_t>(kt) * sfstride);
     }
   }
 };
@@ -656,8 +665,10 @@ void sigmoid_mul_fp8(const float* x, const float* gate, size_t n, float input_sc
 }
 
 void prefill_gemm_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8_t* w, float alpha, float* y, int ldy,
-                        int N, int K, bool accumulate, cudaStream_t s) {
-  launch_gemm<true>(GemmArgs{xq, xs, w, alpha, y, ldy, M, N, K, accumulate}, s);
+                        int N, int K, bool accumulate, cudaStream_t s, const uint8_t* wsf) {
+  GemmArgs p{xq, xs, w, alpha, y, ldy, M, N, K, accumulate};
+  p.wsf = wsf;
+  launch_gemm<true>(p, s);
 }
 
 void narrow_bf16(const float* x, int M, const __nv_bfloat16* wa, const __nv_bfloat16* wb, float* ya, float* yb, int N,
@@ -676,7 +687,7 @@ void narrow_bf16_bf16in(const __nv_bfloat16* x, int M, const __nv_bfloat16* wa, 
 
 void prefill_swiglu_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8_t* gate, float alpha_gate,
                           const uint8_t* up, float alpha_up, int N, int K, float out_input_scale, uint8_t* q_out,
-                          uint8_t* sf_out, cudaStream_t s) {
+                          uint8_t* sf_out, cudaStream_t s, const uint8_t* gate_sf, const uint8_t* up_sf) {
   if (N % 128 != 0 || K % 128 != 0) throw std::runtime_error("prefill_swiglu_nvfp4: N % 128 and K % 128 must be 0");
   if (M < 1) return;
   GemmArgs p{xq, xs, gate, alpha_gate, nullptr, 0, M, N, K, false};
@@ -685,6 +696,8 @@ void prefill_swiglu_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uin
   p.gscale_out = 1.f / out_input_scale;
   p.q_out = q_out;
   p.sf_out = sf_out;
+  p.wsf = gate_sf;
+  p.wsf2 = up_sf;
   if ((M + kBM - 1) / kBM * (2 * N / 256) >= 96) launch_shape<true, 256, 3, true>(p, s);
   else launch_shape<true, 128, 4, true>(p, s);
   check_launch("prefill_swiglu_nvfp4");

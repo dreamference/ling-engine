@@ -49,7 +49,7 @@ std::vector<T> download(const T* d, size_t n) {
 void run(bool fp4, const float* dx, int M, int K, __half* xh, float* xinv, const uint8_t* w, const uint8_t* s,
          float gs, float* dy, int N) {
   ling::kernels::to_half_rows(dx, M, K, xh, xinv, nullptr);
-  if (fp4) ling::kernels::stream_gemm_nvfp4(xh, xinv, M, w, s, gs, dy, N, K, nullptr);
+  if (fp4) ling::kernels::stream_gemm_nvfp4(xh, xinv, M, w, nullptr, gs, dy, N, K, nullptr);
   else ling::kernels::stream_gemm_fp8(xh, xinv, M, w, gs, dy, N, K, nullptr);
 }
 
@@ -133,6 +133,52 @@ bool test_gemm() {
                   worst, same ? "yes" : "NO", good ? "ok" : "FAIL");
     }
   }
+  // B26: the same NVFP4 matrix with 6-bit scale codes streams to the same bits, at every M, alone and in one launch
+  // beside its raw copy; its tiled dequantization (with the raw scales) equals the raw blob's.
+  {
+    uint8_t table[ling::kernels::kScaleCodes], code_of[256];
+    bool same = ling::kernels::scale_code_table(s4.data(), s4.size(), table, code_of);
+    uint8_t *map = upload(std::vector<uint8_t>(code_of, code_of + 256)), *dtab = upload(std::vector<uint8_t>(table, table + 64));
+    uint8_t *coded, *raw;
+    cudaMalloc(&coded, ling::kernels::tiled_bytes_nvfp4_coded(N, K));
+    cudaMalloc(&raw, s4.size());
+    ling::kernels::retile_nvfp4_coded(rw4, ds4, map, coded, raw, N, K, nullptr);
+    for (int M : {1, 8, 12, 16, 17, 24, 32}) {
+      ling::kernels::to_half_rows(dx, M, K, xh, xinv, nullptr);
+      ling::kernels::stream_gemm_nvfp4(xh, xinv, M, dw4, nullptr, gs4, dy, N, K, nullptr);
+      const auto a = download(dy, size_t(M) * N);
+      ling::kernels::stream_gemm_nvfp4(xh, xinv, M, coded, dtab, gs4, dy, N, K, nullptr);
+      same &= download(dy, size_t(M) * N) == a;
+    }
+    {
+      __nv_bfloat16 *a, *b;
+      cudaMalloc(&a, size_t(N) * K * 2);
+      cudaMalloc(&b, size_t(N) * K * 2);
+      ling::kernels::dequant_tiled_nvfp4(dw4, gs4, a, N, K, nullptr);
+      ling::kernels::dequant_tiled_nvfp4(coded, gs4, b, N, K, nullptr, raw);
+      same &= download(a, size_t(N) * K) == download(b, size_t(N) * K);
+      cudaFree(a), cudaFree(b);
+    }
+    {
+      const int M = 12;
+      float *ya, *yb;
+      cudaMalloc(&ya, size_t(M) * N * sizeof(float));
+      cudaMalloc(&yb, size_t(M) * N * sizeof(float));
+      ling::kernels::to_half_rows(dx, M, K, xh, xinv, nullptr);
+      const ling::kernels::StreamTarget t[2] = {{coded, dtab, 0.5f, ya, N}, {dw4, nullptr, 0.25f, yb, N}};
+      ling::kernels::stream_gemm_multi(true, xh, xinv, M, t, 2, K, nullptr);
+      const auto ga = download(ya, size_t(M) * N), gb = download(yb, size_t(M) * N);
+      ling::kernels::stream_gemm_nvfp4(xh, xinv, M, dw4, nullptr, 0.5f, dy, N, K, nullptr);
+      same &= download(dy, size_t(M) * N) == ga;
+      ling::kernels::stream_gemm_nvfp4(xh, xinv, M, dw4, nullptr, 0.25f, dy, N, K, nullptr);
+      same &= download(dy, size_t(M) * N) == gb;
+      cudaFree(ya), cudaFree(yb);
+    }
+    ok &= same;
+    std::printf("stream_gemm nvfp4 with 6-bit scale codes identical to raw scales (M = 1 .. 32, dequant, mixed launch): %s\n",
+                same ? "yes ok" : "NO FAIL");
+    cudaFree(map), cudaFree(dtab), cudaFree(coded), cudaFree(raw);
+  }
   // Several matrices in one launch give exactly the separate launches' results.
   for (bool fp4 : {true, false}) {
     const int M = 16;
@@ -141,8 +187,8 @@ bool test_gemm() {
     cudaMalloc(&yb, size_t(M) * (N - 144) * sizeof(float));
     ling::kernels::to_half_rows(dx, M, K, xh, xinv, nullptr);
     // The second target: the first N - 144 rows of the same weights with another scale.
-    const ling::kernels::StreamTarget t[2] = {{fp4 ? dw4 : dw8, fp4 ? ds4 : nullptr, 0.5f, ya, N},
-                                              {fp4 ? dw4 : dw8, fp4 ? ds4 : nullptr, 0.25f, yb, N - 144}};
+    const ling::kernels::StreamTarget t[2] = {{fp4 ? dw4 : dw8, nullptr, 0.5f, ya, N},
+                                              {fp4 ? dw4 : dw8, nullptr, 0.25f, yb, N - 144}};
     ling::kernels::stream_gemm_multi(fp4, xh, xinv, M, t, 2, K, nullptr);
     const auto ga = download(ya, size_t(M) * N), gb = download(yb, size_t(M) * (N - 144));
     run(fp4, dx, M, K, xh, xinv, fp4 ? dw4 : dw8, ds4, 0.5f, dy, N);
@@ -526,9 +572,19 @@ void bench_groups() {
   };
   const int Ms[] = {1, 12, 16, 24, 32};
   double step_ms[5] = {}, step_gb = 0;
+  // LING_BENCH_CODED=1: the NVFP4 groups as B26's coded blobs (random codes, a 64-entry table).
+  const bool coded = std::getenv("LING_BENCH_CODED") && std::atoi(std::getenv("LING_BENCH_CODED")) != 0;
+  uint8_t* dtab = nullptr;
+  {
+    std::vector<uint8_t> tab(64);
+    for (int i = 0; i < 64; ++i) tab[i] = static_cast<uint8_t>(0x28 + i / 2);
+    dtab = upload(tab);
+  }
   for (const Group& gr : groups) {
     size_t bytes = 0, sizes[3];
-    for (int i = 0; i < gr.n; ++i) bytes += sizes[i] = size_t(gr.N[i]) * gr.K * (gr.fp4 ? 9 : 16) / 16;
+    for (int i = 0; i < gr.n; ++i)
+      bytes += sizes[i] = gr.fp4 && coded ? ling::kernels::tiled_bytes_nvfp4_coded(gr.N[i], gr.K)
+                                          : size_t(gr.N[i]) * gr.K * (gr.fp4 ? 9 : 16) / 16;
     const int copies = int(std::max<size_t>(2, (1024u << 20) / bytes));
     uint8_t* w;
     cudaMalloc(&w, bytes * copies);
@@ -555,7 +611,8 @@ void bench_groups() {
           const uint8_t* base = w + bytes * (it % copies);
           ling::kernels::StreamTarget t[3];
           size_t off = 0;
-          for (int i = 0; i < gr.n; ++i) t[i] = {base + off, nullptr, 1.f, y[i], gr.N[i]}, off += sizes[i];
+          for (int i = 0; i < gr.n; ++i)
+            t[i] = {base + off, gr.fp4 && coded ? dtab : nullptr, 1.f, y[i], gr.N[i]}, off += sizes[i];
           ling::kernels::stream_gemm_multi(gr.fp4, xh, xinv, M, t, gr.n, gr.K, nullptr);
         }
         cudaEventRecord(b);

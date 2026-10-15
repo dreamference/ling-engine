@@ -88,8 +88,24 @@ size_t tiled_bytes_nvfp4(int N, int K);
 size_t tiled_bytes_fp8(int N, int K);
 void retile_nvfp4(const uint8_t* w, const uint8_t* wscale, uint8_t* out, int N, int K, cudaStream_t s);
 void retile_fp8(const uint8_t* w, uint8_t* out, int N, int K, cudaStream_t s);
+// B26, the NVFP4 scales as 6-bit codes: a tensor whose block scales take at most 64 distinct E4M3 values (every
+// matrix of the target but one, and the drafter's) stores every (tile, chunk) block's 1,024 value bytes, then every
+// block's 96 bytes of codes (a lane slot's two 6-bit codes are 12 bits, the first scale's low: lane L's slots L and
+// L + 32 keep their low bytes at 2L and 2L + 1 and their high nibbles in byte 64 + L, so a lane reads one 16-bit
+// word and one byte per tile, as many loads as the raw scales; the value blocks stay 128-byte aligned), 1,120 bytes
+// per block instead of 1,152, with the tensor's 64-entry table (code -> E4M3 byte) beside it; the streaming GEMM
+// looks each code up in shared memory, so the scales it multiplies by are bit for bit the checkpoint's (lossless).
+// The prefill GEMM reads the raw scales from a separate copy (`scales`: 128 bytes per block, in the raw blob's
+// order), which only the prefill path touches.
+constexpr int kScaleCodes = 64;
+// The code of every scale byte (0xff: unused) and the table, or false when the scales take more than 64 values.
+bool scale_code_table(const uint8_t* scales, size_t n, uint8_t (&table)[kScaleCodes], uint8_t (&code_of)[256]);
+size_t tiled_bytes_nvfp4_coded(int N, int K);
+void retile_nvfp4_coded(const uint8_t* w, const uint8_t* wscale, const uint8_t* code_of_dev, uint8_t* out,
+                        uint8_t* raw_scales, int N, int K, cudaStream_t s);
 // Tiled weights -> BF16 row-major [N][K] (the prefill path's cuBLAS input).
-void dequant_tiled_nvfp4(const uint8_t* tw, float scale2, __nv_bfloat16* out, int N, int K, cudaStream_t s);
+void dequant_tiled_nvfp4(const uint8_t* tw, float scale2, __nv_bfloat16* out, int N, int K, cudaStream_t s,
+                         const uint8_t* raw_scales = nullptr);  // raw_scales: the coded blob's (B26)
 void dequant_tiled_fp8(const uint8_t* tw, float wscale, __nv_bfloat16* out, int N, int K, cudaStream_t s);
 
 // ---- Prefill GEMMs for more than 32 rows (prefill_gemm.cu): block-scaled tensor cores over the same tiled
@@ -112,8 +128,9 @@ void gated_rmsnorm_fp8(const float* x, const float* z, const __nv_bfloat16* w, i
 void sigmoid_mul_fp8(const float* x, const float* gate, size_t n, float input_scale, uint8_t* q, cudaStream_t s);
 // y[M][0..N) (rows ldy apart) = alpha * xq . W^T, or += with `accumulate`; W tiled (retile_*), alpha =
 // input_scale * the weight's global scale. N % 128 == 0, K % 128 == 0.
+// wsf (B26): a coded blob's raw scales (retile_nvfp4_coded); nullptr when the blob carries them.
 void prefill_gemm_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8_t* w, float alpha, float* y, int ldy,
-                        int N, int K, bool accumulate, cudaStream_t s);
+                        int N, int K, bool accumulate, cudaStream_t s, const uint8_t* wsf = nullptr);
 void prefill_gemm_fp8(const uint8_t* xq, int M, const uint8_t* w, float alpha, float* y, int ldy, int N, int K,
                       bool accumulate, cudaStream_t s);
 // The FFN's gate and up projections in one GEMM, straight into the down projection's input:
@@ -121,7 +138,8 @@ void prefill_gemm_fp8(const uint8_t* xq, int M, const uint8_t* w, float alpha, f
 // [M][N/2] and sf_out [M][N/16]; the FP32 products are never written. N % 128 == 0, K % 128 == 0.
 void prefill_swiglu_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8_t* gate, float alpha_gate,
                           const uint8_t* up, float alpha_up, int N, int K, float out_input_scale, uint8_t* q_out,
-                          uint8_t* sf_out, cudaStream_t s);
+                          uint8_t* sf_out, cudaStream_t s, const uint8_t* gate_sf = nullptr,
+                          const uint8_t* up_sf = nullptr);
 
 // ya = x . Wa^T, yb = x . Wb^T for two BF16 [48][K] matrices and any M, row-invariant (the prefill path's
 // DeltaNet a and b projections).
@@ -172,6 +190,7 @@ void rmsnorm_half(const float* x, const __nv_bfloat16* w, float* out, __half* xh
 // x [M][K] FP32 -> FP16 with a power-of-two scale per row (xinv[m] undoes it).
 void to_half_rows(const float* x, int M, int K, __half* out, float* xinv, cudaStream_t s);
 // y[M][N] = scale2 * x . W^T, W NVFP4 in the tiled layout (wscale is unused: the scales are in the blob).
+// wscale: the scale-code table of a coded blob (B26), nullptr when the blob carries its raw scales.
 void stream_gemm_nvfp4(const __half* x, const float* xinv, int M, const uint8_t* w, const uint8_t* wscale,
                        float scale2, float* y, int N, int K, cudaStream_t s);
 // y[M][N] = wscale * x . W^T, W FP8 E4M3 in the tiled layout.
@@ -182,7 +201,7 @@ void stream_gemm_fp8(const __half* x, const float* xinv, int M, const uint8_t* w
 // gets y = scale * x . W^T. Row-invariant like the single-matrix calls, and bit-identical to them.
 struct StreamTarget {
   const uint8_t* w;
-  const uint8_t* wscale;  // NVFP4 block scales (nullptr for FP8)
+  const uint8_t* wscale;  // NVFP4: the scale-code table of a coded blob (B26); nullptr for a raw blob and for FP8
   float scale;            // NVFP4 global scale, or the FP8 per-tensor scale
   float* y;
   int N;
