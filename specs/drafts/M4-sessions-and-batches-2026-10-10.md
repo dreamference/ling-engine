@@ -266,6 +266,27 @@ The first two-stream pair (2026-10-14) did not count: main's run took 17,483 tok
 
 **The drafter's NVFP4 scales re-fitted (BACKLOG §19.22): closed, not re-quantized.** The A/B on SGLang with production's flags at 12 drafts, M0's main set at one stream, seeds 1013 and 2026, alternating (2026-10-14): accepted tokens per step NVFP4 4.829 and 4.610, BF16 4.897 and 4.750. Paired by request (136 warm requests, both seeds), BF16 over NVFP4 is 1.023, 95% bootstrap interval 0.983-1.066, while the same arm moves 4.5% (NVFP4) and 3.0% (BF16) between the two seeds: BF16 does not win beyond the run-to-run spread, the item's condition for re-quantizing. The BF16 drafter's step on SGLang is 118 ms against 107 (41.5 and 40.2 tokens/s against 45.0 and 42.9), so it is no serving option either. The outputs of the two arms diverge (a different drafter changes which random draws a seeded request makes), so acceptance was compared on diverging text, part of the spread.
 
+### Stage 5, the gate run, as measured (2026-10-15)
+
+On main `f549b0e` (the kept step savings) with B31's knob cherry-picked for the block-16 arm (branch `steps/stage5`, `5f03234`); the moonshot's P1 missed its own gate and is not in. One production-down session on second-puffin; production's reference is a scratch SGLang with production's flags (12 drafts, request logging) in the same session, seed 1013 for both. Engine figures are ling-serve's request lines pooled per stream (decode tokens over decode seconds; step period = decode seconds over passes); production's are SGLang's request log by the same definition (`bench/replay/server_stats.py`).
+
+| Line (§5) | Requirement | Engine | Production, same session | |
+| --- | --- | --- | --- | --- |
+| Decode per stream, two streams | ≥ 33.9 tokens/s pooled | 34.2 and 34.3 (5.02 tokens per step; both runs the same 17,531 tokens in 3,490 passes) | 36.1 and 33.0 (4.95 and 4.69 accepted per step; the second run on a warm cache), 34.6 pooled | met |
+| Step period per stream | ≤ 145 ms | 146.7 and 146.4 ms | 137.1 and 142.1 ms | missed by 1.6 ms |
+| Aggregate, prefill included | ≥ 49.4 output tokens/s | 45.5 and 45.6 | 53.1 and 50.6 | missed: the engine's server-side prefill time at two streams is 265 s against production's 188 s (at one stream 122 against 140); the outputs also differ in length (19,464 against 21,932 tokens) |
+| Single stream, same build | ≤ 110.5 ms | 101.1 and 101.2 ms, 49.3 tokens/s (4.99 tokens per step) | 107.3 ms, 48.0 tokens/s (5.16) | met |
+| Admission | gauge ≥ 98,304 | 131,072 | | met (the harness's own two-task log not run) |
+| First requests | reported | cold requests' time to first token at two streams, median 11.1 s; a 35K-token prefill beside a decode: 36.9 s (889 tokens/s) with the other stream at 282 ms per step during it (92 before, 96 after) | median 8.1 and 12.6 s; the 35K prefill 19.8 s (1,653 tokens/s) with the other stream stalled at 2,107 ms per step during it | reported |
+| Soak | 8 h, no restart, memory flat | the night of 2026-10-15 | | pending |
+| Exactness | section 4; concurrency 2 the same as 1 | `--spec-check` (two ways), `--batch-check` (four, with graphs), same as main greedy and seeded; greedy replay at one and two streams: the same 18,030 tokens in the same 2,988 passes (the replay script on main records no output hash); `serve_smoke.py` from two clients at once, all OK; `tests/server` not rerun (B26's tree passed 58 and 3 xfailed; B31 adds 18 lines that are off by default) | | met |
+
+**B31 at batch 2:** a block of 16 gave 34.4 and 34.5 tokens/s per stream at 148.8 and 148.6 ms (17,595 tokens in 3,436 passes, 5.12 per step), +0.6% per stream and a lower aggregate (44.1); the default stays 12.
+
+**Against the production bar of MILESTONES §14:** one stream is faster than production (49.3 against 48.0 tokens/s, +2.7%); two streams are 1% below production's pooled figure (34.25 against 34.6), inside production's own spread between its two runs (36.1 and 33.0) but not "no slower". What separates them at two streams is prefill: production prefills a new prompt between decode steps at about twice the engine's rate and stalls the other stream to do it; the engine keeps the other stream moving. The prefill beside decode (section 6 item 6) is the next lever.
+
+**Open, not investigated:** every ling-serve replay (this one and stage 4's) reports prompts 991 tokens longer than the recorded ones (median 21,382 against 20,391 on cold requests), SGLang none. Either ling-serve counts `usage.input_tokens` differently or its rendering differs from production's on M0's main set; it inflates the engine's prefill work if real.
+
 ## 7. Questions for the owner, answered
 
 All eight were answered by the owner on 2026-10-10; each answer follows its question. The next step is the build order of section 6.
