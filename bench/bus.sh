@@ -15,7 +15,7 @@ start() {  # kind arg
   case $1 in
   mem) "$O/bus_neighbour" "$2" 5 0 > "$O/nb-$LABEL.txt" 2>&1 & NB=$! ;;
   index) (cd "$REPO" && while true; do ~/.local/bin/ling-code forget > /dev/null 2>&1; /usr/bin/time -f "index %e s %M KB" ~/.local/bin/ling-code index --wait; done) > "$O/nb-$LABEL.txt" 2>&1 & NB=$! ;;
-  pytest) (while true; do docker run --rm --name steps-bus-pytest -v "$PYSRC":/src:ro -w /src "$PYIMG" sh -c "cp -r /src /tmp/w && cd /tmp/w && python -m pytest tests -q -x -p no:cacheprovider 2>&1 | tail -1"; done) > "$O/nb-$LABEL.txt" 2>&1 & NB=$! ;;
+  pytest) (while true; do docker run --rm --name steps-bus-pytest -v "$PYSRC":/src:ro -w /src "$PYIMG" sh -c "cp -r /src /tmp/w && cd /tmp/w && python -m pytest tests -q -p no:cacheprovider 2>&1 | tail -1"; done) > "$O/nb-$LABEL.txt" 2>&1 & NB=$! ;;
   esac
   sleep 30
 }
