@@ -5,7 +5,6 @@
 
 #include <cstdint>
 
-#include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -57,7 +56,7 @@ __device__ __forceinline__ int seq_pos(const SeqBatch& b, int s) { return b.pos_
 void set_pdl(bool on);
 bool pdl_enabled();
 
-// Largest M the weight-streaming GEMV kernels handle; larger M dequantizes to BF16 and uses cuBLAS.
+// Largest M the weight-streaming GEMV kernels handle; larger M dequantizes to BF16 and uses gemm_bf16.
 constexpr int kMaxGemvRows = 8;
 
 // y[M][N] = scale2 * x[M][K] . W[N][K]^T, W NVFP4: packed [N][K/2] (low nibble first), E4M3 block
@@ -103,7 +102,7 @@ bool scale_code_table(const uint8_t* scales, size_t n, uint8_t (&table)[kScaleCo
 size_t tiled_bytes_nvfp4_coded(int N, int K);
 void retile_nvfp4_coded(const uint8_t* w, const uint8_t* wscale, const uint8_t* code_of_dev, uint8_t* out,
                         uint8_t* raw_scales, int N, int K, cudaStream_t s);
-// Tiled weights -> BF16 row-major [N][K] (the prefill path's cuBLAS input).
+// Tiled weights -> BF16 row-major [N][K] (the prefill path's BF16 GEMM input).
 void dequant_tiled_nvfp4(const uint8_t* tw, float scale2, __nv_bfloat16* out, int N, int K, cudaStream_t s,
                          const uint8_t* raw_scales = nullptr);  // raw_scales: the coded blob's (B26)
 void dequant_tiled_fp8(const uint8_t* tw, float wscale, __nv_bfloat16* out, int N, int K, cudaStream_t s);
@@ -214,14 +213,15 @@ void stream_gemm_multi(bool nvfp4, const __half* x, const float* xinv, int M, co
 size_t topk_scratch_floats(int rows, int K);
 void topk_rows(const float* x, int rows, int V, int K, float* scratch, float* vals, int* ids, cudaStream_t s);
 
-// Dequantize a whole matrix to BF16 (for the cuBLAS path).
+// Dequantize a whole matrix to BF16 (for the BF16 GEMM path).
 void dequant_nvfp4(const uint8_t* w, const uint8_t* wscale, float scale2, __nv_bfloat16* out, int N, int K,
                    cudaStream_t s);
 void dequant_fp8(const uint8_t* w, float wscale, __nv_bfloat16* out, int N, int K, cudaStream_t s);
 void to_bf16(const float* x, __nv_bfloat16* out, int n, cudaStream_t s);
-// y[M][N] = x[M][K] . W[N][K]^T with BF16 inputs and FP32 output, on tensor cores.
-void gemm_bf16_cublas(cublasHandle_t h, const __nv_bfloat16* x, int M, const __nv_bfloat16* w, float* y,
-                      int N, int K);
+// y[M][N] = x[M][K] . W[N][K]^T with BF16 inputs and FP32 output, on tensor cores (gemm_bf16.cu; it
+// replaced cuBLAS, BACKLOG §19.23). K % 64 == 0, N even, x and W 16-byte aligned; any M. A row's result
+// does not depend on M. Graph-capturable.
+void gemm_bf16(const __nv_bfloat16* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s);
 
 void embed(const __nv_bfloat16* table, const int* ids, int M, int H, float* out, cudaStream_t s);
 // out[r] = x[r] * rsqrt(mean(x[r]^2) + eps) * (gemma ? 1 + w : w), rows of length H.

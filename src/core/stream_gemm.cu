@@ -543,7 +543,7 @@ __global__ void retile_nvfp4_coded_scales_kernel(const uint8_t* __restrict__ s, 
 
 __constant__ float kE2M1[16] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
 
-// Tiled layout -> BF16 row-major (the prefill path's cuBLAS input), one thread per output pair (NVFP4)
+// Tiled layout -> BF16 row-major (the prefill path's BF16 GEMM input), one thread per output pair (NVFP4)
 // or element (FP8).
 __global__ void dequant_tiled_nvfp4_kernel(const uint8_t* __restrict__ tw, float scale2, __nv_bfloat16* __restrict__ out,
                                            int N, int K, const uint8_t* __restrict__ raw) {
