@@ -6,7 +6,13 @@
 B is `bench/replay/replay.py --dump-bodies` output (the Responses requests a replay sends); R is
 `sglang_render.py`'s output for the same file, run inside production's SGLang image (the token ids
 production's scheduler receives). The test converts every body with `ling-template --responses` and
-compares token ids, request by request; it passes only if every request is identical. Recorded
+compares token ids, request by request; it passes only if every request is identical.
+
+Bodies with a Responses `custom` tool (Code Mode's `exec`) differ by that tool, by design: ling-serve runs
+custom tools and SGLang drops them. Dump the bodies with `replay.py --custom-tools drop` (what SGLang
+prefilled) or `--custom-tools function` (what `ling` sends SGLang since 2026-10-12) for the reference; on
+M0's main set all three forms are token-identical, 144/144 (2026-10-16), the custom form against the
+function form's reference included. Recorded
 sessions are private: B and R stay on the machine that holds them, so the test skips (exit 0) when
 they are absent.
 """

@@ -285,7 +285,18 @@ On main `f549b0e` (the kept step savings) with B31's knob cherry-picked for the 
 
 **Against the production bar of MILESTONES §14:** one stream is faster than production (49.3 against 48.0 tokens/s, +2.7%); two streams are 1% below production's pooled figure (34.25 against 34.6), inside production's own spread between its two runs (36.1 and 33.0) but not "no slower". What separates them at two streams is prefill: production prefills a new prompt between decode steps at about twice the engine's rate and stalls the other stream to do it; the engine keeps the other stream moving. The prefill beside decode (section 6 item 6) is the next lever.
 
-**Open, not investigated:** every ling-serve replay (this one and stage 4's) reports prompts 991 tokens longer than the recorded ones (median 21,382 against 20,391 on cold requests), SGLang none. Either ling-serve counts `usage.input_tokens` differently or its rendering differs from production's on M0's main set; it inflates the engine's prefill work if real.
+**The 991 tokens, found (2026-10-16): Code Mode's `exec`, which ling-serve runs and SGLang drops.** M0's capture (`tools-capture.json`, `tools-index.json`, 2026-10-07) offers `exec` as a Responses `custom` tool. ling-serve renders a custom tool as a function (BACKLOG §19.13, after M2's render test had passed 144/144); SGLang v0.5.19 drops it without a word, so production prefilled, and the sessions were recorded with, a tool list without `exec`. That one line of `<tools>`, 991 tokens, is the whole difference. Rendered through SGLang's own conversion in production's image (`bench/render/sglang_render.py`) and through `ling-template --responses`: with the custom tool left out, 144/144 requests token-identical; with `exec` as the function `ling` sends SGLang since 2026-10-12 (ling-rs/tools `as_function`), SGLang's prompt equals ling-serve's rendering of the custom tool, 144/144, so today's production prefills those 991 tokens too. ling-serve's renderer is unchanged; `bench/replay/replay.py --custom-tools drop` sends what production prefilled when the sessions were recorded, and a unit test (`ling-api-tests`) pins custom = function form and dropped = custom less the tool's line. Like for like (the stage-5 build, `--custom-tools drop`, seed 1013, 2026-10-16), against production's stage-5 reference above:
+
+| | Engine, tools as captured (stage 5) | Engine, custom tool dropped | Production (stage 5) |
+| --- | --- | --- | --- |
+| Prompt against recorded, median | +991 | 0 | 0 |
+| One stream: decode, step | 49.3 tokens/s, 101.1 ms, 4.99 tokens per step | 48.0 tokens/s, 101.0 ms, 4.85 | 48.0 tokens/s, 107.3 ms |
+| One stream: aggregate; server prefill | 38.0; 121.9 s | 38.3; 120.6 s | 34.7; 140.5 s |
+| Two streams: decode per stream, step | 34.2 and 34.3 at 146.7 and 146.4 ms | 33.3 and 33.3 at 145.7 and 145.5 ms (both runs the same 20,507 warm tokens in 4,231 passes, 4.85 per step) | 36.1 and 33.0 at 137.1 and 142.1 ms |
+| Two streams: aggregate; server prefill | 45.5 and 45.6; 265 s | 46.9 and 47.0; 266.3 and 266.3 s | 53.1 and 50.6; 187.8 and 195.0 s |
+| Output tokens, all requests | 19,529 | 22,589 | 21,932 and 21,797 |
+
+Without `exec` in the prompt the model writes longer answers (closer to production's length) at a lower acceptance (4.85 against 4.99-5.02 tokens per step), which moves the per-stream decode below the 33.9 line while the step period comes to 145.6 ms. The prefill gap at two streams does not move: 266 s against production's 188-195 s with the prompts now identical, so it is the schedule (prefill in 256-token chunks beside a decode, section 6 item 6), not the prompt. Production replays of this set stay valid as they are; engine replays compare like for like only with `--custom-tools drop` (or both arms with `function`).
 
 ## 7. Questions for the owner, answered
 
