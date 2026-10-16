@@ -1,7 +1,7 @@
 // ling_force: the engine side of the agreement study (bench/agreement/run.sh), built by hand against any
 // ling-engine build's libraries so older builds can be scored too:
 //   nvcc -std=c++20 -O2 -gencode arch=compute_121a,code=sm_121a -I$SRC/src ling_force.cpp \
-//        $SRC/build/libling_core.a $SRC/build/libling_tokenizer.a -lcublas -lpcre2-8 -licuuc -o ling-force
+//        $SRC/build/libling_core.a $SRC/build/libling_tokenizer.a -lpcre2-8 -licuuc -o ling-force
 //   ling-force tokenize MODEL < prompts.jsonl            -> {"ids": [...]} per line (prompt strings, JSON)
 //   ling-force score MODEL K < cases.jsonl               -> per case: engine top-K log-probs at each forced position
 //        case: {"prompt": [ids], "cont": [ids]}; position j scores the token after prompt + cont[:j]

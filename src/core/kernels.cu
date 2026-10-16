@@ -1031,15 +1031,6 @@ void to_bf16(const float* x, __nv_bfloat16* out, int n, cudaStream_t s) {
   LING_LAUNCH_CHECK("to_bf16");
 }
 
-void gemm_bf16_cublas(cublasHandle_t h, const __nv_bfloat16* x, int M, const __nv_bfloat16* w, float* y, int N,
-                      int K) {
-  const float alpha = 1.f, beta = 0.f;
-  cublasStatus_t st = cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, w, CUDA_R_16BF, K, x,
-                                   CUDA_R_16BF, K, &beta, y, CUDA_R_32F, N, CUBLAS_COMPUTE_32F,
-                                   CUBLAS_GEMM_DEFAULT);
-  if (st != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasGemmEx failed: " + std::to_string(st));
-}
-
 void embed(const __nv_bfloat16* table, const int* ids, int M, int H, float* out, cudaStream_t s) {
   launch_kernel("embed", embed_kernel, dim3(M), dim3(256), 0, s, table, ids, H, out);
 }
