@@ -39,7 +39,7 @@ echo "build $BUILD, model $M, study $STUDY, prompt $P35" | tee summary.txt
 if [ ! -x "$FORCE" ] || [ "$BUILD/libling_core.a" -nt "$FORCE" ]; then  # the agreement study's engine tool, built against this build's libraries (no GPU needed)
   NVCC=${NVCC:-$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)}
   "$NVCC" -std=c++20 -O2 -gencode arch=compute_121a,code=sm_121a -I"$SRC/src" "$H/agreement/ling_force.cpp" \
-    "$BUILD/libling_core.a" "$BUILD/libling_tokenizer.a" -lcublas -lpcre2-8 -licuuc -o "$FORCE"
+    "$BUILD/libling_core.a" "$BUILD/libling_tokenizer.a" -lpcre2-8 -licuuc -o "$FORCE"
 fi
 
 # ---- 1. Timing: off, on, on, off (alternated so clocks and temperature affect both alike) ----

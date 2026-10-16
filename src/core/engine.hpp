@@ -25,7 +25,6 @@
 #include <string>
 #include <vector>
 
-#include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -305,7 +304,7 @@ class Engine {
   }
   bool xq_is(float scale, bool nvfp4) const { return scale != 0.f && xq_scale_ == scale && xq_nvfp4_ == nvfp4; }
   void linear_bf16(const Bf16Weight& w, const float* x, int M, float* y);
-  void linear_bf16_cublas(const Bf16Weight& w, const float* x, int M, float* y);  // the drafter's BF16 matrices
+  void linear_bf16_drafter(const Bf16Weight& w, const float* x, int M, float* y);  // the drafter's BF16 matrices
   // DeltaNet and conv state, saved or restored as a whole.
   struct StateSlot {
     std::vector<float*> gdn, conv;
@@ -410,7 +409,6 @@ class Engine {
   std::unique_ptr<Model> model_;
   std::unique_ptr<DraftModel> draft_;
   cudaStream_t stream_ = nullptr;
-  cublasHandle_t cublas_ = nullptr;
   std::vector<void*> buffers_;
   template <typename T>
   T* alloc(size_t count);

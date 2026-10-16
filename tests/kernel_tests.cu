@@ -1,7 +1,8 @@
 // Checks the weight-streaming kernels against a host reference on random data, for every row count the
-// GEMV path takes and for the cuBLAS path.
+// GEMV path takes and for the BF16 GEMM (gemm_bf16) path.
 #include <cuda_fp8.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -55,10 +56,8 @@ int main() {
   }
   const float scale2 = 0.37f, scale8 = 0.021f;
   uint8_t *dw4 = upload(w4), *ds4 = upload(s4), *dw8 = upload(w8);
-  cublasHandle_t h;
-  cublasCreate(&h);
 
-  for (int M : {1, 2, 3, 5, 8, 33}) {
+  for (int M : {1, 2, 3, 5, 8, 33, 200}) {
     std::vector<float> x(size_t(M) * K);
     for (auto& v : x) v = normal(rng);
     float* dx = upload(x);
@@ -90,8 +89,15 @@ int main() {
       cudaMalloc(&xb, size_t(M) * K * 2);
       ling::kernels::to_bf16(dx, xb, M * K, nullptr);
       ling::kernels::dequant_nvfp4(dw4, ds4, scale2, wb, N, K, nullptr);
-      ling::kernels::gemm_bf16_cublas(h, xb, M, wb, dy, N, K);
+      ling::kernels::gemm_bf16(xb, M, wb, dy, N, K, nullptr);
       cudaMemcpy(got.data(), dy, got.size() * sizeof(float), cudaMemcpyDeviceToHost);
+      // A row's result does not depend on M: the last row alone gives the same bits.
+      std::vector<float> one(N);
+      ling::kernels::gemm_bf16(xb + size_t(M - 1) * K, 1, wb, dy, N, K, nullptr);
+      cudaMemcpy(one.data(), dy, N * sizeof(float), cudaMemcpyDeviceToHost);
+      const bool invariant = std::equal(one.begin(), one.end(), got.begin() + size_t(M - 1) * N);
+      std::printf("%-26s M=%-3d row-invariant %s\n", "gemm_bf16", M, invariant ? "ok" : "FAIL");
+      ok &= invariant;
       // BF16 inputs: a looser bound.
       // BF16 inputs: compare the worst error with the outputs' RMS, a looser bound.
       double worst = 0, rms = 0;
@@ -100,7 +106,7 @@ int main() {
         rms += double(ref4[i]) * ref4[i];
       }
       worst /= std::sqrt(rms / got.size());
-      std::printf("%-26s M=%-3d max err / rms %.2e %s\n", "dequant_nvfp4+cublas", M, worst, worst < 2e-2 ? "ok" : "FAIL");
+      std::printf("%-26s M=%-3d max err / rms %.2e %s\n", "dequant_nvfp4+gemm_bf16", M, worst, worst < 2e-2 ? "ok" : "FAIL");
       ok &= worst < 2e-2;
       cudaFree(wb);
       cudaFree(xb);
