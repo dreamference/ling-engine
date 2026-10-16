@@ -43,9 +43,6 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   model_ = std::make_unique<Model>(model_dir);
   const ModelConfig& c = model_->config();
   check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream");
-  if (cublasCreate(&cublas_) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasCreate failed");
-  cublasSetStream(cublas_, stream_);
-  cublasSetMathMode(cublas_, CUBLAS_DEFAULT_MATH);
 
   const size_t M = opts_.prefill_chunk;
   const int C = c.lin_conv_channels(), Vs = c.lin_value_size();
@@ -172,7 +169,6 @@ Engine::~Engine() {
     for (const auto& [phase, sec] : phase_seconds_) std::fprintf(stderr, "profile %-24s %8.3f s\n", phase.c_str(), sec);
   }
   for (void* p : buffers_) cudaFree(p);
-  if (cublas_) cublasDestroy(cublas_);
   if (commit_done_) cudaEventDestroy(commit_done_);
   if (commit_stream_) cudaStreamDestroy(commit_stream_);
   if (stream_) cudaStreamDestroy(stream_);
@@ -534,21 +530,21 @@ void Engine::linear_bf16(const Bf16Weight& w, const float* x, int M, float* y) {
     kernels::bf16_rows(x, M, w.w, y, w.N, w.K, stream_);
     return;
   }
-  // cuBLAS would need a preset workspace inside a graph capture; no step matrix takes this path.
-  if (use_dev_pos_) throw std::runtime_error("cuBLAS inside a step graph");
+  // No step matrix takes this path (it was cuBLAS's, which a graph capture could not take).
+  if (use_dev_pos_) throw std::runtime_error("the BF16 GEMM inside a step graph");
   kernels::to_bf16(x, x_bf16_, M * w.K, stream_);
-  kernels::gemm_bf16_cublas(cublas_, x_bf16_, M, w.w, y, w.N, w.K);
+  kernels::gemm_bf16(x_bf16_, M, w.w, y, w.N, w.K, stream_);
 }
 
-void Engine::linear_bf16_cublas(const Bf16Weight& w, const float* x, int M, float* y) {
-  if (M <= kernels::kMaxStreamRows && w.K % 1024 == 0) {  // stream the weights once (cuBLAS: ~90 GB/s here)
+void Engine::linear_bf16_drafter(const Bf16Weight& w, const float* x, int M, float* y) {
+  if (M <= kernels::kMaxStreamRows && w.K % 1024 == 0) {  // stream the weights once
     kernels::bf16_rows(x, M, w.w, y, w.N, w.K, stream_);
     return;
   }
-  // cuBLAS would need a preset workspace inside a graph capture; no step matrix takes this path.
-  if (use_dev_pos_) throw std::runtime_error("cuBLAS inside a step graph");
+  // No step matrix takes this path (it was cuBLAS's, which a graph capture could not take).
+  if (use_dev_pos_) throw std::runtime_error("the BF16 GEMM inside a step graph");
   kernels::to_bf16(x, x_bf16_, M * w.K, stream_);
-  kernels::gemm_bf16_cublas(cublas_, x_bf16_, M, w.w, y, w.N, w.K);
+  kernels::gemm_bf16(x_bf16_, M, w.w, y, w.N, w.K, stream_);
 }
 
 void Engine::linear_fp8(const Fp8Weight& w, const float* x, int M, float* y, bool x_ready) {

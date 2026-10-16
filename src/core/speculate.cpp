@@ -272,8 +272,8 @@ void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
     kernels::bf16_rows_bf16in(cap_ + size_t(cap_row0) * cap_stride_, rows, draft_->fc().w, dctx_, d.hidden, cap_stride_,
                               stream_);
   else
-    kernels::gemm_bf16_cublas(cublas_, cap_ + size_t(cap_row0) * cap_stride_, rows, draft_->fc().w, dctx_, d.hidden,
-                              cap_stride_);
+    kernels::gemm_bf16(cap_ + size_t(cap_row0) * cap_stride_, rows, draft_->fc().w, dctx_, d.hidden, cap_stride_,
+                       stream_);
   kernels::rmsnorm(dctx_, draft_->hidden_norm(), dctx_, rows, d.hidden, d.eps, false, stream_);
   for (int l = 0; l < d.layers; ++l) {
     const DraftLayer& L = draft_->layers()[l];
@@ -301,7 +301,7 @@ void Engine::draft_launch(int B) {
     if (l > 0) kernels::add_inplace(dres_, dout_, B * H, stream_);
     kernels::rmsnorm(dres_, L.input_norm, dh_, B, H, d.eps, false, stream_);
     // Attention wrapped in the grouped conv: input side 0, output side 1, one kernel projection.
-    linear_bf16_cublas(L.attn_kproj, dh_, B, dcoef_);
+    linear_bf16_drafter(L.attn_kproj, dh_, B, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.attn_base, 0, dh2_, B, H, d.conv_groups, B, stream_);
     linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, B);
     kernels::draft_qk_rope(dq_, B, d.heads, dq, L.q_norm, dpos(), d.rope_theta, d.eps, stream_);
@@ -313,7 +313,7 @@ void Engine::draft_launch(int B) {
     kernels::add_inplace(dres_, dout_, B * H, stream_);
     kernels::rmsnorm(dres_, L.post_norm, dh_, B, H, d.eps, false, stream_);
     // The MLP, wrapped the same way.
-    linear_bf16_cublas(L.mlp_kproj, dh_, B, dcoef_);
+    linear_bf16_drafter(L.mlp_kproj, dh_, B, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.mlp_base, 0, dh2_, B, H, d.conv_groups, B, stream_);
     linear_fp4_multi({{&L.gate, dg_}, {&L.up, du_}}, dh2_, B);
     kernels::silu_mul(dg_, du_, dg_, B * d.intermediate, stream_);
@@ -326,7 +326,7 @@ void Engine::draft_launch(int B) {
   kernels::rmsnorm(dres_ + H, draft_->norm(), dh_, E, H, d.eps, false, stream_);
   linear_fp4(model_->lm_head(), dh_, E, dlogits_);
   kernels::topk_rows(dlogits_, E, c.vocab, K16, topk_scratch_, dunary_, dcand_, stream_);
-  linear_bf16_cublas(draft_->selector_projection(), dh_, E, dhp_);
+  linear_bf16_drafter(draft_->selector_projection(), dh_, E, dhp_);
   kernels::selector_lattice(dhp_, dcand_, dunary_, draft_->predecessor_codebook(), draft_->successor_codebook(),
                             pin_->draft_ids[0], E, dscores_, stream_, ids_dev_);
   check(cudaMemcpyAsync(pin_->cand, dcand_, size_t(E) * K16 * sizeof(int), cudaMemcpyDeviceToHost, stream_),
@@ -364,7 +364,7 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B) {
     // never crosses a block), RoPE and attention per sequence through sb.
     if (l > 0) kernels::add_inplace(dres_, dout_, R * H, stream_);
     kernels::rmsnorm(dres_, L.input_norm, dh_, R, H, d.eps, false, stream_);
-    linear_bf16_cublas(L.attn_kproj, dh_, R, dcoef_);
+    linear_bf16_drafter(L.attn_kproj, dh_, R, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.attn_base, 0, dh2_, R, H, d.conv_groups, B, stream_);
     linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, R);
     kernels::draft_qk_rope_seqs(dq_, d.heads, dq, L.q_norm, sb, d.rope_theta, d.eps, stream_);
@@ -375,7 +375,7 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B) {
     kernels::grouped_conv(dh2_, dcoef_, L.attn_base, 1, dout_, R, H, d.conv_groups, B, stream_);
     kernels::add_inplace(dres_, dout_, R * H, stream_);
     kernels::rmsnorm(dres_, L.post_norm, dh_, R, H, d.eps, false, stream_);
-    linear_bf16_cublas(L.mlp_kproj, dh_, R, dcoef_);
+    linear_bf16_drafter(L.mlp_kproj, dh_, R, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.mlp_base, 0, dh2_, R, H, d.conv_groups, B, stream_);
     linear_fp4_multi({{&L.gate, dg_}, {&L.up, du_}}, dh2_, R);
     kernels::silu_mul(dg_, du_, dg_, R * d.intermediate, stream_);
@@ -390,7 +390,7 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B) {
                      stream_);
   linear_fp4(model_->lm_head(), dh_, n * E, dlogits_);
   kernels::topk_rows(dlogits_, n * E, c.vocab, K16, topk_scratch_, dunary_, dcand_, stream_);
-  linear_bf16_cublas(draft_->selector_projection(), dh_, n * E, dhp_);
+  linear_bf16_drafter(draft_->selector_projection(), dh_, n * E, dhp_);
   const int rank = d.selector_rank;
   for (int i = 0; i < n; ++i)
     kernels::selector_lattice(dhp_ + size_t(i) * E * rank, dcand_ + size_t(i) * E * K16, dunary_ + size_t(i) * E * K16,
