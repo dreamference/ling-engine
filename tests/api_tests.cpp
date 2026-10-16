@@ -391,6 +391,38 @@ int main() {
     EXPECT(c.find("\"name\": \"shell\"") != std::string::npos && c.find("apply_patch") == std::string::npos);
   }
   {
+    // The prompt against production's (2026-10-16): a custom tool renders exactly as the function `ling`
+    // offers SGLang in its place (ling-rs/tools custom.rs `as_function`), so ling-serve and today's
+    // production prefill the same prompt; SGLang drops a custom tool sent as it is, and that prompt is
+    // this one less the tool's own line in <tools>. Recorded sessions of 2026-10-07 offered `exec`
+    // custom to SGLang: replayed as captured on ling-serve they prefill that line more (991 tokens on
+    // M0's main set; bench/replay/replay.py --custom-tools, bench/render/render_test.py).
+    const char* input = R"("reasoning":{"effort":"none"},"input":[{"type":"message","role":"user","content":"run it"}])";
+    const json custom = json::parse(std::string(R"({"tools":[{"type":"custom","name":"exec","description":"Run JS.",
+      "format":{"type":"grammar","syntax":"lark","definition":"start: SOURCE"}},
+      {"type":"function","name":"wait","description":"Wait.","strict":false,"parameters":{"type":"object"}}],)") +
+                                    input + "}");
+    const json function = json::parse(std::string(R"({"tools":[{"type":"function","name":"exec",
+      "description":"Run JS.\n\nThe input must follow this lark grammar:\nstart: SOURCE","strict":false,
+      "parameters":{"type":"object","properties":{"input":{"type":"string","description":"The tool's input, as free text"}},"required":["input"]}},
+      {"type":"function","name":"wait","description":"Wait.","strict":false,"parameters":{"type":"object"}}],)") +
+                                      input + "}");
+    const json dropped = json::parse(std::string(R"({"tools":[
+      {"type":"function","name":"wait","description":"Wait.","strict":false,"parameters":{"type":"object"}}],)") +
+                                     input + "}");
+    const std::string tc = ling::serve::parse_responses_request(custom).prompt_text;
+    const std::string tf = ling::serve::parse_responses_request(function).prompt_text;
+    const std::string td = ling::serve::parse_responses_request(dropped).prompt_text;
+    EXPECT(tc == tf);
+    const std::string line = "\n{\"type\": \"function\", \"function\": {\"description\": \"Run JS.\\n\\nThe input must "
+                             "follow this lark grammar:\\nstart: SOURCE\", \"name\": \"exec\", \"parameters\": {\"type\": "
+                             "\"object\", \"properties\": {\"input\": {\"type\": \"string\", \"description\": \"The tool's "
+                             "input, as free text\"}}, \"required\": [\"input\"]}, \"strict\": false}, \"defer_loading\": null}";
+    const size_t at = tc.find(line);
+    EXPECT(at != std::string::npos);
+    if (at != std::string::npos) EXPECT(std::string(tc).erase(at, line.size()) == td);
+  }
+  {
     // vllm#53284, vllm#52738: reasoning_effort "none" on chat completions means thinking off, as it
     // already does on the Responses path (it used to be a 400, "Unexpected reasoning effort none").
     json body = json::parse(R"({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"})");
