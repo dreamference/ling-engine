@@ -1,5 +1,6 @@
 #include "core/engine.hpp"
 
+#include <cuda.h>
 #include <nvtx3/nvToolsExt.h>
 
 #include <algorithm>
@@ -23,6 +24,45 @@ struct NvtxRange {
   ~NvtxRange() { nvtxRangePop(); }
 };
 
+void check_cu(CUresult r, const char* what) {
+  if (r != CUDA_SUCCESS) {
+    const char* m = nullptr;
+    cuGetErrorString(r, &m);
+    throw std::runtime_error(std::string(what) + ": " + (m ? m : "?"));
+  }
+}
+
+// The side pass's stream (EngineOptions::side_prefill): on a green context of `sms` SMs (its kernels then run on
+// those SMs only, while the main stream's work takes any SM), or a plain non-blocking stream when sms < 0.
+cudaStream_t make_side_stream(int sms, void** green) {
+  if (sms < 0) {
+    cudaStream_t st;
+    check(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "side stream");
+    return st;
+  }
+  CUdevice dev;
+  CUdevResource all, part, rest;
+  unsigned groups = 1;
+  CUdevResourceDesc desc;
+  CUgreenCtx g;
+  CUstream st;
+  check_cu(cuDeviceGet(&dev, 0), "cuDeviceGet");
+  check_cu(cuDeviceGetDevResource(dev, &all, CU_DEV_RESOURCE_TYPE_SM), "cuDeviceGetDevResource");
+  check_cu(cuDevSmResourceSplitByCount(&part, &groups, &all, &rest, 0, static_cast<unsigned>(sms)),
+           "cuDevSmResourceSplitByCount");
+  check_cu(cuDevResourceGenerateDesc(&desc, &part, 1), "cuDevResourceGenerateDesc");
+  check_cu(cuGreenCtxCreate(&g, desc, dev, CU_GREEN_CTX_DEFAULT_STREAM), "cuGreenCtxCreate");
+  check_cu(cuGreenCtxStreamCreate(&st, g, CU_STREAM_NON_BLOCKING, 0), "cuGreenCtxStreamCreate");
+  *green = g;
+  std::fprintf(stderr, "side stream: green context of %u of %u SMs\n", part.sm.smCount, all.sm.smCount);
+  return reinterpret_cast<cudaStream_t>(st);
+}
+
+void destroy_side_stream(cudaStream_t st, void* green) {
+  cudaStreamDestroy(st);
+  if (green) cuGreenCtxDestroy(static_cast<CUgreenCtx>(green));
+}
+
 }  // namespace
 
 template <typename T>
@@ -39,15 +79,14 @@ template __half* Engine::alloc<__half>(size_t);
 template __nv_bfloat16* Engine::alloc<__nv_bfloat16>(size_t);
 template uint8_t* Engine::alloc<uint8_t>(size_t);
 
-Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
-  model_ = std::make_unique<Model>(model_dir);
+// The scratch one pass writes (the activations of a prefill chunk, the quantized copies, the attention partials, the
+// last row's logits, the rows path's FP16 copies), into the members named now: the main set, or the side set while
+// swapped (side_prefill).
+void Engine::alloc_scratch() {
   const ModelConfig& c = model_->config();
-  check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream");
-
   const size_t M = opts_.prefill_chunk;
   const int C = c.lin_conv_channels(), Vs = c.lin_value_size();
   const int qsize = c.heads * c.head_dim, kvsize = c.kv_heads * c.head_dim;
-  h_ = alloc<float>(M * c.hidden);
   xn_ = alloc<float>(M * c.hidden);
   t1_ = alloc<float>(M * c.intermediate);
   t2_ = alloc<float>(M * c.intermediate);
@@ -83,6 +122,16 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   mixed_bf16_ = reinterpret_cast<__nv_bfloat16*>(mixed_);
   core_bf16_ = reinterpret_cast<__nv_bfloat16*>(core_);
   ids_dev_ = alloc<int>(M);
+}
+
+Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
+  model_ = std::make_unique<Model>(model_dir);
+  const ModelConfig& c = model_->config();
+  check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream");
+
+  const int C = c.lin_conv_channels(), Vs = c.lin_value_size();
+  const int kvsize = c.kv_heads * c.head_dim;
+  alloc_scratch();
   pos_dev_ = alloc<int>(kernels::kMaxSeqs);
   check(cudaHostAlloc(reinterpret_cast<void**>(&pin_), sizeof(StepPinned), cudaHostAllocDefault), "pinned step buffers");
   kernels::prepare_kernels();  // attributes are set here, never inside a graph capture
@@ -117,6 +166,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   }
   if (sessions_.size() > 1) std::fprintf(stderr, "sessions: %zu resident\n", sessions_.size());
   logits_.resize(c.vocab);
+  logits_host_ = logits_.data();
   profile_ = std::getenv("LING_PROFILE") != nullptr;
   // Step graphs: asked for by the options or LING_STEP_GRAPHS, and only where nothing inside a step would
   // synchronize (LING_PROFILE's per-phase timing) or allocate (LING_KSPLIT's split-K buffer) while capturing.
@@ -150,10 +200,43 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     commit_core_ = alloc<float>(size_t(kernels::kMaxStreamRows) * Vs);
     std::fprintf(stderr, "commit beside the next draft\n");
   }
+  if (const char* e = std::getenv("LING_SIDE_PREFILL")) opts_.side_prefill = std::atoi(e);
+  if (opts_.side_prefill != 0) {
+    // The side set: its own scratch (as the main set's), the drafter's feature and context rows, a pinned buffer for
+    // its logits, and its stream. Allocated with the side names in place, then swapped back.
+    swap_side();
+    alloc_scratch();
+    if (draft_) {
+      const DraftConfig& d = draft_->config();
+      const size_t R = std::max(opts_.prefill_chunk, kernels::kMaxStreamRows);
+      cap_ = alloc<__nv_bfloat16>(R * cap_stride_);
+      dctx_ = alloc<float>(R * d.hidden);
+      dk_ = alloc<float>(R * d.kv_heads * d.head_dim);
+      dv_ = alloc<float>(R * d.kv_heads * d.head_dim);
+      conv_tmp_ = alloc<float>(size_t(C) * (c.conv_kernel - 1));
+    }
+    check(cudaHostAlloc(reinterpret_cast<void**>(&logits_host_), size_t(c.vocab) * sizeof(float), cudaHostAllocDefault),
+          "side logits");
+    s_ = &sessions_[0];
+    stream_ = make_side_stream(opts_.side_prefill, &side_green_);
+    swap_side();
+    check(cudaEventCreateWithFlags(&side_done_, cudaEventDisableTiming), "side event");
+    std::fprintf(stderr, "prefill beside a decode: a second stream%s\n",
+                 opts_.side_prefill > 0 ? (" on a green context of " + std::to_string(opts_.side_prefill) + " SMs").c_str() : "");
+  }
+}
+
+void Engine::swap_side() {
+#define LING_SIDE_SWAP(m) std::swap(m, side_.m);
+  LING_SIDE_SET(LING_SIDE_SWAP)
+#undef LING_SIDE_SWAP
+  side_active_ = !side_active_;
 }
 
 void Engine::join_commit() {
-  if (!commit_pending_) return;
+  // A side pass belongs to another session than the step whose commit is pending: it neither reads nor writes
+  // that state, so it does not wait (and the main stream's join stays pending).
+  if (!commit_pending_ || side_active_) return;
   // A wait on an event recorded outside a capture cannot be captured: every captured body runs with nothing
   // pending (speculate joins before the verify; the draft and the drafter's context KV never join).
   if (use_dev_pos_) throw std::runtime_error("join_commit inside a step graph's capture");
@@ -163,6 +246,12 @@ void Engine::join_commit() {
 
 Engine::~Engine() {
   if (commit_stream_) cudaStreamSynchronize(commit_stream_);
+  if (side_.stream_) {
+    cudaStreamSynchronize(side_.stream_);
+    if (side_.logits_host_) cudaFreeHost(side_.logits_host_);
+    destroy_side_stream(side_.stream_, side_green_);
+    if (side_done_) cudaEventDestroy(side_done_);
+  }
   clear_graphs();
   if (pin_) cudaFreeHost(pin_);
   if (profile_) {
@@ -229,6 +318,7 @@ int Engine::free_session(double protect_seconds, const std::vector<bool>& pinned
 
 void Engine::activate_session(int i, const std::string& key, bool fresh) {
   if (i < 0 || i >= static_cast<int>(sessions_.size())) throw std::runtime_error("no such session");
+  side_join();  // a side chunk's session, store entries and donor KV are complete before anything binds or copies
   s_ = &sessions_[i];
   if (fresh) {
     if (s_->owned) ++evictions_;
@@ -251,6 +341,7 @@ void Engine::select_session(int i) {
 }
 
 void Engine::reset_all() {
+  side_join();
   for (Session& s : sessions_) {
     s_ = &s;
     reset_session();
@@ -813,16 +904,17 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
     kernels::rmsnorm(last, model_->final_norm(), xn_, 1, H, c.eps, true, stream_);
     linear_fp4(lm, xn_, 1, logits_dev_);
   }
-  check(cudaMemcpyAsync(logits_.data(), logits_dev_, logits_.size() * sizeof(float), cudaMemcpyDeviceToHost,
+  check(cudaMemcpyAsync(logits_host_, logits_dev_, logits_.size() * sizeof(float), cudaMemcpyDeviceToHost,
                         stream_),
         "logits");
-  check(cudaStreamSynchronize(stream_), "forward");
+  if (!side_active_) check(cudaStreamSynchronize(stream_), "forward");  // a side pass is waited for by its event
   mark("lm_head");
   s_->pos += M;
 }
 
 Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool from_scratch) {
   if (prompt.empty()) throw std::runtime_error("empty prompt");
+  side_join();
   PrefillCursor cur;
   cur.t0 = std::chrono::steady_clock::now();
   cur.session = active_session();
@@ -917,13 +1009,20 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
 
 bool Engine::prefill_chunk(PrefillCursor& cur, int max_tokens) {
   if (cur.done()) return true;
+  if (side_cur_) throw std::runtime_error("prefill_chunk while a side chunk is in flight");
   select_session(cur.session);
-  const auto t_chunk = std::chrono::steady_clock::now();
+  const ChunkRun run = chunk_begin(cur, max_tokens);
+  return chunk_end(cur, run);
+}
+
+Engine::ChunkRun Engine::chunk_begin(PrefillCursor& cur, int max_tokens) {
+  ChunkRun r;
+  r.t = std::chrono::steady_clock::now();
   const std::vector<int>& prompt = cur.prompt;
   const int L = static_cast<int>(prompt.size());
   int chunk = max_tokens > 0 ? std::min(max_tokens, opts_.prefill_chunk) : opts_.prefill_chunk;
   chunk = std::max(kResumeAlign, chunk - chunk % kResumeAlign);
-  const int i = cur.next, snap_at = cur.snap_at, window = cur.window;
+  const int i = cur.next, snap_at = cur.snap_at;
   int end = std::min(i + chunk, L);
   for (int b : cur.bounds)
     if (b > i && b < end) {
@@ -933,8 +1032,21 @@ bool Engine::prefill_chunk(PrefillCursor& cur, int max_tokens) {
   // The end-of-prompt state at snap_at < end is captured inside the pass (no separate pass for the tail).
   const int keep_at = snap_at > i && snap_at < end ? snap_at - i : -1;
   if (keep_at > 0) s_->snap_pos = -1;  // the snap is rewritten by the pass
-  const int n = end - i, pos0 = s_->pos;
-  forward(prompt.data() + i, n, Pass::Prefill, keep_at);
+  r.i = i;
+  r.end = end;
+  r.keep_at = keep_at;
+  r.n = end - i;
+  r.pos0 = s_->pos;
+  forward(prompt.data() + i, r.n, Pass::Prefill, keep_at);
+  return r;
+}
+
+bool Engine::chunk_end(PrefillCursor& cur, const ChunkRun& run) {
+  const auto t_chunk = run.t;
+  const std::vector<int>& prompt = cur.prompt;
+  const int L = static_cast<int>(prompt.size());
+  const int i = run.i, end = run.end, keep_at = run.keep_at, n = run.n, pos0 = run.pos0;
+  const int snap_at = cur.snap_at, window = cur.window;
   // A pass whose logits are not finite left a broken state (a NaN anywhere in it reaches the last
   // token's logits). Keep nothing from it: the snap stays invalid if the pass wrote it, no checkpoint is
   // saved and its tokens do not join the history. A non-finite checkpoint would be reused by every later
@@ -973,6 +1085,65 @@ bool Engine::prefill_chunk(PrefillCursor& cur, int max_tokens) {
   cur.stats.compute_seconds += std::chrono::duration<double>(now - t_chunk).count();
   cur.stats.prefill_seconds = std::chrono::duration<double>(now - cur.t0).count();
   return true;
+}
+
+void Engine::prefill_chunk_launch(PrefillCursor& cur, int max_tokens) {
+  if (!side_.stream_) throw std::runtime_error("prefill_chunk_launch without side_prefill");
+  if (side_cur_) throw std::runtime_error("a side chunk is already in flight");
+  if (cur.done()) throw std::runtime_error("prefill_chunk_launch on a finished prompt");
+  Session* main_s = s_;
+  swap_side();
+  try {
+    select_session(cur.session);
+    side_run_ = chunk_begin(cur, max_tokens);
+    check(cudaEventRecord(side_done_, stream_), "side chunk");
+  } catch (...) {
+    swap_side();
+    s_ = main_s;
+    throw;
+  }
+  swap_side();
+  s_ = main_s;
+  side_cur_ = &cur;
+}
+
+bool Engine::side_ready() {
+  if (!side_cur_) return true;
+  const cudaError_t e = cudaEventQuery(side_done_);
+  if (e == cudaErrorNotReady) return false;
+  check(e, "side chunk");
+  return true;
+}
+
+bool Engine::prefill_chunk_finish() {
+  if (!side_cur_) throw std::runtime_error("prefill_chunk_finish without a side chunk");
+  PrefillCursor& cur = *side_cur_;
+  side_cur_ = nullptr;
+  check(cudaEventSynchronize(side_done_), "side chunk");
+  bool last = false;
+  swap_side();
+  try {
+    std::copy(logits_host_, logits_host_ + logits_.size(), logits_.begin());
+    last = chunk_end(cur, side_run_);
+  } catch (...) {
+    swap_side();
+    select_session(cur.session);
+    throw;
+  }
+  swap_side();
+  select_session(cur.session);  // as prefill_chunk leaves it
+  return last;
+}
+
+void Engine::side_join() {
+  if (side_cur_) check(cudaEventSynchronize(side_done_), "side chunk");
+  if (side_.stream_ && !side_active_) check(cudaStreamSynchronize(side_.stream_), "side stream");
+}
+
+void Engine::side_abandon() {
+  if (!side_cur_) return;
+  check(cudaEventSynchronize(side_done_), "side chunk");
+  side_cur_ = nullptr;
 }
 
 const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, EngineStats* stats, bool from_scratch) {

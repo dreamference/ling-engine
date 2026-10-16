@@ -6,6 +6,7 @@
 //              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
+//              [--side-prefill N]
 //
 // --sessions N (default 2; M4 §1) keeps N resident sessions, each with its own KV cache and state, so N
 // agent tasks that alternate keep their histories warm. A request runs in the session it extends (its
@@ -20,6 +21,11 @@
 // of 32 up to the prefill chunk of 2,048), so the decoding request's step period stays near twice its
 // normal step during a long prefill. A request that continues a running request's session waits for it.
 // Nothing numeric changes: every unit runs in its own session's state exactly as it would alone.
+//
+// --side-prefill N (drafts/M4-prefill-beside-decode-2026-10-17.md, option B; 0, the default, is off): while another
+// request decodes, a prefill runs in full chunks on the engine's second stream, on a green context of N SMs (-1: a
+// plain second stream), at the same time as the other request's steps on the main stream, instead of alternating
+// contended chunks with them. The same kernels on the same inputs (ling-run --interleave-check --side-prefill N).
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -232,7 +238,8 @@ struct Running {
   double ttft = -1;
   std::chrono::steady_clock::time_point t_decode, last_step;
   long steps0 = 0, drafted0 = 0, accepted0 = 0;
-  int chunks_beside = 0;  // prefill chunks run while another request was decoding (contended size)
+  int chunks_beside = 0;  // prefill chunks run while another request was decoding (contended size, or on the side)
+  bool side_flight = false;  // one of its chunks is in flight on the engine's side stream
   int batched = 0;        // its decode steps taken in a batch with another request (M4 stage 3)
   Periods alone, beside;  // step periods without and with another request's prefill in between
 };
@@ -396,6 +403,7 @@ class Scheduler {
       }
       if (ended.empty()) continue;
       for (Running* e : ended) {
+        if (e->side_flight) ctx_.engine->side_abandon();  // its chunk's pass finishes before the session is reused
         ctx_.engine->touch_session(e->job.session);  // the session's clock restarts however the request ended
         running_.erase(std::find_if(running_.begin(), running_.end(), [&](const auto& p) { return p.get() == e; }));
       }
@@ -487,6 +495,22 @@ class Scheduler {
     Engine& eng = *ctx_.engine;
     if (r.prefilling) {
       const bool contended = other_decoding(r);
+      if (eng.side_enabled() && (r.side_flight || (contended && !eng.side_busy()))) {
+        // A full chunk on the side stream; the decoding request's turns go on while it runs.
+        if (!r.side_flight) {
+          eng.prefill_chunk_launch(r.cur, 0);
+          r.side_flight = true;
+          count_interleaved(r);
+          return false;
+        }
+        if (contended && !eng.side_ready()) return false;
+        r.side_flight = false;
+        if (!eng.prefill_chunk_finish()) return false;
+        r.prefilling = false;
+        begin_decode(r);
+        return emit(r) && end(r);
+      }
+      if (eng.side_busy()) return false;  // another request's chunk is in flight: no prefill beside it
       const bool last = eng.prefill_chunk(r.cur, contended ? contended_ : 0);
       if (contended) count_interleaved(r);
       if (!last) return false;
@@ -1233,7 +1257,7 @@ int main(int argc, char** argv) {
   int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
-  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256;
+  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 0;
   double protect_seconds = 30;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -1265,13 +1289,14 @@ int main(int argc, char** argv) {
     else if (a == "--session-protect-seconds") protect_seconds = std::stod(next());
     else if (a == "--batch") batch = std::stoi(next());
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
+    else if (a == "--side-prefill") side_prefill = std::stoi(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N]\n";
     return 2;
   }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
@@ -1307,6 +1332,7 @@ int main(int argc, char** argv) {
   opts.attention_prefetch = attn_prefetch;
   opts.prefill_bf16 = prefill_bf16;
   opts.sessions = sessions;
+  opts.side_prefill = side_prefill;
   std::cerr << "loading " << model_dir << " ...\n";
   ling::Engine engine(model_dir, opts);
   std::cerr << "loaded " << engine.model().device_bytes() / 1e9 << " GB of weights\n";

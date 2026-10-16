@@ -81,6 +81,12 @@ struct EngineOptions {
   // the next verify waits for it. The same kernels on the same inputs, so the same bits. LING_COMMIT_OVERLAP=0/1
   // overrides.
   bool commit_overlap = true;
+  // The prefill beside a decode (drafts/M4-prefill-beside-decode-2026-10-17.md, option B): a prefill chunk runs on a
+  // second stream with its own scratch while other sessions decode on the main stream (prefill_chunk_launch /
+  // prefill_chunk_finish). > 0: the second stream belongs to a green context of that many SMs, so the chunk's
+  // kernels stay off the other SMs and the decode keeps them; -1: a plain second stream (no partition); 0: off.
+  // The same kernels on the same inputs, so the same bits (--interleave-check with --side-prefill).
+  int side_prefill = 0;
 };
 
 struct EngineStats {
@@ -150,6 +156,19 @@ class Engine {
   };
   PrefillCursor begin_prefill(const std::vector<int>& prompt, bool from_scratch = false);
   bool prefill_chunk(PrefillCursor& cur, int max_tokens = 0);
+  // The same chunk beside other sessions' work (EngineOptions::side_prefill): prefill_chunk_launch queues the
+  // chunk's pass on the side stream, with the side scratch, and returns at once; the caller goes on with other
+  // sessions' steps on the main stream; side_ready() says whether the pass has finished on the GPU, and
+  // prefill_chunk_finish() does the rest of prefill_chunk (it waits for the pass if needed) and returns what
+  // prefill_chunk returns, the cursor's session active. One chunk in flight at a time; nothing else may run a
+  // prefill, bind or prefill a session meanwhile (activate_session and begin_prefill wait for it).
+  bool side_enabled() const { return opts_.side_prefill != 0; }
+  bool side_busy() const { return side_cur_ != nullptr; }
+  void prefill_chunk_launch(PrefillCursor& cur, int max_tokens = 0);
+  bool side_ready();
+  bool prefill_chunk_finish();
+  void side_join();     // waits until the side stream is idle (its chunk's pass and the work its finish queued)
+  void side_abandon();  // the in-flight chunk's request is gone: waits for the pass and forgets it
   const std::vector<float>& logits() const { return logits_; }
   int prefill_chunk_size() const { return opts_.prefill_chunk; }
   // Appends one token and returns the logits after it.
@@ -521,6 +540,37 @@ class Engine {
   std::vector<float> logits_;
   bool profile_ = false;
   std::map<std::string, double> phase_seconds_;
+
+  // The prefill beside a decode (side_prefill). The members a pass writes, swapped as a set: while side_active_ the
+  // names below are the side pass's (its stream, its scratch, its active session, its quantized-input cache and a
+  // pinned buffer for its logits), and side_ holds the main ones; otherwise the other way round. Everything else
+  // (the model, the sessions, the checkpoint store, the decode's graphs and pinned step buffers) is shared and is
+  // touched by one pass at a time: a session by its own pass only, the store from the host between passes.
+  float* logits_host_ = nullptr;  // where a pass copies its last row's logits: logits_'s data, or the side's pinned buffer
+  struct ChunkRun {
+    int i = 0, end = 0, keep_at = -1, n = 0, pos0 = 0;
+    std::chrono::steady_clock::time_point t;
+  };
+  ChunkRun chunk_begin(PrefillCursor& cur, int max_tokens);  // prefill_chunk's pass, launched
+  bool chunk_end(PrefillCursor& cur, const ChunkRun& run);   // and everything after it
+  void alloc_scratch();
+#define LING_SIDE_SET(X)                                                                                     \
+  X(h_) X(xn_) X(t1_) X(t2_) X(mixed_) X(z_) X(a_) X(b_) X(g_) X(beta_) X(core_) X(normed_) X(q_gate_) X(k_)     \
+  X(v_) X(q_) X(gate_) X(attn_) X(attn_scratch_) X(logits_dev_) X(x_bf16_) X(xn_bf16_) X(t2_bf16_) X(z_bf16_)    \
+  X(mixed_bf16_) X(core_bf16_) X(xq_) X(xsf_) X(xq2_) X(xsf2_) X(xh_) X(xinv_) X(ids_dev_) X(conv_tmp_) X(cap_)  \
+  X(dctx_) X(dk_) X(dv_) X(stream_) X(s_) X(quantized_) X(xq_scale_) X(xq_nvfp4_) X(logits_host_)
+#define LING_SIDE_DECL(m) decltype(Engine::m) m{};
+  struct SideSet {
+    LING_SIDE_SET(LING_SIDE_DECL)
+  };
+#undef LING_SIDE_DECL
+  SideSet side_;
+  bool side_active_ = false;
+  void swap_side();
+  cudaEvent_t side_done_ = nullptr;      // recorded after the in-flight chunk's pass
+  void* side_green_ = nullptr;           // the side stream's green context (CUgreenCtx), when side_prefill > 0
+  PrefillCursor* side_cur_ = nullptr;    // the in-flight chunk's cursor
+  ChunkRun side_run_;
 };
 
 }  // namespace ling
