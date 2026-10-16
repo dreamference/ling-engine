@@ -10,10 +10,18 @@ each session; the window's first request is reported separately as a cold reques
 Usage:
   replay.py --url http://127.0.0.1:8000 --tools tools.json --out run.jsonl \
             [--sessions-file sel.txt | rollouts...] [--window 12] [--concurrency 1]
-            [--greedy] [--max-requests N] [--dump-bodies FILE]
+            [--greedy] [--max-requests N] [--dump-bodies FILE] [--custom-tools keep|drop|function]
 
 --dump-bodies writes every request body (one JSON object per line) instead of sending it, so the
 prompt-rendering test (bench/render/) sees exactly the requests a replay sends.
+
+--custom-tools chooses what happens to the capture's Responses `custom` tools (Code Mode's `exec`):
+`keep` sends them as captured (ling-serve runs them; SGLang drops them without a word, so on the
+captured tools the two prompts differ by exactly that tool, 991 tokens on the main set); `drop`
+leaves them out, which is the prompt production prefilled when the sessions were recorded
+(2026-10-07), so a ling-serve run compares like for like with SGLang on the same bodies; `function`
+offers each as the one-string-parameter function `ling` sends to SGLang since 2026-10-12
+(ling-rs/tools custom.rs `as_function`), which SGLang renders as ling-serve renders the custom tool.
 
 Per request it records: input and cached tokens, output tokens, time to first token, total time
 and decode tokens/s. Around the run it reads /metrics, so accepted tokens per verify step come
@@ -131,6 +139,31 @@ def send(url, body):
             "usage": usage, "rid": rid}
 
 
+def custom_as_function(tool):
+    """A Responses custom tool as `ling` offers it to a server that drops custom tools (ling-rs/tools
+    custom.rs `as_function`): one string parameter `input`, the grammar appended to the description."""
+    description = tool.get("description") or ""
+    fmt = tool.get("format") or {}
+    if fmt.get("type") == "grammar" and isinstance(fmt.get("definition"), str):
+        if description:
+            description += "\n\n"
+        description += "The input must follow this "
+        if fmt.get("syntax"):
+            description += fmt["syntax"] + " "
+        description += "grammar:\n" + fmt["definition"]
+    return {"type": "function", "name": tool.get("name", ""), "description": description, "strict": False,
+            "parameters": {"type": "object", "properties": {"input": {"type": "string",
+                           "description": "The tool's input, as free text"}}, "required": ["input"]}}
+
+
+def custom_tools(tools, mode):
+    if mode == "keep":
+        return tools
+    if mode == "drop":
+        return [t for t in tools if t.get("type") != "custom"]
+    return [custom_as_function(t) if t.get("type") == "custom" else t for t in tools]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8000")
@@ -153,10 +186,13 @@ def main():
     ap.add_argument("--max-out", type=int, default=0, help="override the recorded output cap")
     ap.add_argument("--label", default="")
     ap.add_argument("--dump-bodies", help="write the request bodies to this file and send nothing")
+    ap.add_argument("--custom-tools", choices=("keep", "drop", "function"), default="keep",
+                    help="the capture's custom tools: as captured, left out (what SGLang prefilled), or "
+                         "as the function `ling` offers SGLang in their place")
     a = ap.parse_args()
 
-    tools_plain = json.load(open(a.tools))
-    tools_index = json.load(open(a.tools_index)) if a.tools_index else tools_plain
+    tools_plain = custom_tools(json.load(open(a.tools)), a.custom_tools)
+    tools_index = custom_tools(json.load(open(a.tools_index)), a.custom_tools) if a.tools_index else tools_plain
     paths = list(a.rollouts)
     if a.sessions_file:
         paths += [ln.strip() for ln in open(a.sessions_file) if ln.strip()]
