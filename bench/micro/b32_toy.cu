@@ -205,6 +205,132 @@ __global__ void __launch_bounds__(kWarps * 32) ffn_toy_kernel(ToyArgs a) {
   }
 }
 
+
+// The second toy (--narrow): the boundary where the graph path pays a partial wave, a narrow FP8 projection (N = 5,120,
+// K = 6,144: the attention and DeltaNet out-projections; 160 blocks on 96 resident), then the next layer's RMSNorm into
+// its FP16 copy, then the wide gate|up. The norm is rmsnorm_half_kernel's arithmetic in its order: that kernel runs 1,024
+// threads, so each of this block's 256 threads takes four of them (virtual thread tid + 256 j), and the warp and block
+// sums are formed exactly as there.
+constexpr int kKo = 6144;
+struct Toy2Args {
+  const __half* xh;
+  const float* xinv;
+  StreamProblems o;  // the narrow FP8 projection
+  int n_o;
+  float* yo;  // [M][H]
+  const __nv_bfloat16* wnorm;
+  float eps;
+  float* nout;  // the norm's FP32 output
+  __half* xh2;
+  float* xinv2;
+  StreamProblems up;
+  int n_up;
+  unsigned* counters;
+  long long deadline_ns;
+  Diag* diag;
+  unsigned long long* timings;
+};
+
+__device__ void rmsnorm_half_1024(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w, float* __restrict__ out,
+                                  __half* __restrict__ xh, float* __restrict__ xinv, int H, float eps, int r) {
+  __shared__ float red[32];
+  const int tid = threadIdx.x, lane = tid & 31, wq = tid >> 5;
+  const float* row = x + static_cast<size_t>(r) * H;
+  float ss[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    ss[j] = 0.f;
+    for (int h = tid + 256 * j; h < H; h += 1024) ss[j] += row[h] * row[h];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss[j] += __shfl_xor_sync(0xffffffffu, ss[j], o);
+  }
+  if (lane == 0)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) red[wq + 8 * j] = ss[j];
+  __syncthreads();
+  float tot = 0.f;
+  for (int i = 0; i < 32; ++i) tot += red[i];
+  const float rstd = rsqrtf(tot / H + eps);
+  float mx[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    mx[j] = 0.f;
+    for (int h = tid + 256 * j; h < H; h += 1024) {
+      const float wv = __bfloat162float(w[h]);
+      const float v = row[h] * rstd * (1.f + wv);
+      out[static_cast<size_t>(r) * H + h] = v;
+      mx[j] = fmaxf(mx[j], fabsf(v));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) mx[j] = fmaxf(mx[j], __shfl_xor_sync(0xffffffffu, mx[j], o));
+  }
+  __syncthreads();
+  if (lane == 0)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) red[wq + 8 * j] = mx[j];
+  __syncthreads();
+  float m = 0.f;
+  for (int i = 0; i < 32; ++i) m = fmaxf(m, red[i]);
+  int e = 0;
+  if (m > 0.f && isfinite(m)) frexpf(m, &e);
+  const float sc = ldexpf(1.f, 15 - e);
+  for (int h = tid; h < H; h += blockDim.x) xh[static_cast<size_t>(r) * H + h] = __float2half_rn(out[static_cast<size_t>(r) * H + h] * sc);
+  if (tid == 0) xinv[r] = ldexpf(1.f, e - 15);
+}
+
+__device__ bool wait2(const Toy2Args& a, int which, unsigned target, int item) {
+  ToyArgs t{};
+  t.counters = a.counters;
+  t.deadline_ns = a.deadline_ns;
+  t.diag = a.diag;
+  return wait_counter(t, which, target, item);
+}
+struct Counter2Wait {
+  const Toy2Args* a;
+  unsigned target;
+  int item;
+  bool* ok;
+  __device__ __forceinline__ void operator()() const { *ok = wait2(*a, 1, target, item); }
+};
+
+__global__ void __launch_bounds__(kWarps * 32) narrow_toy_kernel(Toy2Args a) {
+  const int G = gridDim.x;
+  auto stamp2 = [&](int item, unsigned long long t0) {
+    if (a.timings && threadIdx.x == 0) {
+      unsigned s;
+      asm volatile("mov.u32 %0, %%smid;" : "=r"(s));
+      a.timings[3 * item] = s;
+      a.timings[3 * item + 1] = t0;
+      a.timings[3 * item + 2] = now_ns();
+    }
+  };
+  for (int i = blockIdx.x; i < a.n_o; i += G) {
+    __syncthreads();
+    const unsigned long long t0 = now_ns();
+    stream_gemm_body<kNT, kTiles, false, kPF, false>(a.xh, a.xinv, kM, a.o, kKo, 1, nullptr, i, 0, NoWait{});
+    __syncthreads();
+    if (threadIdx.x == 0) red_release_add(&a.counters[0], 1u);
+    stamp2(i, t0);
+  }
+  for (int r = blockIdx.x; r < kM; r += G) {
+    if (!wait2(a, 0, a.n_o, a.n_o + r)) return;
+    const unsigned long long t0 = now_ns();
+    rmsnorm_half_1024(a.yo, a.wnorm, a.nout, a.xh2, a.xinv2, kH, a.eps, r);
+    __syncthreads();
+    if (threadIdx.x == 0) red_release_add(&a.counters[1], 1u);
+    stamp2(a.n_o + r, t0);
+  }
+  for (int i = blockIdx.x; i < a.n_up; i += G) {
+    __syncthreads();
+    bool ok = true;
+    const unsigned long long t0 = now_ns();
+    stream_gemm_body<kNT, kTiles, true, kPF, false>(a.xh2, a.xinv2, kM, a.up, kH, 1, nullptr, i, 0,
+                                                    Counter2Wait{&a, static_cast<unsigned>(kM), a.n_o + kM + i, &ok});
+    if (!ok) return;
+    stamp2(a.n_o + kM + i, t0);
+  }
+}
+
 // The host validator: the counters' targets equal their producers' counts, every wait's counter has producers that
 // run before any consumer can be blocked behind them (phase order within a block, all blocks resident), and the
 // schedule covers every item once.
@@ -247,8 +373,9 @@ double avg_ms(F&& f, int iters, cudaStream_t s) {
 
 int main(int argc, char** argv) {
   const char* timings_out = nullptr;
-  int distributed = 0;
+  int distributed = 0, narrow = 0;
   for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--narrow") == 0) narrow = 1;
     if (std::strcmp(argv[i], "--timings") == 0 && i + 1 < argc) timings_out = argv[++i];
     if (std::strcmp(argv[i], "--distributed-rows") == 0) distributed = 1;
   }
@@ -288,6 +415,121 @@ int main(int argc, char** argv) {
   cudaStream_t s;
   cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
   set_pdl(true);
+  if (narrow) {
+    // Weights of the narrow FP8 projection in the tiled layout (no NaN encodings), the norm's weights, the input.
+    std::vector<uint8_t> h8(size_t(kH / 16) * (kKo / kChunk) * kTileBytesFp8);
+    for (auto& b : h8) {
+      do b = byte(rng);
+      while ((b & 0x7f) == 0x7f);
+    }
+    uint8_t* w8;
+    cudaMalloc(&w8, h8.size());
+    cudaMemcpy(w8, h8.data(), h8.size(), cudaMemcpyHostToDevice);
+    std::vector<__nv_bfloat16> hw(kH);
+    for (auto& v : hw) v = __float2bfloat16(0.1f * normal(rng));
+    __nv_bfloat16* wn;
+    cudaMalloc(&wn, kH * 2);
+    cudaMemcpy(wn, hw.data(), kH * 2, cudaMemcpyHostToDevice);
+    std::vector<__half> hxo(size_t(kM) * kKo);
+    for (auto& v : hxo) v = __float2half(normal(rng) * 8192.f);
+    __half *xo, *xn2;
+    float *yo, *nout, *xinvn;
+    cudaMalloc(&xo, hxo.size() * 2);
+    cudaMemcpy(xo, hxo.data(), hxo.size() * 2, cudaMemcpyHostToDevice);
+    cudaMalloc(&yo, size_t(kM) * kH * 4);
+    cudaMalloc(&nout, size_t(kM) * kH * 4);
+    cudaMalloc(&xn2, size_t(kM) * kH * 2);
+    cudaMalloc(&xinvn, kM * 4);
+    const float s8 = 0.0013f, eps = 1e-6f;
+    const StreamTarget up_t2[2] = {{wg, nullptr, sg, g, kI}, {wu, nullptr, su, u, kI}};
+    auto three = [&] {
+      stream_gemm_fp8(xh, xinv, kM, w8, s8, yo, kH, kKo, s);
+      rmsnorm_half(yo, wn, nout, xn2, xinvn, kM, kH, eps, true, s);
+      stream_gemm_multi(true, xn2, xinvn, kM, up_t2, 2, kH, s);
+    };
+    // xh is [M][H] = [16][5120]: the projection needs K = 6,144 values per row, so it reads xo.
+    auto three_o = [&] {
+      stream_gemm_fp8(xo, xinv, kM, w8, s8, yo, kH, kKo, s);
+      rmsnorm_half(yo, wn, nout, xn2, xinvn, kM, kH, eps, true, s);
+      stream_gemm_multi(true, xn2, xinvn, kM, up_t2, 2, kH, s);
+    };
+    (void)three;
+    cudaGraph_t g2;
+    cudaGraphExec_t x2;
+    cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal);
+    three_o();
+    cudaStreamEndCapture(s, &g2);
+    cudaGraphInstantiate(&x2, g2, 0);
+    cudaGraphLaunch(x2, s);
+    cudaStreamSynchronize(s);
+    std::vector<float> gr(size_t(kM) * kI), gm(size_t(kM) * kI), nr(size_t(kM) * kH), nm(size_t(kM) * kH);
+    cudaMemcpy(gr.data(), g, gr.size() * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(nr.data(), nout, nr.size() * 4, cudaMemcpyDeviceToHost);
+    Toy2Args b{};
+    b.xh = xo;
+    b.xinv = xinv;
+    b.o.w[0] = w8;
+    b.o.gscale[0] = s8;
+    b.o.y[0] = yo;
+    b.o.N[0] = kH;
+    b.o.count = 1;
+    b.n_o = kH / (kTiles * 16);
+    b.yo = yo;
+    b.wnorm = wn;
+    b.eps = eps;
+    b.nout = nout;
+    b.xh2 = xn2;
+    b.xinv2 = xinvn;
+    b.up.w[0] = wg;
+    b.up.w[1] = wu;
+    b.up.gscale[0] = sg;
+    b.up.gscale[1] = su;
+    b.up.y[0] = g;
+    b.up.y[1] = u;
+    b.up.N[0] = b.up.N[1] = kI;
+    b.up.block0[1] = kI / (kTiles * 16);
+    b.up.count = 2;
+    b.n_up = 2 * kI / (kTiles * 16);
+    cudaMalloc(&b.counters, 4 * sizeof(unsigned));
+    cudaMalloc(&b.diag, sizeof(Diag));
+    b.deadline_ns = 50'000'000;
+    int per_sm = 0, sms = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, narrow_toy_kernel, kWarps * 32, 0);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    std::printf("narrow toy: %d resident blocks; o-proj %d blocks, rows %d, gate|up %d\n", per_sm * sms, b.n_o, kM, b.n_up);
+    bool ok = true;
+    for (int G : {sms, per_sm * sms}) {
+      auto mk = [&] {
+        cudaMemsetAsync(b.counters, 0, 4 * sizeof(unsigned), s);
+        narrow_toy_kernel<<<G, kWarps * 32, 0, s>>>(b);
+      };
+      cudaMemset(b.diag, 0, sizeof(Diag));
+      cudaMemset(g, 0xff, gr.size() * 4);
+      mk();
+      const cudaError_t e = cudaStreamSynchronize(s);
+      Diag d;
+      cudaMemcpy(&d, b.diag, sizeof d, cudaMemcpyDeviceToHost);
+      if (e != cudaSuccess || d.failed) {
+        std::printf("G=%d: %s; diag failed=%d item %d counter %d observed %u expected %u\n", G, cudaGetErrorString(e), d.failed,
+                    d.item, d.counter, d.observed, d.expected);
+        ok = false;
+        continue;
+      }
+      cudaMemcpy(gm.data(), g, gm.size() * 4, cudaMemcpyDeviceToHost);
+      cudaMemcpy(nm.data(), nout, nm.size() * 4, cudaMemcpyDeviceToHost);
+      const bool same = std::memcmp(gm.data(), gr.data(), gr.size() * 4) == 0 && std::memcmp(nm.data(), nr.data(), nr.size() * 4) == 0;
+      ok &= same;
+      double tg = 0, tm = 0;
+      for (int rep = 0; rep < 3; ++rep) {
+        tg += avg_ms([&] { cudaGraphLaunch(x2, s); }, 200, s);
+        tm += avg_ms(mk, 200, s);
+      }
+      std::printf("G=%-4d bit-identical %s; graph (fp8 o-proj, rmsnorm_half, gate|up; PDL) %.3f ms, persistent %.3f ms (x%.3f)\n", G,
+                  same ? "yes" : "NO", tg / 3, tm / 3, tm / tg);
+    }
+    std::printf(ok ? "NARROW TOY: bit-identical to the graph path\n" : "NARROW TOY: DIFFERS or FAILED\n");
+    return ok ? 0 : 1;
+  }
   // The reference: the four kernels, as the engine's rows path runs the FFN, captured as a graph with PDL.
   const StreamTarget up_t[2] = {{wg, nullptr, sg, g, kI}, {wu, nullptr, su, u, kI}};
   auto four = [&] {
