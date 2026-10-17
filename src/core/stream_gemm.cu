@@ -138,14 +138,17 @@ __device__ __forceinline__ uint32_t word_of(const uint4& v, int i) {
   return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
 }
 
-// PF: chunks each warp keeps in flight ahead of the one it computes; CODED (NVFP4 only): 6-bit scale codes (B26).
-template <int NT, int TILES, bool FP4, int PF, bool CODED = false>
-__global__ void __launch_bounds__(kWarps * 32)
-    stream_gemm_kernel(const __half* __restrict__ x, const float* __restrict__ xinv, int M, StreamProblems pr, int K,
-                       int ksplit, float* __restrict__ part) {
+// The kernel's body as a device function of its block coordinates (bx, by) and of what it waits on before it reads
+// x (`wait`: pdl_begin() in the kernel; a dependency counter in a persistent kernel, megakernel B32): one body, so
+// every launcher computes the same bits. PF: chunks each warp keeps in flight ahead of the one it computes; CODED
+// (NVFP4 only): 6-bit scale codes (B26).
+template <int NT, int TILES, bool FP4, int PF, bool CODED, typename Wait>
+__device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, const float* __restrict__ xinv, int M,
+                                                 const StreamProblems& pr, int K, int ksplit, float* __restrict__ part,
+                                                 int bx, int by, Wait&& wait) {
   // Several matrices with the same input in one launch (q|k|v, gate|up, ...): this block's matrix.
   int pi = 0;
-  while (pi + 1 < pr.count && static_cast<int>(blockIdx.x) >= pr.block0[pi + 1]) ++pi;
+  while (pi + 1 < pr.count && bx >= pr.block0[pi + 1]) ++pi;
   const uint8_t* __restrict__ w = pr.w[pi];
   const float gscale = pr.gscale[pi];
   float* __restrict__ y = pr.y[pi];
@@ -153,11 +156,11 @@ __global__ void __launch_bounds__(kWarps * 32)
   __shared__ float red[kWarps][TILES * 16][NT * 8 + 1];
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int g = lane >> 2, t = lane & 3;
-  const int row0 = (blockIdx.x - pr.block0[pi]) * TILES * 16;
+  const int row0 = (bx - pr.block0[pi]) * TILES * 16;
   // Split K (blockIdx.y of ksplit): this block takes chunks [cbeg, cend). The split depends only on the
   // matrix shape, never on M, so a row's sum is the same in every call.
   const int per_split = (K / kChunk + ksplit - 1) / ksplit;
-  const int cbeg = blockIdx.y * per_split, chunks = min(K / kChunk, cbeg + per_split);
+  const int cbeg = by * per_split, chunks = min(K / kChunk, cbeg + per_split);
 
   float acc[TILES][NT][4];
 #pragma unroll
@@ -179,7 +182,7 @@ __global__ void __launch_bounds__(kWarps * 32)
   }
   // PDL (launch.cuh): the first weight chunks above read only the weights, which never change, so they are
   // in flight while this block waits for the kernel that wrote x and xinv. Nothing else happens before this.
-  pdl_begin();
+  wait();
   for (int c = cbeg + warp; c < chunks; c += kWarps) {
     if (c + PF * kWarps < chunks) load_weights<TILES, FP4, CODED>(buf[PF], w, row0, N, K, c + PF * kWarps, g, t);
     const WeightRegs<TILES, FP4, CODED>& cur = buf[0];
@@ -266,8 +269,19 @@ __global__ void __launch_bounds__(kWarps * 32)
     if (ksplit == 1)
       y[static_cast<size_t>(n) * N + row0 + r] = sum * gscale * xinv[n];
     else
-      part[(static_cast<size_t>(blockIdx.y) * M + n) * N + row0 + r] = sum;
+      part[(static_cast<size_t>(by) * M + n) * N + row0 + r] = sum;
   }
+}
+
+struct PdlBegin {
+  __device__ __forceinline__ void operator()() const { pdl_begin(); }
+};
+
+template <int NT, int TILES, bool FP4, int PF, bool CODED = false>
+__global__ void __launch_bounds__(kWarps * 32)
+    stream_gemm_kernel(const __half* __restrict__ x, const float* __restrict__ xinv, int M, StreamProblems pr, int K,
+                       int ksplit, float* __restrict__ part) {
+  stream_gemm_body<NT, TILES, FP4, PF, CODED>(x, xinv, M, pr, K, ksplit, part, blockIdx.x, blockIdx.y, PdlBegin{});
 }
 
 // The split-K partial sums, added in split order.
@@ -322,11 +336,13 @@ __global__ void __launch_bounds__(1024) rmsnorm_half_kernel(const float* __restr
 }
 
 // One block per row: a power-of-two scale that puts the row's largest magnitude in [2^14, 2^15).
-__global__ void to_half_rows_kernel(const float* __restrict__ x, int K, __half* __restrict__ out,
-                                    float* __restrict__ xinv) {
-  pdl_begin();  // first statement: see launch.cuh
+// The body for row `r` (one block per row); `wait` as in stream_gemm_body (the kernel's first statement).
+template <typename Wait>
+__device__ __forceinline__ void to_half_rows_body(const float* __restrict__ x, int K, __half* __restrict__ out,
+                                                  float* __restrict__ xinv, int r, Wait&& wait) {
+  wait();  // first statement: see launch.cuh
   __shared__ float red[32];
-  const float* row = x + static_cast<size_t>(blockIdx.x) * K;
+  const float* row = x + static_cast<size_t>(r) * K;
   float mx = 0.f;
   for (int k = threadIdx.x; k < K; k += blockDim.x) mx = fmaxf(mx, fabsf(row[k]));
 #pragma unroll
@@ -339,8 +355,13 @@ __global__ void to_half_rows_kernel(const float* __restrict__ x, int K, __half* 
   if (mx > 0.f && isfinite(mx)) frexpf(mx, &e);  // mx < 2^e
   const float s = ldexpf(1.f, 15 - e);
   for (int k = threadIdx.x; k < K; k += blockDim.x)
-    out[static_cast<size_t>(blockIdx.x) * K + k] = __float2half_rn(row[k] * s);
-  if (threadIdx.x == 0) xinv[blockIdx.x] = ldexpf(1.f, e - 15);
+    out[static_cast<size_t>(r) * K + k] = __float2half_rn(row[k] * s);
+  if (threadIdx.x == 0) xinv[r] = ldexpf(1.f, e - 15);
+}
+
+__global__ void to_half_rows_kernel(const float* __restrict__ x, int K, __half* __restrict__ out,
+                                    float* __restrict__ xinv) {
+  to_half_rows_body(x, K, out, xinv, blockIdx.x, PdlBegin{});
 }
 
 // Enough blocks for the last wave to be a small part of the launch: blocks x ksplit >= ~1100 (about eight
