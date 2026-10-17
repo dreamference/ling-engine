@@ -22,7 +22,7 @@
 // normal step during a long prefill. A request that continues a running request's session waits for it.
 // Nothing numeric changes: every unit runs in its own session's state exactly as it would alone.
 //
-// --side-prefill N (drafts/M4-prefill-beside-decode-2026-10-17.md, option B; 0, the default, is off): while another
+// --side-prefill N (drafts/M4-prefill-beside-decode-2026-10-17.md, option B; default 40, 0 off): while another
 // request decodes, a prefill runs in full chunks on the engine's second stream, on a green context of N SMs (-1: a
 // plain second stream), at the same time as the other request's steps on the main stream, instead of alternating
 // contended chunks with them. The same kernels on the same inputs (ling-run --interleave-check --side-prefill N).
@@ -385,7 +385,15 @@ class Scheduler {
   void run() {
     while (admit()) {
       if (running_.empty()) continue;
-      const size_t k = turn_++ % running_.size();
+      size_t k = turn_++ % running_.size();
+      // A side chunk whose pass is done is finished (and the next one launched) before anything else, so the side
+      // stream does not wait out another request's step.
+      if (ctx_.engine->side_busy() && ctx_.engine->side_ready())
+        for (size_t j = 0; j < running_.size(); ++j)
+          if (running_[j]->side_flight) {
+            k = j;
+            break;
+          }
       Running& r = *running_[k];
       std::vector<Running*> ended;
       std::vector<Running*> batch = batch_with(r);
@@ -505,7 +513,14 @@ class Scheduler {
         }
         if (contended && !eng.side_ready()) return false;
         r.side_flight = false;
-        if (!eng.prefill_chunk_finish()) return false;
+        if (!eng.prefill_chunk_finish()) {
+          if (other_decoding(r)) {  // the next chunk at once
+            eng.prefill_chunk_launch(r.cur, 0);
+            r.side_flight = true;
+            count_interleaved(r);
+          }
+          return false;
+        }
         r.prefilling = false;
         begin_decode(r);
         return emit(r) && end(r);
@@ -1257,7 +1272,7 @@ int main(int argc, char** argv) {
   int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
-  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 0;
+  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40;
   double protect_seconds = 30;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];

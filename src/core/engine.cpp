@@ -1013,6 +1013,9 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
 bool Engine::prefill_chunk(PrefillCursor& cur, int max_tokens) {
   if (cur.done()) return true;
   if (side_cur_) throw std::runtime_error("prefill_chunk while a side chunk is in flight");
+  // A prompt whose earlier chunk ran on the side stream: that chunk's finish queued the snap and checkpoint copies of
+  // this session's state and its drafter context there, which this pass must not overwrite before they are done.
+  side_join();
   select_session(cur.session);
   const ChunkRun run = chunk_begin(cur, max_tokens);
   return chunk_end(cur, run);
