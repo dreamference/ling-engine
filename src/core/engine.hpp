@@ -568,6 +568,7 @@ class Engine {
   bool side_active_ = false;
   void swap_side();
   cudaEvent_t side_done_ = nullptr;      // recorded after the in-flight chunk's pass
+  cudaEvent_t side_after_main_ = nullptr;  // the main stream's work so far (the side chunk starts after it)
   void* side_green_ = nullptr;           // the side stream's green context (CUgreenCtx), when side_prefill > 0
   PrefillCursor* side_cur_ = nullptr;    // the in-flight chunk's cursor
   ChunkRun side_run_;

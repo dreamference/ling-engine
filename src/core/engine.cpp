@@ -87,6 +87,7 @@ void Engine::alloc_scratch() {
   const size_t M = opts_.prefill_chunk;
   const int C = c.lin_conv_channels(), Vs = c.lin_value_size();
   const int qsize = c.heads * c.head_dim, kvsize = c.kv_heads * c.head_dim;
+  h_ = alloc<float>(M * c.hidden);
   xn_ = alloc<float>(M * c.hidden);
   t1_ = alloc<float>(M * c.intermediate);
   t2_ = alloc<float>(M * c.intermediate);
@@ -221,6 +222,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     stream_ = make_side_stream(opts_.side_prefill, &side_green_);
     swap_side();
     check(cudaEventCreateWithFlags(&side_done_, cudaEventDisableTiming), "side event");
+    check(cudaEventCreateWithFlags(&side_after_main_, cudaEventDisableTiming), "side event");
     std::fprintf(stderr, "prefill beside a decode: a second stream%s\n",
                  opts_.side_prefill > 0 ? (" on a green context of " + std::to_string(opts_.side_prefill) + " SMs").c_str() : "");
   }
@@ -251,6 +253,7 @@ Engine::~Engine() {
     if (side_.logits_host_) cudaFreeHost(side_.logits_host_);
     destroy_side_stream(side_.stream_, side_green_);
     if (side_done_) cudaEventDestroy(side_done_);
+    if (side_after_main_) cudaEventDestroy(side_after_main_);
   }
   clear_graphs();
   if (pin_) cudaFreeHost(pin_);
@@ -1092,8 +1095,12 @@ void Engine::prefill_chunk_launch(PrefillCursor& cur, int max_tokens) {
   if (side_cur_) throw std::runtime_error("a side chunk is already in flight");
   if (cur.done()) throw std::runtime_error("prefill_chunk_launch on a finished prompt");
   Session* main_s = s_;
+  // The chunk starts after everything queued on the main stream so far: begin_prefill's reset, state copy and
+  // donor KV for this session ran there, and the previous chunk's finish may have been followed by main-stream work.
+  check(cudaEventRecord(side_after_main_, stream_), "side order");
   swap_side();
   try {
+    check(cudaStreamWaitEvent(stream_, side_after_main_, 0), "side order");
     select_session(cur.session);
     side_run_ = chunk_begin(cur, max_tokens);
     check(cudaEventRecord(side_done_, stream_), "side chunk");
