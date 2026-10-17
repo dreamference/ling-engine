@@ -6,7 +6,7 @@
 //            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N]]
 //            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16] [--graph-check] [--seed N]
 //            [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N]]
-//            [--batch-check]
+//            [--batch-check] [--side-prefill N]
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -44,6 +44,10 @@
 // the steps and the accepted drafts must equal the run alone. Greedy and sampled (--temperature, default 1,
 // seeded by --seed or 1), and with the pair swapped.
 //
+// --side-prefill N (with --interleave-check): B's chunks run on the engine's side stream (EngineOptions::side_prefill:
+// a green context of N SMs, or a plain second stream for -1), each a full chunk launched while A goes on taking steps
+// on the main stream, finished when its pass is done; the same comparison with the runs alone.
+//
 // --batch-check (M4 §4, stage 3; needs --draft and --sessions 2) takes the prompts in pairs (A, B) and decodes
 // each pair as a batch of two (Engine::speculate_batch: one verify pass over both sequences' rows), --max-tokens
 // each, greedily and sampled (--temperature, default 1, seeded by --seed or 1). Four runs per pair and mode: both
@@ -76,7 +80,7 @@ int main(int argc, char** argv) {
   uint64_t seed = 0;
   int attn_prefetch = 2;
   std::string draft;
-  int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256;
+  int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256, side_prefill = 0;
   bool interleave_check = false, batch_check = false, batch_bench = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -117,6 +121,7 @@ int main(int argc, char** argv) {
     else if (a == "--batch-check") batch_check = true;
     else if (a == "--batch-bench") batch_check = batch_bench = true;
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
+    else if (a == "--side-prefill") side_prefill = std::stoi(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
@@ -163,6 +168,7 @@ int main(int argc, char** argv) {
     opts.attention_prefetch = attn_prefetch;
     opts.prefill_bf16 = prefill_bf16;
     opts.sessions = sessions;
+    opts.side_prefill = side_prefill;
     ling::Engine engine(model, opts);
     auto t1 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "loaded %.1f GB of weights in %.1f s\n", engine.model().device_bytes() / 1e9,
@@ -316,7 +322,16 @@ int main(int argc, char** argv) {
             ling::Engine::PrefillCursor cur = engine.begin_prefill(B);
             int chunks_beside = 0;
             while (!a.done || !b.done) {
-              if (!cur.done()) {
+              if (!cur.done() && engine.side_enabled() && (engine.side_busy() || !a.done)) {
+                // The side path: a full chunk queued beside A's steps; finished once its pass is done (or when A
+                // has nothing left to run beside it).
+                if (!engine.side_busy()) {
+                  engine.prefill_chunk_launch(cur, 0);
+                  chunks_beside += !a.done;
+                } else if (a.done || engine.side_ready()) {
+                  if (engine.prefill_chunk_finish()) b.pending = {engine.sample(engine.logits(), sp, engine.history())};
+                }
+              } else if (!cur.done()) {
                 if (engine.prefill_chunk(cur, a.done ? 0 : contended)) {
                   b.pending = {engine.sample(engine.logits(), sp, engine.history())};
                 }

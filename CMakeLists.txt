@@ -53,7 +53,7 @@ add_library(ling_core STATIC
   src/core/engine.cpp
 )
 target_include_directories(ling_core PUBLIC src)
-target_link_libraries(ling_core PUBLIC CUDA::cudart CUDA::nvtx3 nlohmann_json::nlohmann_json)
+target_link_libraries(ling_core PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::nvtx3 nlohmann_json::nlohmann_json)
 set_target_properties(ling_core PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
 # The tokenizer: byte-level BPE with Qwen's pre-tokenizer pattern (PCRE2) and NFC (ICU).
