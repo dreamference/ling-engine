@@ -27,6 +27,19 @@ struct Fp4Upload {
 Fp4Upload upload_nvfp4(const TensorView& values, const TensorView& scales, int N, int K, size_t* bytes,
                        std::vector<void*>& owned);
 
+// BACKLOG 33: a BF16 matrix [N][K] (K a multiple of 16, on the host) rounded to NVFP4 in the checkpoints' layout,
+// bit for bit as bench/quant/drafter_variants.py's nvfp4_codes: the global scale g = amax / (448 * 6), each block of
+// 16 an E4M3 scale amax16 / 6 / g (at least 2^-9, rounded to nearest even), each value the E2M1 code nearest to
+// x / (scale * g), a value halfway between two codes taking the smaller magnitude; two codes a byte, the first in the
+// low nibble. The arithmetic is FP32 as there, row by row on a few host threads.
+struct Nvfp4Host {
+  std::vector<uint8_t> values;  // [N][K / 2] E2M1 codes
+  std::vector<uint8_t> scales;  // [N][K / 16] E4M3
+  float scale2 = 0.f;           // g
+  double rel_sq_error = 0;      // sum (dequantized - w)^2 / sum w^2
+};
+Nvfp4Host quantize_nvfp4(const __nv_bfloat16* w, int N, int K);
+
 struct ModelConfig {
   int hidden = 0;            // 5120
   int intermediate = 0;      // 17408

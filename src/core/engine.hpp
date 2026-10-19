@@ -42,6 +42,10 @@ struct EngineOptions {
   int prefill_chunk = 2048;  // measured: 647 tokens/s against 582 at 1024 on a 7.7K-token prompt
   std::string draft_dir;     // the DFlash2 drafter's checkpoint; empty: no speculation
   int draft_block = 16;      // rows per verify: the anchor and block - 1 drafted tokens (2 .. 32)
+  // BACKLOG 33: the drafter's fc and conv kernel projections as NVFP4 copies rounded at load, read on the rows path
+  // instead of BF16 (the conv projections' BF16 originals are then not kept; the fc's stay for the prompt's chunks).
+  // Changes only the drafter's proposals, never what the verify accepts. LING_DRAFT_NVFP4=0/1 overrides.
+  bool draft_nvfp4 = true;
   // The context-lookup source: 0 off; 1 shadow (proposed and scored afterwards against what was really
   // generated, never verified); 2 auto (verified instead of the drafter's chain when the match is at
   // least lookup_min_match tokens long, and the drafter's pass is skipped).
@@ -338,6 +342,8 @@ class Engine {
   bool xq_is(float scale, bool nvfp4) const { return scale != 0.f && xq_scale_ == scale && xq_nvfp4_ == nvfp4; }
   void linear_bf16(const Bf16Weight& w, const float* x, int M, float* y);
   void linear_bf16_drafter(const Bf16Weight& w, const float* x, int M, float* y);  // the drafter's BF16 matrices
+  // A conv kernel projection: its NVFP4 copy on the rows path when it has one (BACKLOG 33), else the BF16 matrix.
+  void linear_draft_kproj(const Bf16Weight& w, const Fp4Weight& w4, const float* x, int M, float* y);
   // DeltaNet and conv state, saved or restored as a whole.
   struct StateSlot {
     std::vector<float*> gdn, conv;
@@ -522,6 +528,7 @@ class Engine {
   // and the block's buffers.
   std::vector<int> feature_layer_;  // target layer -> index of its feature slot, or -1
   __nv_bfloat16* cap_ = nullptr;
+  __half* xh_fc_ = nullptr;  // BACKLOG 33: the FP16 rows of the fc's input for its NVFP4 copy
   int cap_stride_ = 0;
   std::vector<__nv_bfloat16*> dkc_, dvc_;
   float *dctx_ = nullptr, *dk_ = nullptr, *dv_ = nullptr, *dres_ = nullptr, *dh_ = nullptr, *dh2_ = nullptr;
@@ -608,7 +615,7 @@ class Engine {
   X(h_) X(xn_) X(t1_) X(t2_) X(mixed_) X(z_) X(a_) X(b_) X(g_) X(beta_) X(core_) X(normed_) X(q_gate_) X(k_)     \
   X(v_) X(q_) X(gate_) X(attn_) X(attn_scratch_) X(logits_dev_) X(x_bf16_) X(xn_bf16_) X(t2_bf16_) X(z_bf16_)    \
   X(mixed_bf16_) X(core_bf16_) X(xq_) X(xsf_) X(xq2_) X(xsf2_) X(xh_) X(xinv_) X(ids_dev_) X(conv_tmp_) X(cap_)  \
-  X(dctx_) X(dk_) X(dv_) X(stream_) X(s_) X(quantized_) X(xq_scale_) X(xq_nvfp4_) X(logits_host_)
+  X(xh_fc_) X(dctx_) X(dk_) X(dv_) X(stream_) X(s_) X(quantized_) X(xq_scale_) X(xq_nvfp4_) X(logits_host_)
 #define LING_SIDE_DECL(m) decltype(Engine::m) m{};
   struct SideSet {
     LING_SIDE_SET(LING_SIDE_DECL)
