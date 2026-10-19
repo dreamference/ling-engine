@@ -610,6 +610,25 @@ __global__ void dequant_tiled_fp8_kernel(const uint8_t* __restrict__ tw, float w
   }
 }
 
+// The megakernel probe's L2 run-ahead (BACKLOG 28): the first `nc` chunks of every 16-row tile of a tiled weight blob
+// into L2, one bulk prefetch per tile and region, issued before pdl_begin() since the weights never change. Each block of
+// a stream GEMM reads its tiles' chunks in order from chunk 0, so a per-tile prefix is what every block reads first.
+// Nothing is written: the GEMM that follows computes the same bits, only some of its loads hit L2.
+__global__ void l2_prefetch_tiles_kernel(const uint8_t* __restrict__ w, int tiles, int chunks, int blk_bytes, int nc,
+                                         const uint8_t* __restrict__ codes, int code_bytes) {
+  const int tile = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tile < tiles) {
+    const uint8_t* p = w + static_cast<size_t>(tile) * chunks * blk_bytes;
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(nc * blk_bytes) : "memory");
+    if (codes) {
+      const uint8_t* c = codes + static_cast<size_t>(tile) * chunks * code_bytes;
+      const int cb = (nc * code_bytes + 15) & ~15;  // codes of a tile start 16-byte aligned (chunks * 96)
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(c), "r"(cb) : "memory");
+    }
+  }
+  pdl_begin();
+}
+
 int grid_of(size_t n) { return static_cast<int>(std::min<size_t>((n + 255) / 256, 65535 * 4)); }
 
 void check_shape(int N, int K, const char* what) {
@@ -682,6 +701,17 @@ void dequant_tiled_fp8(const uint8_t* tw, float wscale, __nv_bfloat16* out, int 
 void rmsnorm_half(const float* x, const __nv_bfloat16* w, float* out, __half* xh, float* xinv, int rows, int H, float eps,
                   bool gemma, cudaStream_t s) {
   launch_kernel("rmsnorm_half", rmsnorm_half_kernel, dim3(rows), dim3(1024), 0, s, x, w, out, xh, xinv, H, eps, gemma);
+}
+
+void l2_prefetch_weights(const uint8_t* w, bool fp4, bool coded, int N, int K, size_t bytes, cudaStream_t s) {
+  if (!w || bytes == 0) return;
+  const int tiles = N / 16, chunks = K / kChunk;
+  const int blk = fp4 ? (coded ? kValueBytesFp4 : kTileBytesFp4) : kTileBytesFp8;
+  const size_t per_chunk = static_cast<size_t>(tiles) * (blk + (coded ? kCodeBytesFp4 : 0));
+  const int nc = static_cast<int>(std::min<size_t>(chunks, std::max<size_t>(1, bytes / per_chunk)));
+  const uint8_t* codes = coded ? w + static_cast<size_t>(tiles) * chunks * kValueBytesFp4 : nullptr;
+  launch_kernel("l2_prefetch", l2_prefetch_tiles_kernel, dim3((tiles + 127) / 128), dim3(128), 0, s, w, tiles, chunks, blk,
+                nc, codes, coded ? kCodeBytesFp4 : 0);
 }
 
 void to_half_rows(const float* x, int M, int K, __half* out, float* xinv, cudaStream_t s) {
