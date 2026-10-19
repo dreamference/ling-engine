@@ -519,6 +519,13 @@ void Engine::plan_accept(StepPlan& sp, const float* vals, const int* ids) {
   const int V = sp.V, K = sp.K, E = sp.E;
   require_finite_topk({vals, size_t(V) * K}, {ids, size_t(V) * K}, model_->config().vocab);
   // 3. Accept.
+  if (sp.greedy && force_n_ > 0) {  // bench: the drafts are checked against the forced text, not the argmax
+    int accepted = 0;
+    while (accepted < E && accepted + 1 < force_n_ && sp.rows[accepted + 1] == force_[accepted]) ++accepted;
+    sp.accepted = accepted;
+    sp.next = force_[accepted];
+    return;
+  }
   if (sp.greedy) {  // K = 1: ids holds each row's argmax
     int accepted = 0;
     while (accepted < E && sp.rows[accepted + 1] == ids[accepted]) ++accepted;

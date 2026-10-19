@@ -248,6 +248,10 @@ Request parse_request(const json& body, bool chat) {
     else if (p.is_array() && p.size() == 1 && p[0].is_string()) r.prompt_text = p[0];
     else throw std::invalid_argument("prompt must be a string or a list of token ids");
     r.reasoning = false;
+    if (body.contains("force_tokens") && body["force_tokens"].is_array() && !body["force_tokens"].empty()) {
+      r.force_tokens = body["force_tokens"].get<std::vector<int>>();
+      r.sampling.temperature = 0.f;  // forcing is defined for the greedy accept rule only
+    }
   }
   if (body.contains("prompt_cache_key") && body["prompt_cache_key"].is_string())
     r.session_key = body["prompt_cache_key"].get<std::string>();

@@ -191,6 +191,9 @@ class Engine {
   // row-invariant rows path makes bit for bit what plain decoding gives). Null by default: nothing is
   // copied off the device beyond each row's top K.
   std::vector<int> speculate(int anchor, const SamplingParams& p, std::vector<float>* row_logits = nullptr);
+  // Bench only: the next speculate() at greedy accepts the drafts equal to t[0 .. n - 1] and returns them and
+  // t[accepted] (the given text's next token) instead of the target's argmax; n = 0 turns it off.
+  void set_force(const int* t, int n) { force_ = t; force_n_ = n; }
   // A batch of speculative steps (M4 §2, stage 3): one step for each of several sessions, their verify rows
   // concatenated in one forward pass ([a1, d1 ..] of the first, then [a2, d2 ..] of the second); the drafter, the
   // state-bearing kernels (attention and its KV writes, the DeltaNet conv and recurrence), the lattice walk, the
@@ -392,6 +395,8 @@ class Engine {
   // depends on, so there is one commit graph per count; the draft and verify graphs have fixed shapes
   // (block B; the verify's attention launches the key ranges of the whole max_context, empty ones exiting at
   // once). Positions are read on the device from pos_dev_, written before every graph step.
+  const int* force_ = nullptr;   // set_force
+  int force_n_ = 0;
   bool graphs_ = false;          // step graphs in use (opts_.step_graphs and nothing preventing them)
   bool graphs_allowed_ = false;  // nothing prevents them (a drafter, no LING_PROFILE or LING_KSPLIT)
   bool use_dev_pos_ = false;  // set while capturing: dpos() points the kernels at pos_dev_
