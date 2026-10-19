@@ -95,7 +95,9 @@ struct EngineOptions {
   double tree_temp = 1.0;
   int tree_width = 16;
   int tree_max_depth = 1000;
-  int tree_chain = 1000;  // LING_TREE_CHAIN: the chain's length within the block (the rest are tree nodes)
+  int tree_chain = 1000;
+  double tree_min_mass = 0;  // LING_TREE_MIN: a step whose extra nodes' summed path probability is below this
+                             // verifies the chain alone  // LING_TREE_CHAIN: the chain's length within the block (the rest are tree nodes)
 };
 
 struct EngineStats {

@@ -41,6 +41,7 @@ struct DraftTree {
   int E = 0;                            // the chain's drafted tokens: rows 1 .. E (at most the block's positions)
   std::vector<int> parent, depth, token, pick;  // per row; pick: the node's candidate index at its position
   std::vector<std::vector<int>> children;       // per row, in row order
+  double extra_mass = 0;                        // the extra nodes' path probabilities, summed (their expected tokens)
   int rows() const { return static_cast<int>(parent.size()); }
 };
 
