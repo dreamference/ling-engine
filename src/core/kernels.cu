@@ -10,6 +10,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ling::kernels {
 namespace {
@@ -944,6 +945,27 @@ void set_pdl(bool on) { g_pdl = on; }
 void set_attention_bulk(bool on) { g_attn_bulk = on; }
 void set_attention_prefetch(int tiles) { g_attn_prefetch = tiles < 0 ? 0 : tiles; }
 bool pdl_enabled() { return g_pdl; }
+
+__global__ void probe_noop_kernel() { pdl_begin(); }
+
+bool probe_skip(const char* what) {
+  static const std::vector<std::string> names = [] {
+    std::vector<std::string> v;
+    const char* e = std::getenv("LING_PROBE_SKIP");
+    for (std::string s = e ? e : ""; !s.empty();) {
+      const size_t c = s.find(',');
+      if (c != 0) v.push_back(s.substr(0, c));
+      s = c == std::string::npos ? "" : s.substr(c + 1);
+    }
+    return v;
+  }();
+  if (names.empty()) return false;
+  const std::string w(what);
+  for (const std::string& n : names) {
+    if (n.back() == '*' ? w.compare(0, n.size() - 1, n, 0, n.size() - 1) == 0 : w == n) return true;
+  }
+  return false;
+}
 bool pdl_attention_enabled() {
   static const bool attn = [] {
     const char* e = std::getenv("LING_PDL_ATTN");

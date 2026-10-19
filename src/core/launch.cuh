@@ -49,6 +49,13 @@ __device__ __forceinline__ void pdl_begin() {
   pdl_trigger();
 }
 
+// The megakernel probe (BACKLOG 28; a measurement, never for serving): LING_PROBE_SKIP is a comma-separated list of
+// launch names (the `what` below; "*gemm" style prefixes end in '*') whose launches are replaced by
+// probe_noop_kernel, one block that waits for its predecessor and triggers its successor. The output is then wrong;
+// the step's time without those kernels is the bound on what hiding them beside the weight stream could take.
+bool probe_skip(const char* what);
+__global__ void probe_noop_kernel();
+
 // kernel<<<grid, block, smem, s>>>(args...), with the PDL attribute when `pdl`.
 template <typename... Params, typename... Args>
 void launch_kernel_pdl(bool pdl, const char* what, void (*kernel)(Params...), dim3 grid, dim3 block, size_t smem,
@@ -63,6 +70,14 @@ void launch_kernel_pdl(bool pdl, const char* what, void (*kernel)(Params...), di
   cfg.stream = s;
   cfg.attrs = attr;
   cfg.numAttrs = pdl ? 1 : 0;
+  if (probe_skip(what)) {  // timing probe only (LING_PROBE_SKIP): the launch becomes one block that waits and triggers
+    cfg.gridDim = dim3(1);
+    cfg.blockDim = dim3(32);
+    cfg.dynamicSmemBytes = 0;
+    const cudaError_t e = cudaLaunchKernelEx(&cfg, probe_noop_kernel);
+    if (e != cudaSuccess) throw std::runtime_error(std::string(what) + " (probe): " + cudaGetErrorString(e));
+    return;
+  }
   const cudaError_t e = cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...);
   if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
