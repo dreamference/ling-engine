@@ -700,6 +700,12 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
     phase_seconds_[std::string(kind) + phase] += std::chrono::duration<double>(now - t_last).count();
     t_last = now;
   };
+  // The megakernel probe (BACKLOG 28): LING_L2_HINT_GDN, _MLP and _ATTN (MB, default 0: off) prefetch that much of the
+  // next projection's weights into L2 right after the GEMM before a latency-bound stretch (the DeltaNet chain before
+  // the out-projection, silu and the FP16 copy before the down projection, attention before its out-projection).
+  static const size_t hint_gdn = std::getenv("LING_L2_HINT_GDN") ? size_t(std::atof(std::getenv("LING_L2_HINT_GDN")) * 1e6) : 0;
+  static const size_t hint_mlp = std::getenv("LING_L2_HINT_MLP") ? size_t(std::atof(std::getenv("LING_L2_HINT_MLP")) * 1e6) : 0;
+  static const size_t hint_attn = std::getenv("LING_L2_HINT_ATTN") ? size_t(std::atof(std::getenv("LING_L2_HINT_ATTN")) * 1e6) : 0;
   check(cudaMemcpyAsync(ids_dev_, ids, M * sizeof(int), cudaMemcpyHostToDevice, stream_), "ids");
   kernels::embed(model_->embed(), ids_dev_, M, H, h_, stream_);
 
@@ -719,6 +725,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
     if (L.full) {
       NvtxRange r("attention");
       linear_fp8_multi({{&L.q, q_gate_}, {&L.k, k_}, {&L.v, v_}}, xn_, M, xn_half);
+      if (!quantized_) kernels::l2_prefetch_weights(L.o.w, false, false, L.o.N, L.o.K, hint_attn, stream_);
       mark("attn_proj");
       // Per sequence (M4 §2): its rows' q/k norms and RoPE at its positions, their KV into its cache, and their
       // attention over it.
@@ -806,6 +813,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       float* beta = verify ? v_beta_[slot] : beta_;
       // The prefill path convolves out of place: the projection goes to t2_ (free until the MLP).
       linear_fp8_multi({{&L.in_qkv, verify ? v_pre_[slot] : quantized_ ? t2_ : mixed}, {&L.in_z, z_}}, xn_, M, xn_half);
+      if (!quantized_) kernels::l2_prefetch_weights(L.out.w, false, false, L.out.N, L.out.K, hint_gdn, stream_);
       if (quantized_) {  // tensor cores, row-invariant for any M
         kernels::narrow_bf16(xn_, M, L.in_a.w, L.in_b.w, a_, b_, L.in_a.N, L.in_a.K, stream_);
       } else if (L.in_a.N == L.in_b.N) {  // both in one launch
@@ -869,6 +877,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       const bool post_half = norm_rows(h_, L.post_norm, xn_, M, L.gate.in_scale, true, L.up.in_scale != L.gate.in_scale);
       if (!quantized_) {
         linear_fp4_multi({{&L.gate, t1_}, {&L.up, t2_}}, xn_, M, post_half);
+        kernels::l2_prefetch_weights(L.down.w, true, L.down.table != nullptr, L.down.N, L.down.K, hint_mlp, stream_);
         kernels::silu_mul(t1_, t2_, t1_, M * I, stream_);
         linear_fp4(L.down, t1_, M, t2_);
         kernels::add_inplace(h_, t2_, M * H, stream_);

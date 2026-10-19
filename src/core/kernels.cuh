@@ -207,6 +207,10 @@ struct StreamTarget {
 };
 void stream_gemm_multi(bool nvfp4, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K,
                        cudaStream_t s);
+// The megakernel probe (BACKLOG 28): about `bytes` of a tiled weight blob (the first chunks of every tile, what a stream
+// GEMM's blocks read first) prefetched into L2 by one PDL launch, so the latency-bound kernels before that GEMM run
+// beside its first bytes. Writes nothing; the GEMM computes the same bits.
+void l2_prefetch_weights(const uint8_t* w, bool fp4, bool coded, int N, int K, size_t bytes, cudaStream_t s);
 
 // Top-K (K <= 64) of each row of x [rows][V]: values descending, ties to the lower index (so entry 0 is
 // what std::max_element returns). `scratch` needs topk_scratch_floats(rows, K) floats.
