@@ -40,14 +40,19 @@ struct DraftLayer {
   Fp4Weight q, k, v, o, gate, up, down;
   const __nv_bfloat16* q_norm = nullptr;
   const __nv_bfloat16* k_norm = nullptr;
-  Bf16Weight attn_kproj, mlp_kproj;  // [2 * taps * groups][hidden]
+  Bf16Weight attn_kproj, mlp_kproj;  // [2 * taps * groups][hidden]; w null when the NVFP4 copies replace them
+  // BACKLOG 33: the conv kernel projections in NVFP4, rounded at load (w null with the copies off). The block's rows
+  // path reads them instead of the BF16 originals, which are then not kept: every drafter pass has at most
+  // kMaxStreamRows rows.
+  Fp4Weight attn_kproj4, mlp_kproj4;
   const __nv_bfloat16* attn_base = nullptr;  // [2][taps][hidden]
   const __nv_bfloat16* mlp_base = nullptr;
 };
 
 class DraftModel {
  public:
-  explicit DraftModel(const std::string& dir);
+  // nvfp4_copies (BACKLOG 33): round the fc and the conv kernel projections to NVFP4 at load for the rows path.
+  explicit DraftModel(const std::string& dir, bool nvfp4_copies = true);
   ~DraftModel();
   DraftModel(const DraftModel&) = delete;
   DraftModel& operator=(const DraftModel&) = delete;
@@ -55,6 +60,11 @@ class DraftModel {
   const DraftConfig& config() const { return cfg_; }
   const std::vector<DraftLayer>& layers() const { return layers_; }
   const Bf16Weight& fc() const { return fc_; }  // [hidden][features * hidden]
+  // BACKLOG 33: the fc's NVFP4 copy for at most kMaxStreamRows rows (w null with the copies off); the BF16 fc stays
+  // for the prompt's longer chunks.
+  const Fp4Weight& fc4() const { return fc4_; }
+  bool nvfp4_copies() const { return fc4_.w != nullptr; }
+  double nvfp4_rel_sq_error() const { return rel_sq_error_; }  // the largest of the copies' relative squared errors
   const __nv_bfloat16* hidden_norm() const { return hidden_norm_; }
   const __nv_bfloat16* norm() const { return norm_; }
   const Bf16Weight& selector_projection() const { return sel_proj_; }  // [rank][hidden]
@@ -66,6 +76,8 @@ class DraftModel {
   DraftConfig cfg_;
   std::vector<DraftLayer> layers_;
   Bf16Weight fc_, sel_proj_;
+  Fp4Weight fc4_;
+  double rel_sq_error_ = 0;
   const __nv_bfloat16* hidden_norm_ = nullptr;
   const __nv_bfloat16* norm_ = nullptr;
   const __nv_bfloat16* pred_ = nullptr;

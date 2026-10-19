@@ -6,7 +6,7 @@
 //              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
-//              [--side-prefill N]
+//              [--side-prefill N] [--draft-bf16]
 //
 // --sessions N (default 2; M4 §1) keeps N resident sessions, each with its own KV cache and state, so N
 // agent tasks that alternate keep their histories warm. A request runs in the session it extends (its
@@ -34,6 +34,9 @@
 // how often a streamed request that has produced no token yet is sent a keep-alive (API §3, §4).
 // --prefill-bf16 keeps the prefill's DeltaNet intermediates in BF16 as production does (B34; not exact, off
 // by default: MILESTONES §14).
+// --draft-bf16 reads the drafter's fc and conv kernel projections in BF16, as its file has them, instead of the
+// NVFP4 copies rounded at load (BACKLOG 33; the default since 2026-10-20; LING_DRAFT_NVFP4=0/1 overrides). Only the
+// drafter's proposals change, so only acceptance can move: the verify decides every token either way.
 //
 // With --draft, requests decode speculatively with the DFlash2 drafter (requests that set penalties
 // decode plainly). GET /metrics exports SGLang's counter names, so M0's replay harness reads them as is.
@@ -1275,6 +1278,7 @@ int main(int argc, char** argv) {
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40;
   double protect_seconds = 30;
+  bool draft_bf16 = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -1302,6 +1306,7 @@ int main(int argc, char** argv) {
     else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
     else if (a == "--keepalive-seconds") keepalive_seconds = std::stoi(next());
     else if (a == "--prefill-bf16") prefill_bf16 = true;
+    else if (a == "--draft-bf16") draft_bf16 = true;
     else if (a == "--sessions") sessions = std::stoi(next());
     else if (a == "--session-protect-seconds") protect_seconds = std::stod(next());
     else if (a == "--batch") batch = std::stoi(next());
@@ -1349,6 +1354,7 @@ int main(int argc, char** argv) {
   opts.attention_bulk = attn_bulk;
   opts.attention_prefetch = attn_prefetch;
   opts.prefill_bf16 = prefill_bf16;
+  opts.draft_nvfp4 = !draft_bf16;
   opts.sessions = sessions;
   opts.side_prefill = side_prefill;
   std::cerr << "loading " << model_dir << " ...\n";

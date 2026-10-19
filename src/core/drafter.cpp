@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -50,7 +51,7 @@ DraftConfig DraftConfig::from_file(const std::string& path) {
   return c;
 }
 
-DraftModel::DraftModel(const std::string& dir) {
+DraftModel::DraftModel(const std::string& dir, bool nvfp4_copies) {
   cfg_ = DraftConfig::from_file(dir + "/config.json");
   Checkpoint ck(dir);
   auto upload = [&](const std::string& name, const std::string& dtype) -> const void* {
@@ -89,7 +90,33 @@ DraftModel::DraftModel(const std::string& dir) {
     std::memcpy(&w.in_scale, is.data, 4);
     return w;
   };
+  // BACKLOG 33: a BF16 matrix's NVFP4 copy, rounded here (quantize_nvfp4) and tiled as a checkpoint's NVFP4 is.
+  auto fp4_copy = [&](const std::string& name) {
+    const TensorView& t = ck.get(name);
+    if (t.dtype != "BF16" || t.shape.size() != 2) throw std::runtime_error(name + ": not a BF16 matrix");
+    Fp4Weight w;
+    w.N = static_cast<int>(t.shape[0]);
+    w.K = static_cast<int>(t.shape[1]);
+    const Nvfp4Host q = quantize_nvfp4(reinterpret_cast<const __nv_bfloat16*>(t.data), w.N, w.K);
+    TensorView v, sc;
+    v.dtype = "U8", v.shape = {w.N, w.K / 2}, v.data = q.values.data(), v.bytes = q.values.size();
+    sc.dtype = "F8_E4M3", sc.shape = {w.N, w.K / 16}, sc.data = q.scales.data(), sc.bytes = q.scales.size();
+    const Fp4Upload u = upload_nvfp4(v, sc, w.N, w.K, &bytes_, allocations_);
+    w.w = u.w, w.table = u.table, w.scales = u.scales;
+    w.scale2 = q.scale2;  // in_scale stays 1: the copies only take the rows path
+    rel_sq_error_ = std::max(rel_sq_error_, q.rel_sq_error);
+    return w;
+  };
+  // A BF16 matrix's shape only (the NVFP4 copy replaces it): w stays null.
+  auto shape_only = [&](const std::string& name) {
+    Bf16Weight w;
+    const TensorView& t = ck.get(name);
+    w.N = static_cast<int>(t.shape[0]);
+    w.K = static_cast<int>(t.shape[1]);
+    return w;
+  };
   fc_ = bf_w("fc.weight");
+  if (nvfp4_copies) fc4_ = fp4_copy("fc.weight");
   hidden_norm_ = bf("hidden_norm.weight");
   norm_ = bf("norm.weight");
   sel_proj_ = bf_w("candidate_selector.hidden_projection.weight");
@@ -111,8 +138,16 @@ DraftModel::DraftModel(const std::string& dir) {
     L.down = fp4(p + "mlp.down_proj");
     L.q_norm = bf(p + "self_attn.q_norm.weight");
     L.k_norm = bf(p + "self_attn.k_norm.weight");
-    L.attn_kproj = bf_w(p + "attention_conv.kernel_projection.weight");
-    L.mlp_kproj = bf_w(p + "mlp_conv.kernel_projection.weight");
+    auto kproj = [&](const std::string& name, Bf16Weight& bw, Fp4Weight& w4) {
+      if (!nvfp4_copies) {
+        bw = bf_w(name);
+        return;
+      }
+      w4 = fp4_copy(name);
+      bw = shape_only(name);
+    };
+    kproj(p + "attention_conv.kernel_projection.weight", L.attn_kproj, L.attn_kproj4);
+    kproj(p + "mlp_conv.kernel_projection.weight", L.mlp_kproj, L.mlp_kproj4);
     L.attn_base = bf(p + "attention_conv.base_kernel");
     L.mlp_base = bf(p + "mlp_conv.base_kernel");
     if (L.attn_kproj.N != 2 * cfg_.conv_taps * cfg_.conv_groups) throw std::runtime_error("drafter conv projection shape");

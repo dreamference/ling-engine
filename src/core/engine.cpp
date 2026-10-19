@@ -161,9 +161,15 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   s_ = &sessions_[0];
   for (int i = 0; i < opts_.prefix_checkpoints; ++i) ckpt_slots_.push_back(alloc_slot());
   if (!opts_.draft_dir.empty()) {
-    draft_ = std::make_unique<DraftModel>(opts_.draft_dir);
+    bool nvfp4 = opts_.draft_nvfp4;
+    if (const char* e = std::getenv("LING_DRAFT_NVFP4")) nvfp4 = std::atoi(e) != 0;
+    draft_ = std::make_unique<DraftModel>(opts_.draft_dir, nvfp4);
     alloc_drafter();
-    std::fprintf(stderr, "drafter: %.2f GB, block %d\n", draft_->device_bytes() / 1e9, opts_.draft_block);
+    std::fprintf(stderr, "drafter: %.2f GB, block %d, fc and conv projections %s\n", draft_->device_bytes() / 1e9,
+                 opts_.draft_block,
+                 draft_->nvfp4_copies()
+                     ? ("NVFP4 (relative squared error " + std::to_string(draft_->nvfp4_rel_sq_error()) + ")").c_str()
+                     : "BF16");
   }
   if (sessions_.size() > 1) std::fprintf(stderr, "sessions: %zu resident\n", sessions_.size());
   logits_.resize(c.vocab);
@@ -249,6 +255,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
       dk_ = alloc<float>(R * d.kv_heads * d.head_dim);
       dv_ = alloc<float>(R * d.kv_heads * d.head_dim);
       conv_tmp_ = alloc<float>(size_t(C) * (c.conv_kernel - 1));
+      if (draft_->nvfp4_copies()) xh_fc_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * draft_->fc4().K);
     }
     check(cudaHostAlloc(reinterpret_cast<void**>(&logits_host_), size_t(c.vocab) * sizeof(float), cudaHostAllocDefault),
           "side logits");

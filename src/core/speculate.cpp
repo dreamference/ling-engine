@@ -155,6 +155,7 @@ void Engine::alloc_drafter() {
       s.dvc.push_back(alloc<__nv_bfloat16>(size_t(ring_) * dkv));
     }
   dctx_ = alloc<float>(size_t(R) * H);
+  if (draft_->nvfp4_copies()) xh_fc_ = alloc<__half>(size_t(B) * draft_->fc4().K);
   dk_ = alloc<float>(size_t(R) * dkv);
   dv_ = alloc<float>(size_t(R) * dkv);
   dres_ = alloc<float>(size_t(B) * H);
@@ -332,7 +333,11 @@ void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
   const int dkv = d.kv_heads * d.head_dim;
   // fc over the concatenated target features (already BF16), then the hidden norm. The context goes
   // straight to each layer's K and V: no input norm, no convolution (SGLang's prepare_context_hidden_for_kv).
-  if (rows <= kernels::kMaxStreamRows)
+  const Fp4Weight& fc4 = draft_->fc4();
+  if (rows <= kernels::kMaxStreamRows && fc4.w) {  // BACKLOG 33: the NVFP4 copy on the rows path
+    kernels::bf16_to_half_rows(cap_ + size_t(cap_row0) * cap_stride_, rows, fc4.K, xh_fc_, xinv_, stream_);
+    kernels::stream_gemm_nvfp4(xh_fc_, xinv_, rows, fc4.w, fc4.table, fc4.scale2, dctx_, fc4.N, fc4.K, stream_);
+  } else if (rows <= kernels::kMaxStreamRows)
     kernels::bf16_rows_bf16in(cap_ + size_t(cap_row0) * cap_stride_, rows, draft_->fc().w, dctx_, d.hidden, cap_stride_,
                               stream_);
   else
@@ -345,6 +350,14 @@ void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
     kernels::draft_qk_rope(dk_, rows, d.kv_heads, dkv, L.k_norm, pos0, d.rope_theta, d.eps, stream_);
     kernels::draft_store_kv(dk_, dv_, rows, dkv, pos0, s_->dkc[l], s_->dvc[l], ring_, stream_);
   }
+}
+
+void Engine::linear_draft_kproj(const Bf16Weight& w, const Fp4Weight& w4, const float* x, int M, float* y) {
+  if (!w4.w) return linear_bf16_drafter(w, x, M, y);
+  // Without the BF16 original only the rows path is there; a drafter pass never has more rows (pin_->draft_ids).
+  if (M > kernels::kMaxStreamRows) throw std::runtime_error("the drafter's NVFP4 conv projection over > 32 rows");
+  kernels::to_half_rows(x, M, w4.K, xh_, xinv_, stream_);
+  kernels::stream_gemm_nvfp4(xh_, xinv_, M, w4.w, w4.table, w4.scale2, y, w4.N, w4.K, stream_);
 }
 
 void Engine::draft_launch(int B) {
@@ -365,7 +378,7 @@ void Engine::draft_launch(int B) {
     if (l > 0) kernels::add_inplace(dres_, dout_, B * H, stream_);
     kernels::rmsnorm(dres_, L.input_norm, dh_, B, H, d.eps, false, stream_);
     // Attention wrapped in the grouped conv: input side 0, output side 1, one kernel projection.
-    linear_bf16_drafter(L.attn_kproj, dh_, B, dcoef_);
+    linear_draft_kproj(L.attn_kproj, L.attn_kproj4, dh_, B, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.attn_base, 0, dh2_, B, H, d.conv_groups, B, stream_);
     linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, B);
     kernels::draft_qk_rope(dq_, B, d.heads, dq, L.q_norm, dpos(), d.rope_theta, d.eps, stream_);
@@ -377,7 +390,7 @@ void Engine::draft_launch(int B) {
     kernels::add_inplace(dres_, dout_, B * H, stream_);
     kernels::rmsnorm(dres_, L.post_norm, dh_, B, H, d.eps, false, stream_);
     // The MLP, wrapped the same way.
-    linear_bf16_drafter(L.mlp_kproj, dh_, B, dcoef_);
+    linear_draft_kproj(L.mlp_kproj, L.mlp_kproj4, dh_, B, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.mlp_base, 0, dh2_, B, H, d.conv_groups, B, stream_);
     linear_fp4_multi({{&L.gate, dg_}, {&L.up, du_}}, dh2_, B);
     kernels::silu_mul(dg_, du_, dg_, B * d.intermediate, stream_);
@@ -428,7 +441,7 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B) {
     // never crosses a block), RoPE and attention per sequence through sb.
     if (l > 0) kernels::add_inplace(dres_, dout_, R * H, stream_);
     kernels::rmsnorm(dres_, L.input_norm, dh_, R, H, d.eps, false, stream_);
-    linear_bf16_drafter(L.attn_kproj, dh_, R, dcoef_);
+    linear_draft_kproj(L.attn_kproj, L.attn_kproj4, dh_, R, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.attn_base, 0, dh2_, R, H, d.conv_groups, B, stream_);
     linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, R);
     kernels::draft_qk_rope_seqs(dq_, d.heads, dq, L.q_norm, sb, d.rope_theta, d.eps, stream_);
@@ -439,7 +452,7 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B) {
     kernels::grouped_conv(dh2_, dcoef_, L.attn_base, 1, dout_, R, H, d.conv_groups, B, stream_);
     kernels::add_inplace(dres_, dout_, R * H, stream_);
     kernels::rmsnorm(dres_, L.post_norm, dh_, R, H, d.eps, false, stream_);
-    linear_bf16_drafter(L.mlp_kproj, dh_, R, dcoef_);
+    linear_draft_kproj(L.mlp_kproj, L.mlp_kproj4, dh_, R, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.mlp_base, 0, dh2_, R, H, d.conv_groups, B, stream_);
     linear_fp4_multi({{&L.gate, dg_}, {&L.up, du_}}, dh2_, R);
     kernels::silu_mul(dg_, du_, dg_, R * d.intermediate, stream_);

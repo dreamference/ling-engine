@@ -239,7 +239,35 @@ __global__ void copy_rows_bf16_kernel(const float* __restrict__ src, int H, __nv
     dst[static_cast<size_t>(r) * dst_stride + i] = __float2bfloat16(src[static_cast<size_t>(r) * H + i]);
 }
 
+// to_half_rows (stream_gemm.cu) from BF16 rows: one block per row, the power-of-two scale that puts the row's largest
+// magnitude in [2^14, 2^15), the same arithmetic on the same values.
+__global__ void bf16_to_half_rows_kernel(const __nv_bfloat16* __restrict__ x, int K, __half* __restrict__ out,
+                                         float* __restrict__ xinv) {
+  pdl_begin();  // first statement: see launch.cuh
+  __shared__ float red[32];
+  const __nv_bfloat16* row = x + static_cast<size_t>(blockIdx.x) * K;
+  float mx = 0.f;
+  for (int k = threadIdx.x; k < K; k += blockDim.x) mx = fmaxf(mx, fabsf(__bfloat162float(row[k])));
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = mx;
+  __syncthreads();
+  mx = 0.f;
+  for (int i = 0; i < (blockDim.x + 31) / 32; ++i) mx = fmaxf(mx, red[i]);
+  int e = 0;
+  if (mx > 0.f && isfinite(mx)) frexpf(mx, &e);  // mx < 2^e
+  const float s = ldexpf(1.f, 15 - e);
+  for (int k = threadIdx.x; k < K; k += blockDim.x)
+    out[static_cast<size_t>(blockIdx.x) * K + k] = __float2half_rn(__bfloat162float(row[k]) * s);
+  if (threadIdx.x == 0) xinv[blockIdx.x] = ldexpf(1.f, e - 15);
+}
+
 }  // namespace
+
+void bf16_to_half_rows(const __nv_bfloat16* x, int M, int K, __half* out, float* xinv, cudaStream_t s) {
+  if (M <= 0) return;
+  launch_kernel("bf16_to_half_rows", bf16_to_half_rows_kernel, dim3(M), dim3(256), 0, s, x, K, out, xinv);
+}
 
 void copy_rows_bf16(const float* src, int rows, int H, __nv_bfloat16* dst, int dst_stride, cudaStream_t s) {
   if (rows <= 0) return;

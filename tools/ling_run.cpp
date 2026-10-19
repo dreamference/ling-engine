@@ -6,13 +6,14 @@
 //            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N]]
 //            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16] [--graph-check] [--seed N]
 //            [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N]]
-//            [--batch-check] [--side-prefill N]
+//            [--batch-check] [--side-prefill N] [--draft-bf16]
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
 // tiles with bulk copies (M3); --attn-prefetch N sets how many KV tiles ahead its attention prefetches into L2
 // (default 2, 0 off; M3); --prefill-bf16 keeps the prefill's DeltaNet intermediates in BF16 as production does
-// (B34; not exact, off by default: MILESTONES §14).
+// (B34; not exact, off by default: MILESTONES §14); --draft-bf16 reads the drafter's fc and conv kernel projections
+// in BF16 instead of the NVFP4 copies rounded at load (BACKLOG 33, the default; LING_DRAFT_NVFP4=0/1 overrides).
 //
 // --graph-check decodes each prompt speculatively twice from the same prefill, without and with step graphs,
 // greedily and then sampling (--temperature, default 1, top-k 20, top-p 0.95, seeded by --seed or 1), and
@@ -83,7 +84,7 @@ int main(int argc, char** argv) {
   int attn_prefetch = 2;
   std::string draft;
   int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256, side_prefill = 0;
-  bool interleave_check = false, batch_check = false, batch_bench = false;
+  bool interleave_check = false, batch_check = false, batch_bench = false, draft_bf16 = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -117,6 +118,7 @@ int main(int argc, char** argv) {
     else if (a == "--attn-bulk") attn_bulk = true;
     else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
     else if (a == "--prefill-bf16") prefill_bf16 = true;
+    else if (a == "--draft-bf16") draft_bf16 = true;
     else if (a == "--sessions") sessions = std::stoi(next());
     else if (a == "--chunk-check") chunk_check = std::stoi(next());
     else if (a == "--interleave-check") interleave_check = true;
@@ -169,6 +171,7 @@ int main(int argc, char** argv) {
     opts.attention_bulk = attn_bulk;
     opts.attention_prefetch = attn_prefetch;
     opts.prefill_bf16 = prefill_bf16;
+    opts.draft_nvfp4 = !draft_bf16;
     opts.sessions = sessions;
     if (batch_check) opts.tree_nodes = 0;  // the chain alone, as a batch verifies (see --batch-check above)
     opts.side_prefill = side_prefill;

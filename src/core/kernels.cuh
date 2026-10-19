@@ -385,6 +385,8 @@ void set_attention_prefetch(int tiles);
 // ---- The DFlash2 drafter (draft_kernels.cu). ----
 // dst[r][0..H) = bf16(src[r][0..H)), rows dst_stride apart (the target features the drafter conditions on).
 void copy_rows_bf16(const float* src, int rows, int H, __nv_bfloat16* dst, int dst_stride, cudaStream_t s);
+// to_half_rows from BF16 rows [M][K] (BACKLOG 33: the captured features into the fc's NVFP4 copy).
+void bf16_to_half_rows(const __nv_bfloat16* x, int M, int K, __half* out, float* xinv, cudaStream_t s);
 // Per-head RMSNorm (plain weight) and NeoX RoPE over the full 128-dim head at positions pos0 + row, in place.
 void draft_qk_rope(float* x, int rows, int heads, int row_stride, const __nv_bfloat16* norm, DevPos pos0, float theta,
                    float eps, cudaStream_t s);

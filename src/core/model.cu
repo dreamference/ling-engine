@@ -2,12 +2,16 @@
 
 #include "core/kernels.cuh"
 
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <thread>
 
 #include <nlohmann/json.hpp>
 
@@ -179,6 +183,69 @@ Fp4Upload upload_nvfp4(const TensorView& values, const TensorView& scales, int N
   u.table = tab;
   u.scales = raw;
   return u;
+}
+
+Nvfp4Host quantize_nvfp4(const __nv_bfloat16* w, int N, int K) {
+  if (N <= 0 || K <= 0 || K % 16) throw std::runtime_error("quantize_nvfp4: K must be a positive multiple of 16");
+  static constexpr float kE2M1[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+  static constexpr float kBounds[7] = {0.25f, 0.75f, 1.25f, 1.75f, 2.5f, 3.5f, 5.f};
+  auto bf = [&](size_t i) { return __bfloat162float(w[i]); };
+  auto e4m3 = [](uint8_t c) {
+    __nv_fp8_e4m3 v;
+    v.__x = c;
+    return static_cast<float>(v);
+  };
+  const int nt = std::clamp(static_cast<int>(std::thread::hardware_concurrency()), 1, 16);
+  // Rows [r0, r1) of each thread's share; fn(t, r0, r1).
+  auto parallel = [&](auto&& fn) {
+    std::vector<std::thread> ts;
+    for (int t = 0; t < nt; ++t) {
+      const int r0 = static_cast<int>(int64_t(N) * t / nt), r1 = static_cast<int>(int64_t(N) * (t + 1) / nt);
+      ts.emplace_back([&fn, t, r0, r1] { fn(t, r0, r1); });
+    }
+    for (std::thread& th : ts) th.join();
+  };
+  std::vector<float> amax(nt, 0.f);
+  parallel([&](int t, int r0, int r1) {
+    float m = 0.f;
+    for (size_t i = size_t(r0) * K; i < size_t(r1) * K; ++i) m = std::max(m, std::fabs(bf(i)));
+    amax[t] = m;
+  });
+  const float mx = *std::max_element(amax.begin(), amax.end());
+  Nvfp4Host q;
+  q.scale2 = mx > 0.f ? mx / (448.f * 6.f) : 1.f;
+  q.values.assign(size_t(N) * K / 2, 0);
+  q.scales.assign(size_t(N) * K / 16, 0);
+  std::vector<double> err(nt, 0.0), ref(nt, 0.0);
+  const float g = q.scale2;
+  parallel([&](int t, int r0, int r1) {
+    double e = 0, s2 = 0;
+    for (int r = r0; r < r1; ++r)
+      for (int b = 0; b < K / 16; ++b) {
+        const size_t base = size_t(r) * K + size_t(b) * 16;
+        float bm = 0.f;
+        for (int j = 0; j < 16; ++j) bm = std::max(bm, std::fabs(bf(base + j)));
+        const float sv = std::max(bm / 6.f / g, 0x1p-9f);
+        const uint8_t sc = __nv_cvt_float_to_fp8(sv, __NV_SATFINITE, __NV_E4M3);
+        q.scales[size_t(r) * (K / 16) + b] = sc;
+        const float s = e4m3(sc) * g;
+        for (int j = 0; j < 16; ++j) {
+          const float x = bf(base + j), y = x / s, a = std::fabs(y);
+          uint8_t c = 0;
+          while (c < 7 && kBounds[c] < a) ++c;
+          const float dq = (x < 0.f ? -kE2M1[c] : kE2M1[c]) * s;
+          if (x < 0.f && c > 0) c |= 8;
+          q.values[(base + j) / 2] |= static_cast<uint8_t>(j % 2 ? c << 4 : c);
+          e += double(dq - x) * double(dq - x);
+          s2 += double(x) * double(x);
+        }
+      }
+    err[t] = e, ref[t] = s2;
+  });
+  double e = 0, s2 = 0;
+  for (int t = 0; t < nt; ++t) e += err[t], s2 += ref[t];
+  q.rel_sq_error = s2 > 0 ? e / s2 : 0;
+  return q;
 }
 
 Fp4Weight Model::fp4(const Checkpoint& ck, const std::string& prefix) {

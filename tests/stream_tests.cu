@@ -6,6 +6,8 @@
 //   ling-stream-tests --bench    plus timings
 //   LING_PDL=1 ling-stream-tests  the same with programmatic dependent launch (launch.cuh)
 //   LING_NO_TIMING=1 ling-stream-tests  skips the attention timings (under compute-sanitizer)
+//   ling-stream-tests --nvfp4-oracle DIR  only: the at-load NVFP4 rounding (BACKLOG 33) against the "<name>.nvfp4.*"
+//                                        copies bench/quant/drafter_variants.py --nvfp4-copy wrote into DIR, byte for byte
 #include <cuda.h>
 #include <cuda_fp8.h>
 
@@ -18,9 +20,12 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "core/kernels.cuh"
+#include "core/model.hpp"
+#include "core/safetensors.hpp"
 
 namespace {
 
@@ -675,6 +680,151 @@ void bench_groups() {
   std::printf("\n");
 }
 
+
+// BACKLOG 33: the drafter's NVFP4 copies, rounded at load by ling::quantize_nvfp4.
+//   - a hand-made block: every halfway value takes the smaller magnitude, the sign bit only on a non-zero code, the
+//     packing (first code in the low nibble), the E4M3 scale, and an all-zero block's scale clamped to 2^-9;
+//   - a Gaussian matrix's relative squared error (the offline copies of the drafter measured 0.0090);
+//   - the copy through upload_nvfp4 and the rows path (to_half_rows or bf16_to_half_rows, then stream_gemm_nvfp4)
+//     against a host GEMM on the dequantized copy (as tight as test_gemm) and on the BF16 matrix (bounded by the
+//     rounding), every row bit for bit the same at every M; bf16_to_half_rows equal to to_half_rows on the same values.
+bool test_nvfp4_copy() {
+  bool ok = true;
+  {
+    // amax 2688 = 448 * 6: the global scale 1 and the first block's scale 448 exactly, so x / 448 lands on the bounds.
+    const float row[32] = {2688, 112, 336, 560, 784, 1120, 1568, 2240, 113, -336, -10, 0, -2688, 338, -1568, 448,
+                           0,    0,   0,   0,   0,   0,    0,    0,    0,   0,    0,   0, 0,     0,   0,     0};
+    const uint8_t want[16] = {7, 0, 1, 2, 3, 4, 5, 6, 1, 9, 0, 0, 15, 2, 13, 2};
+    std::vector<__nv_bfloat16> w(32);
+    for (int i = 0; i < 32; ++i) w[i] = __float2bfloat16(row[i]);
+    const ling::Nvfp4Host q = ling::quantize_nvfp4(w.data(), 1, 32);
+    bool good = q.scale2 == 1.f && q.scales.size() == 2 && q.scales[0] == 0x7e && q.scales[1] == 0x01;
+    for (int i = 0; i < 16; ++i) good &= ((q.values[i / 2] >> (4 * (i & 1))) & 15) == want[i];
+    for (int i = 8; i < 16; ++i) good &= q.values[i] == 0;
+    ok &= good;
+    std::printf("nvfp4 copy: hand-made block (ties to the smaller code, sign, packing, scales) %s\n", good ? "ok" : "FAIL");
+  }
+  std::mt19937 rng(33);
+  std::normal_distribution<float> normal(0.f, 1.f);
+  {
+    const int N = 256, K = 1024;
+    std::vector<__nv_bfloat16> w(size_t(N) * K);
+    for (auto& v : w) v = __float2bfloat16(normal(rng) * 0.02f);
+    const ling::Nvfp4Host q = ling::quantize_nvfp4(w.data(), N, K);
+    const bool good = q.rel_sq_error > 0.007 && q.rel_sq_error < 0.011;
+    ok &= good;
+    std::printf("nvfp4 copy: Gaussian matrix, relative squared error %.5f %s\n", q.rel_sq_error, good ? "ok" : "FAIL");
+  }
+  // The conv kernel projection's shape (FP32 rows in) and a narrow slice of the fc's (BF16 rows in, K = 5 x 5120).
+  for (auto [N, K, bf16_in] : {std::tuple{1280, 5120, false}, std::tuple{96, 25600, true}}) {
+    const int MMAX = ling::kernels::kMaxStreamRows;
+    std::vector<__nv_bfloat16> w(size_t(N) * K);
+    for (auto& v : w) v = __float2bfloat16(normal(rng) * 0.02f);
+    const ling::Nvfp4Host q = ling::quantize_nvfp4(w.data(), N, K);
+    std::vector<float> wq(w.size()), wb(w.size());  // the copy dequantized, and the BF16 matrix
+    for (size_t i = 0; i < w.size(); ++i) {
+      const uint8_t c = q.values[i / 2];
+      wq[i] = kFp4[(i & 1) ? c >> 4 : c & 15] * fp8(q.scales[i / 16]) * q.scale2;
+      wb[i] = __bfloat162float(w[i]);
+    }
+    ling::TensorView tv, ts;
+    tv.dtype = "U8", tv.shape = {N, K / 2}, tv.data = q.values.data(), tv.bytes = q.values.size();
+    ts.dtype = "F8_E4M3", ts.shape = {N, K / 16}, ts.data = q.scales.data(), ts.bytes = q.scales.size();
+    size_t bytes = 0;
+    std::vector<void*> owned;
+    const ling::Fp4Upload u = ling::upload_nvfp4(tv, ts, N, K, &bytes, owned);
+    std::vector<float> x(size_t(MMAX) * K);
+    std::vector<__nv_bfloat16> xb(x.size());
+    for (size_t i = 0; i < x.size(); ++i) {
+      xb[i] = __float2bfloat16(normal(rng) * (i % 97 == 0 ? 30.f : 1.f));
+      x[i] = __bfloat162float(xb[i]);
+    }
+    float* dx = upload(x);
+    __nv_bfloat16* dxb = upload(xb);
+    __half *xh, *xh2;
+    float *xinv, *xinv2, *dy;
+    cudaMalloc(&xh, x.size() * sizeof(__half));
+    cudaMalloc(&xh2, x.size() * sizeof(__half));
+    cudaMalloc(&xinv, MMAX * sizeof(float));
+    cudaMalloc(&xinv2, MMAX * sizeof(float));
+    cudaMalloc(&dy, size_t(MMAX) * N * sizeof(float));
+    auto gemm = [&](int M) {
+      if (bf16_in) ling::kernels::bf16_to_half_rows(dxb, M, K, xh, xinv, nullptr);
+      else ling::kernels::to_half_rows(dx, M, K, xh, xinv, nullptr);
+      ling::kernels::stream_gemm_nvfp4(xh, xinv, M, u.w, u.table, q.scale2, dy, N, K, nullptr);
+      return download(dy, size_t(M) * N);
+    };
+    if (bf16_in) {
+      ling::kernels::bf16_to_half_rows(dxb, MMAX, K, xh, xinv, nullptr);
+      ling::kernels::to_half_rows(dx, MMAX, K, xh2, xinv2, nullptr);
+      const std::vector<__half> a = download(xh, x.size()), b = download(xh2, x.size());
+      const bool same = std::memcmp(a.data(), b.data(), a.size() * sizeof(__half)) == 0 &&
+                        download(xinv, MMAX) == download(xinv2, MMAX);
+      ok &= same;
+      std::printf("bf16_to_half_rows equals to_half_rows on the same values: %s\n", same ? "yes ok" : "NO FAIL");
+    }
+    const std::vector<float> full = gemm(MMAX);
+    for (int M : {1, 7, 12, 16, 32}) {
+      const std::vector<float> got = gemm(M);
+      double worst = 0, e2 = 0, r2 = 0;
+      for (int m = 0; m < M; ++m) {
+        std::vector<double> ref(N), bf(N);
+        double rms = 0;
+        for (int n = 0; n < N; ++n) {
+          double a = 0, b = 0;
+          const float *pq = &wq[size_t(n) * K], *pb = &wb[size_t(n) * K], *px = &x[size_t(m) * K];
+          for (int k = 0; k < K; ++k) a += double(pq[k]) * px[k], b += double(pb[k]) * px[k];
+          ref[n] = a, bf[n] = b, rms += a * a;
+        }
+        rms = std::sqrt(rms / N);
+        for (int n = 0; n < N; ++n) {
+          const double y = got[size_t(m) * N + n];
+          worst = std::max(worst, std::abs(y - ref[n]) / rms);
+          e2 += (y - bf[n]) * (y - bf[n]), r2 += bf[n] * bf[n];
+        }
+      }
+      const double vs_bf16 = std::sqrt(e2 / r2);
+      const bool same = std::memcmp(got.data(), full.data(), got.size() * sizeof(float)) == 0;
+      const bool good = worst < 2e-3 && vs_bf16 < 0.15 && same;
+      ok &= good;
+      std::printf("nvfp4 copy %dx%d %s M=%-2d err/rms vs the copy %.2e, vs BF16 %.3f, rows identical to M=32: %s %s\n", N,
+                  K, bf16_in ? "BF16 rows" : "FP32 rows", M, worst, vs_bf16, same ? "yes" : "NO", good ? "ok" : "FAIL");
+    }
+    for (void* p : owned) cudaFree(p);
+    cudaFree(dx), cudaFree(dxb), cudaFree(xh), cudaFree(xh2), cudaFree(xinv), cudaFree(xinv2), cudaFree(dy);
+  }
+  return ok;
+}
+
+// --nvfp4-oracle DIR: every "<name>.nvfp4.weight" in DIR's checkpoint (bench/quant/drafter_variants.py --nvfp4-copy,
+// the copies BACKLOG 33 measured) against quantize_nvfp4 of "<name>.weight", byte for byte.
+bool nvfp4_oracle(const std::string& dir) {
+  ling::Checkpoint ck(dir);
+  bool ok = true;
+  int n = 0;
+  std::vector<std::string> names = {"fc"};
+  for (int l = 0; l < 64; ++l)
+    for (const char* k : {"attention_conv.kernel_projection", "mlp_conv.kernel_projection"})
+      names.push_back("layers." + std::to_string(l) + "." + k);
+  for (const std::string& b : names) {
+    if (!ck.has(b + ".nvfp4.weight")) continue;
+    const ling::TensorView& t = ck.get(b + ".weight");
+    const ling::Nvfp4Host q =
+        ling::quantize_nvfp4(reinterpret_cast<const __nv_bfloat16*>(t.data), int(t.shape[0]), int(t.shape[1]));
+    const ling::TensorView &v = ck.get(b + ".nvfp4.weight"), &s = ck.get(b + ".nvfp4.weight_scale"),
+                           &g = ck.get(b + ".nvfp4.weight_scale_2");
+    const bool same = v.bytes == q.values.size() && std::memcmp(v.data, q.values.data(), v.bytes) == 0 &&
+                      s.bytes == q.scales.size() && std::memcmp(s.data, q.scales.data(), s.bytes) == 0 &&
+                      g.bytes == 4 && std::memcmp(g.data, &q.scale2, 4) == 0;
+    std::printf("%s: %s (relative squared error %.5f)\n", b.c_str(), same ? "identical" : "DIFFERS", q.rel_sq_error);
+    ok &= same;
+    ++n;
+  }
+  ok &= n > 0;
+  std::printf(ok ? "nvfp4 oracle: %d copies identical\n" : "NVFP4 ORACLE FAILED (%d copies)\n", n);
+  return ok;
+}
+
 }  // namespace
 
 // M4 stage 4: each state kernel over two sequences in one launch (kernels::SeqBatch) against its launch per
@@ -860,6 +1010,7 @@ bool test_batched_state_kernels() {
 
 int main(int argc, char** argv) {
   if (const char* e = std::getenv("LING_PDL")) ling::kernels::set_pdl(std::atoi(e) != 0);
+  if (argc > 2 && std::string(argv[1]) == "--nvfp4-oracle") return nvfp4_oracle(argv[2]) ? 0 : 1;
   if (argc > 1 && std::string(argv[1]) == "--bench-groups") {  // timings only (B16 sweeps)
     bench_groups();
     return cudaDeviceSynchronize() == cudaSuccess ? 0 : 1;
@@ -870,6 +1021,7 @@ int main(int argc, char** argv) {
   ok &= test_attention_rows();
   ok &= test_topk();
   ok &= test_batched_state_kernels();
+  ok &= test_nvfp4_copy();
   if (argc > 1 && std::string(argv[1]) == "--bench") bench();
   const cudaError_t e = cudaDeviceSynchronize();
   if (e != cudaSuccess) {
