@@ -424,7 +424,7 @@ void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, in
 //     matrices gain too (out-projections 211-228 -> 241-244 GB/s at M = 12).
 //   - Chunks in flight per warp (PF): two, now that the narrow launches have half the blocks.
 // LING_SG_TN, LING_SG_TW (tiles at M <= 16 for narrow / wide launches), LING_SG_TN4, LING_SG_TW4 (at M > 16) and
-// LING_SG_PF override them for experiments (TILES 1, 2 or 4, at most 2 at M > 16; PF 1 or 2).
+// LING_SG_PF override them for experiments (TILES 1, 2 or 4, at most 2 at M > 16; PF 1 to 4).
 constexpr int kTilesNarrow = 2, kTilesWide = 2, kTilesNarrow4 = 2, kTilesWide4 = 2, kInFlight = 2;
 
 int sg_env(const char* n, int d) {
@@ -443,11 +443,19 @@ template <int NT, bool FP4>
 void launch_k(int tiles, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
   static const int pf = sg_env("LING_SG_PF", kInFlight);
   const bool coded = FP4 && t[0].wscale != nullptr;  // dispatch keeps a launch's matrices of one kind
+  // PF 3 and 4 (LING_SG_PF): the megakernel probe's deeper run-ahead past a PDL boundary (BACKLOG 28); the same
+  // arithmetic in the same order, only more weight chunks in flight per warp.
   if (coded) {
     if constexpr (FP4) {
-      if (pf == 2) launch_t<NT, FP4, 2, true>(tiles, x, xinv, M, t, n, K, s);
+      if (pf == 4) launch_t<NT, FP4, 4, true>(tiles, x, xinv, M, t, n, K, s);
+      else if (pf == 3) launch_t<NT, FP4, 3, true>(tiles, x, xinv, M, t, n, K, s);
+      else if (pf == 2) launch_t<NT, FP4, 2, true>(tiles, x, xinv, M, t, n, K, s);
       else launch_t<NT, FP4, 1, true>(tiles, x, xinv, M, t, n, K, s);
     }
+  } else if (pf == 4) {
+    launch_t<NT, FP4, 4, false>(tiles, x, xinv, M, t, n, K, s);
+  } else if (pf == 3) {
+    launch_t<NT, FP4, 3, false>(tiles, x, xinv, M, t, n, K, s);
   } else if (pf == 2) {
     launch_t<NT, FP4, 2, false>(tiles, x, xinv, M, t, n, K, s);
   } else {
