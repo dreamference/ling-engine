@@ -364,6 +364,27 @@ class Engine {
   cudaEvent_t commit_done_ = nullptr;
   float* commit_core_ = nullptr;  // the replay's recurrence output, which nothing reads (core_ belongs to stream_)
   void join_commit();
+  // The overlap probe (BACKLOG 28; LING_GDN_FORK, off by default): in a single sequence's verify, a DeltaNet layer's
+  // latency-bound chain (the a/b projections, gating, conv, recurrence) runs on fork_stream_ beside the in_z
+  // projection's weight stream on stream_; the same kernels on the same inputs, so the same bits. 1: a plain stream;
+  // 2: the highest stream priority, and the step graphs instantiated with node priorities.
+  int fork_ = 0;
+  // The megakernel's stage 1 in the step (LING_MK_FFN=1, off by default): the rows path's FFN as one persistent kernel
+  // (kernels::ffn_persistent), with its own FP16 buffer for the down projection's input and one counter set per layer.
+  int mk_ffn_ = 0;
+  unsigned* mk_counters_ = nullptr;
+  int mk_gdn_ = 0;  // stage 2 (LING_MK_GDN=1): a verify's DeltaNet mixer as one persistent kernel
+  unsigned* mk_gdn_counters_ = nullptr;
+  // LING_MK_TIMES=1: the persistent kernels' timings store ([layer][kMkTimesBlocks][kMkTimesPerBlock] globaltimer
+  // stamps of each layer's last launch), summarized on stderr when the engine is destroyed.
+  static constexpr int kMkTimesBlocks = 128;
+  unsigned long long* mk_ffn_times_ = nullptr;
+  unsigned long long* mk_gdn_times_ = nullptr;
+  void mk_times_report();
+  __half* xh2_ = nullptr;
+  float* xinv2_ = nullptr;
+  cudaStream_t fork_stream_ = nullptr;
+  cudaEvent_t fork_xn_ = nullptr, fork_qkv_ = nullptr, fork_done_ = nullptr;
   // The commit's two halves: the DeltaNet replay (on commit_stream_ when overlapped) and the drafter's context KV.
   void commit_state_launch(int row0, int n, cudaStream_t st);
   void commit_state_async(int row0, int n, bool graph);  // the replay on commit_stream_, then commit_done_

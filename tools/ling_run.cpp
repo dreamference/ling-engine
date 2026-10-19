@@ -174,7 +174,9 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "loaded %.1f GB of weights in %.1f s\n", engine.model().device_bytes() / 1e9,
                  std::chrono::duration<double>(t1 - t0).count());
     const int im_end = tok.token_id("<|im_end|>");
-    auto is_end = [&](int t) { return t == engine.config().eos_token || t == im_end; };
+    // LING_PROBE_SKIP's runs (src/core/launch.cuh) produce garbage tokens; they decode to --max-tokens regardless.
+    const bool no_end = std::getenv("LING_PROBE_SKIP") != nullptr;
+    auto is_end = [&](int t) { return !no_end && (t == engine.config().eos_token || t == im_end); };
 
     // Generates from `prompt` (state reset first): plainly or speculatively. Prints text unless `quiet`.
     auto generate = [&](const std::vector<int>& prompt, const ling::SamplingParams& sp, bool use_spec, bool quiet,

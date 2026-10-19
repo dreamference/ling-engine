@@ -201,6 +201,40 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     commit_core_ = alloc<float>(size_t(kernels::kMaxStreamRows) * Vs);
     std::fprintf(stderr, "commit beside the next draft\n");
   }
+  if (const char* e = std::getenv("LING_MK_FFN")) mk_ffn_ = std::atoi(e);
+  if (const char* e = std::getenv("LING_MK_GDN")) mk_gdn_ = std::atoi(e);
+  if (mk_ffn_ > 0 || mk_gdn_ > 0) {
+    xh2_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * std::max(c.intermediate, Vs));
+    xinv2_ = alloc<float>(kernels::kMaxStreamRows);
+  }
+  if (mk_ffn_ > 0) {
+    const size_t words = size_t(c.layers) * kernels::kMkFfnWords;
+    mk_counters_ = reinterpret_cast<unsigned*>(alloc<int>(words));
+    check(cudaMemset(mk_counters_, 0, words * sizeof(unsigned)), "megakernel counters");
+    std::fprintf(stderr, "megakernel stage 1: the rows path's FFN as one persistent kernel (LING_MK_FFN=%d)\n", mk_ffn_);
+  }
+  if ((mk_ffn_ > 0 || mk_gdn_ > 0) && std::getenv("LING_MK_TIMES") && std::atoi(std::getenv("LING_MK_TIMES")) != 0) {
+    const size_t n = size_t(c.layers) * kMkTimesBlocks * kernels::kMkTimesPerBlock;
+    for (unsigned long long** t : {&mk_ffn_times_, &mk_gdn_times_}) {
+      *t = reinterpret_cast<unsigned long long*>(alloc<uint8_t>(n * sizeof(unsigned long long)));
+      check(cudaMemset(*t, 0, n * sizeof(unsigned long long)), "megakernel timings");
+    }
+  }
+  if (mk_gdn_ > 0) {
+    const size_t words = size_t(c.layers) * kernels::kMkGdnWords;
+    mk_gdn_counters_ = reinterpret_cast<unsigned*>(alloc<int>(words));
+    check(cudaMemset(mk_gdn_counters_, 0, words * sizeof(unsigned)), "megakernel counters");
+    std::fprintf(stderr, "megakernel stage 2: a verify's DeltaNet mixer as one persistent kernel (LING_MK_GDN=%d)\n", mk_gdn_);
+  }
+  if (const char* e = std::getenv("LING_GDN_FORK")) fork_ = std::atoi(e);
+  if (fork_ > 0) {
+    int lo = 0, hi = 0;
+    check(cudaDeviceGetStreamPriorityRange(&lo, &hi), "priority range");
+    check(cudaStreamCreateWithPriority(&fork_stream_, cudaStreamNonBlocking, fork_ >= 2 ? hi : lo), "fork stream");
+    for (cudaEvent_t* ev : {&fork_xn_, &fork_qkv_, &fork_done_})
+      check(cudaEventCreateWithFlags(ev, cudaEventDisableTiming), "fork event");
+    std::fprintf(stderr, "probe: the DeltaNet chain beside the in_z projection (LING_GDN_FORK=%d)\n", fork_);
+  }
   if (const char* e = std::getenv("LING_SIDE_PREFILL")) opts_.side_prefill = std::atoi(e);
   if (opts_.side_prefill != 0) {
     // The side set: its own scratch (as the main set's), the drafter's feature and context rows, a pinned buffer for
@@ -246,7 +280,54 @@ void Engine::join_commit() {
   commit_pending_ = false;
 }
 
+// The timings store's summary: per kernel kind, the mean over layers of each stamp's offset from the layer's first
+// block start, for the chain's blocks and the others (stage 2), in microseconds.
+void Engine::mk_times_report() {
+  const ModelConfig& c = model_->config();
+  const int S = kernels::kMkTimesPerBlock;
+  std::vector<unsigned long long> h(size_t(c.layers) * kMkTimesBlocks * S);
+  for (int kind = 0; kind < 2; ++kind) {
+    unsigned long long* d = kind == 0 ? mk_ffn_times_ : mk_gdn_times_;
+    if (!d || cudaMemcpy(h.data(), d, h.size() * sizeof(h[0]), cudaMemcpyDeviceToHost) != cudaSuccess) continue;
+    const int chain = kind == 1 ? (std::getenv("LING_MK_CHAIN") ? std::atoi(std::getenv("LING_MK_CHAIN")) : 24) : 0;
+    double sum[2][16] = {}, cnt[2][16] = {}, endmax = 0, nl = 0;
+    for (int l = 0; l < c.layers; ++l) {
+      const unsigned long long* L = h.data() + size_t(l) * kMkTimesBlocks * S;
+      unsigned long long t0 = ~0ull, tend = 0;
+      for (int b = 0; b < kMkTimesBlocks; ++b)
+        if (L[b * S]) t0 = std::min(t0, L[b * S]);
+      if (t0 == ~0ull) continue;
+      for (int b = 0; b < kMkTimesBlocks; ++b) {
+        if (!L[b * S]) continue;
+        const int role = b < chain ? 0 : 1;
+        for (int k = 0; k < S; ++k)
+          if (L[b * S + k] >= t0 && L[b * S + k] - t0 < 100'000'000ull) {
+            sum[role][k] += double(L[b * S + k] - t0) / 1e3;
+            cnt[role][k] += 1;
+            tend = std::max(tend, L[b * S + k]);
+          }
+      }
+      endmax += double(tend - t0) / 1e3;
+      nl += 1;
+    }
+    if (nl == 0) continue;
+    std::fprintf(stderr, "megakernel timings (%s, %d layers, last step; us from the first block's start; layer span %.1f):\n",
+                 kind == 0 ? "ffn_persistent" : "gdn_persistent", int(nl), endmax / nl);
+    for (int role = 0; role < 2; ++role) {
+      if (kind == 0 && role == 0) continue;
+      std::fprintf(stderr, "  %s:", kind == 0 ? "all blocks" : role == 0 ? "chain blocks" : "streaming blocks");
+      for (int k = 0; k < S; ++k)
+        if (cnt[role][k] > 0) std::fprintf(stderr, " p%d %.1f", k, sum[role][k] / cnt[role][k]);
+      std::fprintf(stderr, "\n");
+    }
+  }
+}
+
 Engine::~Engine() {
+  if (mk_ffn_times_ || mk_gdn_times_) {
+    cudaDeviceSynchronize();
+    mk_times_report();
+  }
   if (commit_stream_) cudaStreamSynchronize(commit_stream_);
   if (side_.stream_) {
     cudaStreamSynchronize(side_.stream_);
@@ -263,6 +344,9 @@ Engine::~Engine() {
   for (void* p : buffers_) cudaFree(p);
   if (commit_done_) cudaEventDestroy(commit_done_);
   if (commit_stream_) cudaStreamDestroy(commit_stream_);
+  for (cudaEvent_t ev : {fork_xn_, fork_qkv_, fork_done_})
+    if (ev) cudaEventDestroy(ev);
+  if (fork_stream_) cudaStreamDestroy(fork_stream_);
   if (stream_) cudaStreamDestroy(stream_);
 }
 
@@ -703,6 +787,12 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
     phase_seconds_[std::string(kind) + phase] += std::chrono::duration<double>(now - t_last).count();
     t_last = now;
   };
+  // The megakernel probe (BACKLOG 28): LING_L2_HINT_GDN, _MLP and _ATTN (MB, default 0: off) prefetch that much of the
+  // next projection's weights into L2 right after the GEMM before a latency-bound stretch (the DeltaNet chain before
+  // the out-projection, silu and the FP16 copy before the down projection, attention before its out-projection).
+  static const size_t hint_gdn = std::getenv("LING_L2_HINT_GDN") ? size_t(std::atof(std::getenv("LING_L2_HINT_GDN")) * 1e6) : 0;
+  static const size_t hint_mlp = std::getenv("LING_L2_HINT_MLP") ? size_t(std::atof(std::getenv("LING_L2_HINT_MLP")) * 1e6) : 0;
+  static const size_t hint_attn = std::getenv("LING_L2_HINT_ATTN") ? size_t(std::atof(std::getenv("LING_L2_HINT_ATTN")) * 1e6) : 0;
   check(cudaMemcpyAsync(ids_dev_, ids, M * sizeof(int), cudaMemcpyHostToDevice, stream_), "ids");
   kernels::embed(model_->embed(), ids_dev_, M, H, h_, stream_);
 
@@ -722,6 +812,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
     if (L.full) {
       NvtxRange r("attention");
       linear_fp8_multi({{&L.q, q_gate_}, {&L.k, k_}, {&L.v, v_}}, xn_, M, xn_half);
+      if (!quantized_) kernels::l2_prefetch_weights(L.o.w, false, false, L.o.N, L.o.K, hint_attn, stream_);
       mark("attn_proj");
       // Per sequence (M4 §2): its rows' q/k norms and RoPE at its positions, their KV into its cache, and their
       // attention over it.
@@ -808,8 +899,84 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       float* mixed = verify ? v_post_[slot] : mixed_;
       float* g = verify ? v_g_[slot] : g_;
       float* beta = verify ? v_beta_[slot] : beta_;
+      const bool fork = fork_ > 0 && verify && !tree_ && !multi && !quantized_ && L.in_a.N == L.in_b.N;
+      // The megakernel's stage 2 (LING_MK_GDN): the whole mixer of one verify sequence as one persistent kernel. A tree
+      // verify (BACKLOG 26) keeps the graph path's mixer: its conv taps and recurrence follow the tree's paths
+      // (gdn_conv_tree, gdn_recurrent_tree), which the persistent kernel's chain conv and recurrence do not.
+      bool mk_gdn = mk_gdn_ > 0 && verify && !tree_ && !multi && !quantized_ && xn_half && L.in_a.N == L.in_b.N &&
+                    L.in_a.N == c.lin_v_heads;
+      if (mk_gdn) {
+        const Seg& sg = segs[0];
+        kernels::MkGdnParams p{};
+        p.xh = xh_;
+        p.xinv = xinv_;
+        p.xn = xn_;
+        p.M = M;
+        p.K = H;
+        p.in_qkv = {L.in_qkv.w, nullptr, L.in_qkv.scale, v_pre_[slot], L.in_qkv.N};
+        p.in_z = {L.in_z.w, nullptr, L.in_z.scale, z_, L.in_z.N};
+        p.out = {L.out.w, nullptr, L.out.scale, t1_, L.out.N};
+        p.wa = L.in_a.w;
+        p.wb = L.in_b.w;
+        p.a = a_;
+        p.b = b_;
+        p.g = g;
+        p.beta = beta;
+        p.A_log = L.A_log;
+        p.dt_bias = L.dt_bias;
+        p.mixed = mixed;
+        p.conv_state = sg.s->conv[slot];
+        p.conv_w = L.conv;
+        p.state = sg.s->gdn[slot];
+        p.core = core_;
+        p.norm_w = L.lin_norm;
+        p.eps = c.eps;
+        p.normed = normed_;
+        p.xh2 = xh2_;
+        p.xinv2 = xinv2_;
+        p.C = C;
+        p.H = c.lin_k_heads;
+        p.HV = c.lin_v_heads;
+        p.Dk = c.lin_k_dim;
+        p.Dv = c.lin_v_dim;
+        p.Vs = Vs;
+        p.counters = mk_gdn_counters_ + size_t(slot) * kernels::kMkGdnWords;
+        if (mk_gdn_times_) p.times = mk_gdn_times_ + size_t(li) * kMkTimesBlocks * kernels::kMkTimesPerBlock;
+        mk_gdn = L.in_qkv.K == H && L.in_z.K == H && L.out.K == Vs && L.in_a.K == H && kernels::gdn_persistent(p, stream_);
+      }
+      if (mk_gdn) {
+        kernels::add_inplace(h_, t1_, M * H, stream_);
+        mark("gdn_proj");
+      } else if (fork) {
+        // The overlap probe (LING_GDN_FORK): in_qkv alone, then in_z on stream_ while the chain runs on fork_stream_
+        // (a matrix's result does not depend on its launch companions, so splitting the launch changes no bit).
+        const Seg& sg = segs[0];
+        cudaStream_t fs = fork_stream_;
+        check(cudaEventRecord(fork_xn_, stream_), "fork");
+        check(cudaStreamWaitEvent(fs, fork_xn_), "fork");
+        kernels::bf16_rows(xn_, M, L.in_a.w, a_, L.in_a.N, L.in_a.K, fs, L.in_b.w, b_);
+        kernels::gdn_gating(a_, b_, L.A_log, L.dt_bias, g, beta, M, c.lin_v_heads, fs);
+        linear_fp8_multi({{&L.in_qkv, v_pre_[slot]}}, xn_, M, xn_half);
+        check(cudaEventRecord(fork_qkv_, stream_), "fork");
+        linear_fp8_multi({{&L.in_z, z_}}, xn_, M, true);
+        kernels::l2_prefetch_weights(L.out.w, false, false, L.out.N, L.out.K, hint_gdn, stream_);
+        check(cudaStreamWaitEvent(fs, fork_qkv_), "fork");
+        check(cudaMemcpyAsync(mixed, v_pre_[slot], size_t(M) * C * sizeof(float), cudaMemcpyDeviceToDevice, fs),
+              "verify inputs");
+        check(cudaMemcpyAsync(conv_tmp_, sg.s->conv[slot], size_t(C) * (c.conv_kernel - 1) * sizeof(float),
+                              cudaMemcpyDeviceToDevice, fs),
+              "verify conv");
+        kernels::gdn_conv(mixed, conv_tmp_, L.conv, M, C, fs);
+        kernels::gdn_recurrent(mixed, g, beta, sg.s->gdn[slot], nullptr, core_, M, c.lin_k_heads, c.lin_v_heads, fs);
+        check(cudaEventRecord(fork_done_, fs), "fork");
+        check(cudaStreamWaitEvent(stream_, fork_done_), "fork");
+        kernels::gated_rmsnorm(core_, z_, L.lin_norm, normed_, M * c.lin_v_heads, c.lin_v_dim, c.eps, stream_);
+        linear_fp8_residual(L.out, normed_, M, false);
+        mark("gdn_proj");
+      } else {
       // The prefill path convolves out of place: the projection goes to t2_ (free until the MLP).
       linear_fp8_multi({{&L.in_qkv, verify ? v_pre_[slot] : quantized_ ? t2_ : mixed}, {&L.in_z, z_}}, xn_, M, xn_half);
+      if (!quantized_) kernels::l2_prefetch_weights(L.out.w, false, false, L.out.N, L.out.K, hint_gdn, stream_);
       if (quantized_) {  // tensor cores, row-invariant for any M
         kernels::narrow_bf16(xn_, M, L.in_a.w, L.in_b.w, a_, b_, L.in_a.N, L.in_a.K, stream_);
       } else if (L.in_a.N == L.in_b.N) {  // both in one launch
@@ -872,12 +1039,22 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       }
       linear_fp8_residual(L.out, normed_, M, quantized_);
       mark("gdn_proj");
+      }  // not forked
     }
     {
       NvtxRange r("mlp");
       const bool post_half = norm_rows(h_, L.post_norm, xn_, M, L.gate.in_scale, true, L.up.in_scale != L.gate.in_scale);
-      if (!quantized_) {
+      const kernels::StreamTarget mk_g{L.gate.w, L.gate.table, L.gate.scale2, t1_, L.gate.N},
+          mk_u{L.up.w, L.up.table, L.up.scale2, t2_, L.up.N}, mk_d{L.down.w, L.down.table, L.down.scale2, t2_, L.down.N};
+      if (!quantized_ && mk_ffn_ > 0 && post_half &&
+          kernels::ffn_persistent(xh_, xinv_, M, mk_g, mk_u, mk_d, H, I, t1_, t2_, xh2_, xinv2_,
+                                  mk_counters_ + size_t(li) * kernels::kMkFfnWords, stream_,
+                                  mk_ffn_times_ ? mk_ffn_times_ + size_t(li) * kMkTimesBlocks * kernels::kMkTimesPerBlock
+                                                : nullptr)) {
+        kernels::add_inplace(h_, t2_, M * H, stream_);
+      } else if (!quantized_) {
         linear_fp4_multi({{&L.gate, t1_}, {&L.up, t2_}}, xn_, M, post_half);
+        kernels::l2_prefetch_weights(L.down.w, true, L.down.table != nullptr, L.down.N, L.down.K, hint_mlp, stream_);
         kernels::silu_mul(t1_, t2_, t1_, M * I, stream_);
         linear_fp4(L.down, t1_, M, t2_);
         kernels::add_inplace(h_, t2_, M * H, stream_);
