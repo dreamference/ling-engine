@@ -202,6 +202,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     std::fprintf(stderr, "commit beside the next draft\n");
   }
   if (const char* e = std::getenv("LING_SIDE_PREFILL")) opts_.side_prefill = std::atoi(e);
+  if (const char* e = std::getenv("LING_DRAFT_TEMP")) opts_.draft_temp = static_cast<float>(std::atof(e));
   if (opts_.side_prefill != 0) {
     // The side set: its own scratch (as the main set's), the drafter's feature and context rows, a pinned buffer for
     // its logits, and its stream. Allocated with the side names in place, then swapped back.

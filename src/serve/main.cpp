@@ -6,7 +6,7 @@
 //              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
-//              [--side-prefill N]
+//              [--side-prefill N] [--draft-temp X]
 //
 // --sessions N (default 2; M4 §1) keeps N resident sessions, each with its own KV cache and state, so N
 // agent tasks that alternate keep their histories warm. A request runs in the session it extends (its
@@ -26,6 +26,10 @@
 // request decodes, a prefill runs in full chunks on the engine's second stream, on a green context of N SMs (-1: a
 // plain second stream), at the same time as the other request's steps on the main stream, instead of alternating
 // contended chunks with them. The same kernels on the same inputs (ling-run --interleave-check --side-prefill N).
+//
+// --draft-temp X (default 1; BACKLOG 32): a sampled request's drafter draws its path at X times the request's
+// temperature, 0 meaning the argmax path. The accept rule divides by the q the path was drawn from, so the output's
+// distribution is the target's for every X; only the accepted drafts per step move. Greedy requests are unaffected.
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -1274,6 +1278,7 @@ int main(int argc, char** argv) {
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40;
   double protect_seconds = 30;
+  float draft_temp = 1.0f;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -1305,13 +1310,14 @@ int main(int argc, char** argv) {
     else if (a == "--batch") batch = std::stoi(next());
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else if (a == "--side-prefill") side_prefill = std::stoi(next());
+    else if (a == "--draft-temp") draft_temp = std::stof(next());
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--draft-temp X]\n";
     return 2;
   }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
@@ -1337,6 +1343,7 @@ int main(int argc, char** argv) {
   opts.max_context = max_context;
   opts.draft_dir = draft_dir;
   opts.draft_block = draft_block;
+  opts.draft_temp = draft_temp;
   opts.lookup_mode = lookup;
   opts.lookup_min_match = lookup_min;
   opts.prefix_checkpoints = checkpoints;

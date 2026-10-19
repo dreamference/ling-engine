@@ -41,6 +41,11 @@ struct EngineOptions {
   int prefill_chunk = 2048;  // measured: 647 tokens/s against 582 at 1024 on a 7.7K-token prompt
   std::string draft_dir;     // the DFlash2 drafter's checkpoint; empty: no speculation
   int draft_block = 16;      // rows per verify: the anchor and block - 1 drafted tokens (2 .. 32)
+  // The drafter's sampling temperature when the request samples, as a multiple of the request's: the selector's
+  // path is drawn from softmax(scores / (T * draft_temp)) and the accept rule divides by that same q, so the
+  // target's output distribution is exact for any value (only acceptance moves). 1 = the request's T (SGLang's
+  // rule); 0 = the argmax path (q a point mass). Greedy requests are unaffected. LING_DRAFT_TEMP overrides.
+  float draft_temp = 1.0f;
   // The context-lookup source: 0 off; 1 shadow (proposed and scored afterwards against what was really
   // generated, never verified); 2 auto (verified instead of the drafter's chain when the match is at
   // least lookup_min_match tokens long, and the drafter's pass is skipped).
