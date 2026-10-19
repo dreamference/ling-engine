@@ -351,6 +351,13 @@ class Engine {
   cudaEvent_t commit_done_ = nullptr;
   float* commit_core_ = nullptr;  // the replay's recurrence output, which nothing reads (core_ belongs to stream_)
   void join_commit();
+  // The overlap probe (BACKLOG 28; LING_GDN_FORK, off by default): in a single sequence's verify, a DeltaNet layer's
+  // latency-bound chain (the a/b projections, gating, conv, recurrence) runs on fork_stream_ beside the in_z
+  // projection's weight stream on stream_; the same kernels on the same inputs, so the same bits. 1: a plain stream;
+  // 2: the highest stream priority, and the step graphs instantiated with node priorities.
+  int fork_ = 0;
+  cudaStream_t fork_stream_ = nullptr;
+  cudaEvent_t fork_xn_ = nullptr, fork_qkv_ = nullptr, fork_done_ = nullptr;
   // The commit's two halves: the DeltaNet replay (on commit_stream_ when overlapped) and the drafter's context KV.
   void commit_state_launch(int row0, int n, cudaStream_t st);
   void commit_state_async(int row0, int n, bool graph);  // the replay on commit_stream_, then commit_done_

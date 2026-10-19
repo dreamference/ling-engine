@@ -221,7 +221,7 @@ cudaGraphExec_t Engine::capture(const std::function<void()>& body, cudaStream_t 
   use_dev_pos_ = false;
   check(cudaStreamEndCapture(st, &graph), "end capture");
   cudaGraphExec_t exec = nullptr;
-  const cudaError_t e = cudaGraphInstantiate(&exec, graph, 0);
+  const cudaError_t e = cudaGraphInstantiate(&exec, graph, fork_ >= 2 ? cudaGraphInstantiateFlagUseNodePriority : 0);
   cudaGraphDestroy(graph);
   check(e, "graph instantiate");
   return exec;
