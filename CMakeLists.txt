@@ -48,6 +48,7 @@ add_library(ling_core STATIC
   src/core/speculate.cpp
   src/core/lookup.cpp
   src/core/accept.cpp
+  src/core/tree.cpp
   src/core/sampling.cpp
   src/core/model.cu
   src/core/engine.cpp
@@ -98,6 +99,9 @@ enable_testing()
 add_executable(ling-kernel-tests tests/kernel_tests.cu)
 target_link_libraries(ling-kernel-tests PRIVATE ling_core)
 add_test(NAME kernels COMMAND ling-kernel-tests)
+add_executable(ling-tree-tests tests/tree_tests.cu)
+target_link_libraries(ling-tree-tests PRIVATE ling_core)
+add_test(NAME tree COMMAND ling-tree-tests)
 add_executable(ling-stream-tests tests/stream_tests.cu)
 target_link_libraries(ling-stream-tests PRIVATE ling_core CUDA::cuda_driver)
 add_test(NAME stream COMMAND ling-stream-tests)
