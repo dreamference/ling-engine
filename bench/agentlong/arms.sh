@@ -4,6 +4,7 @@
 #   engine:BUILD:DRAFTER:MODE:LABEL[:EXTRA[:ENV]]  BUILD a ling-engine checkout with build/ling-serve; EXTRA ling-serve
 #                                             flags and ENV variable assignments, each with commas for spaces
 #   sglang:DRAFTER:MODE:LABEL                 a scratch SGLang from bench/sglang/serve.py
+#   run:SCRIPT:LABEL                          any script, inside the same hold
 # DRAFTER rtn (the RTNcal file production loads) or ss (the ScaleSearch re-quantization); MODE greedy or seedN.
 # Holds the GPU lock for the whole list (logging when it was taken and released); m0-prod8000 is stopped first and
 # started again at the end, unless KEEP_M0_DOWN=1 or another job is waiting for the lock. Lock hold times are appended
@@ -21,6 +22,9 @@ T_LOCK=$(date -u +%s); echo "=== lock taken $(date -u +%T) UTC"
 if [ -n "$(docker ps -q -f name=^m0-prod8000$)" ]; then docker stop m0-prod8000 > /dev/null; echo "m0 stopped $(date -u +%T) UTC"; fi
 for item in "$@"; do
   IFS=: read -r kind a b c d e f <<< "$item"
+  if [ "$kind" = run ]; then  # run:SCRIPT:LABEL, a script run inside the hold (output to LABEL.log)
+    bash "$a" > "$O/$b.log" 2>&1 8>&- < /dev/null; echo "$b ($(date -u +%T)): exit $?"; continue
+  fi
   if [ "$kind" = engine ]; then
     B=$a; D=$([ "$b" = ss ] && echo "$SS" || echo "$RTN"); mode=$c; label=$d; extra=${e:-}; envs=${f:-}
     # ONLY=t00+t08 among an item's ENV: that item replays only those turns (overrides the global ONLY).
