@@ -48,6 +48,7 @@ add_library(ling_core STATIC
   src/core/speculate.cpp
   src/core/lookup.cpp
   src/core/accept.cpp
+  src/core/tree.cpp
   src/core/sampling.cpp
   src/core/model.cu
   src/core/engine.cpp

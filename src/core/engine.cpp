@@ -374,6 +374,9 @@ SpecStats Engine::spec_stats_total() const {
     t.lookup_steps += a.lookup_steps;
     t.lookup_accepted += a.lookup_accepted;
     t.batched_steps += a.batched_steps;
+    t.tree_steps += a.tree_steps;
+    t.tree_branch_steps += a.tree_branch_steps;
+    t.tree_off_chain += a.tree_off_chain;
     for (int b = 0; b < 5; ++b) {
       t.shadow_steps[b] += a.shadow_steps[b];
       t.shadow_lookup[b] += a.shadow_lookup[b];
@@ -739,14 +742,15 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         const size_t r0 = g.row0;
         kernels::attn_prepare(q_gate_ + r0 * 2 * qsize, k_ + r0 * kvsize, v_ + r0 * kvsize, L.q_norm, L.k_norm,
                               seg_pos(g, 0), g.rows, c.heads, c.kv_heads, c.head_dim, c.rotary_dim, c.rope_theta, c.eps,
-                              q_ + r0 * qsize, gate_ + r0 * qsize, g.s->kcache[slot], g.s->vcache[slot], stream_);
+                              q_ + r0 * qsize, gate_ + r0 * qsize, g.s->kcache[slot], g.s->vcache[slot], stream_,
+                              verify ? tree_ : nullptr);
         // Fixed key ranges at fixed positions for every pass (row-invariant), in slices of queries that
         // bound the partial results' scratch. A captured graph launches the ranges of the whole context.
         for (int q0 = 0; q0 < g.rows; q0 += kAttnSlice) {
           const int n = std::min(kAttnSlice, g.rows - q0);
           kernels::attention_rows(q_ + (r0 + q0) * qsize, g.s->kcache[slot], g.s->vcache[slot], seg_pos(g, q0), n,
                                   c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_ + (r0 + q0) * qsize, stream_,
-                                  use_dev_pos_ ? opts_.max_context : 0);
+                                  use_dev_pos_ ? opts_.max_context : 0, verify ? tree_ : nullptr);
         }
       }
       if (quantized_) {
@@ -816,7 +820,9 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       }
       mark("gdn_proj");
       const bool keep = quantized_ && keep_at > 0 && keep_at < M;
-      if (verify) {
+      if (verify && tree_) {  // a tree (BACKLOG 26): each row's taps are its ancestors', the window left unwritten
+        kernels::gdn_conv_tree(v_pre_[slot], mixed, s_->conv[slot], L.conv, M, C, tree_, stream_);
+      } else if (verify) {
         check(cudaMemcpyAsync(mixed, v_pre_[slot], size_t(M) * C * sizeof(float), cudaMemcpyDeviceToDevice, stream_),
               "verify inputs");
         // Per sequence (M4 §2), from its own conv window, left unwritten.
@@ -842,6 +848,9 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       if (quantized_)
         kernels::gdn_recurrent_prefill(mixed, g, beta, s_->gdn[slot], core_, M, c.lin_k_heads, c.lin_v_heads, s_->pos,
                                        stream_, keep ? s_->snap.gdn[slot] : nullptr, keep_at);
+      else if (verify && tree_)  // a tree (BACKLOG 26), from the state, left unwritten
+        kernels::gdn_recurrent_tree(mixed, g, beta, s_->gdn[slot], core_, c.lin_k_heads, c.lin_v_heads, tree_,
+                                    tree_grid_, stream_);
       else if (multi) {  // a verify: each sequence from its own state, left unwritten
         kernels::SeqPtrs<const float> st;
         for (int i = 0; i < sb.n; ++i) st.p[i] = segs[i].s->gdn[slot];
