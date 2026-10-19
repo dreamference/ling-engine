@@ -362,6 +362,12 @@ class Engine {
   unsigned* mk_counters_ = nullptr;
   int mk_gdn_ = 0;  // stage 2 (LING_MK_GDN=1): a verify's DeltaNet mixer as one persistent kernel
   unsigned* mk_gdn_counters_ = nullptr;
+  // LING_MK_TIMES=1: the persistent kernels' timings store ([layer][kMkTimesBlocks][kMkTimesPerBlock] globaltimer
+  // stamps of each layer's last launch), summarized on stderr when the engine is destroyed.
+  static constexpr int kMkTimesBlocks = 128;
+  unsigned long long* mk_ffn_times_ = nullptr;
+  unsigned long long* mk_gdn_times_ = nullptr;
+  void mk_times_report();
   __half* xh2_ = nullptr;
   float* xinv2_ = nullptr;
   cudaStream_t fork_stream_ = nullptr;
