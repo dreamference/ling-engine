@@ -15,6 +15,12 @@ tables and offsets, not the entropy bound. Formats:
              per stream (4 per tile) and the tile offset
   byte-tile  Huffman on the whole byte (length-limited to 12 bits), one stream per tile, the tile offset
   rans-S     rANS on the whole byte, 12-bit frequencies, S interleaved streams per tile (32-bit states), the offset
+  lane-L     stage 2's decodable form: one exponent stream per lane (its 64 values of the tile: rows g and g + 8,
+             32 K values each, the four 16-byte pieces it loads), Huffman held to L bits (10 or 12), byte-padded,
+             a 1-byte length per lane (32 a tile, a warp's prefix scan finds each lane's start), the tile's stream
+             padded to 4 bytes, and the tile offset
+  lane-L-d4  the same with the lengths as a 1-byte base and 4-bit deltas (17 bytes a tile; a lane whose delta
+             would exceed 15 pads the shorter ones up)
 
 CPU only. Usage: fp8_code_size.py SNAPSHOT_DIR [--workers 4] [--json OUT]
 """
@@ -55,6 +61,24 @@ def huffman_lengths(freq, limit):
         f[used] = np.sqrt(f[used]) + f[used].mean() * 1e-3   # flatten and retry: conservative
 
 
+def limited_lengths(freq, limit):
+    """Optimal code lengths with none above `limit` (package-merge), for the decode table stage 2 builds."""
+    used = [int(i) for i in np.nonzero(freq)[0]]
+    out = np.zeros(len(freq), dtype=np.int64)
+    if len(used) == 1:
+        out[used[0]] = 1
+        return out
+    leaves = sorted((int(freq[i]), (i,)) for i in used)
+    level = list(leaves)
+    for _ in range(limit - 1):
+        pk = [(level[j][0] + level[j + 1][0], level[j][1] + level[j + 1][1]) for j in range(0, len(level) - 1, 2)]
+        level = sorted(leaves + pk, key=lambda e: e[0])
+    for _, syms in level[:2 * len(used) - 2]:
+        for i in syms:
+            out[i] += 1
+    return out
+
+
 def rans_cost(freq):
     """Bits per symbol at 12-bit quantized frequencies (every used symbol at least 1/4096)."""
     total = 1 << 12
@@ -90,12 +114,14 @@ def measure(job):
     for b in range(256):
         exp_freq[(b >> 3) & 15] += byte_freq[b]
     exp_len = huffman_lengths(exp_freq, 15)
+    lim = {L: limited_lengths(exp_freq, L) for L in (10, 12)}
     byte_len = huffman_lengths(byte_freq, 12)
     rcost = rans_cost(byte_freq)
     exp_of = np.array([(b >> 3) & 15 for b in range(256)])
     exp_bits_of = exp_len[exp_of]                          # per byte value
     byte_bits_of = byte_len
-    sizes = {k: 0 for k in ("exp-tile", "exp-lane", "exp-warp", "byte-tile", "rans-4", "rans-32")}
+    sizes = {k: 0 for k in ("exp-tile", "exp-lane", "exp-warp", "byte-tile", "rans-4", "rans-32",
+                            "lane-10", "lane-12", "lane-10-d4", "lane-12-d4")}
     for r0 in range(0, tiles_r, 64):                       # 64 tile rows (1,024 matrix rows) at a time
         blk = np.asarray(w[r0 * TILE_ROWS:(r0 + 64) * TILE_ROWS])
         nr = blk.shape[0] // TILE_ROWS
@@ -115,13 +141,22 @@ def measure(job):
         pe = piece_e.reshape(nr, 2, 8, tiles_k, 4, 2)      # [tile row, h, g, chunk, t, q]
         warp_e = pe.transpose(0, 3, 1, 5, 2, 4).reshape(nr, tiles_k, 4, 32).sum(-1)
         sizes["exp-warp"] += int(((warp_e + 7) // 8).sum()) + warp_e.size * 2
+        for L, ln in lim.items():                          # stage 2's per-lane streams
+            le = ln[exp_of][blk].reshape(nr * TILE_ROWS, K // 16, 16).sum(-1).reshape(nr, 2, 8, tiles_k, 4, 2)
+            lane_b = (le.sum((1, 5)) + 7) // 8                   # [tile row, g, chunk, t] bytes of each lane
+            lane_b = lane_b.transpose(0, 2, 1, 3).reshape(nr, tiles_k, 32)
+            seg = lane_b.sum(-1) + 32
+            sizes[f"lane-{L}"] += int(((seg + 3) // 4 * 4).sum())
+            d4 = np.maximum(lane_b, lane_b.max(-1, keepdims=True) - 15)   # pad the short lanes when the range > 15
+            seg4 = d4.sum(-1) + 17
+            sizes[f"lane-{L}-d4"] += int(((seg4 + 3) // 4 * 4).sum())
         for S in (4, 32):
             sizes[f"rans-{S}"] += int(np.ceil(tile_r / 8).sum()) + tile_r.size * 4 * S
     raw_plane = tiles * TILE_BYTES // 2                   # sign + mantissa, 4 bits a value
     out = {}
     for k, v in sizes.items():
         b = v + tiles * OFFSET
-        if k.startswith("exp"):
+        if k.startswith("exp") or k.startswith("lane"):
             b += raw_plane + 16
         elif k == "byte-tile":
             b += 256
@@ -132,7 +167,7 @@ def measure(job):
     pe_ = exp_freq[exp_freq > 0] / exp_freq.sum()
     h_exp = float(-(pe_ * np.log2(pe_)).sum())
     return dict(name=name, bytes=N * K, h_byte=h_byte, h_exp=h_exp, sizes=out,
-                exp_len=exp_len.tolist(), max_byte_len=int(byte_len.max()))
+                exp_len=exp_len.tolist(), max_byte_len=int(byte_len.max()), lane_len={L: v.tolist() for L, v in lim.items()})
 
 
 def main():
