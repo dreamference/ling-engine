@@ -30,6 +30,8 @@ const float* lattice(const float* scores, int e, int prev_pick, int K16) {
 DraftTree build_tree(int anchor, const int* cand, const float* scores, int E, int K16, const std::vector<int>& chain_tokens,
                      const std::vector<int>& chain_picks, const TreeShape& shape) {
   DraftTree t;
+  const int P = E;  // the block's drafted positions: the tree's deepest level
+  E = std::min(E, std::max(1, shape.chain));
   t.E = E;
   auto add = [&](int par, int tok, int pick) {
     t.parent.push_back(par);
@@ -46,7 +48,7 @@ DraftTree build_tree(int anchor, const int* cand, const float* scores, int E, in
     add(e, chain_tokens[e], chain_picks[e]);
     prob.push_back(prob[e] * soft(lattice(scores, e, t.pick[e], K16), K16, shape.temp)[chain_picks[e]]);
   }
-  const int limit = std::min(kernels::kMaxStreamRows, E + 1 + shape.nodes);
+  const int limit = std::min(kernels::kMaxStreamRows, E + 1 + shape.nodes);  // E + 1 + nodes rows
   if (t.rows() >= limit) return t;
   // Best first over the children of every node (max-heap on the path probability; ties to the lower row, then
   // the lower candidate).
@@ -56,7 +58,7 @@ DraftTree build_tree(int anchor, const int* cand, const float* scores, int E, in
   for (int r = 1; r <= E; ++r) have.insert({t.parent[r], t.pick[r]});
   auto push_children = [&](int r) {
     const int e = t.depth[r];  // the children's position in the block
-    if (e >= E || e + 1 > shape.max_depth) return;
+    if (e >= P || e + 1 > shape.max_depth) return;
     const std::vector<double> p = soft(lattice(scores, e, t.pick[r], K16), K16, shape.temp);
     for (int k = 0; k < K16; ++k)
       if (!have.count({r, k})) heap.push({prob[r] * p[k], -r, -k});
