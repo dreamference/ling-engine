@@ -487,12 +487,12 @@ void Engine::plan_walk(StepPlan& sp, int B, const int* cand, const float* scores
     const float* sc = scores_host + (size_t(e) * K16 + (e == 0 ? 0 : prev)) * K16;
     std::vector<double>& q = sp.q[e];
     int pick = 0;
-    if (sp.greedy) {
+    if (sp.greedy || opts_.draft_temp <= 0.f) {  // the argmax path: q is a point mass, exact under either rule
       for (int k = 1; k < K16; ++k)
         if (sc[k] > sc[pick]) pick = k;  // ties to the lower index
       q[pick] = 1.0;
     } else {
-      const double T = std::max(double(p.temperature), 1e-5);
+      const double T = std::max(double(p.temperature) * opts_.draft_temp, 1e-5);
       double mx = sc[0];
       for (int k = 1; k < K16; ++k) mx = std::max(mx, double(sc[k]));
       double sum = 0;
