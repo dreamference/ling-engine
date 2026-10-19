@@ -494,8 +494,11 @@ __global__ void __launch_bounds__(32)
   for (int k = 0; k < kGdnDk; ++k) S[k] = st[k * kGdnDv + v];
   const float scale = rsqrtf(static_cast<float>(kGdnDk));
   const int len = td->gdn_len[pth];
+  __shared__ int steps[2 * kMaxStreamRows];  // the path's steps, staged once (each row's loads depend on them)
+  for (int i = lane; i < len; i += 32) steps[i] = td->gdn_step[pth][i];
+  __syncwarp();
   for (int i = 0; i < len; ++i) {
-    const int step = td->gdn_step[pth][i];
+    const int step = steps[i];
     const int t = step & 0xff;
     const bool leaf = (step & TreeDesc::kLeaf) != 0, write = (step & TreeDesc::kWrite) != 0;
     const float* row = mixed + static_cast<size_t>(t) * C;
@@ -538,7 +541,11 @@ __global__ void __launch_bounds__(32)
       const float d = (vv - kv) * b;
 #pragma unroll
       for (int k = 0; k < kGdnDk; ++k) {
-        const float sk = fmaf(d, ks[k], S[k] * decay);
+        // The same product as the first loop's, recomputed (an opaque multiply: kept products would double the live
+        // registers and spill the state).
+        float sd;
+        asm volatile("mul.rn.f32 %0, %1, %2;" : "=f"(sd) : "f"(S[k]), "f"(decay));
+        const float sk = fmaf(d, ks[k], sd);
         o = fmaf(sk, qs[k], o);
       }
     }
@@ -1016,8 +1023,9 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
     const __nv_bfloat16* ks = stage(it);
     if (active) tile_compute(ks, k0, true, true);
   }
-  // The tail of a tree: per variant present in this block, its tile, committed by that variant's rows only.
-  if (td != nullptr && kctx < khi) {
+  // The tail of a tree: per variant present in this block, its tile, committed by that variant's rows only. (Trees
+  // take the cp.async tiles: the bulk-copy instantiation has no tail, and attention_rows refuses a tree with it.)
+  if constexpr (!BULK) if (td != nullptr && kctx < khi) {
     const int first_m = r0 / G;
     for (int k0 = kctx; k0 < khi; k0 += TK) {
       for (int v = 0; v < td->nvar; ++v) {
@@ -1339,6 +1347,7 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
                     const TreeDesc* td) {
   if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
   if (pos0.dev && fixed_ctx <= 0) throw std::runtime_error("attention_rows: a device position needs a fixed context");
+  if (td && g_attn_bulk) throw std::runtime_error("attention_rows: a tree verify needs the cp.async tiles (no --attn-bulk)");
   // The grid: the ranges covering the rows' keys, or (in a graph) every range up to fixed_ctx.
   const int splits = attention_rows_splits(fixed_ctx > 0 ? fixed_ctx : pos0.host + M);
   constexpr int rows = kAttnRows, tk = kAttnTk, ns = kAttnNs;
