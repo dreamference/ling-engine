@@ -4,7 +4,8 @@
 #   engine:BUILD:DRAFTER:MODE:LABEL[:EXTRA[:ENV]]  BUILD a ling-engine checkout with build/ling-serve; EXTRA ling-serve
 #                                             flags and ENV variable assignments, each with commas for spaces
 #   sglang:DRAFTER:MODE:LABEL                 a scratch SGLang from bench/sglang/serve.py
-# DRAFTER rtn (the RTNcal file production loads) or ss (the ScaleSearch re-quantization); MODE greedy or seedN.
+# DRAFTER rtn (the RTNcal file production loads), ss (the ScaleSearch re-quantization) or, for engine items, a
+# drafter directory's absolute path; MODE greedy or seedN.
 # Holds the GPU lock for the whole list (logging when it was taken and released); m0-prod8000 is stopped first and
 # started again at the end, unless KEEP_M0_DOWN=1 or another job is waiting for the lock. Lock hold times are appended
 # to ~/.ling-gpu-holds.log. ONLY=t03,t09 replays only those turns. Run it with setsid nohup ... < /dev/null &.
@@ -16,13 +17,14 @@ RTN=$(ls -d ~/.cache/huggingface/hub/models--maurienne-ai--Qwen3.8-27B-DFlash2-N
 SS=$HOME/.cache/dreamference/drafters/dflash2-nvfp4-scalesearch
 SGRTN=/root/.cache/huggingface/hub/models--maurienne-ai--Qwen3.8-27B-DFlash2-NVFP4-RTNcal/snapshots/$(basename "$RTN")
 SGSS=/root/.cache/dreamference/drafters/dflash2-nvfp4-scalesearch
-exec 8> /home/user/.ling-gpu.lock; flock 8
+# LOCK_HELD=1: the caller already holds the lock (and logs the hold, and starts m0-prod8000 again itself).
+if [ "${LOCK_HELD:-0}" != 1 ]; then exec 8> /home/user/.ling-gpu.lock; flock 8; else KEEP_M0_DOWN=1; fi
 T_LOCK=$(date -u +%s); echo "=== lock taken $(date -u +%T) UTC"
 if [ -n "$(docker ps -q -f name=^m0-prod8000$)" ]; then docker stop m0-prod8000 > /dev/null; echo "m0 stopped $(date -u +%T) UTC"; fi
 for item in "$@"; do
   IFS=: read -r kind a b c d e f <<< "$item"
   if [ "$kind" = engine ]; then
-    B=$a; D=$([ "$b" = ss ] && echo "$SS" || echo "$RTN"); mode=$c; label=$d; extra=${e:-}; envs=${f:-}
+    B=$a; case $b in ss) D=$SS;; rtn) D=$RTN;; *) D=$b;; esac; mode=$c; label=$d; extra=${e:-}; envs=${f:-}
     env ${envs//,/ } setsid "$B"/build/ling-serve --model "$M" --draft "$D" --port 8300 --served-model-name RadixArk/Qwen3.8-27B-NVFP4 \
       --max-context 65536 --draft-block 12 --graphs --pdl ${extra//,/ } > "$O/$label.serve.log" 2>&1 8>&- < /dev/null &
     SRV=$!
@@ -48,6 +50,6 @@ if [ "${KEEP_M0_DOWN:-0}" != 1 ] && [ "$WAITING" = 0 ]; then
   docker start m0-prod8000 > /dev/null
   for i in $(seq 1 120); do curl -sf -m 3 http://127.0.0.1:8000/v1/models > /dev/null && { echo "m0 healthy $(date -u +%T) UTC after $((i*5)) s"; break; }; sleep 5; done
 fi
-[ "$WAITING" != 0 ] && echo "m0 left down: $WAITING job(s) waiting for the lock"
+[ "${LOCK_HELD:-0}" != 1 ] && [ "$WAITING" != 0 ] && echo "m0 left down: $WAITING job(s) waiting for the lock"
 echo "=== lock released $(date -u +%T) UTC, held $(( ($(date -u +%s) - T_LOCK) / 60 )) min"
-echo "$(date -u -d @$T_LOCK +%F\ %T)-$(date -u +%T) UTC agentlong/arms.sh $O $*" >> ~/.ling-gpu-holds.log
+[ "${LOCK_HELD:-0}" != 1 ] && echo "$(date -u -d @$T_LOCK +%F\ %T)-$(date -u +%T) UTC agentlong/arms.sh $O $*" >> ~/.ling-gpu-holds.log
