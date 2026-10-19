@@ -36,6 +36,10 @@ struct Request {
   // resident session first, and which sessions are protected from eviction (M4 §1). A hint only: the
   // token prefix decides what is reused. Empty when the request carries none.
   std::string session_key;
+  // Bench only (completions with token ids, greedy): the output is forced to these tokens, and each speculative
+  // step accepts the drafts that equal them, so the drafter's acceptance is measured on a given text
+  // (bench/accept/forced.py: another server's greedy output, step for step). Empty: normal decoding.
+  std::vector<int> force_tokens;
 };
 
 constexpr int kMaxTopLogprobs = 20;  // vLLM's --max-logprobs default
