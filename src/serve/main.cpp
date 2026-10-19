@@ -232,6 +232,7 @@ struct Running {
   std::optional<StopScanner> stops;
   std::string finish = "length";
   int produced = 0, passes = 0, reasoning = 0;
+  size_t forced = 0;  // tokens of job.req.force_tokens chosen so far (bench only)
   bool in_think = false;
   int newlines_after_think = 0;  // of the blank line after </think>, still to count
   bool ended_by_eos = false;
@@ -426,7 +427,8 @@ class Scheduler {
 
   // Whether r's next decode step can join a batch: past its prompt, speculative, room for a full draft block.
   bool batchable(const Running& r) const {
-    return !r.prefilling && r.spec && ctx_.engine->can_batch(r.job.session, r.job.req.sampling);
+    return !r.prefilling && r.spec && r.job.req.force_tokens.empty() &&
+           ctx_.engine->can_batch(r.job.session, r.job.req.sampling);
   }
   // The requests that step with r (r first, then the others in running order) while their rows fit one pass;
   // just r, or nothing, when there is no batch to form.
@@ -536,6 +538,8 @@ class Scheduler {
     const auto now = std::chrono::steady_clock::now();
     (other_prefilling(r) ? r.beside : r.alone).add(std::chrono::duration<double>(now - r.last_step).count());
     r.last_step = now;
+    const std::vector<int>& force = r.job.req.force_tokens;
+    if (!force.empty() && r.forced >= force.size()) return end(r);  // the forced text is used up
     eng.select_session(r.job.session);
     ++r.passes;
     {
@@ -543,13 +547,17 @@ class Scheduler {
       ctx_.metrics.batch_rows = r.spec ? std::min(eng.draft_block(), eng.max_context() - static_cast<int>(eng.history().size())) : 1;
     }
     if (r.spec) {
+      if (!force.empty()) eng.set_force(force.data() + r.forced, static_cast<int>(force.size() - r.forced));
       r.pending = eng.speculate(r.pending.back(), r.job.req.sampling, r.job.req.logprobs ? &r.rows : nullptr);
+      eng.set_force(nullptr, 0);
+      r.forced += r.pending.size();
       // The verify checks only each row's top K for NaN and inf (the plain path's sample() checks the
       // whole row); a row reported as logprobs is checked whole, so a NaN never reaches the client.
       if (r.job.req.logprobs) require_finite(r.rows);
     } else {
       r.logits = eng.step(r.pending.back());
       r.pending = {eng.sample(r.logits, r.job.req.sampling, eng.history())};
+      if (!force.empty()) r.pending = {force[r.forced++]};
     }
     return emit(r) && end(r);
   }
@@ -579,6 +587,7 @@ class Scheduler {
     // `pending` holds chosen tokens not yet emitted: the first from the prefill's logits, then a
     // speculative step's accepted drafts and its next token, or a plain step's sample.
     r.pending = {eng.sample(r.logits, j.req.sampling, eng.history())};
+    if (!j.req.force_tokens.empty()) r.pending = {j.req.force_tokens[r.forced++]};
     r.rows.clear();
   }
 
