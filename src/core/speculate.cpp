@@ -40,6 +40,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 #include <nvtx3/nvToolsExt.h>
@@ -95,6 +96,18 @@ Dist target_dist(const float* vals, const int* ids, int K, const SamplingParams&
   Dist d(keep);
   for (int i = 0; i < keep; ++i) d[i] = {ids[i], probs[i] / kept};
   return d;
+}
+
+// LING_DUMP_STEPS=FILE (a measurement aid for tree verification, BACKLOG 26): every one-stream speculative step appended
+// to FILE as int32 [magic 0x54524545, pos, anchor, E, K16, K, accepted, next, greedy], the drafter's candidates
+// [E][K16] (int32) and lattice scores [E][K16][K16] (float32), the verified rows [E + 1] (int32), and the verify's
+// top K per row, values [E + 1][K] (float32) and ids [E + 1][K] (int32). Host-side only: the step is unchanged.
+std::FILE* dump_file() {
+  static std::FILE* f = [] {
+    const char* p = std::getenv("LING_DUMP_STEPS");
+    return p && *p ? std::fopen(p, "ab") : nullptr;
+  }();
+  return f;
 }
 
 }  // namespace
@@ -604,6 +617,17 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   }
   check(cudaStreamSynchronize(stream_), "verify");
   plan_accept(sp, pin_->topk_vals, pin_->topk_ids);  // 3. accept
+  if (std::FILE* f = dump_file(); f && !sp.use_lookup) {
+    const int K16 = draft_->config().selector_top_k;
+    const int hdr[9] = {0x54524545, s_->pos, anchor, sp.E, K16, K, sp.accepted, sp.next, sp.greedy ? 1 : 0};
+    std::fwrite(hdr, sizeof(int), 9, f);
+    std::fwrite(sp.cand.data(), sizeof(int), size_t(sp.E) * K16, f);
+    std::fwrite(pin_->scores, sizeof(float), size_t(sp.E) * K16 * K16, f);
+    std::fwrite(sp.rows.data(), sizeof(int), size_t(V), f);
+    std::fwrite(pin_->topk_vals, sizeof(float), size_t(V) * K, f);
+    std::fwrite(pin_->topk_ids, sizeof(int), size_t(V) * K, f);
+    std::fflush(f);
+  }
   auto t2 = std::chrono::steady_clock::now();
   s_->spec.verify_seconds += std::chrono::duration<double>(t2 - t1).count();
 

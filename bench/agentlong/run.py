@@ -14,7 +14,7 @@ output text (every streamed delta, by event type) and its SHA-256 are recorded, 
 can be compared token for token (--compare).
 
 Usage:
-  run.py --url http://127.0.0.1:8300 --mode greedy|seed:N --out RUN.jsonl [--label L]
+  run.py --url http://127.0.0.1:8300 --mode greedy|seedN --out RUN.jsonl [--label L]
          [--bodies ~/bench-sets/agentlong/bodies.jsonl] [--manifest manifest.json] [--only t00,t03]
   run.py --compare A.jsonl B.jsonl       per-turn output identity and the two summaries
   run.py --summary RUN.jsonl [RUN.jsonl ...]
@@ -125,7 +125,7 @@ def load(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url")
-    ap.add_argument("--mode", default="greedy", help="greedy, or seed:N (sampled, a per-turn seed from N)")
+    ap.add_argument("--mode", default="greedy", help="greedy, or seed:N / seedN (sampled, a per-turn seed from N)")
     ap.add_argument("--out")
     ap.add_argument("--label", default="")
     ap.add_argument("--bodies", default=f"{HOME}/bench-sets/agentlong/bodies.jsonl")
@@ -167,7 +167,7 @@ def main():
     if len(bodies) != len(man):
         sys.exit("the bodies file and the manifest name different turns")
     greedy = a.mode == "greedy"
-    seed0 = None if greedy else int(a.mode.split(":", 1)[1])
+    seed0 = None if greedy else int(a.mode[4:].lstrip(":"))
     out = open(a.out, "w")
     out.write(json.dumps({"header": True, "label": a.label, "mode": a.mode, "url": a.url, "t": time.time(),
                           "manifest_sha256": hashlib.sha256(open(a.manifest, "rb").read()).hexdigest()}) + "\n")
