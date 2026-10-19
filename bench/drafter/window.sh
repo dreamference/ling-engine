@@ -45,7 +45,7 @@ for st in "$@"; do
     LOCK_HELD=1 bash $LE/bench/agentlong/arms.sh $OUT "engine:$LE:$a:$b:$c::${d:-}" 8>&- < /dev/null | grep -v "^=== lock\|^m0 "
   fi
 done
-WAITING=$(fuser /home/kladko/.ling-gpu.lock 2>/dev/null | tr -s ' ' '\n' | grep -v "^$$\$" | grep -c .)
+WAITING=$(exec 8>&-; fuser /home/kladko/.ling-gpu.lock 2>/dev/null | tr -s ' ' '\n' | grep -v "^$$\$" | grep -c .)
 if [ "$WAITING" = 0 ] || [ $(date -u +%H%M) -ge 1930 ]; then
   docker start m0-prod8000 > /dev/null; echo "m0 started $(date -u +%T) UTC"
   echo "$(date -u +%FT%TZ) drafter-agent m0-prod8000 started" >> $HOLDS
