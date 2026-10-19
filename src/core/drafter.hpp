@@ -41,6 +41,8 @@ struct DraftLayer {
   const __nv_bfloat16* q_norm = nullptr;
   const __nv_bfloat16* k_norm = nullptr;
   Bf16Weight attn_kproj, mlp_kproj;  // [2 * taps * groups][hidden]
+  // drafter/lowp (bench): optional NVFP4 copies ("<name>.nvfp4.*" in the file) the block's rows path reads instead.
+  Fp4Weight attn_kproj4, mlp_kproj4;
   const __nv_bfloat16* attn_base = nullptr;  // [2][taps][hidden]
   const __nv_bfloat16* mlp_base = nullptr;
 };
@@ -55,6 +57,7 @@ class DraftModel {
   const DraftConfig& config() const { return cfg_; }
   const std::vector<DraftLayer>& layers() const { return layers_; }
   const Bf16Weight& fc() const { return fc_; }  // [hidden][features * hidden]
+  const Fp4Weight& fc4() const { return fc4_; }  // drafter/lowp: an optional NVFP4 copy for <= 32 rows (w null if none)
   const __nv_bfloat16* hidden_norm() const { return hidden_norm_; }
   const __nv_bfloat16* norm() const { return norm_; }
   const Bf16Weight& selector_projection() const { return sel_proj_; }  // [rank][hidden]
@@ -66,6 +69,7 @@ class DraftModel {
   DraftConfig cfg_;
   std::vector<DraftLayer> layers_;
   Bf16Weight fc_, sel_proj_;
+  Fp4Weight fc4_;
   const __nv_bfloat16* hidden_norm_ = nullptr;
   const __nv_bfloat16* norm_ = nullptr;
   const __nv_bfloat16* pred_ = nullptr;

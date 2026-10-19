@@ -90,6 +90,7 @@ DraftModel::DraftModel(const std::string& dir) {
     return w;
   };
   fc_ = bf_w("fc.weight");
+  if (ck.has("fc.nvfp4.weight")) fc4_ = fp4("fc.nvfp4");
   hidden_norm_ = bf("hidden_norm.weight");
   norm_ = bf("norm.weight");
   sel_proj_ = bf_w("candidate_selector.hidden_projection.weight");
@@ -113,6 +114,9 @@ DraftModel::DraftModel(const std::string& dir) {
     L.k_norm = bf(p + "self_attn.k_norm.weight");
     L.attn_kproj = bf_w(p + "attention_conv.kernel_projection.weight");
     L.mlp_kproj = bf_w(p + "mlp_conv.kernel_projection.weight");
+    if (ck.has(p + "attention_conv.kernel_projection.nvfp4.weight"))
+      L.attn_kproj4 = fp4(p + "attention_conv.kernel_projection.nvfp4");
+    if (ck.has(p + "mlp_conv.kernel_projection.nvfp4.weight")) L.mlp_kproj4 = fp4(p + "mlp_conv.kernel_projection.nvfp4");
     L.attn_base = bf(p + "attention_conv.base_kernel");
     L.mlp_base = bf(p + "mlp_conv.base_kernel");
     if (L.attn_kproj.N != 2 * cfg_.conv_taps * cfg_.conv_groups) throw std::runtime_error("drafter conv projection shape");

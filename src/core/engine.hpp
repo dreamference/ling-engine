@@ -484,6 +484,7 @@ class Engine {
   // and the block's buffers.
   std::vector<int> feature_layer_;  // target layer -> index of its feature slot, or -1
   __nv_bfloat16* cap_ = nullptr;
+  __half* xh_fc_ = nullptr;  // drafter/lowp: the FP16 rows of the drafter's fc input (its NVFP4 copy)
   int cap_stride_ = 0;
   std::vector<__nv_bfloat16*> dkc_, dvc_;
   float *dctx_ = nullptr, *dk_ = nullptr, *dv_ = nullptr, *dres_ = nullptr, *dh_ = nullptr, *dh2_ = nullptr;
