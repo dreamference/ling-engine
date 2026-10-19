@@ -655,6 +655,7 @@ __device__ __forceinline__ void mk_red_release(unsigned* p, unsigned v) {
   asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
 }
 constexpr unsigned long long kMkDeadlineNs = 50'000'000ull;
+constexpr int kMkStamps = 10;  // timings store slots per block (LING_MK_TIMES)
 
 // Thread 0 waits until *c >= target, then the block goes on.
 __device__ __forceinline__ void mk_wait(const unsigned* c, unsigned target) {
@@ -676,6 +677,29 @@ __device__ __forceinline__ void mk_done(unsigned* c) {
   __threadfence();
   __syncthreads();
   if (threadIdx.x == 0) mk_red_release(c, 1u);
+}
+
+// LING_MK_PREF_KB (default 0, off): at a barrier, a block first asks L2 for the leading bytes of every 16-row tile of
+// the next GEMM it will compute (its weights never change), so the bus is not idle while the block waits. Writes nothing.
+__device__ __forceinline__ void mk_prefetch_tiles(const uint8_t* w, bool fp4, bool coded, int N, int K, int item0,
+                                                  int step, int items, int bytes) {
+  if (bytes <= 0) return;
+  const int chunks = K / kChunk, blk = fp4 ? (coded ? kValueBytesFp4 : kTileBytesFp4) : kTileBytesFp8;
+  const int nc = max(1, min(chunks, bytes / blk));
+  const uint8_t* codes = coded ? w + static_cast<size_t>(N / 16) * chunks * kValueBytesFp4 : nullptr;
+  // thread j: tile 2 * (j / 2) + j % 2 of item item0 + (j / 2) * step (two 16-row tiles per 32-row item)
+  const int j = threadIdx.x, it = item0 + (j >> 1) * step;
+  if (j < 16 && it < items) {
+    const int tile = it * 2 + (j & 1);
+    if (tile < N / 16) {
+      const uint8_t* p = w + static_cast<size_t>(tile) * chunks * blk;
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(nc * blk) : "memory");
+      if (codes) {
+        const uint8_t* c = codes + static_cast<size_t>(tile) * chunks * kCodeBytesFp4;
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(c), "r"((nc * kCodeBytesFp4 + 15) & ~15) : "memory");
+      }
+    }
+  }
 }
 
 struct NoWaitMk {
@@ -707,6 +731,8 @@ struct MkFfnArgs {
   StreamProblems down;
   int n_down;
   int M, H, I;
+  int pref;     // LING_MK_PREF_KB in bytes
+  unsigned long long* times;  // LING_MK_TIMES: per block kMkFfnStamps globaltimer stamps, or nullptr
   unsigned* c;  // kMkFfnWords: [0] blocks past gate|up, [1] past the SiLU pass, [2] past the FP16 pass, [3] exits,
                 // [4..4 + 32) the rows' maxima (as float bits)
 };
@@ -716,14 +742,20 @@ template <int NT, bool CODED>
 __global__ void __launch_bounds__(kWarps * 32, NT == 4 ? 1 : 2) ffn_persistent_kernel(MkFfnArgs a) {
   const int G = gridDim.x;
   unsigned* c = a.c;
+#define MK_STAMP(k) \
+  if (a.times && threadIdx.x == 0) a.times[blockIdx.x * kMkStamps + (k)] = mk_now();
+  MK_STAMP(0)
   if (static_cast<int>(blockIdx.x) >= a.n_up) pdl_begin();  // never with the grids used, kept for the rule
   for (int i = blockIdx.x; i < a.n_up; i += G) {
     __syncthreads();  // the body's shared memory is reused by the next tile
     stream_gemm_body<NT, 2, true, 2, CODED>(a.xh, a.xinv, a.M, a.up, a.H, 1, nullptr, i, 0,
                                             FirstPdl{i == static_cast<int>(blockIdx.x)});
   }
+  MK_STAMP(1)
   mk_done(&c[0]);
+  mk_prefetch_tiles(a.down.w[0], true, a.down.table[0] != nullptr, a.down.N[0], a.I, blockIdx.x, G, a.n_down, a.pref);
   mk_wait(&c[0], G);
+  MK_STAMP(2)
   // The row step over every block.
   const size_t n = size_t(a.M) * a.I, stride = size_t(G) * blockDim.x;
   unsigned* rowmax = c + 4;
@@ -742,6 +774,7 @@ __global__ void __launch_bounds__(kWarps * 32, NT == 4 ? 1 : 2) ffn_persistent_k
   if (threadIdx.x < a.M && smax[threadIdx.x]) atomicMax(&rowmax[threadIdx.x], smax[threadIdx.x]);
   mk_done(&c[1]);
   mk_wait(&c[1], G);
+  MK_STAMP(3)
   if (threadIdx.x < a.M) {
     const float mx = __uint_as_float(mk_ld_acquire(&rowmax[threadIdx.x]));
     int e = 0;
@@ -752,6 +785,7 @@ __global__ void __launch_bounds__(kWarps * 32, NT == 4 ? 1 : 2) ffn_persistent_k
   __syncthreads();
   for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride)
     a.xh2[i] = __float2half_rn(a.g[i] * sc[i / a.I]);
+  MK_STAMP(4)
   mk_done(&c[2]);
   for (int i = blockIdx.x; i < a.n_down; i += G) {
     __syncthreads();
@@ -759,6 +793,7 @@ __global__ void __launch_bounds__(kWarps * 32, NT == 4 ? 1 : 2) ffn_persistent_k
                                             CounterWaitMk{&c[2], static_cast<unsigned>(G), i == static_cast<int>(blockIdx.x)});
   }
   if (static_cast<int>(blockIdx.x) >= a.n_down) mk_wait(&c[2], G);  // (no block idles with the grids used)
+  MK_STAMP(5)
   // The last block out resets the counters for the next launch (ordered after this kernel's completion).
   __syncthreads();
   if (threadIdx.x == 0 && atomicAdd(&c[3], 1u) == static_cast<unsigned>(G) - 1u) {
@@ -834,6 +869,8 @@ struct MkGdnArgs {
   int n_out;
   int M, K, C, H, HV, Vs;
   int chain;
+  int pref;  // LING_MK_PREF_KB in bytes
+  unsigned long long* times;  // LING_MK_TIMES: per block kMkStamps globaltimer stamps, or nullptr
   unsigned* c;
 };
 
@@ -968,6 +1005,7 @@ __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArg
   __shared__ float red[2][4][32];
   __shared__ float qk[kWarps][2][kGdnK];
   const int grp = threadIdx.x >> 7, gt = threadIdx.x & 127;
+  MK_STAMP(0)
   if (chain) {
     MaybePdl{&waited}();
     // The a/b projections, each output n of both matrices, then the gating of (t, n) for every row t: the chain's
@@ -986,6 +1024,7 @@ __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArg
     // Every group runs the same number of rounds of the loop above (its barriers are block-wide): HV is a multiple of
     // 2 x chain here (checked on the host).
     mk_done(&c[kAbDone]);
+    MK_STAMP(1)
   }
   // The in_qkv tiles, from a queue, on every block.
   for (;;) {
@@ -994,6 +1033,7 @@ __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArg
     stream_gemm_body<NT, 2, false, 2, false>(a.xh, a.xinv, a.M, a.inp, a.K, 1, nullptr, i, 0, MaybePdl{&waited});
     mk_done(&c[kQkvDone]);
   }
+  MK_STAMP(2)
   if (chain) {
     mk_wait(&c[kQkvDone], a.n_qkv);
     // gdn_conv_kernel's channel c over the rows, from the session's window, out of place (vpre -> mixed).
@@ -1013,11 +1053,13 @@ __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArg
     mk_done(&c[kConvDone]);
     mk_wait(&c[kConvDone], a.chain);
     mk_wait(&c[kAbDone], a.chain);
+    MK_STAMP(3)
     // The recurrence: item w of HV x 4 on warp w of the chain's blocks.
     const int warp = threadIdx.x >> 5;
     for (int it = bid * kWarps + warp; it < a.HV * 4; it += a.chain * kWarps)
       mk_recurrent(a.mixed, a.g, a.beta, a.state, a.core, a.M, a.H, a.HV, it, qk[warp][0], qk[warp][1]);
     mk_done(&c[kRecDone]);
+    MK_STAMP(4)
   }
   // The in_z tiles, from a queue: the streaming blocks at once, the chain's when the recurrence is done.
   for (;;) {
@@ -1028,8 +1070,11 @@ __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArg
     mk_done(&c[kZDone]);
   }
   MaybePdl{&waited}();
+  MK_STAMP(5)
+  mk_prefetch_tiles(a.outp.w[0], false, false, a.outp.N[0], a.Vs, bid, G, a.n_out, a.pref);
   mk_wait(&c[kZDone], a.n_z);
   mk_wait(&c[kRecDone], a.chain);
+  MK_STAMP(6)
   // gated_rmsnorm_kernel's row r (D = 128 threads, block_sum over its 4 warps) by group grp, rows r = 2 bid + grp,
   // + 2G, ...; each row's maximum of |output| into the row maxima; then the FP16 copy of the group's own rows.
   unsigned* rowmax = c + 12;
@@ -1059,6 +1104,7 @@ __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArg
   }
   mk_done(&c[kNormDone]);
   mk_wait(&c[kNormDone], G);
+  MK_STAMP(7)
   __shared__ float sc[kMaxStreamRows];
   if (threadIdx.x < a.M) {
     const float mx = __uint_as_float(mk_ld_acquire(&rowmax[threadIdx.x]));
@@ -1072,6 +1118,7 @@ __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArg
     const size_t i = static_cast<size_t>(r) * kGdnK + gt;  // = t * Vs + hv * 128 + d
     a.xh2[i] = __float2half_rn(a.normed[i] * sc[r / a.HV]);
   }
+  MK_STAMP(8)
   mk_done(&c[kHalfDone]);
   // The out-projection, b, b + G, ... after every block's FP16 rows.
   for (int i = bid; i < a.n_out; i += G) {
@@ -1080,6 +1127,7 @@ __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArg
                                              CounterWaitMk{&c[kHalfDone], static_cast<unsigned>(G), i == bid});
   }
   if (bid >= a.n_out) mk_wait(&c[kHalfDone], G);
+  MK_STAMP(9)
   __syncthreads();
   if (threadIdx.x == 0 && atomicAdd(&c[kExit], 1u) == static_cast<unsigned>(G) - 1u) {
     for (int k = 0; k < kMkGdnWords; ++k) c[k] = 0u;
@@ -1279,6 +1327,8 @@ bool gdn_persistent(const MkGdnParams& p, cudaStream_t s) {
   a.HV = p.HV;
   a.Vs = p.Vs;
   a.chain = chain;
+  a.pref = sg_env("LING_MK_PREF_KB", 0) * 1024;
+  a.times = p.times;
   a.c = p.counters;
   if (p.M <= 8) mk_gdn_launch<1>(a, s);
   else if (p.M <= 16) mk_gdn_launch<2>(a, s);
@@ -1288,7 +1338,7 @@ bool gdn_persistent(const MkGdnParams& p, cudaStream_t s) {
 
 bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarget& gate, const StreamTarget& up,
                     const StreamTarget& down, int H, int I, float* g, float* u, __half* xh2, float* xinv2,
-                    unsigned* counters, cudaStream_t s) {
+                    unsigned* counters, cudaStream_t s, unsigned long long* times) {
   const bool coded = gate.wscale != nullptr;
   // Only the shapes dispatch() gives the four-kernel path: TILES 2 and PF 2 everywhere, one kind of blob.
   if ((up.wscale != nullptr) != coded || (down.wscale != nullptr) != coded) return false;
@@ -1327,6 +1377,8 @@ bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarg
   a.M = M;
   a.H = H;
   a.I = I;
+  a.pref = sg_env("LING_MK_PREF_KB", 0) * 1024;
+  a.times = times;
   a.c = counters;
   if (M <= 8) coded ? mk_ffn_launch<1, true>(a, s) : mk_ffn_launch<1, false>(a, s);
   else if (M <= 16) coded ? mk_ffn_launch<2, true>(a, s) : mk_ffn_launch<2, false>(a, s);

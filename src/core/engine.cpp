@@ -213,6 +213,13 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     check(cudaMemset(mk_counters_, 0, words * sizeof(unsigned)), "megakernel counters");
     std::fprintf(stderr, "megakernel stage 1: the rows path's FFN as one persistent kernel (LING_MK_FFN=%d)\n", mk_ffn_);
   }
+  if ((mk_ffn_ > 0 || mk_gdn_ > 0) && std::getenv("LING_MK_TIMES") && std::atoi(std::getenv("LING_MK_TIMES")) != 0) {
+    const size_t n = size_t(c.layers) * kMkTimesBlocks * kernels::kMkTimesPerBlock;
+    for (unsigned long long** t : {&mk_ffn_times_, &mk_gdn_times_}) {
+      *t = reinterpret_cast<unsigned long long*>(alloc<uint8_t>(n * sizeof(unsigned long long)));
+      check(cudaMemset(*t, 0, n * sizeof(unsigned long long)), "megakernel timings");
+    }
+  }
   if (mk_gdn_ > 0) {
     const size_t words = size_t(c.layers) * kernels::kMkGdnWords;
     mk_gdn_counters_ = reinterpret_cast<unsigned*>(alloc<int>(words));
@@ -273,7 +280,54 @@ void Engine::join_commit() {
   commit_pending_ = false;
 }
 
+// The timings store's summary: per kernel kind, the mean over layers of each stamp's offset from the layer's first
+// block start, for the chain's blocks and the others (stage 2), in microseconds.
+void Engine::mk_times_report() {
+  const ModelConfig& c = model_->config();
+  const int S = kernels::kMkTimesPerBlock;
+  std::vector<unsigned long long> h(size_t(c.layers) * kMkTimesBlocks * S);
+  for (int kind = 0; kind < 2; ++kind) {
+    unsigned long long* d = kind == 0 ? mk_ffn_times_ : mk_gdn_times_;
+    if (!d || cudaMemcpy(h.data(), d, h.size() * sizeof(h[0]), cudaMemcpyDeviceToHost) != cudaSuccess) continue;
+    const int chain = kind == 1 ? (std::getenv("LING_MK_CHAIN") ? std::atoi(std::getenv("LING_MK_CHAIN")) : 24) : 0;
+    double sum[2][16] = {}, cnt[2][16] = {}, endmax = 0, nl = 0;
+    for (int l = 0; l < c.layers; ++l) {
+      const unsigned long long* L = h.data() + size_t(l) * kMkTimesBlocks * S;
+      unsigned long long t0 = ~0ull, tend = 0;
+      for (int b = 0; b < kMkTimesBlocks; ++b)
+        if (L[b * S]) t0 = std::min(t0, L[b * S]);
+      if (t0 == ~0ull) continue;
+      for (int b = 0; b < kMkTimesBlocks; ++b) {
+        if (!L[b * S]) continue;
+        const int role = b < chain ? 0 : 1;
+        for (int k = 0; k < S; ++k)
+          if (L[b * S + k] >= t0 && L[b * S + k] - t0 < 100'000'000ull) {
+            sum[role][k] += double(L[b * S + k] - t0) / 1e3;
+            cnt[role][k] += 1;
+            tend = std::max(tend, L[b * S + k]);
+          }
+      }
+      endmax += double(tend - t0) / 1e3;
+      nl += 1;
+    }
+    if (nl == 0) continue;
+    std::fprintf(stderr, "megakernel timings (%s, %d layers, last step; us from the first block's start; layer span %.1f):\n",
+                 kind == 0 ? "ffn_persistent" : "gdn_persistent", int(nl), endmax / nl);
+    for (int role = 0; role < 2; ++role) {
+      if (kind == 0 && role == 0) continue;
+      std::fprintf(stderr, "  %s:", kind == 0 ? "all blocks" : role == 0 ? "chain blocks" : "streaming blocks");
+      for (int k = 0; k < S; ++k)
+        if (cnt[role][k] > 0) std::fprintf(stderr, " p%d %.1f", k, sum[role][k] / cnt[role][k]);
+      std::fprintf(stderr, "\n");
+    }
+  }
+}
+
 Engine::~Engine() {
+  if (mk_ffn_times_ || mk_gdn_times_) {
+    cudaDeviceSynchronize();
+    mk_times_report();
+  }
   if (commit_stream_) cudaStreamSynchronize(commit_stream_);
   if (side_.stream_) {
     cudaStreamSynchronize(side_.stream_);
@@ -881,6 +935,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         p.Dv = c.lin_v_dim;
         p.Vs = Vs;
         p.counters = mk_gdn_counters_ + size_t(slot) * kernels::kMkGdnWords;
+        if (mk_gdn_times_) p.times = mk_gdn_times_ + size_t(li) * kMkTimesBlocks * kernels::kMkTimesPerBlock;
         mk_gdn = L.in_qkv.K == H && L.in_z.K == H && L.out.K == Vs && L.in_a.K == H && kernels::gdn_persistent(p, stream_);
       }
       if (mk_gdn) {
@@ -982,7 +1037,9 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
           mk_u{L.up.w, L.up.table, L.up.scale2, t2_, L.up.N}, mk_d{L.down.w, L.down.table, L.down.scale2, t2_, L.down.N};
       if (!quantized_ && mk_ffn_ > 0 && post_half &&
           kernels::ffn_persistent(xh_, xinv_, M, mk_g, mk_u, mk_d, H, I, t1_, t2_, xh2_, xinv2_,
-                                  mk_counters_ + size_t(li) * kernels::kMkFfnWords, stream_)) {
+                                  mk_counters_ + size_t(li) * kernels::kMkFfnWords, stream_,
+                                  mk_ffn_times_ ? mk_ffn_times_ + size_t(li) * kMkTimesBlocks * kernels::kMkTimesPerBlock
+                                                : nullptr)) {
         kernels::add_inplace(h_, t2_, M * H, stream_);
       } else if (!quantized_) {
         linear_fp4_multi({{&L.gate, t1_}, {&L.up, t2_}}, xn_, M, post_half);

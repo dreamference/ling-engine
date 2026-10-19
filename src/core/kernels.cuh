@@ -240,11 +240,13 @@ struct MkGdnParams {
   float* xinv2;
   int C, H, HV, Dk, Dv, Vs;
   unsigned* counters;
+  unsigned long long* times = nullptr;  // LING_MK_TIMES: [blocks][kMkTimesPerBlock] stamps of the last launch
 };
 bool gdn_persistent(const MkGdnParams& p, cudaStream_t s);
 bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarget& gate, const StreamTarget& up,
                     const StreamTarget& down, int H, int I, float* g, float* u, __half* xh2, float* xinv2,
-                    unsigned* counters, cudaStream_t s);
+                    unsigned* counters, cudaStream_t s, unsigned long long* times = nullptr);
+constexpr int kMkTimesPerBlock = 10;  // LING_MK_TIMES: globaltimer stamps per block of a persistent kernel
 // The megakernel probe (BACKLOG 28): about `bytes` of a tiled weight blob (the first chunks of every tile, what a stream
 // GEMM's blocks read first) prefetched into L2 by one PDL launch, so the latency-bound kernels before that GEMM run
 // beside its first bytes. Writes nothing; the GEMM computes the same bits.
