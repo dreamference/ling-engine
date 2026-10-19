@@ -222,6 +222,61 @@ bool check_tree(int E, int extra, uint64_t seed) {
   return ok;
 }
 
+// build_tree and describe_tree on random drafter outputs: the chain is rows 0 .. E, parents precede children, every
+// row's variant path holds it at its depth, and each gdn path advances parent to child with leaves after their parent,
+// writing every row exactly once.
+bool check_tree_desc(uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  std::uniform_real_distribution<float> u(-4.f, 4.f);
+  bool ok = true;
+  for (int trial = 0; trial < 2000 && ok; ++trial) {
+    const int E = 1 + trial % 15, K16 = 16;
+    std::vector<int> cand(size_t(E) * K16);
+    for (size_t i = 0; i < cand.size(); ++i) cand[i] = int(i % K16) * 100 + int(i / K16);  // distinct per position
+    std::vector<float> scores(size_t(E) * K16 * K16);
+    for (float& x : scores) x = u(rng);
+    std::vector<int> toks, picks;
+    for (int e = 0, prev = 0; e < E; ++e) {
+      const float* sc = scores.data() + (size_t(e) * K16 + (e ? prev : 0)) * K16;
+      int pick = 0;
+      for (int k = 1; k < K16; ++k)
+        if (sc[k] > sc[pick]) pick = k;
+      toks.push_back(cand[size_t(e) * K16 + pick]);
+      picks.push_back(pick);
+      prev = pick;
+    }
+    ling::TreeShape shape;
+    shape.nodes = int(rng() % 32);
+    shape.width = 1 + int(rng() % 4);
+    shape.temp = 0.5 + (rng() % 3);
+    const ling::DraftTree t = ling::build_tree(7, cand.data(), scores.data(), E, K16, toks, picks, shape);
+    ling::kernels::TreeDesc d;
+    ling::describe_tree(t, d);
+    const int n = t.rows();
+    ok &= n <= ling::kernels::kMaxStreamRows && n >= E + 1;
+    for (int r = 1; r <= E; ++r) ok &= t.parent[r] == r - 1;
+    for (int r = 1; r < n; ++r) ok &= t.parent[r] < r && t.depth[r] == t.depth[t.parent[r]] + 1 && t.depth[r] <= E;
+    for (int r = 0; r < n; ++r) ok &= d.var[r] >= 0 && d.var[r] < d.nvar && d.path[d.var[r]][t.depth[r]] == r;
+    std::vector<int> writes(n, 0);
+    for (int p = 0; p < d.ngdn; ++p) {
+      int last = -1;  // the last advanced row
+      for (int i = 0; i < d.gdn_len[p]; ++i) {
+        const int st = d.gdn_step[p][i], r = st & 0xff;
+        if (st & ling::kernels::TreeDesc::kWrite) ++writes[r];
+        if (st & ling::kernels::TreeDesc::kLeaf) {
+          ok &= t.children[r].empty() && t.parent[r] == last;
+        } else {
+          ok &= t.parent[r] == last;
+          last = r;
+        }
+      }
+    }
+    for (int r = 0; r < n; ++r) ok &= writes[r] == 1;
+  }
+  std::printf("tree descriptions %s\n", ok ? "ok" : "FAIL");
+  return ok;
+}
+
 bool check_lookup() {
   bool ok = true;
   // "a b c d e f a b c" -> the last "a b c" occurred at 0; propose "d e f a" (max 4), match 3.
@@ -250,6 +305,7 @@ int main() {
   ok &= check_accept(false, 3, 2);
   ok &= check_accept(true, 2, 3);
   ok &= check_accept(true, 4, 4);
+  ok &= check_tree_desc(11);
   ok &= check_tree(1, 3, 5);
   ok &= check_tree(3, 6, 6);
   ok &= check_tree(4, 12, 7);

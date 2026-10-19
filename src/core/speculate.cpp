@@ -189,7 +189,7 @@ void Engine::alloc_drafter() {
   if (const char* e = std::getenv("LING_TREE_T")) opts_.tree_temp = std::atof(e);
   if (const char* e = std::getenv("LING_TREE_W")) opts_.tree_width = std::atoi(e);
   if (const char* e = std::getenv("LING_TREE_DEPTH")) opts_.tree_max_depth = std::atoi(e);
-  tree_dev_ = alloc<kernels::TreeDesc>(1);
+  tree_dev_ = reinterpret_cast<kernels::TreeDesc*>(alloc<uint8_t>(sizeof(kernels::TreeDesc)));
   gather_rows_dev_ = alloc<int>(kernels::kMaxStreamRows);
   tree_grid_ = std::min(kernels::kMaxTreeVariants, 1 + std::max(0, opts_.tree_nodes));
   // Each session's buffers a tree's accepted path is gathered in: every full-attention layer's K and V per KV head
@@ -213,7 +213,7 @@ void Engine::alloc_drafter() {
       }
     for (const kernels::GatherBuf& b : g)
       if (b.row_bytes % 16 != 0) throw std::runtime_error("tree gather: a row is not a multiple of 16 bytes");
-    s.gather = alloc<kernels::GatherBuf>(g.size());
+    s.gather = reinterpret_cast<kernels::GatherBuf*>(alloc<uint8_t>(g.size() * sizeof(kernels::GatherBuf)));
     s.ngather = static_cast<int>(g.size());
     check(cudaMemcpy(s.gather, g.data(), g.size() * sizeof(kernels::GatherBuf), cudaMemcpyHostToDevice), "tree gather");
   }
