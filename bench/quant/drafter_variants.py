@@ -91,6 +91,19 @@ def fake_nvfp4(w):
     return (decode(e2m1_codes(b / s)) * s).reshape(N, K)
 
 
+def nvfp4_codes(w):
+    """RTN NVFP4 of a BF16 matrix in modelopt's layout: packed E2M1 [N][K/2], E4M3 scales [N][K/16], global scale."""
+    w = w.float()
+    N, K = w.shape
+    g = (w.abs().max() / (448.0 * 6.0)).item()
+    b = w.reshape(N, K // 16, 16)
+    sc = (b.abs().amax(-1, keepdim=True) / 6.0 / g).clamp(min=2 ** -9).to(torch.float8_e4m3fn)
+    s = sc.float() * g
+    codes = e2m1_codes(b / s).reshape(N, K)
+    rel = (((decode(codes.reshape(N, K // 16, 16)) * s).reshape(N, K) - w) ** 2).sum().item() / (w ** 2).sum().item()
+    return pack(codes), sc.reshape(N, K // 16), g, rel
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
@@ -98,6 +111,8 @@ def main():
     ap.add_argument("--prune24", choices=["all", "mlp", "attn"])
     ap.add_argument("--bf16", choices=["fp8", "nvfp4"])
     ap.add_argument("--bf16-which", default="fc,kproj,sel")
+    ap.add_argument("--nvfp4-copy", default="", help="fc,kproj: add '<name>.nvfp4.*' NVFP4 copies the engine's "
+                    "rows path reads (drafter/lowp), the BF16 originals kept for the prefill")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     out = {}
@@ -132,8 +147,21 @@ def main():
             out[name] = q.to(torch.bfloat16)
             tot.append(rel)
             print(f"{name}: {a.bf16} round trip, relative squared error {rel:.5f}", flush=True)
+    for kind in [k for k in a.nvfp4_copy.split(",") if k]:
+        for name in sorted(n for n in list(out) if n.endswith(".weight") and out[n].dtype == torch.bfloat16):
+            if not ((kind == "fc" and name == "fc.weight") or (kind == "kproj" and "kernel_projection" in name)):
+                continue
+            base = name[: -len(".weight")] + ".nvfp4"
+            q, sc, g, rel = nvfp4_codes(out[name])
+            out[base + ".weight"] = q.contiguous()
+            out[base + ".weight_scale"] = sc.contiguous()
+            out[base + ".weight_scale_2"] = torch.tensor(g, dtype=torch.float32)
+            out[base + ".input_scale"] = torch.tensor(1.0, dtype=torch.float32)  # unused: rows path only
+            tot.append(rel)
+            print(f"{base}: NVFP4 copy {tuple(q.shape)}, relative squared error {rel:.5f}", flush=True)
     meta = dict(meta or {})
-    meta["drafter_variant"] = json.dumps({"prune24": a.prune24, "bf16": a.bf16, "bf16_which": a.bf16_which})
+    meta["drafter_variant"] = json.dumps({"prune24": a.prune24, "bf16": a.bf16, "bf16_which": a.bf16_which,
+                                          "nvfp4_copy": a.nvfp4_copy})
     save_file(out, os.path.join(a.out, "model.safetensors"), metadata=meta)
     for fn in os.listdir(a.src):
         p = os.path.join(a.src, fn)

@@ -322,13 +322,15 @@ __global__ void __launch_bounds__(1024) rmsnorm_half_kernel(const float* __restr
 }
 
 // One block per row: a power-of-two scale that puts the row's largest magnitude in [2^14, 2^15).
-__global__ void to_half_rows_kernel(const float* __restrict__ x, int K, __half* __restrict__ out,
+// T float (to_half_rows) or BF16 rows `stride` apart (bf16_to_half_rows: the drafter's captured features).
+template <typename T>
+__global__ void to_half_rows_kernel(const T* __restrict__ x, int K, size_t stride, __half* __restrict__ out,
                                     float* __restrict__ xinv) {
   pdl_begin();  // first statement: see launch.cuh
   __shared__ float red[32];
-  const float* row = x + static_cast<size_t>(blockIdx.x) * K;
+  const T* row = x + static_cast<size_t>(blockIdx.x) * stride;
   float mx = 0.f;
-  for (int k = threadIdx.x; k < K; k += blockDim.x) mx = fmaxf(mx, fabsf(row[k]));
+  for (int k = threadIdx.x; k < K; k += blockDim.x) mx = fmaxf(mx, fabsf(static_cast<float>(row[k])));
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
   if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = mx;
@@ -339,7 +341,7 @@ __global__ void to_half_rows_kernel(const float* __restrict__ x, int K, __half* 
   if (mx > 0.f && isfinite(mx)) frexpf(mx, &e);  // mx < 2^e
   const float s = ldexpf(1.f, 15 - e);
   for (int k = threadIdx.x; k < K; k += blockDim.x)
-    out[static_cast<size_t>(blockIdx.x) * K + k] = __float2half_rn(row[k] * s);
+    out[static_cast<size_t>(blockIdx.x) * K + k] = __float2half_rn(static_cast<float>(row[k]) * s);
   if (threadIdx.x == 0) xinv[blockIdx.x] = ldexpf(1.f, e - 15);
 }
 
@@ -656,7 +658,12 @@ void rmsnorm_half(const float* x, const __nv_bfloat16* w, float* out, __half* xh
 }
 
 void to_half_rows(const float* x, int M, int K, __half* out, float* xinv, cudaStream_t s) {
-  launch_kernel("to_half_rows", to_half_rows_kernel, dim3(M), dim3(256), 0, s, x, K, out, xinv);
+  launch_kernel("to_half_rows", to_half_rows_kernel<float>, dim3(M), dim3(256), 0, s, x, K, size_t(K), out, xinv);
+}
+
+void bf16_to_half_rows(const __nv_bfloat16* x, int M, int K, int stride, __half* out, float* xinv, cudaStream_t s) {
+  launch_kernel("bf16_to_half_rows", to_half_rows_kernel<__nv_bfloat16>, dim3(M), dim3(256), 0, s, x, K, size_t(stride),
+                out, xinv);
 }
 
 void stream_gemm_nvfp4(const __half* x, const float* xinv, int M, const uint8_t* w, const uint8_t* wscale,

@@ -188,6 +188,8 @@ void rmsnorm_half(const float* x, const __nv_bfloat16* w, float* out, __half* xh
                   bool gemma, cudaStream_t s);
 // x [M][K] FP32 -> FP16 with a power-of-two scale per row (xinv[m] undoes it).
 void to_half_rows(const float* x, int M, int K, __half* out, float* xinv, cudaStream_t s);
+// The same from BF16 rows `stride` elements apart (drafter/lowp: the drafter's fc input, the captured features).
+void bf16_to_half_rows(const __nv_bfloat16* x, int M, int K, int stride, __half* out, float* xinv, cudaStream_t s);
 // y[M][N] = scale2 * x . W^T, W NVFP4 in the tiled layout (wscale is unused: the scales are in the blob).
 // wscale: the scale-code table of a coded blob (B26), nullptr when the blob carries its raw scales.
 void stream_gemm_nvfp4(const __half* x, const float* xinv, int M, const uint8_t* w, const uint8_t* wscale,

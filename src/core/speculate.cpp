@@ -138,6 +138,7 @@ void Engine::alloc_drafter() {
       s.dvc.push_back(alloc<__nv_bfloat16>(size_t(ring_) * dkv));
     }
   dctx_ = alloc<float>(size_t(R) * H);
+  if (draft_->fc4().w) xh_fc_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * draft_->fc4().K);
   dk_ = alloc<float>(size_t(R) * dkv);
   dv_ = alloc<float>(size_t(R) * dkv);
   dres_ = alloc<float>(size_t(B) * H);
@@ -268,7 +269,11 @@ void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
   const int dkv = d.kv_heads * d.head_dim;
   // fc over the concatenated target features (already BF16), then the hidden norm. The context goes
   // straight to each layer's K and V: no input norm, no convolution (SGLang's prepare_context_hidden_for_kv).
-  if (rows <= kernels::kMaxStreamRows)
+  const Fp4Weight& fc4 = draft_->fc4();
+  if (rows <= kernels::kMaxStreamRows && fc4.w) {  // drafter/lowp: the NVFP4 copy on the rows path
+    kernels::bf16_to_half_rows(cap_ + size_t(cap_row0) * cap_stride_, rows, fc4.K, cap_stride_, xh_fc_, xinv_, stream_);
+    kernels::stream_gemm_nvfp4(xh_fc_, xinv_, rows, fc4.w, fc4.table, fc4.scale2, dctx_, fc4.N, fc4.K, stream_);
+  } else if (rows <= kernels::kMaxStreamRows)
     kernels::bf16_rows_bf16in(cap_ + size_t(cap_row0) * cap_stride_, rows, draft_->fc().w, dctx_, d.hidden, cap_stride_,
                               stream_);
   else
@@ -303,6 +308,14 @@ void Engine::draft_launch(int B) {
   const DraftConfig& d = draft_->config();
   const int H = d.hidden, E = B - 1, dq = d.heads * d.head_dim, dkv = d.kv_heads * d.head_dim;
   const int K16 = d.selector_top_k;
+  // drafter/lowp: a conv kernel projection's NVFP4 copy, when the file has one, on the rows path.
+  auto kproj = [&](const Bf16Weight& w, const Fp4Weight& w4) {
+    if (w4.w && !quantized_) {
+      kernels::to_half_rows(dh_, B, w4.K, xh_, xinv_, stream_);
+      kernels::stream_gemm_nvfp4(xh_, xinv_, B, w4.w, w4.table, w4.scale2, dcoef_, w4.N, w4.K, stream_);
+    } else
+      linear_bf16_drafter(w, dh_, B, dcoef_);
+  };
   check(cudaMemcpyAsync(ids_dev_, pin_->draft_ids, B * sizeof(int), cudaMemcpyHostToDevice, stream_), "draft ids");
   kernels::embed(model_->embed(), ids_dev_, B, H, dres_, stream_);
   for (int l = 0; l < d.layers; ++l) {
@@ -311,7 +324,7 @@ void Engine::draft_launch(int B) {
     if (l > 0) kernels::add_inplace(dres_, dout_, B * H, stream_);
     kernels::rmsnorm(dres_, L.input_norm, dh_, B, H, d.eps, false, stream_);
     // Attention wrapped in the grouped conv: input side 0, output side 1, one kernel projection.
-    linear_bf16_drafter(L.attn_kproj, dh_, B, dcoef_);
+    kproj(L.attn_kproj, L.attn_kproj4);
     kernels::grouped_conv(dh_, dcoef_, L.attn_base, 0, dh2_, B, H, d.conv_groups, B, stream_);
     linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, B);
     kernels::draft_qk_rope(dq_, B, d.heads, dq, L.q_norm, dpos(), d.rope_theta, d.eps, stream_);
@@ -323,7 +336,7 @@ void Engine::draft_launch(int B) {
     kernels::add_inplace(dres_, dout_, B * H, stream_);
     kernels::rmsnorm(dres_, L.post_norm, dh_, B, H, d.eps, false, stream_);
     // The MLP, wrapped the same way.
-    linear_bf16_drafter(L.mlp_kproj, dh_, B, dcoef_);
+    kproj(L.mlp_kproj, L.mlp_kproj4);
     kernels::grouped_conv(dh_, dcoef_, L.mlp_base, 0, dh2_, B, H, d.conv_groups, B, stream_);
     linear_fp4_multi({{&L.gate, dg_}, {&L.up, du_}}, dh2_, B);
     kernels::silu_mul(dg_, du_, dg_, B * d.intermediate, stream_);

@@ -4,9 +4,9 @@
 # estimate's minutes remain, or after 19:15 UTC), starts m0-prod8000 again unless another job waits for the lock
 # (then leaves it down for the waiter, as arms.sh does), and logs the hold in ~/.ling-gpu-holds.log.
 # Steps:  nsys:LABEL[:ENV[:GRAPHS[:NSYS]]]          ling-run --spec under nsys (one ~3K-token chat prompt), with step
-#                                                   graphs unless GRAPHS=0; NSYS the trace options (commas for spaces;
+#                                                   graphs unless GRAPHS=0; NSYS the trace options (+ for spaces;
 #                                                   default hardware trace of graph nodes, which on this GB10 kept no
-#                                                   kernel timestamps; -t,cuda-sw,nvtx with GRAPHS=0 does)
+#                                                   kernel timestamps; -t+cuda-sw,nvtx with GRAPHS=0)
 #         arm:DRAFTER:MODE:LABEL[:ENV]              one agentlong arm (arms.sh), DRAFTER ss, rtn or a path
 # Run it with setsid nohup ... < /dev/null &.
 set -u
@@ -36,8 +36,8 @@ for st in "$@"; do
   need=$([ "$kind" = nsys ] && echo 4 || echo 10)
   if [ $(left) -lt $need ] || late; then echo "skipped $st ($(left) min left) $(date -u +%T)"; continue; fi
   if [ "$kind" = nsys ]; then
-    label=$a; envs=${b:-}; g=$([ "${c:-1}" = 0 ] || echo --graphs); nopt=${d:--t,cuda,nvtx,--cuda-graph-trace=node}
-    env ${envs//,/ } nsys profile ${nopt//,/ } -f true -o $LE/prof/$label \
+    label=$a; envs=${b:-}; g=$([ "${c:-1}" = 0 ] || echo --graphs); nopt=${d:--t+cuda,nvtx+--cuda-graph-trace=node}
+    env ${envs//,/ } nsys profile ${nopt//+/ } -f true -o $LE/prof/$label \
       $LE/build/ling-run --model "$M" --draft "$SS" --block 12 --spec $g --pdl --max-context 16384 \
       --chat "$PROMPT" --max-tokens 384 > $LE/prof/$label.out 2> $LE/prof/$label.err 8>&- < /dev/null
     echo "nsys $label rc $? $(date -u +%T): $(grep -h '^spec:' $LE/prof/$label.err)"
