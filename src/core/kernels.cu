@@ -372,6 +372,29 @@ __global__ void gdn_conv_seqs_kernel(float* mixed, SeqPtrs<const float> state, c
   }
 }
 
+// The verify's conv over a tree (BACKLOG 26): row t's taps are the raw inputs of its ancestors at depths d - 3 .. d - 1
+// (rows of its variant's path), or the window `state` before depth 0; read from pre, written to post, the window left
+// unwritten. The same arithmetic as gdn_conv_kernel's for the row's path as a chain.
+__global__ void gdn_conv_tree_kernel(const float* __restrict__ pre, float* __restrict__ post, const float* state,
+                                     const __nv_bfloat16* __restrict__ w, int M, int C, const TreeDesc* __restrict__ td) {
+  pdl_begin();  // first statement: see launch.cuh
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= C) return;
+  const float w0 = __bfloat162float(w[c * 4]), w1 = __bfloat162float(w[c * 4 + 1]);
+  const float w2 = __bfloat162float(w[c * 4 + 2]), w3 = __bfloat162float(w[c * 4 + 3]);
+  for (int t = 0; t < M; ++t) {
+    const int d = td->depth[t];
+    const int* path = td->path[td->var[t]];
+    auto tap = [&](int j) {  // the input at depth j < d
+      return j >= 0 ? pre[static_cast<size_t>(path[j]) * C + c] : state[c * 3 + 3 + j];
+    };
+    const float s0 = tap(d - 3), s1 = tap(d - 2), s2 = tap(d - 1);
+    const float xv = pre[static_cast<size_t>(t) * C + c];
+    const float o = w0 * s0 + w1 * s1 + w2 * s2 + w3 * xv;
+    post[static_cast<size_t>(t) * C + c] = silu(o);
+  }
+}
+
 __global__ void gdn_gating_kernel(const float* a, const float* b, const __nv_bfloat16* A_log,
                                   const __nv_bfloat16* dt_bias, float* g, float* beta, int n, int HV) {
   pdl_begin();  // first statement: see launch.cuh
@@ -450,6 +473,95 @@ __global__ void __launch_bounds__(32)
   gdn_recurrent_body(mixed, g, beta, state_in, state_out, out, M, H, HV, blockIdx.x);
 }
 
+// The verify's recurrence over a tree (BACKLOG 26), blockIdx.y the gdn path: its rows advance the state row by row from
+// state_in (unwritten), as gdn_recurrent_body does for a chain; a leaf row's output is computed from the state its
+// parent left, which it does not advance (the same products: S[k] * decay, then the fma with d). Only the rows marked
+// kWrite are written (each row by one path).
+__global__ void __launch_bounds__(32)
+    gdn_recurrent_tree_kernel(const float* __restrict__ mixed, const float* __restrict__ g,
+                              const float* __restrict__ beta, const float* state_in, float* __restrict__ out, int H,
+                              int HV, const TreeDesc* __restrict__ td) {
+  pdl_begin();  // first statement: see launch.cuh
+  __shared__ float qs[kGdnDk], ks[kGdnDk];
+  const int bx = blockIdx.x, pth = blockIdx.y;
+  if (pth >= td->ngdn) return;  // the launch covers the configuration's most paths
+  const int hv = bx / 4, part = bx % 4, lane = threadIdx.x, v = part * 32 + lane;
+  const int h = hv / (HV / H);
+  const int C = 2 * H * kGdnDk + HV * kGdnDv;
+  const float* st = state_in + static_cast<size_t>(hv) * kGdnDk * kGdnDv;
+  float S[kGdnDk];
+#pragma unroll
+  for (int k = 0; k < kGdnDk; ++k) S[k] = st[k * kGdnDv + v];
+  const float scale = rsqrtf(static_cast<float>(kGdnDk));
+  const int len = td->gdn_len[pth];
+  for (int i = 0; i < len; ++i) {
+    const int step = td->gdn_step[pth][i];
+    const int t = step & 0xff;
+    const bool leaf = (step & TreeDesc::kLeaf) != 0, write = (step & TreeDesc::kWrite) != 0;
+    const float* row = mixed + static_cast<size_t>(t) * C;
+    const float4 q4 = *reinterpret_cast<const float4*>(row + h * kGdnDk + lane * 4);
+    const float4 k4 = *reinterpret_cast<const float4*>(row + H * kGdnDk + h * kGdnDk + lane * 4);
+    float qn = q4.x * q4.x + q4.y * q4.y + q4.z * q4.z + q4.w * q4.w;
+    float kn = k4.x * k4.x + k4.y * k4.y + k4.z * k4.z + k4.w * k4.w;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      qn += __shfl_xor_sync(0xffffffffu, qn, o);
+      kn += __shfl_xor_sync(0xffffffffu, kn, o);
+    }
+    const float qr = rsqrtf(qn + 1e-6f) * scale, kr = rsqrtf(kn + 1e-6f);
+    __syncwarp();
+    qs[lane * 4] = q4.x * qr, qs[lane * 4 + 1] = q4.y * qr, qs[lane * 4 + 2] = q4.z * qr, qs[lane * 4 + 3] = q4.w * qr;
+    ks[lane * 4] = k4.x * kr, ks[lane * 4 + 1] = k4.y * kr, ks[lane * 4 + 2] = k4.z * kr, ks[lane * 4 + 3] = k4.w * kr;
+    __syncwarp();
+    const float decay = __expf(g[t * HV + hv]);
+    const float b = beta[t * HV + hv];
+    const float vv = row[2 * H * kGdnDk + hv * kGdnDv + v];
+    float kv = 0.f, o = 0.f;
+    if (!leaf) {
+#pragma unroll
+      for (int k = 0; k < kGdnDk; ++k) {
+        S[k] *= decay;
+        kv = fmaf(S[k], ks[k], kv);
+      }
+      const float d = (vv - kv) * b;
+#pragma unroll
+      for (int k = 0; k < kGdnDk; ++k) {
+        S[k] = fmaf(d, ks[k], S[k]);
+        o = fmaf(S[k], qs[k], o);
+      }
+    } else {
+#pragma unroll
+      for (int k = 0; k < kGdnDk; ++k) {
+        const float sk = S[k] * decay;
+        kv = fmaf(sk, ks[k], kv);
+      }
+      const float d = (vv - kv) * b;
+#pragma unroll
+      for (int k = 0; k < kGdnDk; ++k) {
+        const float sk = fmaf(d, ks[k], S[k] * decay);
+        o = fmaf(sk, qs[k], o);
+      }
+    }
+    if (write) out[static_cast<size_t>(t) * HV * kGdnDv + hv * kGdnDv + v] = o;
+  }
+}
+
+// tree_gather: block (i, j) moves row rows[j] of buffer i to row j (j ascending is safe in place: rows[j] >= j, and no
+// earlier destination is a later source). One block per buffer, the rows in order.
+__global__ void tree_gather_kernel(const GatherBuf* __restrict__ bufs, const int* __restrict__ rows, int n, DevPos pos) {
+  pdl_begin();  // first statement: see launch.cuh
+  const GatherBuf b = bufs[blockIdx.x];
+  const size_t off = b.pos_rel ? static_cast<size_t>(pos_value(pos)) : 0;
+  for (int j = 1; j < n; ++j) {
+    const int r = rows[j];
+    if (r == j) continue;
+    const int4* src = reinterpret_cast<const int4*>(b.base + (off + r) * b.stride);
+    int4* dst = reinterpret_cast<int4*>(b.base + (off + j) * b.stride);
+    for (int i = threadIdx.x; i < b.row_bytes / 16; i += blockDim.x) dst[i] = src[i];
+    __syncthreads();
+  }
+}
+
 // The verify's recurrence over several sequences in one launch (M4 stage 4): blockIdx.y is the sequence, its rows
 // [row0, row0 + rows) read from its own state, which stays unwritten.
 __global__ void __launch_bounds__(32)
@@ -483,13 +595,14 @@ __device__ __forceinline__ void attn_prepare_body(const float* __restrict__ q_ga
                                                   const __nv_bfloat16* __restrict__ k_norm, int m, int pos, int Hq,
                                                   int Hkv, int D, int rot, float theta, float eps, float* __restrict__ q,
                                                   float* __restrict__ gate, __nv_bfloat16* __restrict__ kcache,
-                                                  __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps) {
+                                                  __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps,
+                                                  int cpos) {  // cpos: the cache slot (pos except in a tree)
   extern __shared__ float xn[];
   __shared__ float red[32];
   const int slot = blockIdx.y, d = threadIdx.x;
   if (slot >= Hq + Hkv) {  // v: copy into the cache
     const int kh = slot - Hq - Hkv;
-    vcache[kh * hs + pos * ps + d] = __float2bfloat16(v[(static_cast<size_t>(m) * Hkv + kh) * D + d]);
+    vcache[kh * hs + cpos * ps + d] = __float2bfloat16(v[(static_cast<size_t>(m) * Hkv + kh) * D + d]);
     return;
   }
   const bool is_q = slot < Hq;
@@ -517,7 +630,7 @@ __device__ __forceinline__ void attn_prepare_body(const float* __restrict__ q_ga
   if (is_q) {
     q[(static_cast<size_t>(m) * Hq + head) * D + d] = o;
   } else {
-    kcache[head * hs + pos * ps + d] = __float2bfloat16(o);
+    kcache[head * hs + cpos * ps + d] = __float2bfloat16(o);
   }
 }
 
@@ -526,11 +639,13 @@ __global__ void attn_prepare_kernel(const float* __restrict__ q_gate, const floa
                                     const __nv_bfloat16* __restrict__ k_norm, DevPos pos0, int Hq, int Hkv, int D,
                                     int rot, float theta, float eps, float* __restrict__ q,
                                     float* __restrict__ gate, __nv_bfloat16* __restrict__ kcache,
-                                    __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps) {
+                                    __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps,
+                                    const TreeDesc* __restrict__ td) {
   pdl_begin();  // first statement: see launch.cuh
-  const int m = blockIdx.x;
-  attn_prepare_body(q_gate, k, v, q_norm, k_norm, m, pos_value(pos0) + m, Hq, Hkv, D, rot, theta, eps, q, gate, kcache,
-                    vcache, hs, ps);
+  const int m = blockIdx.x, p0 = pos_value(pos0);
+  // In a tree (BACKLOG 26) the row's position is its depth's; its key and value still go to slot p0 + m.
+  attn_prepare_body(q_gate, k, v, q_norm, k_norm, m, td ? p0 + td->depth[m] : p0 + m, Hq, Hkv, D, rot, theta, eps, q,
+                    gate, kcache, vcache, hs, ps, p0 + m);
 }
 
 // Several sequences' rows in one launch (M4 stage 4): row m belongs to sequence seq_of(m), at that sequence's
@@ -543,8 +658,9 @@ __global__ void attn_prepare_seqs_kernel(const float* __restrict__ q_gate, const
                                          size_t hs, size_t ps) {
   pdl_begin();  // first statement: see launch.cuh
   const int m = blockIdx.x, sq = seq_of(b, m);
-  attn_prepare_body(q_gate, k, v, q_norm, k_norm, m, seq_pos(b, sq) + m - b.row0[sq], Hq, Hkv, D, rot, theta, eps, q,
-                    gate, kc.p[sq], vc.p[sq], hs, ps);
+  const int p = seq_pos(b, sq) + m - b.row0[sq];
+  attn_prepare_body(q_gate, k, v, q_norm, k_norm, m, p, Hq, Hkv, D, rot, theta, eps, q, gate, kc.p[sq], vc.p[sq], hs, ps,
+                    p);
 }
 
 // ---- Rows-path attention on tensor cores (decode and verify, M <= 32). ----
@@ -618,6 +734,27 @@ __device__ __forceinline__ void attn_load_tile(__nv_bfloat16* stage, const __nv_
   asm volatile("cp.async.commit_group;");
 }
 
+// A tree verify's tile (BACKLOG 26): keys from pos0 on are the variant's path (path[j] is the row at depth j, whose
+// key sits at slot pos0 + path[j]), at the positions a chain holding that path would hold them in; the keys below
+// pos0 are the context's, as in attn_load_tile.
+template <int TK>
+__device__ __forceinline__ void attn_load_tile_tree(__nv_bfloat16* stage, const __nv_bfloat16* __restrict__ kcache,
+                                                    const __nv_bfloat16* __restrict__ vcache, int k0, int khi, int kvh,
+                                                    size_t hs, size_t ps, int pos0, const int* __restrict__ path) {
+  constexpr int D = kMmaD, KS = kMmaKS;
+  __nv_bfloat16* ks = stage;
+  __nv_bfloat16* vs = stage + TK * KS;
+  for (int i = threadIdx.x; i < TK * (D / 8); i += blockDim.x) {
+    const int j = i / (D / 8), c = i % (D / 8), key = k0 + j;
+    const bool valid = key < khi;
+    const int src = key < pos0 ? key : pos0 + path[min(key - pos0, kMaxStreamRows - 1)];
+    const size_t off = kvh * hs + static_cast<size_t>(valid ? src : 0) * ps + 8 * c;
+    cp_async16(ks + j * KS + 8 * c, kcache + off, valid);
+    cp_async16(vs + j * KS + 8 * c, vcache + off, valid);
+  }
+  asm volatile("cp.async.commit_group;");
+}
+
 // ---- The same tiles through the bulk-copy (TMA) engine (M3, set_attention_bulk). ----
 // One key's 256 values of one KV head are 512 contiguous bytes in both KV layouts, so a tile is TK bulk
 // copies for K and TK for V, one per lane of one warp, each into its padded shared-memory row: the layout
@@ -684,7 +821,7 @@ template <int ROWS, int TK, int NS, bool BULK>
 __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                                                    const __nv_bfloat16* __restrict__ vcache, int pos0, int M, int Hq,
                                                    int Hkv, int splits, int chunk, float* __restrict__ scratch, size_t hs,
-                                                   size_t ps, int pf, int bx) {
+                                                   size_t ps, int pf, int bx, const TreeDesc* __restrict__ td = nullptr) {
   constexpr int D = kMmaD, G = 6, KS = kMmaKS;
   extern __shared__ __align__(16) unsigned char smem[];
   auto stage = [&](int i) { return reinterpret_cast<__nv_bfloat16*>(smem + (i % NS) * mma_stage(TK)); };
@@ -707,8 +844,10 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
   // This thread's two rows (g and g + 8 of the warp's 16), their positions, and their queries as MMA
   // A fragments in BF16, scaled by 1 / sqrt(D) (a power of two: exact).
   const int ra = r0 + warp * 16 + g, rb = ra + 8;
-  const int pa = pos0 + ra / G, pb = pos0 + rb / G;
   const bool va = ra < r0 + nrows, vb = rb < r0 + nrows;
+  // A tree's row sees the keys up to its depth's position (its path's, from the tail tiles on).
+  const int pa = pos0 + (td ? (va ? td->depth[ra / G] : 0) : ra / G);
+  const int pb = pos0 + (td ? (vb ? td->depth[rb / G] : 0) : rb / G);
   const float* qa = q + (static_cast<size_t>(ra / G) * Hq + kvh * G + ra % G) * D;
   const float* qb = q + (static_cast<size_t>(rb / G) * Hq + kvh * G + rb % G) * D;
   uint32_t qf[D / 16][4];
@@ -731,7 +870,10 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
   // A ring of NS stages: tiles i + 1 .. i + NS - 1 are in flight while tile i is computed. Every
   // iteration commits one cp.async group (empty past the range), so wait_group NS - 2 always means
   // "tile i has landed". With BULK, stage s's tiles complete phases 0, 1, 0, ... of bar[s] instead.
-  const int ntiles = (khi - klo + TK - 1) / TK;
+  // In a tree the pipelined loop stops before the first tile (on the range's own grid of TK keys) holding a key at
+  // or past pos0, the tail, which follows per variant below; a chain's loop covers the whole range.
+  const int kctx = td ? min(khi, klo + max(0, (pos0 - klo) / TK) * TK) : khi;
+  const int ntiles = (kctx - klo + TK - 1) / TK;
   __shared__ __align__(8) uint64_t bar[BULK ? NS : 1];
   if constexpr (BULK) {
     // Zero the stages once (rows past the range are never copied), make those generic-proxy writes
@@ -745,38 +887,11 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     __syncthreads();
   }
-#pragma unroll
-  for (int p = 0; p < NS - 1; ++p) {
-    if constexpr (BULK) {
-      if (warp == 0 && p < ntiles) attn_bulk_tile<TK>(stage(p), kcache, vcache, klo + p * TK, khi, kvh, hs, ps, &bar[p]);
-    } else {
-      if (p < ntiles) attn_load_tile<TK>(stage(p), kcache, vcache, klo + p * TK, khi, kvh, hs, ps);
-      else asm volatile("cp.async.commit_group;");
-    }
-  }
-  for (int it = 0; it < ntiles; ++it) {
-    const int k0 = klo + it * TK;
-    if constexpr (BULK) mbar_wait(&bar[it % NS], (it / NS) & 1);
-    else asm volatile("cp.async.wait_group %0;" ::"n"(NS - 2));
-    __syncthreads();  // tile it is visible to all, and stage (it - 1) % NS is free again
-    if constexpr (BULK) {
-      if (warp == 0 && it + NS - 1 < ntiles)
-        attn_bulk_tile<TK>(stage(it + NS - 1), kcache, vcache, k0 + (NS - 1) * TK, khi, kvh, hs, ps,
-                           &bar[(it + NS - 1) % NS]);
-    } else {
-      if (it + NS - 1 < ntiles) attn_load_tile<TK>(stage(it + NS - 1), kcache, vcache, k0 + (NS - 1) * TK, khi, kvh, hs, ps);
-      else asm volatile("cp.async.commit_group;");
-      // Tiles it + NS .. it + NS + pf - 1 on their way into L2 (the first iteration starts the whole window).
-      if (pf > 0 && ps == static_cast<size_t>(D)) {
-        if (it == 0)
-          for (int p = NS; p < NS + pf - 1; ++p)
-            if (p < ntiles) attn_prefetch_tile<TK>(kcache, vcache, klo + p * TK, khi, kvh, hs, ps);
-        if (it + NS + pf - 1 < ntiles) attn_prefetch_tile<TK>(kcache, vcache, k0 + (NS + pf - 1) * TK, khi, kvh, hs, ps);
-      }
-    }
-    const __nv_bfloat16* ks = stage(it);
+  // One tile's scores, online softmax and P V for this warp's rows; ca / cb: rows a / b take the tile (a chain's
+  // rows always do).
+  auto tile_compute = [&](const __nv_bfloat16* ks, int k0, bool ca, bool cb) {
     const __nv_bfloat16* vs = ks + TK * KS;
-    if (active) {
+    {
       // S = Q K^T for 16 rows x 32 keys: 4 key tiles of 8.
       float sc[TK / 8][4];
 #pragma unroll
@@ -824,16 +939,29 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
       sa += __shfl_xor_sync(0xffffffffu, sa, 2);
       sb += __shfl_xor_sync(0xffffffffu, sb, 1);
       sb += __shfl_xor_sync(0xffffffffu, sb, 2);
-      la = la * alpha_a + sa;
-      lb = lb * alpha_b + sb;
-      ma = na;
-      mb = nb;
+      // A tree's tail tile: a row of another variant keeps its state (alpha 1 and P 0 leave it bit for bit).
+      if (ca) {
+        la = la * alpha_a + sa;
+        ma = na;
+      }
+      if (cb) {
+        lb = lb * alpha_b + sb;
+        mb = nb;
+      }
+      const float fa = ca ? alpha_a : 1.f, fb = cb ? alpha_b : 1.f;
+#pragma unroll
+      for (int n = 0; n < TK / 8; ++n)
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          if (!ca) sc[n][e] = 0.f;
+          if (!cb) sc[n][2 + e] = 0.f;
+        }
 #pragma unroll
       for (int i = 0; i < D / 8; ++i) {
-        o[i][0] *= alpha_a;
-        o[i][1] *= alpha_a;
-        o[i][2] *= alpha_b;
-        o[i][3] *= alpha_b;
+        o[i][0] *= fa;
+        o[i][1] *= fa;
+        o[i][2] *= fb;
+        o[i][3] *= fb;
       }
       // O += P V: P from the score fragments, V's B fragments by a transposing ldmatrix (two dim tiles each).
 #pragma unroll
@@ -853,6 +981,54 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
           mma_bf16_16816(o[i], a0, a1, a2, a3, b0, b1);
           mma_bf16_16816(o[i + 1], a0, a1, a2, a3, b2, b3);
         }
+      }
+    }
+  };
+#pragma unroll
+  for (int p = 0; p < NS - 1; ++p) {
+    if constexpr (BULK) {
+      if (warp == 0 && p < ntiles) attn_bulk_tile<TK>(stage(p), kcache, vcache, klo + p * TK, khi, kvh, hs, ps, &bar[p]);
+    } else {
+      if (p < ntiles) attn_load_tile<TK>(stage(p), kcache, vcache, klo + p * TK, khi, kvh, hs, ps);
+      else asm volatile("cp.async.commit_group;");
+    }
+  }
+  for (int it = 0; it < ntiles; ++it) {
+    const int k0 = klo + it * TK;
+    if constexpr (BULK) mbar_wait(&bar[it % NS], (it / NS) & 1);
+    else asm volatile("cp.async.wait_group %0;" ::"n"(NS - 2));
+    __syncthreads();  // tile it is visible to all, and stage (it - 1) % NS is free again
+    if constexpr (BULK) {
+      if (warp == 0 && it + NS - 1 < ntiles)
+        attn_bulk_tile<TK>(stage(it + NS - 1), kcache, vcache, k0 + (NS - 1) * TK, khi, kvh, hs, ps,
+                           &bar[(it + NS - 1) % NS]);
+    } else {
+      if (it + NS - 1 < ntiles) attn_load_tile<TK>(stage(it + NS - 1), kcache, vcache, k0 + (NS - 1) * TK, khi, kvh, hs, ps);
+      else asm volatile("cp.async.commit_group;");
+      // Tiles it + NS .. it + NS + pf - 1 on their way into L2 (the first iteration starts the whole window).
+      if (pf > 0 && ps == static_cast<size_t>(D)) {
+        if (it == 0)
+          for (int p = NS; p < NS + pf - 1; ++p)
+            if (p < ntiles) attn_prefetch_tile<TK>(kcache, vcache, klo + p * TK, khi, kvh, hs, ps);
+        if (it + NS + pf - 1 < ntiles) attn_prefetch_tile<TK>(kcache, vcache, k0 + (NS + pf - 1) * TK, khi, kvh, hs, ps);
+      }
+    }
+    const __nv_bfloat16* ks = stage(it);
+    if (active) tile_compute(ks, k0, true, true);
+  }
+  // The tail of a tree: per variant present in this block, its tile, committed by that variant's rows only.
+  if (td != nullptr && kctx < khi) {
+    const int first_m = r0 / G;
+    for (int k0 = kctx; k0 < khi; k0 += TK) {
+      for (int v = 0; v < td->nvar; ++v) {
+        bool any = false;
+        for (int m = first_m; m <= last_m; ++m) any = any || td->var[m] == v;
+        if (!any) continue;
+        __syncthreads();  // every warp is done with stage 0
+        attn_load_tile_tree<TK>(stage(0), kcache, vcache, k0, khi, kvh, hs, ps, pos0, td->path[v]);
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+        __syncthreads();
+        if (active) tile_compute(stage(0), k0, va && td->var[ra / G] == v, vb && td->var[rb / G] == v);
       }
     }
   }
@@ -879,10 +1055,11 @@ template <int ROWS, int TK, int NS, bool BULK>
 __global__ void __launch_bounds__(ROWS * 2)
     attention_mma_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                          const __nv_bfloat16* __restrict__ vcache, DevPos pos0_arg, int M, int Hq, int Hkv,
-                         int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf) {
+                         int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf,
+                         const TreeDesc* __restrict__ td) {
   pdl_begin();  // first statement: see launch.cuh
   attention_mma_body<ROWS, TK, NS, BULK>(q, kcache, vcache, pos_value(pos0_arg), M, Hq, Hkv, splits, chunk, scratch, hs,
-                                         ps, pf, blockIdx.x);
+                                         ps, pf, blockIdx.x, td);
 }
 
 // Several sequences in one launch (M4 stage 4): the x blocks of sequence i are [blk0[i], blk0[i + 1]); each block
@@ -1069,6 +1246,23 @@ void gdn_recurrent(const float* mixed, const float* g, const float* beta, const 
                 state_out, out, M, H, HV);
 }
 
+void gdn_conv_tree(const float* pre, float* post, const float* state, const __nv_bfloat16* w, int M, int C,
+                   const TreeDesc* td, cudaStream_t s) {
+  launch_kernel("gdn_conv_tree", gdn_conv_tree_kernel, dim3((C + 255) / 256), dim3(256), 0, s, pre, post, state, w, M, C,
+                td);
+}
+
+void gdn_recurrent_tree(const float* mixed, const float* g, const float* beta, const float* state_in, float* out,
+                        int H, int HV, const TreeDesc* td, int ngdn, cudaStream_t s) {
+  launch_kernel("gdn_recurrent_tree", gdn_recurrent_tree_kernel, dim3(HV * 4, ngdn), dim3(32), 0, s, mixed, g, beta,
+                state_in, out, H, HV, td);
+}
+
+void tree_gather(const GatherBuf* bufs, int nbufs, const int* rows, int n, DevPos pos, cudaStream_t s) {
+  if (nbufs <= 0 || n <= 1) return;
+  launch_kernel("tree_gather", tree_gather_kernel, dim3(nbufs), dim3(256), 0, s, bufs, rows, n, pos);
+}
+
 void gdn_conv_seqs(float* mixed, SeqPtrs<const float> state, const __nv_bfloat16* w, const SeqBatch& b, int C,
                    cudaStream_t s) {
   launch_kernel("gdn_conv_seqs", gdn_conv_seqs_kernel, dim3((C + 255) / 256, b.n), dim3(256), 0, s, mixed, state, w, b, C);
@@ -1088,10 +1282,10 @@ void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float
 void attn_prepare(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
                   const __nv_bfloat16* k_norm, DevPos pos0, int M, int Hq, int Hkv, int D, int rot, float theta,
                   float eps, float* q, float* gate, __nv_bfloat16* kcache, __nv_bfloat16* vcache,
-                  cudaStream_t s) {
+                  cudaStream_t s, const TreeDesc* td) {
   dim3 grid(M, Hq + 2 * Hkv);
   launch_kernel("attn_prepare", attn_prepare_kernel, grid, dim3(D), D * sizeof(float), s, q_gate, k, v, q_norm, k_norm,
-                pos0, Hq, Hkv, D, rot, theta, eps, q, gate, kcache, vcache, kv_hs(D), kv_ps(Hkv, D));
+                pos0, Hq, Hkv, D, rot, theta, eps, q, gate, kcache, vcache, kv_hs(D), kv_ps(Hkv, D), td);
 }
 
 void attn_prepare_seqs(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
@@ -1141,7 +1335,8 @@ void prepare_kernels() {
 }
 
 void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, DevPos pos0, int M,
-                    int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s, int fixed_ctx) {
+                    int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s, int fixed_ctx,
+                    const TreeDesc* td) {
   if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
   if (pos0.dev && fixed_ctx <= 0) throw std::runtime_error("attention_rows: a device position needs a fixed context");
   // The grid: the ranges covering the rows' keys, or (in a graph) every range up to fixed_ctx.
@@ -1152,7 +1347,7 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows",
                     g_attn_bulk ? attention_mma_kernel<rows, tk, ns, true> : attention_mma_kernel<rows, tk, ns, false>,
                     dim3((R + rows - 1) / rows, Hkv, splits), dim3(rows * 2), mma_smem(tk, ns), s, q, kcache, vcache,
-                    pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch);
+                    pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, td);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel, dim3(M * Hq), dim3(D),
                     0, s, scratch, splits, D, out);
 }

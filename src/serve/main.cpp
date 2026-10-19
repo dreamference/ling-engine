@@ -103,7 +103,8 @@ struct Metrics {
               {"accept_histogram", spec.accept_hist}, {"draft_seconds", spec.draft_seconds},
               {"verify_seconds", spec.verify_seconds}, {"commit_seconds", spec.commit_seconds},
               {"lookup_steps", spec.lookup_steps}, {"lookup_accepted", spec.lookup_accepted},
-              {"batched_steps", spec.batched_steps},
+              {"batched_steps", spec.batched_steps}, {"tree_steps", spec.tree_steps},
+              {"tree_branch_steps", spec.tree_branch_steps}, {"tree_off_chain", spec.tree_off_chain},
               {"shadow_total_steps", spec.shadow_total_steps}, {"shadow_dflash_all", spec.shadow_dflash_all},
               {"shadow_best", spec.shadow_best}};
     for (int b = 0; b < 5; ++b) {

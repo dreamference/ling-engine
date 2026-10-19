@@ -625,6 +625,9 @@ int main(int argc, char** argv) {
                     prompt.size(), plain.size(), plain.size() / t_plain, fast.size(), fast.size() / t_spec, st.steps,
                     st.steps ? double(st.accepted + st.steps) / st.steps : 0.0, same ? "identical" : "DIFFER",
                     state ? "identical" : "DIFFERS");
+        if (st.tree_steps)
+          std::printf("  tree: %ld steps, %ld left the chain (%ld off-chain tokens)\n", st.tree_steps, st.tree_branch_steps,
+                      st.tree_off_chain);
         if (!same) {
           size_t i = 0;
           while (i < plain.size() && i < fast.size() && plain[i] == fast[i]) ++i;
@@ -651,6 +654,9 @@ int main(int argc, char** argv) {
                      st.steps ? 1e3 * (st.draft_seconds + st.verify_seconds + st.commit_seconds) / st.steps : 0.0,
                      st.steps ? 1e3 * st.draft_seconds / st.steps : 0.0, st.steps ? 1e3 * st.verify_seconds / st.steps : 0.0,
                      st.steps ? 1e3 * st.commit_seconds / st.steps : 0.0);
+        if (st.tree_steps)
+          std::fprintf(stderr, "tree: %ld steps, %ld left the chain (%ld off-chain tokens)\n", st.tree_steps,
+                       st.tree_branch_steps, st.tree_off_chain);
         if (st.lookup_steps)
           std::fprintf(stderr, "lookup: %ld steps verified its chain, %.2f tokens/step\n", st.lookup_steps,
                        double(st.lookup_accepted + st.lookup_steps) / st.lookup_steps);

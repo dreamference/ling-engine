@@ -79,6 +79,45 @@ void gemv_bf16(const float* x, int M, const __nv_bfloat16* w, float* y, int N, i
 // Row-invariant: a row's result is bit-for-bit the same whatever M is, so a token verified in a block of
 // 16 gets exactly the numbers it would get decoded alone.
 constexpr int kMaxStreamRows = 32;
+
+// Tree verification (BACKLOG 26): one verify's rows form a tree under the anchor (row 0) instead of a chain. Row m
+// sits at depth depth[m] (its position is pos0 + depth[m]) and its key and value at cache slot pos0 + m, as a chain's
+// do; every ancestor of a row has a lower index. Each row is computed exactly as a chain holding its root-to-row path
+// would compute it, bit for bit:
+//   - attention: a row's keys from pos0 on are its path's (variant var[m], a root-to-leaf path through m, whose row
+//     at depth j is path[var][j]), loaded at the positions the chain would hold them in;
+//   - the conv: its taps are its ancestors' inputs (from the variant's path);
+//   - the recurrence: walked along gdn paths, each a root-to-node path advanced row by row from the state, with a
+//     leaf child computed from its parent's state without advancing it; gdn_step[p][i] = row | kLeaf | kWrite.
+// Written by the host before each tree verify (a graph's memcpy node copies it from pinned memory).
+constexpr int kMaxTreeVariants = 32;
+struct TreeDesc {
+  int n = 0;
+  int depth[kMaxStreamRows] = {};
+  int var[kMaxStreamRows] = {};
+  int nvar = 0;
+  int path[kMaxTreeVariants][kMaxStreamRows] = {};
+  int ngdn = 0;
+  int gdn_len[kMaxTreeVariants] = {};
+  int gdn_step[kMaxTreeVariants][2 * kMaxStreamRows] = {};
+  static constexpr int kLeaf = 1 << 8, kWrite = 1 << 9;
+};
+// The verify's conv over a tree: post[m] from pre[m] and its ancestors' pre rows (or the window `state`, unwritten).
+void gdn_conv_tree(const float* pre, float* post, const float* state, const __nv_bfloat16* w, int M, int C,
+                   const TreeDesc* td, cudaStream_t s);
+// The verify's recurrence over a tree, from state_in (unwritten).
+void gdn_recurrent_tree(const float* mixed, const float* g, const float* beta, const float* state_in, float* out,
+                        int H, int HV, const TreeDesc* td, int ngdn, cudaStream_t s);
+// After a tree verify's accept: the accepted path's rows rows[j] (j < n, rows[j] >= j, rows[0] = 0) moved to row j in
+// every buffer of `bufs` (row r of buffer i at base + (r + (pos_rel ? pos : 0)) * stride bytes, row_bytes long), in
+// place, j ascending.
+struct GatherBuf {
+  char* base;
+  size_t stride;
+  int row_bytes;
+  int pos_rel;
+};
+void tree_gather(const GatherBuf* bufs, int nbufs, const int* rows, int n, DevPos pos, cudaStream_t s);
 // The weights stream_gemm reads are tiled (SPEC.md §8, stage 4): each (16-row tile, 128-value chunk) is
 // one contiguous block in the order the warp's lanes read it, so every load covers 512 contiguous bytes
 // (measured: the row-major pattern reads at 215 GB/s, contiguous blocks at 232). NVFP4 blocks carry
@@ -280,7 +319,7 @@ void set_kv_layout(size_t head_stride, size_t pos_stride);
 void attn_prepare(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
                   const __nv_bfloat16* k_norm, DevPos pos0, int M, int Hq, int Hkv, int D, int rot, float theta,
                   float eps, float* q, float* gate, __nv_bfloat16* kcache, __nv_bfloat16* vcache,
-                  cudaStream_t s);
+                  cudaStream_t s, const TreeDesc* td = nullptr);
 // Causal attention of M queries (positions pos0..) over the cache, on tensor cores over fixed 4096-key ranges at
 // fixed positions (combined afterwards), so each row's result is independent of M: decode, verify and prefill
 // (in slices of queries). `scratch` needs attention_rows_scratch_floats(M, Hq, D, ctx) floats.
@@ -289,7 +328,8 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
 // so the result is bit for bit the eager launch's.
 size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx);
 void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, DevPos pos0, int M,
-                    int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s, int fixed_ctx = 0);
+                    int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s, int fixed_ctx = 0,
+                    const TreeDesc* td = nullptr);
 // Sets the kernels' shared-memory attributes once, outside any graph capture.
 void prepare_kernels();
 // M3: attention_rows loads its key/value tiles with bulk copies (TMA, one 512-byte copy per key row) instead

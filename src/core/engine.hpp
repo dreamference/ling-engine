@@ -33,6 +33,7 @@
 #include "core/kernels.cuh"
 #include "core/model.hpp"
 #include "core/sampling.hpp"
+#include "core/tree.hpp"
 
 namespace ling {
 
@@ -87,6 +88,13 @@ struct EngineOptions {
   // kernels stay off the other SMs and the decode keeps them; -1: a plain second stream (no partition); 0: off.
   // The same kernels on the same inputs, so the same bits (--interleave-check with --side-prefill).
   int side_prefill = 0;
+  // Tree verification (BACKLOG 26): this many drafter candidates beyond the chain verified in the same pass, as a
+  // tree (core/tree.hpp), on one-stream steps; 0: the chain alone. LING_TREE, LING_TREE_T, LING_TREE_W and
+  // LING_TREE_DEPTH override these four.
+  int tree_nodes = 0;
+  double tree_temp = 1.0;
+  int tree_width = 16;
+  int tree_max_depth = 1000;
 };
 
 struct EngineStats {
@@ -109,6 +117,8 @@ struct SpecStats {
   // draft, verify and commit times are the batch's wall times, charged to each sequence in it, so a session's
   // seconds per step read as its own step period.
   long batched_steps = 0;
+  // BACKLOG 26: tree verifies, those whose accepted path left the chain, and the off-chain tokens they accepted.
+  long tree_steps = 0, tree_branch_steps = 0, tree_off_chain = 0;
   // Shadow scoring, per bucket of match length (3, 4-7, 8-15, 16-31, 32+): steps with a proposal, the
   // tokens the proposal would have had accepted (its agreement with what was generated next), and the
   // drafter's accepted tokens on the same steps. `shadow_best` adds up the better of the two per step.
@@ -362,7 +372,7 @@ class Engine {
   // The three parts of a speculative step as launch sequences with no host synchronization inside, so
   // each can be captured into a CUDA graph. Their inputs and outputs on the host side are pin_'s buffers.
   void draft_launch(int B);         // pin_->draft_ids -> pin_->cand, pin_->scores
-  void verify_launch(int V, int K);  // pin_->rows -> each row's top K in pin_->topk_vals / topk_ids
+  void verify_launch(int V, int K, bool tree = false);  // pin_->rows -> each row's top K in pin_->topk_vals / topk_ids
   void commit_launch(int row0, int n);  // the anchor and n - 1 accepted drafts into the recurrent state and drafter KV
   // One sequence's part of a speculative step on the host (speculate.cpp): its proposal, the drafted rows and
   // the draft's distribution, then the accept.
@@ -421,6 +431,8 @@ class Engine {
     float scores[kernels::kMaxStreamRows * 16 * 16];
     float topk_vals[kernels::kMaxStreamRows * 64];
     int topk_ids[kernels::kMaxStreamRows * 64];
+    kernels::TreeDesc tree;                     // a tree verify's description (BACKLOG 26)
+    int gather_rows[kernels::kMaxStreamRows];  // its accepted path's rows
   };
   StepPinned* pin_ = nullptr;
 
@@ -470,6 +482,13 @@ class Engine {
   // the decay and the write strength, for up to 32 rows.
   std::vector<float*> v_pre_, v_post_, v_g_, v_beta_;
   float* conv_tmp_ = nullptr;
+  // Tree verification (BACKLOG 26): the device copy of pin_->tree, set as tree_ while a tree verify's pass runs;
+  // tree_grid_ gdn paths launched (fixed per configuration, the unused ones exit at once).
+  kernels::TreeDesc* tree_dev_ = nullptr;
+  const kernels::TreeDesc* tree_ = nullptr;
+  int tree_grid_ = 1;
+  int* gather_rows_dev_ = nullptr;
+  bool tree_step(const SamplingParams& p, bool use_lookup, bool want_logits, int B) const;
 
   // Drafter: target features [rows][layers * hidden] (BF16), its context KV per layer [max_context][kv],
   // and the block's buffers.
@@ -516,6 +535,9 @@ class Engine {
     std::mt19937_64 rng;
     cudaGraphExec_t draft_graph = nullptr;
     std::map<int, cudaGraphExec_t> verify_graphs;  // by top-K (1 when greedy)
+    std::map<int, cudaGraphExec_t> tree_verify_graphs;  // a tree verify's, by top-K
+    kernels::GatherBuf* gather = nullptr;  // the buffers a tree's accepted path is gathered in (device)
+    int ngather = 0;
     std::vector<cudaGraphExec_t> commit_graphs;    // by accepted count + 1
     std::map<std::pair<int, int>, cudaGraphExec_t> batch_commit_graphs;  // a batched step's: (slot, count), slot > 0
     // With commit_overlap, commit_graphs and batch_commit_graphs hold the drafter's context KV only, and these the
