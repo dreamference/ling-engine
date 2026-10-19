@@ -1,0 +1,216 @@
+{
+ "set": "agentlong",
+ "seed": 20261019,
+ "bins": [
+  [
+   25000,
+   33000,
+   4,
+   400
+  ],
+  [
+   33000,
+   41000,
+   4,
+   400
+  ],
+  [
+   41000,
+   49000,
+   4,
+   400
+  ],
+  [
+   49000,
+   52000,
+   2,
+   400
+  ],
+  [
+   52000,
+   64000,
+   2,
+   250
+  ]
+ ],
+ "traces_root": "~/m0/traces/swe-bench",
+ "custom_tools": "drop",
+ "turns": [
+  {
+   "id": "t00",
+   "rollout": "im-scip-only/scratch/django__django-11740/codex-home/sessions/2026/10/07/rollout-2026-10-07T02-42-28-01a1143d-adca-7680-a224-cb4c47b335a2.jsonl",
+   "req": 16,
+   "instance": "django__django-11740",
+   "rec_in": 28534,
+   "rec_out": 522,
+   "kind": "message,exec_command",
+   "edit": true,
+   "body_sha256": "023f2af07387f7b62de7fca2c49c40f044f95026bab5cd2ef97b3ad043e0c137"
+  },
+  {
+   "id": "t01",
+   "rollout": "ab-default-b/scratch/django__django-14787/codex-home/sessions/2026/10/03/rollout-2026-10-03T21-17-46-01a103a1-51f5-79f3-aac1-5ae705dd0527.jsonl",
+   "req": 132,
+   "instance": "django__django-14787",
+   "rec_in": 28970,
+   "rec_out": 545,
+   "kind": "message,exec_command",
+   "edit": true,
+   "body_sha256": "dbb8c4c94d4c4713a111829cca4fd1812ab5422de972d9382e098e96116ba931"
+  },
+  {
+   "id": "t02",
+   "rollout": "im-scip-only/scratch/sympy__sympy-18211/codex-home/sessions/2026/10/07/rollout-2026-10-07T03-31-19-01a1146a-672f-75e0-86c4-1007507ad525.jsonl",
+   "req": 31,
+   "instance": "sympy__sympy-18211",
+   "rec_in": 30681,
+   "rec_out": 510,
+   "kind": "message,exec_command",
+   "edit": false,
+   "body_sha256": "a54d8337736948c943bc733ab41d26926e1c286d88985dccabd6cb6fd705f6c2"
+  },
+  {
+   "id": "t03",
+   "rollout": "ab-default-a/scratch/astropy__astropy-13453/codex-home/sessions/2026/10/03/rollout-2026-10-03T17-44-20-01a102dd-ebc6-7e91-b435-f15ccabdc7fb.jsonl",
+   "req": 83,
+   "instance": "astropy__astropy-13453",
+   "rec_in": 32755,
+   "rec_out": 513,
+   "kind": "message,exec_command",
+   "edit": true,
+   "body_sha256": "5cd9d7c2edf37709977e1ba92f80f2ca67b74e80f13bb990cd49503aa3445a8d"
+  },
+  {
+   "id": "t04",
+   "rollout": "acc-25-index/scratch/scikit-learn__scikit-learn-25747/codex-home/sessions/2026/10/02/rollout-2026-10-02T01-04-37-01a0fa24-49f3-7681-bcd3-3b00384e2c65.jsonl",
+   "req": 40,
+   "instance": "scikit-learn__scikit-learn-25747",
+   "rec_in": 34103,
+   "rec_out": 566,
+   "kind": "message,exec_command",
+   "edit": false,
+   "body_sha256": "81e40340468d4186090b10adf40572ec671d6e08bf97a96d91b7abd778a9a472"
+  },
+  {
+   "id": "t05",
+   "rollout": "im100-default/scratch/django__django-11066/codex-home/sessions/2026/10/08/rollout-2026-10-08T01-59-45-01a1193c-ecf0-75f3-a71d-f350456c52c2.jsonl",
+   "req": 67,
+   "instance": "django__django-11066",
+   "rec_in": 34324,
+   "rec_out": 597,
+   "kind": "message,exec_command",
+   "edit": true,
+   "body_sha256": "1a834df21efc3eb7320e82180886afc10aaa27bde1d88e06baf92b24de870a48"
+  },
+  {
+   "id": "t06",
+   "rollout": "im-refine/scratch/django__django-16502/codex-home/sessions/2026/10/07/rollout-2026-10-07T11-14-01-01a11612-00df-7ca0-a474-d82bb35e8e56.jsonl",
+   "req": 44,
+   "instance": "django__django-16502",
+   "rec_in": 35305,
+   "rec_out": 1046,
+   "kind": "message,exec_command",
+   "edit": true,
+   "body_sha256": "7203f8d1ee07b606eae382aa4051a242b6b80cbcf85b365f5eecf52d3765f6cf"
+  },
+  {
+   "id": "t07",
+   "rollout": "ab-default-a/scratch/sphinx-doc__sphinx-9230/codex-home/sessions/2026/10/03/rollout-2026-10-03T18-47-21-01a10317-9cb3-76c3-8dde-3e0e3157679a.jsonl",
+   "req": 41,
+   "instance": "sphinx-doc__sphinx-9230",
+   "rec_in": 40343,
+   "rec_out": 411,
+   "kind": "message,exec_command",
+   "edit": true,
+   "body_sha256": "928aae301f0e11b842627c1938e8826d362ed6ff6c542afd14f7afa63adff3e1"
+  },
+  {
+   "id": "t08",
+   "rollout": "acc-25/scratch/django__django-16100/codex-home/sessions/2026/10/01/rollout-2026-10-01T21-57-21-01a0f978-d72a-70a1-b9d3-9407cc92a0a0.jsonl",
+   "req": 64,
+   "instance": "django__django-16100",
+   "rec_in": 41492,
+   "rec_out": 598,
+   "kind": "exec_command",
+   "edit": true,
+   "body_sha256": "25bfefb0d8db1c9af4442ac286668529a2abcf4815250b09fa9d60cce4cacafc"
+  },
+  {
+   "id": "t09",
+   "rollout": "im100-default/scratch/django__django-16950/codex-home/sessions/2026/10/08/rollout-2026-10-08T06-11-59-01a11a23-d85c-7372-8260-e06135c61247.jsonl",
+   "req": 305,
+   "instance": "django__django-16950",
+   "rec_in": 42309,
+   "rec_out": 636,
+   "kind": "exec_command",
+   "edit": true,
+   "body_sha256": "f00998ed3a58a09329c6aead2dd58447bda1d406157c96662e3257b6de3fd7c8"
+  },
+  {
+   "id": "t10",
+   "rollout": "im100-default/scratch/django__django-13837/codex-home/sessions/2026/10/08/rollout-2026-10-08T03-49-39-01a119a1-8c16-7d91-89a3-d59b400e522a.jsonl",
+   "req": 73,
+   "instance": "django__django-13837",
+   "rec_in": 44093,
+   "rec_out": 1014,
+   "kind": "message",
+   "edit": false,
+   "body_sha256": "af3f942475e0482b3dd777e04aa860fc21dea2d1d8d0abdb03c6d45fd3d480ed"
+  },
+  {
+   "id": "t11",
+   "rollout": "im-strip-index-on/scratch/sympy__sympy-13798/codex-home/sessions/2026/10/07/rollout-2026-10-07T06-10-49-01a114fc-6cd2-7b62-9302-47e5362fb37e.jsonl",
+   "req": 94,
+   "instance": "sympy__sympy-13798",
+   "rec_in": 45229,
+   "rec_out": 539,
+   "kind": "message,exec_command",
+   "edit": true,
+   "body_sha256": "86fc163234a0d24606af9687fc7a1914ff96d37354ea4b99d4e5c5a8424a1c46"
+  },
+  {
+   "id": "t12",
+   "rollout": "acc-25-index/scratch/django__django-15563/codex-home/sessions/2026/10/02/rollout-2026-10-02T00-02-53-01a0f9eb-c413-7cc1-9f74-9be8cbe4adc8.jsonl",
+   "req": 144,
+   "instance": "django__django-15563",
+   "rec_in": 49139,
+   "rec_out": 629,
+   "kind": "message,exec_command",
+   "edit": true,
+   "body_sha256": "136e8fe5f6e1137b1c26a6e8697c7f8f3f0f5113847aa41afd53b15dd4a58d13"
+  },
+  {
+   "id": "t13",
+   "rollout": "acc-25-index/scratch/django__django-16454/codex-home/sessions/2026/10/02/rollout-2026-10-02T00-36-35-01a0fa0a-9f65-71b3-aa09-5c8acde7a7f0.jsonl",
+   "req": 55,
+   "instance": "django__django-16454",
+   "rec_in": 51801,
+   "rec_out": 1782,
+   "kind": "message",
+   "edit": false,
+   "body_sha256": "10a9c8482d2c3413638870b7bc1e99b1c931491ea7d643eaa60e9acdf0bab66c"
+  },
+  {
+   "id": "t14",
+   "rollout": "im-scip-only/scratch/django__django-15957/codex-home/sessions/2026/10/07/rollout-2026-10-07T02-58-00-01a1144b-e4d5-7d21-87e4-2675a5bd2dc3.jsonl",
+   "req": 56,
+   "instance": "django__django-15957",
+   "rec_in": 57185,
+   "rec_out": 1465,
+   "kind": "message",
+   "edit": false,
+   "body_sha256": "c07f2db6cd2aad87d68939f486684a1f0597f03502f5a116f9884463446d54b4"
+  },
+  {
+   "id": "t15",
+   "rollout": "ab-default-a/scratch/sympy__sympy-13877/codex-home/sessions/2026/10/03/rollout-2026-10-03T18-58-32-01a10321-d919-78f1-a68f-be4ab8020440.jsonl",
+   "req": 161,
+   "instance": "sympy__sympy-13877",
+   "rec_in": 57270,
+   "rec_out": 278,
+   "kind": "message,exec_command",
+   "edit": true,
+   "body_sha256": "73faa8d481147dc22b685bb3e9f6ba5114e832e3e706b8f1b7293f3122dc99d3"
+  }
+ ]
+}
