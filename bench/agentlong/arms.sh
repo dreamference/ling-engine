@@ -50,7 +50,7 @@ for item in "$@"; do
   echo "$label ($(date -u +%T)): $(tail -1 "$O/$label.jsonl")"
 done
 # Waiters: every other process with the lock file open (a flock waiting, or a script that opened it to wait).
-WAITING=$(fuser /home/kladko/.ling-gpu.lock 2>/dev/null | tr -s ' ' '\n' | grep -v "^$$\$" | grep -c .)
+WAITING=$(exec 8>&-; fuser /home/kladko/.ling-gpu.lock 2>/dev/null | tr -s ' ' '\n' | grep -v "^$$\$" | grep -c .)
 if [ "${KEEP_M0_DOWN:-0}" != 1 ] && [ "$WAITING" = 0 ]; then
   docker start m0-prod8000 > /dev/null
   for i in $(seq 1 120); do curl -sf -m 3 http://127.0.0.1:8000/v1/models > /dev/null && { echo "m0 healthy $(date -u +%T) UTC after $((i*5)) s"; break; }; sleep 5; done
