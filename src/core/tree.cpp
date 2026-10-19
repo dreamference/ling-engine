@@ -72,6 +72,7 @@ DraftTree build_tree(int anchor, const int* cand, const float* scores, int E, in
     have.insert({par, k});
     const int r = add(par, cand[size_t(t.depth[par]) * K16 + k], k);
     prob.push_back(pr);
+    t.extra_mass += pr;
     push_children(r);
   }
   return t;
