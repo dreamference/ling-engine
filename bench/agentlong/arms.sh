@@ -29,6 +29,7 @@ for item in "$@"; do
     for i in $(seq 1 120); do curl -sf -m 2 localhost:8300/health > /dev/null && break; sleep 3; done
     python3 "$HERE/run.py" --url http://127.0.0.1:8300 --mode "$mode" --label "$label" --out "$O/$label.jsonl" \
       ${ONLY:+--only $ONLY} > "$O/$label.log" 2>&1 8>&-
+    curl -s -m 10 localhost:8300/spec_stats > "$O/$label.spec.json" 2>/dev/null
     kill $SRV; wait $SRV 2>/dev/null
   else
     D=$([ "$a" = ss ] && echo "$SGSS" || echo "$SGRTN"); mode=$b; label=$c
