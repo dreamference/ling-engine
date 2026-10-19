@@ -112,6 +112,9 @@ def build(s, shape, T):
     E, K16 = s["E"], s["K16"]
     tree = {}
     trunc = None
+    leaves = shape.startswith("leaf")  # leafSHAPE: extra nodes only as leaves under chain nodes
+    if leaves:
+        shape = shape[4:]
     if shape[0] == "c" and shape[1].isdigit():  # cK+N: the chain's first K nodes, then best first to N in all
         trunc = int(shape[1:].split("+")[0])
         shape = "chain+" + shape.split("+")[1]
@@ -166,7 +169,8 @@ def build(s, shape, T):
             tree[nid] = (par, e, k)
             have.add((par, k))
             prob[nid] = -negp
-            push_children(nid, -negp)
+            if not leaves:
+                push_children(nid, -negp)
         return tree
     if shape.startswith("fixed:"):
         spec = [int(x) for x in shape.split(":")[1].split(",")]
