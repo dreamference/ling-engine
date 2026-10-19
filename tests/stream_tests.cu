@@ -4,6 +4,7 @@
 //
 //   ling-stream-tests            correctness only
 //   ling-stream-tests --bench    plus timings
+//   ling-stream-tests --bench-half  the FP16 copy's time per call (LING_HALF_BLOCKS=0: the one-block-per-row kernel)
 //   LING_PDL=1 ling-stream-tests  the same with programmatic dependent launch (launch.cuh)
 //   LING_NO_TIMING=1 ling-stream-tests  skips the attention timings (under compute-sanitizer)
 //   ling-stream-tests --nvfp4-oracle DIR  only: the at-load NVFP4 rounding (BACKLOG 33) against the "<name>.nvfp4.*"
@@ -58,6 +59,62 @@ void run(bool fp4, const float* dx, int M, int K, __half* xh, float* xinv, const
   ling::kernels::to_half_rows(dx, M, K, xh, xinv, nullptr);
   if (fp4) ling::kernels::stream_gemm_nvfp4(xh, xinv, M, w, nullptr, gs, dy, N, K, nullptr);
   else ling::kernels::stream_gemm_fp8(xh, xinv, M, w, gs, dy, N, K, nullptr);
+}
+
+// The FP16 copy (the wide kernel, BACKLOG 28) against the host's exact reference: a power-of-two scale putting the
+// row's largest magnitude in [2^14, 2^15), each value rounded to nearest. Every bit, for the step's shapes, a zero
+// row, a row with one huge value, an infinite one, and an unaligned input (the scalar path).
+bool test_to_half_rows() {
+  std::mt19937 rng(5);
+  std::normal_distribution<float> normal(0.f, 1.f);
+  const int Ms[] = {1, 2, 8, 12, 16, 24, 32}, Ks[] = {128, 1000, 4096, 5120, 6144, 17408};
+  const int MMAX = 32, KMAX = 17408;
+  std::vector<float> x(size_t(MMAX) * KMAX + 1);
+  float* dx;
+  __half* dh;
+  float* dinv;
+  cudaMalloc(&dx, x.size() * sizeof(float));
+  cudaMalloc(&dh, size_t(MMAX) * KMAX * sizeof(__half));
+  cudaMalloc(&dinv, MMAX * sizeof(float));
+  bool ok = true;
+  int cases = 0;
+  for (int K : Ks)
+    for (int M : Ms)
+      for (int off = 0; off < 2; ++off) {
+        for (size_t i = 0; i < x.size(); ++i) x[i] = normal(rng) * (i % 89 == 0 ? 200.f : 1.f);
+        if (M > 2) {
+          for (int k = 0; k < K; ++k) x[off + size_t(1) * K + k] = 0.f;  // a zero row
+          x[off + size_t(2) * K + K / 3] = 3.0e30f;                       // one huge value: the rest underflows
+        }
+        if (M > 3) x[off + size_t(3) * K + K - 1] = INFINITY;
+        cudaMemcpy(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice);
+        ling::kernels::to_half_rows(dx + off, M, K, dh, dinv, nullptr);
+        const auto h = download(dh, size_t(M) * K);
+        const auto inv = download(dinv, M);
+        for (int m = 0; m < M && ok; ++m) {
+          const float* row = x.data() + off + size_t(m) * K;
+          float mx = 0.f;
+          for (int k = 0; k < K; ++k) mx = std::fmax(mx, std::fabs(row[k]));
+          int e = 0;
+          if (mx > 0.f && std::isfinite(mx)) std::frexp(mx, &e);
+          const float s = std::ldexp(1.f, 15 - e);
+          if (inv[m] != std::ldexp(1.f, e - 15)) {
+            std::printf("to_half_rows M=%d K=%d off=%d row %d: scale differs FAIL\n", M, K, off, m);
+            ok = false;
+          }
+          for (int k = 0; k < K && ok; ++k) {
+            const __half want = __float2half_rn(row[k] * s), got = h[size_t(m) * K + k];
+            if (std::memcmp(&want, &got, sizeof(__half)) != 0) {
+              std::printf("to_half_rows M=%d K=%d off=%d row %d col %d differs FAIL\n", M, K, off, m, k);
+              ok = false;
+            }
+          }
+        }
+        ++cases;
+      }
+  cudaFree(dx), cudaFree(dh), cudaFree(dinv);
+  std::printf("to_half_rows: %d shapes bit for bit against the host %s\n", cases, ok ? "ok" : "FAIL");
+  return ok;
 }
 
 bool test_gemm() {
@@ -554,6 +611,43 @@ void bench() {
   }
 }
 
+// BACKLOG 28: the FP16 copy's time per call at the step's shapes, 200 calls in one graph (LING_HALF_BLOCKS=0 for
+// the one-block-per-row kernel). The input stays in L2, as in the step, where its producer has just written it.
+void bench_half() {
+  float *x, *xinv;
+  __half* xh;
+  cudaMalloc(&x, size_t(32) * 17408 * sizeof(float));
+  cudaMalloc(&xh, size_t(32) * 17408 * sizeof(__half));
+  cudaMalloc(&xinv, 32 * sizeof(float));
+  cudaMemset(x, 0x3c, size_t(32) * 17408 * sizeof(float));
+  cudaStream_t st;
+  cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+  cudaEvent_t a, b;
+  cudaEventCreate(&a), cudaEventCreate(&b);
+  for (int K : {5120, 6144, 17408}) {
+    std::printf("bench to_half_rows K=%-5d", K);
+    for (int M : {1, 8, 12, 16, 24, 32}) {
+      cudaGraph_t g;
+      cudaGraphExec_t ge;
+      cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+      for (int i = 0; i < 200; ++i) ling::kernels::to_half_rows(x, M, K, xh, xinv, st);
+      cudaStreamEndCapture(st, &g);
+      cudaGraphInstantiate(&ge, g, 0);
+      cudaGraphLaunch(ge, st);
+      cudaEventRecord(a, st);
+      for (int rep = 0; rep < 5; ++rep) cudaGraphLaunch(ge, st);
+      cudaEventRecord(b, st);
+      cudaEventSynchronize(b);
+      float ms = 0;
+      cudaEventElapsedTime(&ms, a, b);
+      std::printf("  M=%-2d %6.2f us", M, ms * 1e3f / 1000.f);
+      cudaGraphExecDestroy(ge), cudaGraphDestroy(g);
+    }
+    std::printf("\n");
+  }
+  cudaFree(x), cudaFree(xh), cudaFree(xinv);
+}
+
 __global__ void fill_random_kernel(uint32_t* p, size_t n, uint32_t seed) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
     uint32_t h = static_cast<uint32_t>(i) * 2654435761u ^ seed;
@@ -1015,7 +1109,12 @@ int main(int argc, char** argv) {
     bench_groups();
     return cudaDeviceSynchronize() == cudaSuccess ? 0 : 1;
   }
-  bool ok = test_gemm();
+  if (argc > 1 && std::string(argv[1]) == "--bench-half") {  // timings only (BACKLOG 28's FP16 copies)
+    bench_half();
+    return cudaDeviceSynchronize() == cudaSuccess ? 0 : 1;
+  }
+  bool ok = test_to_half_rows();
+  ok &= test_gemm();
   ok &= test_gemm_wide();
   ok &= test_bf16_rows();
   ok &= test_attention_rows();
