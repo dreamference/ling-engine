@@ -246,6 +246,50 @@ struct StreamTarget {
 };
 void stream_gemm_multi(bool nvfp4, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K,
                        cudaStream_t s);
+// The megakernel's stage 1 in the step (LING_MK_FFN): the rows path's FFN (gate|up from xh, silu(g) * u into g, its FP16
+// copy into xh2 with xinv2, down into down.y) as one persistent kernel, bit for bit the four kernels. `counters` is
+// kMkFfnWords zeroed words, owned by this call site (the kernel leaves them zeroed). False: a shape or a stream GEMM
+// override (LING_SG_*, LING_KSPLIT) the kernel does not reproduce; nothing was launched.
+constexpr int kMkFfnWords = 4 + kMaxStreamRows;
+// The megakernel's stage 2 in the step (LING_MK_GDN): one verify sequence's DeltaNet mixer, from the input norm's output
+// (xn in FP32, xh/xinv its FP16 copy) to the out-projection's output (out.y), as one persistent kernel: in_qkv's output
+// into in_qkv.y (kept for the commit), in_z's into in_z.y, the a/b projections and the gating into a, b, g, beta, the
+// conv's output into mixed (from conv_state, left unwritten), the recurrence's into core (from state, left unwritten),
+// the gated norm's into normed and its FP16 copy into xh2/xinv2. Bit for bit the graph path's kernels. `counters` is
+// kMkGdnWords zeroed words owned by the call site. False: a shape or override it does not reproduce; nothing launched.
+constexpr int kMkGdnWords = 12 + kMaxStreamRows;
+struct MkGdnParams {
+  const __half* xh;
+  const float* xinv;
+  const float* xn;
+  int M, K;  // rows; the hidden size (the projections' K and the out-projection's N)
+  StreamTarget in_qkv, in_z, out;  // FP8
+  const __nv_bfloat16 *wa, *wb;    // [HV][K] each
+  float *a, *b, *g, *beta;
+  const __nv_bfloat16 *A_log, *dt_bias;
+  float* mixed;
+  const float* conv_state;
+  const __nv_bfloat16* conv_w;
+  const float* state;
+  float* core;
+  const __nv_bfloat16* norm_w;
+  float eps;
+  float* normed;
+  __half* xh2;
+  float* xinv2;
+  int C, H, HV, Dk, Dv, Vs;
+  unsigned* counters;
+  unsigned long long* times = nullptr;  // LING_MK_TIMES: [blocks][kMkTimesPerBlock] stamps of the last launch
+};
+bool gdn_persistent(const MkGdnParams& p, cudaStream_t s);
+bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarget& gate, const StreamTarget& up,
+                    const StreamTarget& down, int H, int I, float* g, float* u, __half* xh2, float* xinv2,
+                    unsigned* counters, cudaStream_t s, unsigned long long* times = nullptr);
+constexpr int kMkTimesPerBlock = 10;  // LING_MK_TIMES: globaltimer stamps per block of a persistent kernel
+// The megakernel probe (BACKLOG 28): about `bytes` of a tiled weight blob (the first chunks of every tile, what a stream
+// GEMM's blocks read first) prefetched into L2 by one PDL launch, so the latency-bound kernels before that GEMM run
+// beside its first bytes. Writes nothing; the GEMM computes the same bits.
+void l2_prefetch_weights(const uint8_t* w, bool fp4, bool coded, int N, int K, size_t bytes, cudaStream_t s);
 
 // Top-K (K <= 64) of each row of x [rows][V]: values descending, ties to the lower index (so entry 0 is
 // what std::max_element returns). `scratch` needs topk_scratch_floats(rows, K) floats.
