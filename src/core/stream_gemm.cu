@@ -792,6 +792,324 @@ void mk_ffn_launch(MkFfnArgs& a, cudaStream_t s) {
   launch_kernel("ffn_persistent", ffn_persistent_kernel<NT, CODED>, dim3(G), dim3(kWarps * 32), 0, s, a);
 }
 
+// ---- The megakernel's stage 2 in the step: a DeltaNet layer's mixer as one persistent kernel (LING_MK_GDN) ----
+//
+// One verify sequence's DeltaNet mixer from the input norm's output to the out-projection: in_qkv|in_z (FP8 stream
+// GEMMs), the a/b projections (BF16) with the gating, the causal conv (from the session's window, left unwritten), the
+// gated delta rule (from the session's state, left unwritten), the gated RMSNorm, the FP16 copy of its output under each
+// row's power-of-two scale, and the out-projection. The point is the overlap the graph path cannot have: blocks
+// [0, chain) are the chain's (the a/b projections and the gating at once, then, as soon as the last in_qkv tile is in,
+// the conv and the recurrence), while the other blocks stream the in_qkv and then the in_z tiles beside them; the
+// chain's blocks join the in_z queue when they are done. Every element is computed by the four-kernel path's arithmetic
+// in its order (the stream GEMM's bodies; bf16_rows', gdn_conv's, gdn_gating's, gdn_recurrent_body's and
+// gated_rmsnorm's expressions, reductions and orders reproduced per 128-thread group or per warp), so the outputs are
+// bit for bit the graph path's; only which block computes an item, and when, changes. One block per SM (the recurrence
+// holds 128 state values per thread).
+enum MkGdnCounter { kQkvQueue = 0, kQkvDone, kZQueue, kZDone, kAbDone, kConvDone, kRecDone, kNormDone, kHalfDone, kExit };
+constexpr int kGdnK = 128;  // the key and value head size (kernels.cu's kGdnDk, kGdnDv)
+
+struct MkGdnArgs {
+  const __half* xh;  // the input norm's FP16 copy and row scales (the stream GEMMs' input)
+  const float* xinv;
+  const float* xn;  // its FP32 output (the a/b projections' input)
+  StreamProblems inp;  // in_qkv (matrix 0) and in_z (matrix 1)
+  int n_qkv, n_z;      // their tiles
+  const __nv_bfloat16 *wa, *wb;
+  float *a, *b;
+  const __nv_bfloat16 *A_log, *dt_bias;
+  float *g, *beta;
+  const float* vpre;  // in_qkv's output [M][C] (inp.y[0]; kept for the commit)
+  float* mixed;       // the conv's output [M][C]
+  const float* conv_state;  // [C][3], read only
+  const __nv_bfloat16* conv_w;
+  const float* state;  // [HV][128][128], read only
+  float* core;         // [M][HV * 128]
+  const float* z;      // in_z's output [M][Vs] (inp.y[1])
+  const __nv_bfloat16* norm_w;
+  float eps;
+  float* normed;
+  __half* xh2;
+  float* xinv2;
+  StreamProblems outp;
+  int n_out;
+  int M, K, C, H, HV, Vs;
+  int chain;
+  unsigned* c;
+};
+
+__device__ __forceinline__ float mk_silu(float x) { return x / (1.f + __expf(-x)); }  // kernels.cu's silu
+__device__ __forceinline__ float mk_warp_sum(float v) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  return v;
+}
+
+// bf16_rows_kernel's output n for every row, by one group of 128 threads (gt its thread, red its [4][32]).
+__device__ __forceinline__ void mk_bf16_row(const float* __restrict__ x, int M, const __nv_bfloat16* __restrict__ w,
+                                            float* __restrict__ y, int n, int N, int K, int gt, float (*red)[32]) {
+  constexpr int MT = 32, T = 128;
+  const int lane = gt & 31, warp = gt >> 5;
+  float acc[MT];
+#pragma unroll
+  for (int m = 0; m < MT; ++m) acc[m] = 0.f;
+  const __nv_bfloat16* wr = w + static_cast<size_t>(n) * K;
+  for (int k0 = gt * 8; k0 < K; k0 += T * 8) {
+    const uint4 raw = *reinterpret_cast<const uint4*>(wr + k0);
+    const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
+    float wf[8];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const float2 f = __bfloat1622float2(w2[i]);
+      wf[2 * i] = f.x;
+      wf[2 * i + 1] = f.y;
+    }
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+      if (m >= M) break;
+      const float4 xa = *reinterpret_cast<const float4*>(x + static_cast<size_t>(m) * K + k0);
+      const float4 xb = *reinterpret_cast<const float4*>(x + static_cast<size_t>(m) * K + k0 + 4);
+      const float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+      float v = acc[m];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) v = fmaf(wf[i], xv[i], v);
+      acc[m] = v;
+    }
+  }
+#pragma unroll
+  for (int m = 0; m < MT; ++m) {
+    if (m >= M) break;
+    const float v = mk_warp_sum(acc[m]);
+    if (lane == 0) red[warp][m] = v;
+  }
+  __syncthreads();  // both groups of the block come here together
+  if (gt < M) {
+    float v = 0.f;
+#pragma unroll
+    for (int i = 0; i < T / 32; ++i) v += red[i][gt];
+    y[static_cast<size_t>(gt) * N + n] = v;
+  }
+  __syncthreads();  // red is reused by the group's next output
+}
+
+// gdn_recurrent_body for item bx (head bx / 4, value columns (bx % 4) * 32 ...) by one warp; qs and ks are the warp's.
+__device__ __forceinline__ void mk_recurrent(const float* mixed, const float* g, const float* beta,
+                                             const float* __restrict__ state_in, float* out, int M, int H, int HV, int bx,
+                                             float* qs, float* ks) {
+  const int hv = bx / 4, part = bx % 4, lane = threadIdx.x & 31, v = part * 32 + lane;
+  const int h = hv / (HV / H);
+  const int C = 2 * H * kGdnK + HV * kGdnK;
+  const float* st = state_in + static_cast<size_t>(hv) * kGdnK * kGdnK;
+  float S[kGdnK];
+#pragma unroll
+  for (int k = 0; k < kGdnK; ++k) S[k] = st[k * kGdnK + v];
+  const float scale = rsqrtf(static_cast<float>(kGdnK));
+  for (int t = 0; t < M; ++t) {
+    const float* row = mixed + static_cast<size_t>(t) * C;
+    const float4 q4 = *reinterpret_cast<const float4*>(row + h * kGdnK + lane * 4);
+    const float4 k4 = *reinterpret_cast<const float4*>(row + H * kGdnK + h * kGdnK + lane * 4);
+    float qn = q4.x * q4.x + q4.y * q4.y + q4.z * q4.z + q4.w * q4.w;
+    float kn = k4.x * k4.x + k4.y * k4.y + k4.z * k4.z + k4.w * k4.w;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      qn += __shfl_xor_sync(0xffffffffu, qn, o);
+      kn += __shfl_xor_sync(0xffffffffu, kn, o);
+    }
+    const float qr = rsqrtf(qn + 1e-6f) * scale, kr = rsqrtf(kn + 1e-6f);
+    __syncwarp();
+    qs[lane * 4] = q4.x * qr, qs[lane * 4 + 1] = q4.y * qr, qs[lane * 4 + 2] = q4.z * qr, qs[lane * 4 + 3] = q4.w * qr;
+    ks[lane * 4] = k4.x * kr, ks[lane * 4 + 1] = k4.y * kr, ks[lane * 4 + 2] = k4.z * kr, ks[lane * 4 + 3] = k4.w * kr;
+    __syncwarp();
+    const float decay = __expf(g[t * HV + hv]);
+    const float b = beta[t * HV + hv];
+    const float vv = row[2 * H * kGdnK + hv * kGdnK + v];
+    float kv = 0.f;
+#pragma unroll
+    for (int k = 0; k < kGdnK; ++k) {
+      S[k] *= decay;
+      kv = fmaf(S[k], ks[k], kv);
+    }
+    const float d = (vv - kv) * b;
+    float o = 0.f;
+#pragma unroll
+    for (int k = 0; k < kGdnK; ++k) {
+      S[k] = fmaf(d, ks[k], S[k]);
+      o = fmaf(S[k], qs[k], o);
+    }
+    out[static_cast<size_t>(t) * HV * kGdnK + hv * kGdnK + v] = o;
+  }
+  __syncwarp();  // qs and ks are reused by the warp's next item
+}
+
+// A block's next item from a queue (thread 0 takes it, every thread gets it).
+__device__ __forceinline__ int mk_take(unsigned* q) {
+  __shared__ int item;
+  __syncthreads();
+  if (threadIdx.x == 0) item = static_cast<int>(atomicAdd(q, 1u));
+  __syncthreads();
+  return item;
+}
+
+struct MaybePdl {  // pdl_begin() once per block, at the first read of the predecessor's output
+  bool* waited;
+  __device__ __forceinline__ void operator()() const {
+    if (!*waited) {
+      pdl_begin();
+      *waited = true;
+    }
+  }
+};
+
+template <int NT>
+__global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArgs a) {
+  const int G = gridDim.x, bid = blockIdx.x;
+  unsigned* c = a.c;
+  const bool chain = bid < a.chain;
+  bool waited = false;
+  __shared__ float red[2][4][32];
+  __shared__ float qk[kWarps][2][kGdnK];
+  const int grp = threadIdx.x >> 7, gt = threadIdx.x & 127;
+  if (chain) {
+    MaybePdl{&waited}();
+    // The a/b projections, each output n of both matrices, then the gating of (t, n) for every row t: the chain's
+    // 2 x chain groups take n = group, group + 2 x chain, ...
+    for (int n = bid * 2 + grp; n < a.HV; n += 2 * a.chain) {
+      mk_bf16_row(a.xn, a.M, a.wa, a.a, n, a.HV, a.K, gt, red[grp]);
+      mk_bf16_row(a.xn, a.M, a.wb, a.b, n, a.HV, a.K, gt, red[grp]);
+      if (gt < a.M) {  // gdn_gating_kernel's element i = gt * HV + n
+        const int i = gt * a.HV + n;
+        const float x = a.a[i] + __bfloat162float(a.dt_bias[n]);
+        const float softplus = x <= 20.f ? log1pf(__expf(x)) : x;
+        a.g[i] = -__expf(__bfloat162float(a.A_log[n])) * softplus;
+        a.beta[i] = 1.f / (1.f + __expf(-a.b[i]));
+      }
+    }
+    // Every group runs the same number of rounds of the loop above (its barriers are block-wide): HV is a multiple of
+    // 2 x chain here (checked on the host).
+    mk_done(&c[kAbDone]);
+  }
+  // The in_qkv tiles, from a queue, on every block.
+  for (;;) {
+    const int i = mk_take(&c[kQkvQueue]);
+    if (i >= a.n_qkv) break;
+    stream_gemm_body<NT, 2, false, 2, false>(a.xh, a.xinv, a.M, a.inp, a.K, 1, nullptr, i, 0, MaybePdl{&waited});
+    mk_done(&c[kQkvDone]);
+  }
+  if (chain) {
+    mk_wait(&c[kQkvDone], a.n_qkv);
+    // gdn_conv_kernel's channel c over the rows, from the session's window, out of place (vpre -> mixed).
+    for (int ch = bid * blockDim.x + threadIdx.x; ch < a.C; ch += a.chain * blockDim.x) {
+      float s0 = a.conv_state[ch * 3], s1 = a.conv_state[ch * 3 + 1], s2 = a.conv_state[ch * 3 + 2];
+      const float w0 = __bfloat162float(a.conv_w[ch * 4]), w1 = __bfloat162float(a.conv_w[ch * 4 + 1]);
+      const float w2 = __bfloat162float(a.conv_w[ch * 4 + 2]), w3 = __bfloat162float(a.conv_w[ch * 4 + 3]);
+      for (int t = 0; t < a.M; ++t) {
+        const float xv = a.vpre[static_cast<size_t>(t) * a.C + ch];
+        const float o = w0 * s0 + w1 * s1 + w2 * s2 + w3 * xv;
+        s0 = s1;
+        s1 = s2;
+        s2 = xv;
+        a.mixed[static_cast<size_t>(t) * a.C + ch] = mk_silu(o);
+      }
+    }
+    mk_done(&c[kConvDone]);
+    mk_wait(&c[kConvDone], a.chain);
+    mk_wait(&c[kAbDone], a.chain);
+    // The recurrence: item w of HV x 4 on warp w of the chain's blocks.
+    const int warp = threadIdx.x >> 5;
+    for (int it = bid * kWarps + warp; it < a.HV * 4; it += a.chain * kWarps)
+      mk_recurrent(a.mixed, a.g, a.beta, a.state, a.core, a.M, a.H, a.HV, it, qk[warp][0], qk[warp][1]);
+    mk_done(&c[kRecDone]);
+  }
+  // The in_z tiles, from a queue: the streaming blocks at once, the chain's when the recurrence is done.
+  for (;;) {
+    const int j = mk_take(&c[kZQueue]);
+    if (j >= a.n_z) break;
+    stream_gemm_body<NT, 2, false, 2, false>(a.xh, a.xinv, a.M, a.inp, a.K, 1, nullptr, a.n_qkv + j, 0,
+                                             MaybePdl{&waited});
+    mk_done(&c[kZDone]);
+  }
+  MaybePdl{&waited}();
+  mk_wait(&c[kZDone], a.n_z);
+  mk_wait(&c[kRecDone], a.chain);
+  // gated_rmsnorm_kernel's row r (D = 128 threads, block_sum over its 4 warps) by group grp, rows r = 2 bid + grp,
+  // + 2G, ...; each row's maximum of |output| into the row maxima; then the FP16 copy of the group's own rows.
+  unsigned* rowmax = c + 12;
+  const int rows = a.M * a.HV;
+  for (int r0 = 0; r0 < rows; r0 += 2 * G) {  // every group runs the same rounds (the barriers are block-wide)
+    const int r = r0 + 2 * bid + grp;
+    const bool live = r < rows;
+    const float x = live ? a.core[static_cast<size_t>(r) * kGdnK + gt] : 0.f;
+    float ss = x * x;
+    // block_sum over the row's 128 threads, exactly: the warp sums, then lanes < 4 of a warp_sum over them.
+    ss = mk_warp_sum(ss);
+    __syncthreads();
+    if ((gt & 31) == 0) red[grp][0][gt >> 5] = ss;
+    __syncthreads();
+    const float tsum = mk_warp_sum((gt & 31) < 4 ? red[grp][0][gt & 31] : 0.f);
+    if (live) {
+      const float rstd = rsqrtf(tsum / kGdnK + a.eps);
+      const float o = x * rstd * __bfloat162float(a.norm_w[gt]) * mk_silu(a.z[static_cast<size_t>(r) * kGdnK + gt]);
+      a.normed[static_cast<size_t>(r) * kGdnK + gt] = o;
+      const float m = fabsf(o);
+      // the row of the out-projection's input is t = r / HV
+      float wm = isnan(m) ? 0.f : m;
+#pragma unroll
+      for (int s = 16; s > 0; s >>= 1) wm = fmaxf(wm, __shfl_xor_sync(0xffffffffu, wm, s));
+      if ((gt & 31) == 0 && wm > 0.f) atomicMax(&rowmax[r / a.HV], __float_as_uint(wm));
+    }
+  }
+  mk_done(&c[kNormDone]);
+  mk_wait(&c[kNormDone], G);
+  __shared__ float sc[kMaxStreamRows];
+  if (threadIdx.x < a.M) {
+    const float mx = __uint_as_float(mk_ld_acquire(&rowmax[threadIdx.x]));
+    int e = 0;
+    if (mx > 0.f && isfinite(mx)) frexpf(mx, &e);  // as to_half_rows
+    sc[threadIdx.x] = ldexpf(1.f, 15 - e);
+    if (bid == 0) a.xinv2[threadIdx.x] = ldexpf(1.f, e - 15);
+  }
+  __syncthreads();
+  for (int r = 2 * bid + grp; r < rows; r += 2 * G) {
+    const size_t i = static_cast<size_t>(r) * kGdnK + gt;  // = t * Vs + hv * 128 + d
+    a.xh2[i] = __float2half_rn(a.normed[i] * sc[r / a.HV]);
+  }
+  mk_done(&c[kHalfDone]);
+  // The out-projection, b, b + G, ... after every block's FP16 rows.
+  for (int i = bid; i < a.n_out; i += G) {
+    __syncthreads();
+    stream_gemm_body<NT, 2, false, 2, false>(a.xh2, a.xinv2, a.M, a.outp, a.Vs, 1, nullptr, i, 0,
+                                             CounterWaitMk{&c[kHalfDone], static_cast<unsigned>(G), i == bid});
+  }
+  if (bid >= a.n_out) mk_wait(&c[kHalfDone], G);
+  __syncthreads();
+  if (threadIdx.x == 0 && atomicAdd(&c[kExit], 1u) == static_cast<unsigned>(G) - 1u) {
+    for (int k = 0; k < kMkGdnWords; ++k) c[k] = 0u;
+    __threadfence();
+  }
+}
+
+template <int NT>
+int mk_gdn_resident() {
+  static const int r = [] {
+    int per_sm = 0, sms = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_persistent_kernel<NT>, kWarps * 32, 0);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    return per_sm * sms;
+  }();
+  return r;
+}
+
+template <int NT>
+void mk_gdn_launch(MkGdnArgs& a, cudaStream_t s) {
+  const int G = mk_gdn_resident<NT>();
+  if (G < 2 * a.chain || G < 1) throw std::runtime_error("gdn_persistent: too few resident blocks");
+  static bool told = false;
+  if (!told) {
+    told = true;
+    std::fprintf(stderr, "megakernel stage 2: gdn_persistent<%d> on %d blocks, %d of them the chain's\n", NT, G, a.chain);
+  }
+  launch_kernel("gdn_persistent", gdn_persistent_kernel<NT>, dim3(G), dim3(kWarps * 32), 0, s, a);
+}
+
 int grid_of(size_t n) { return static_cast<int>(std::min<size_t>((n + 255) / 256, 65535 * 4)); }
 
 void check_shape(int N, int K, const char* what) {
@@ -897,6 +1215,75 @@ void stream_gemm_multi(bool nvfp4, const __half* x, const float* xinv, int M, co
                        cudaStream_t s) {
   if (nvfp4) dispatch<true>(x, xinv, M, t, n, K, s);
   else dispatch<false>(x, xinv, M, t, n, K, s);
+}
+
+bool gdn_persistent(const MkGdnParams& p, cudaStream_t s) {
+  static const int chain_env = sg_env("LING_MK_CHAIN", 24);
+  const int chain = chain_env;
+  if (p.M < 1 || p.M > kMaxStreamRows || p.Dk != kGdnK || p.Dv != kGdnK || p.HV % p.H != 0) return false;
+  if (chain < 1 || p.HV % (2 * chain) != 0 || p.K % kChunk || p.Vs % kChunk) return false;
+  if (p.in_qkv.N != p.C || p.in_z.N != p.Vs || p.out.N != p.K || p.C % 32 || p.Vs % 32 || p.K % 32) return false;
+  if (sg_env("LING_SG_PF", kInFlight) != 2 || sg_env("LING_SG_TW", kTilesWide) != 2 || sg_env("LING_SG_TN", kTilesNarrow) != 2 ||
+      sg_env("LING_SG_TW4", kTilesWide4) != 2 || sg_env("LING_SG_TN4", kTilesNarrow4) != 2 || sg_env("LING_KSPLIT", 0) != 0)
+    return false;
+  MkGdnArgs a{};
+  a.xh = p.xh;
+  a.xinv = p.xinv;
+  a.xn = p.xn;
+  const StreamTarget* it[2] = {&p.in_qkv, &p.in_z};
+  int blocks = 0;
+  for (int i = 0; i < 2; ++i) {
+    a.inp.w[i] = it[i]->w;
+    a.inp.gscale[i] = it[i]->scale;
+    a.inp.y[i] = it[i]->y;
+    a.inp.N[i] = it[i]->N;
+    a.inp.table[i] = nullptr;
+    a.inp.block0[i] = blocks;
+    blocks += it[i]->N / 32;
+  }
+  a.inp.count = 2;
+  a.n_qkv = p.C / 32;
+  a.n_z = p.Vs / 32;
+  a.wa = p.wa;
+  a.wb = p.wb;
+  a.a = p.a;
+  a.b = p.b;
+  a.A_log = p.A_log;
+  a.dt_bias = p.dt_bias;
+  a.g = p.g;
+  a.beta = p.beta;
+  a.vpre = p.in_qkv.y;
+  a.mixed = p.mixed;
+  a.conv_state = p.conv_state;
+  a.conv_w = p.conv_w;
+  a.state = p.state;
+  a.core = p.core;
+  a.z = p.in_z.y;
+  a.norm_w = p.norm_w;
+  a.eps = p.eps;
+  a.normed = p.normed;
+  a.xh2 = p.xh2;
+  a.xinv2 = p.xinv2;
+  a.outp.w[0] = p.out.w;
+  a.outp.gscale[0] = p.out.scale;
+  a.outp.y[0] = p.out.y;
+  a.outp.N[0] = p.out.N;
+  a.outp.table[0] = nullptr;
+  a.outp.block0[0] = 0;
+  a.outp.count = 1;
+  a.n_out = p.out.N / 32;
+  a.M = p.M;
+  a.K = p.K;
+  a.C = p.C;
+  a.H = p.H;
+  a.HV = p.HV;
+  a.Vs = p.Vs;
+  a.chain = chain;
+  a.c = p.counters;
+  if (p.M <= 8) mk_gdn_launch<1>(a, s);
+  else if (p.M <= 16) mk_gdn_launch<2>(a, s);
+  else mk_gdn_launch<4>(a, s);
+  return true;
 }
 
 bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarget& gate, const StreamTarget& up,

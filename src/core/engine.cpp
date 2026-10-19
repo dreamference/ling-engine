@@ -202,13 +202,22 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     std::fprintf(stderr, "commit beside the next draft\n");
   }
   if (const char* e = std::getenv("LING_MK_FFN")) mk_ffn_ = std::atoi(e);
-  if (mk_ffn_ > 0) {
-    xh2_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * c.intermediate);
+  if (const char* e = std::getenv("LING_MK_GDN")) mk_gdn_ = std::atoi(e);
+  if (mk_ffn_ > 0 || mk_gdn_ > 0) {
+    xh2_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * std::max(c.intermediate, Vs));
     xinv2_ = alloc<float>(kernels::kMaxStreamRows);
+  }
+  if (mk_ffn_ > 0) {
     const size_t words = size_t(c.layers) * kernels::kMkFfnWords;
     mk_counters_ = reinterpret_cast<unsigned*>(alloc<int>(words));
     check(cudaMemset(mk_counters_, 0, words * sizeof(unsigned)), "megakernel counters");
     std::fprintf(stderr, "megakernel stage 1: the rows path's FFN as one persistent kernel (LING_MK_FFN=%d)\n", mk_ffn_);
+  }
+  if (mk_gdn_ > 0) {
+    const size_t words = size_t(c.layers) * kernels::kMkGdnWords;
+    mk_gdn_counters_ = reinterpret_cast<unsigned*>(alloc<int>(words));
+    check(cudaMemset(mk_gdn_counters_, 0, words * sizeof(unsigned)), "megakernel counters");
+    std::fprintf(stderr, "megakernel stage 2: a verify's DeltaNet mixer as one persistent kernel (LING_MK_GDN=%d)\n", mk_gdn_);
   }
   if (const char* e = std::getenv("LING_GDN_FORK")) fork_ = std::atoi(e);
   if (fork_ > 0) {
@@ -833,7 +842,51 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       float* g = verify ? v_g_[slot] : g_;
       float* beta = verify ? v_beta_[slot] : beta_;
       const bool fork = fork_ > 0 && verify && !multi && !quantized_ && L.in_a.N == L.in_b.N;
-      if (fork) {
+      // The megakernel's stage 2 (LING_MK_GDN): the whole mixer of one verify sequence as one persistent kernel.
+      bool mk_gdn = mk_gdn_ > 0 && verify && !multi && !quantized_ && xn_half && L.in_a.N == L.in_b.N &&
+                    L.in_a.N == c.lin_v_heads;
+      if (mk_gdn) {
+        const Seg& sg = segs[0];
+        kernels::MkGdnParams p{};
+        p.xh = xh_;
+        p.xinv = xinv_;
+        p.xn = xn_;
+        p.M = M;
+        p.K = H;
+        p.in_qkv = {L.in_qkv.w, nullptr, L.in_qkv.scale, v_pre_[slot], L.in_qkv.N};
+        p.in_z = {L.in_z.w, nullptr, L.in_z.scale, z_, L.in_z.N};
+        p.out = {L.out.w, nullptr, L.out.scale, t1_, L.out.N};
+        p.wa = L.in_a.w;
+        p.wb = L.in_b.w;
+        p.a = a_;
+        p.b = b_;
+        p.g = g;
+        p.beta = beta;
+        p.A_log = L.A_log;
+        p.dt_bias = L.dt_bias;
+        p.mixed = mixed;
+        p.conv_state = sg.s->conv[slot];
+        p.conv_w = L.conv;
+        p.state = sg.s->gdn[slot];
+        p.core = core_;
+        p.norm_w = L.lin_norm;
+        p.eps = c.eps;
+        p.normed = normed_;
+        p.xh2 = xh2_;
+        p.xinv2 = xinv2_;
+        p.C = C;
+        p.H = c.lin_k_heads;
+        p.HV = c.lin_v_heads;
+        p.Dk = c.lin_k_dim;
+        p.Dv = c.lin_v_dim;
+        p.Vs = Vs;
+        p.counters = mk_gdn_counters_ + size_t(slot) * kernels::kMkGdnWords;
+        mk_gdn = L.in_qkv.K == H && L.in_z.K == H && L.out.K == Vs && L.in_a.K == H && kernels::gdn_persistent(p, stream_);
+      }
+      if (mk_gdn) {
+        kernels::add_inplace(h_, t1_, M * H, stream_);
+        mark("gdn_proj");
+      } else if (fork) {
         // The overlap probe (LING_GDN_FORK): in_qkv alone, then in_z on stream_ while the chain runs on fork_stream_
         // (a matrix's result does not depend on its launch companions, so splitting the launch changes no bit).
         const Seg& sg = segs[0];
