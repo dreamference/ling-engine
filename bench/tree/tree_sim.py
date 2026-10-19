@@ -11,7 +11,8 @@ Trees are built from the lattice, as the engine's chain is: a node is (depth e, 
 parent, its probability softmax(scores[e][parent's k] / T)[k] times its parent's. Shapes:
   chain            the engine's greedy walk (argmax per depth given the predecessor)
   best:N           best-first over path probability, N nodes (the anchor not counted)
-  chain+N          the chain's E nodes, then best-first extras up to N nodes in all
+  chain+N          the chain's E nodes, then best-first extras up to N nodes in all (the engine's LING_TREE = N - E)
+  cK+N             the chain's first K nodes only (LING_TREE_CHAIN=K), then best first up to N nodes in all
   width:W          the chain plus, at every chain depth, the next W - 1 siblings as leaves
   fixed:SPEC       DARTree-like static shape: SPEC like "3,2,2,1,1" gives the children kept per depth along the
                    best path of each subtree (rank-ordered), truncated at E
@@ -110,8 +111,14 @@ def accept(s, tree):
 def build(s, shape, T):
     E, K16 = s["E"], s["K16"]
     tree = {}
+    trunc = None
+    if shape[0] == "c" and shape[1].isdigit():  # cK+N: the chain's first K nodes, then best first to N in all
+        trunc = int(shape[1:].split("+")[0])
+        shape = "chain+" + shape.split("+")[1]
     if shape == "chain" or shape.startswith("chain+") or shape.startswith("width:"):
         ch = chain_nodes(s)
+        if trunc is not None:
+            ch = ch[:trunc]
         par = -1
         for e, k in enumerate(ch):
             tree[len(tree)] = (par, e, k)
