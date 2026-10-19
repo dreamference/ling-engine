@@ -275,20 +275,30 @@ void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
     kernels::gemm_bf16(cap_ + size_t(cap_row0) * cap_stride_, rows, draft_->fc().w, dctx_, d.hidden, cap_stride_,
                        stream_);
   kernels::rmsnorm(dctx_, draft_->hidden_norm(), dctx_, rows, d.hidden, d.eps, false, stream_);
+  const bool saved = quantized_;
+  if (draft_act_ == 4) quantized_ = true;
+  if (draft_act_ == 16) quantized_ = false;
   for (int l = 0; l < d.layers; ++l) {
     const DraftLayer& L = draft_->layers()[l];
-    linear_fp4_multi({{&L.k, dk_}, {&L.v, dv_}}, dctx_, rows);
+    if (draft_act_ == 16 && rows > kRowsMax)
+      for (int r0 = 0; r0 < rows; r0 += kRowsMax)
+        linear_fp4_multi({{&L.k, dk_ + size_t(r0) * dkv}, {&L.v, dv_ + size_t(r0) * dkv}}, dctx_ + size_t(r0) * d.hidden,
+                         std::min(kRowsMax, rows - r0));
+    else
+      linear_fp4_multi({{&L.k, dk_}, {&L.v, dv_}}, dctx_, rows);
     kernels::draft_qk_rope(dk_, rows, d.kv_heads, dkv, L.k_norm, pos0, d.rope_theta, d.eps, stream_);
     kernels::draft_store_kv(dk_, dv_, rows, dkv, pos0, s_->dkc[l], s_->dvc[l], ring_, stream_);
   }
+  quantized_ = saved;
+  if (draft_act_) set_xq(0.f, false);  // the drafter's quantized input is no target matrix's
 }
 
 void Engine::draft_launch(int B) {
   NvtxRange range("draft");
   // The drafter's block always takes the rows path. quantized_ is whatever the last forward() left: after a
   // prefill it is set, which made the first draft after each prompt take the quantized prefill path (and a
-  // draft graph captured on that step would have kept it for every later step).
-  quantized_ = false;
+  // draft graph captured on that step would have kept it for every later step). LING_DRAFT_ACT=4 takes it on purpose.
+  quantized_ = draft_act_ == 4;
   const ModelConfig& c = model_->config();
   const DraftConfig& d = draft_->config();
   const int H = d.hidden, E = B - 1, dq = d.heads * d.head_dim, dkv = d.kv_heads * d.head_dim;
@@ -329,6 +339,8 @@ void Engine::draft_launch(int B) {
   linear_bf16_drafter(draft_->selector_projection(), dh_, E, dhp_);
   kernels::selector_lattice(dhp_, dcand_, dunary_, draft_->predecessor_codebook(), draft_->successor_codebook(),
                             pin_->draft_ids[0], E, dscores_, stream_, ids_dev_);
+  quantized_ = false;
+  if (draft_act_) set_xq(0.f, false);
   check(cudaMemcpyAsync(pin_->cand, dcand_, size_t(E) * K16 * sizeof(int), cudaMemcpyDeviceToHost, stream_),
         "draft candidates");
   check(cudaMemcpyAsync(pin_->scores, dscores_, size_t(E) * K16 * K16 * sizeof(float), cudaMemcpyDeviceToHost,
@@ -338,7 +350,7 @@ void Engine::draft_launch(int B) {
 
 void Engine::draft_batch_launch(std::span<StepPlan> plans, int B) {
   NvtxRange range("draft");
-  quantized_ = false;  // the rows path (see draft_launch)
+  quantized_ = draft_act_ == 4;  // the rows path (see draft_launch), unless LING_DRAFT_ACT=4
   const ModelConfig& c = model_->config();
   const DraftConfig& d = draft_->config();
   const int n = static_cast<int>(plans.size()), R = n * B, H = d.hidden, E = B - 1, dq = d.heads * d.head_dim;
@@ -396,6 +408,8 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B) {
     kernels::selector_lattice(dhp_ + size_t(i) * E * rank, dcand_ + size_t(i) * E * K16, dunary_ + size_t(i) * E * K16,
                               draft_->predecessor_codebook(), draft_->successor_codebook(), pin_->draft_ids[i * B], E,
                               dscores_ + size_t(i) * E * K16 * K16, stream_, ids_dev_ + i * B);
+  quantized_ = false;
+  if (draft_act_) set_xq(0.f, false);
   check(cudaMemcpyAsync(pin_->cand, dcand_, size_t(n) * E * K16 * sizeof(int), cudaMemcpyDeviceToHost, stream_),
         "draft candidates");
   check(cudaMemcpyAsync(pin_->scores, dscores_, size_t(n) * E * K16 * K16 * sizeof(float), cudaMemcpyDeviceToHost,
@@ -519,6 +533,13 @@ void Engine::plan_accept(StepPlan& sp, const float* vals, const int* ids) {
   const int V = sp.V, K = sp.K, E = sp.E;
   require_finite_topk({vals, size_t(V) * K}, {ids, size_t(V) * K}, model_->config().vocab);
   // 3. Accept.
+  if (sp.greedy && force_n_ > 0) {  // bench: the drafts are checked against the forced text, not the argmax
+    int accepted = 0;
+    while (accepted < E && accepted + 1 < force_n_ && sp.rows[accepted + 1] == force_[accepted]) ++accepted;
+    sp.accepted = accepted;
+    sp.next = force_[accepted];
+    return;
+  }
   if (sp.greedy) {  // K = 1: ids holds each row's argmax
     int accepted = 0;
     while (accepted < E && sp.rows[accepted + 1] == ids[accepted]) ++accepted;
