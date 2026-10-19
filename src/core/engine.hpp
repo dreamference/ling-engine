@@ -311,6 +311,10 @@ class Engine {
   static constexpr int kAttnSlice = 256;
   static constexpr int kResumeAlign = 32;  // kept states sit at multiples of this (the DeltaNet's chunk)  // prefill attention: queries per call (bounds the partials' scratch)
   bool quantized_ = false;                // set by forward(): the pass is a prefill
+  // LING_DRAFT_ACT (bench, BACKLOG 19.32): the drafter's NVFP4 activations. 0 (default): as the target's passes,
+  // NVFP4 in a prefill's context rows and FP16 in the block and a commit's rows; 4: NVFP4 everywhere (SGLang's W4A4);
+  // 16: FP16 everywhere (the prompt's context rows too, through the rows path 32 at a time).
+  int draft_act_ = 0;
   bool prefill_bf16_ = false;             // opts_.prefill_bf16 or LING_PREFILL_BF16: BF16 DeltaNet intermediates
   // RMSNorm; on the rows path it also leaves the FP16 copy for the next linear call (x_ready).
   // On the prefill path it writes the quantized input of the next GEMMs instead (input scale `in_scale`,

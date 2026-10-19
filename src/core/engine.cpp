@@ -190,6 +190,9 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   if (const char* e = std::getenv("LING_ATTN_PREFETCH")) prefetch = std::atoi(e);
   kernels::set_attention_prefetch(prefetch);
   // B34: BF16 DeltaNet intermediates in the prefill (not exact; off by default, MILESTONES §14).
+  if (const char* e = std::getenv("LING_DRAFT_ACT")) draft_act_ = std::atoi(e);
+  if (draft_act_) std::fprintf(stderr, "drafter: %s activations in every NVFP4 GEMM (LING_DRAFT_ACT=%d)\n",
+                               draft_act_ == 4 ? "NVFP4" : "FP16", draft_act_);
   prefill_bf16_ = opts_.prefill_bf16;
   if (const char* e = std::getenv("LING_PREFILL_BF16")) prefill_bf16_ = std::atoi(e) != 0;
   if (prefill_bf16_) std::fprintf(stderr, "prefill: BF16 DeltaNet intermediates (not the exact path)\n");
