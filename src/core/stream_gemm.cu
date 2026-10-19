@@ -430,9 +430,70 @@ __device__ __forceinline__ void to_half_rows_body(const float* __restrict__ x, i
   if (threadIdx.x == 0) xinv[r] = ldexpf(1.f, e - 15);
 }
 
+// LING_HALF_BLOCKS=0 keeps this shape (12 blocks at a 12-row verify, each thread 68 dependent loads of a 17,408 row).
 __global__ void to_half_rows_kernel(const float* __restrict__ x, int K, __half* __restrict__ out,
                                     float* __restrict__ xinv) {
   to_half_rows_body(x, K, out, xinv, blockIdx.x, PdlBegin{});
+}
+
+__device__ __forceinline__ float abs_max4(float m, const float4& v) {
+  return fmaxf(m, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+}
+
+// The wide copy: row blockIdx.x over gridDim.y blocks. Every block finds the largest magnitude of the whole row (the
+// row was just written, so it reads from L2) and converts only its slice [blockIdx.y * slice, + slice) of K. A
+// maximum is exact in any order, so every block finds the same scale, and each element is converted on its own:
+// the values are bit for bit those of the one-block kernel above, for any split. VEC: x and out aligned to 16 and 8
+// bytes, K and slice multiples of 4 (float4 loads, 8 of them in flight per thread).
+template <bool VEC>
+__global__ void __launch_bounds__(256) to_half_rows_wide_kernel(const float* __restrict__ x, int K, int slice,
+                                                                __half* __restrict__ out, float* __restrict__ xinv) {
+  pdl_begin();  // first statement: see launch.cuh
+  __shared__ float red[8];
+  const size_t r = blockIdx.x;
+  const float* row = x + r * K;
+  const int tid = threadIdx.x;
+  float m0 = 0.f, m1 = 0.f;
+  if constexpr (VEC) {
+    const float4* row4 = reinterpret_cast<const float4*>(row);
+    const int K4 = K / 4;
+    int k = tid;
+    for (; k + 7 * 256 < K4; k += 8 * 256) {
+      float4 v[8];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) v[i] = row4[k + i * 256];
+#pragma unroll
+      for (int i = 0; i < 8; i += 2) m0 = abs_max4(m0, v[i]), m1 = abs_max4(m1, v[i + 1]);
+    }
+    for (; k < K4; k += 256) m0 = abs_max4(m0, row4[k]);
+  } else {
+    for (int k = tid; k < K; k += 256) m0 = fmaxf(m0, fabsf(row[k]));
+  }
+  float mx = fmaxf(m0, m1);
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+  if ((tid & 31) == 0) red[tid >> 5] = mx;
+  __syncthreads();
+  mx = 0.f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) mx = fmaxf(mx, red[i]);
+  int e = 0;
+  if (mx > 0.f && isfinite(mx)) frexpf(mx, &e);  // mx < 2^e
+  const float s = ldexpf(1.f, 15 - e);
+  const int k0 = blockIdx.y * slice, k1 = min(K, k0 + slice);
+  if constexpr (VEC) {
+    const float4* row4 = reinterpret_cast<const float4*>(row);
+    uint2* out4 = reinterpret_cast<uint2*>(out + r * K);
+    for (int k = k0 / 4 + tid; k < k1 / 4; k += 256) {
+      const float4 v = row4[k];
+      const __half2 a = __halves2half2(__float2half_rn(v.x * s), __float2half_rn(v.y * s));
+      const __half2 b = __halves2half2(__float2half_rn(v.z * s), __float2half_rn(v.w * s));
+      out4[k] = make_uint2(*reinterpret_cast<const uint32_t*>(&a), *reinterpret_cast<const uint32_t*>(&b));
+    }
+  } else {
+    for (int k = k0 + tid; k < k1; k += 256) out[r * K + k] = __float2half_rn(row[k] * s);
+  }
+  if (blockIdx.y == 0 && tid == 0) xinv[r] = ldexpf(1.f, e - 15);
 }
 
 // Enough blocks for the last wave to be a small part of the launch: blocks x ksplit >= ~1100 (about eight
@@ -1731,7 +1792,18 @@ void l2_prefetch_weights(const uint8_t* w, bool fp4, bool coded, int N, int K, s
 }
 
 void to_half_rows(const float* x, int M, int K, __half* out, float* xinv, cudaStream_t s) {
-  launch_kernel("to_half_rows", to_half_rows_kernel, dim3(M), dim3(256), 0, s, x, K, out, xinv);
+  static const int target = sg_env("LING_HALF_BLOCKS", 96);
+  if (target <= 0) {
+    launch_kernel("to_half_rows", to_half_rows_kernel, dim3(M), dim3(256), 0, s, x, K, out, xinv);
+    return;
+  }
+  const bool vec = K % 4 == 0 && reinterpret_cast<uintptr_t>(x) % 16 == 0 && reinterpret_cast<uintptr_t>(out) % 8 == 0;
+  const int split = std::clamp((target + M - 1) / M, 1, std::max(1, K / 1024));
+  int slice = (K + split - 1) / split;
+  if (vec) slice = (slice + 3) / 4 * 4;
+  const dim3 grid(M, (K + slice - 1) / slice);
+  if (vec) launch_kernel("to_half_rows", to_half_rows_wide_kernel<true>, grid, dim3(256), 0, s, x, K, slice, out, xinv);
+  else launch_kernel("to_half_rows", to_half_rows_wide_kernel<false>, grid, dim3(256), 0, s, x, K, slice, out, xinv);
 }
 
 void stream_gemm_nvfp4(const __half* x, const float* xinv, int M, const uint8_t* w, const uint8_t* wscale,
