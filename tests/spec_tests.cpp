@@ -12,6 +12,7 @@
 
 #include "core/accept.hpp"
 #include "core/lookup.hpp"
+#include "core/tree.hpp"
 
 namespace {
 
@@ -93,6 +94,191 @@ bool check_accept(bool lookup, int E, uint64_t seed) {
   return ok;
 }
 
+// Tree verification's accept rule (BACKLOG 26, core/tree.hpp): a toy target whose next-token distribution depends on
+// the whole prefix, a chain drawn from a draft that depends on the position and the predecessor, extra nodes (siblings
+// of chain rows, some with children of their own) chosen at random; the joint distribution of the first kLen tokens
+// must be the target's (chi-square), and the greedy walk must emit the target's argmax continuation.
+uint64_t hash_prefix(const std::vector<int>& v) {
+  uint64_t h = 1469598103934665603ull;
+  for (int t : v) h = (h ^ uint64_t(t + 1)) * 1099511628211ull;
+  return h;
+}
+
+bool check_tree(int E, int extra, uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  std::map<uint64_t, ling::Dist> tcache, qcache;
+  auto target = [&](const std::vector<int>& prefix) -> const ling::Dist& {
+    const uint64_t h = hash_prefix(prefix);
+    auto it = tcache.find(h);
+    if (it != tcache.end()) return it->second;
+    std::mt19937_64 r(h ^ seed);
+    return tcache[h] = random_dist(r, true);
+  };
+  auto draftq = [&](int pos, int prev) -> const ling::Dist& {
+    const uint64_t h = uint64_t(pos) * 131 + prev + 7;
+    auto it = qcache.find(h);
+    if (it != qcache.end()) return it->second;
+    std::mt19937_64 r(h * 977 + seed);
+    return qcache[h] = random_dist(r, false);
+  };
+  std::map<std::vector<int>, long> counts;
+  bool greedy_ok = true;
+  std::uniform_int_distribution<int> tok(0, kVocab - 1);
+  for (int trial = 0; trial < kTrials; ++trial) {
+    std::vector<int> out;
+    int anchor = 0;
+    while (static_cast<int>(out.size()) < kLen) {
+      // The tree: the anchor (the last emitted token, or 0), the chain drawn from q, then `extra` random nodes.
+      ling::DraftTree t;
+      t.E = E;
+      auto add = [&](int par, int token) {
+        t.parent.push_back(par);
+        t.depth.push_back(par < 0 ? 0 : t.depth[par] + 1);
+        t.token.push_back(token);
+        t.pick.push_back(0);
+        t.children.emplace_back();
+        if (par >= 0) t.children[par].push_back(t.rows() - 1);
+      };
+      add(-1, anchor);
+      std::vector<int> chain;
+      for (int e = 0; e < E; ++e) {
+        const int d = ling::draw(draftq(static_cast<int>(out.size()) + e, e ? chain.back() : anchor), rng);
+        chain.push_back(d);
+        add(e, d);
+      }
+      for (int x = 0; x < extra; ++x) {
+        std::uniform_int_distribution<int> pick(0, t.rows() - 1);
+        const int par = pick(rng);
+        if (t.depth[par] >= E) continue;
+        const int token = tok(rng);
+        bool dup = false;
+        for (int c : t.children[par]) dup = dup || t.token[c] == token;
+        if (!dup) add(par, token);
+      }
+      // Each row's target distribution: given the emitted prefix and the row's path.
+      std::vector<ling::Dist> P(t.rows());
+      std::vector<int> argmax(t.rows());
+      for (int r = 0; r < t.rows(); ++r) {
+        std::vector<int> pre = out;
+        std::vector<int> path;
+        for (int a = r; a > 0; a = t.parent[a]) path.push_back(t.token[a]);
+        pre.insert(pre.end(), path.rbegin(), path.rend());
+        P[r] = target(pre);
+        argmax[r] = P[r][0].first;
+        for (const auto& [x, pr] : P[r])
+          if (pr > prob(P[r], argmax[r])) argmax[r] = x;
+      }
+      auto q = [&](int e, int token) {
+        return prob(draftq(static_cast<int>(out.size()) + e, e ? chain[e - 1] : anchor), token);
+      };
+      if (trial < 2000) {  // greedy: the argmax walk
+        int next = 0;
+        const std::vector<int> path = ling::accept_tree_greedy(t, argmax.data(), next);
+        // Along the path each child's token is its parent row's argmax, and next is the last row's.
+        for (size_t j = 1; j < path.size(); ++j) greedy_ok &= t.token[path[j]] == argmax[path[j - 1]];
+        greedy_ok &= next == argmax[path.back()];
+        for (int c : t.children[path.back()]) greedy_ok &= t.token[c] != next;
+      }
+      int next = 0;
+      const std::vector<int> path = ling::accept_tree_sampled(t, P, q, rng, next);
+      for (size_t j = 1; j < path.size(); ++j) out.push_back(t.token[path[j]]);
+      out.push_back(next);
+      anchor = next;
+    }
+    out.resize(kLen);
+    counts[out]++;
+  }
+  double chi = 0;
+  int cells = 0;
+  std::vector<int> seq(kLen, 0);
+  for (int idx = 0; idx < std::pow(kVocab, kLen); ++idx) {
+    int r = idx;
+    for (int j = 0; j < kLen; ++j) {
+      seq[j] = r % kVocab;
+      r /= kVocab;
+    }
+    double expected = kTrials;
+    std::vector<int> pre;
+    for (int j = 0; j < kLen; ++j) {
+      expected *= prob(target(pre), seq[j]);
+      pre.push_back(seq[j]);
+    }
+    const long seen = counts.count(seq) ? counts[seq] : 0;
+    if (expected == 0) {
+      if (seen != 0) {
+        std::printf("tree accept (E=%d, +%d): impossible sequence emitted %ld times FAIL\n", E, extra, seen);
+        return false;
+      }
+      continue;
+    }
+    chi += (seen - expected) * (seen - expected) / expected;
+    ++cells;
+  }
+  const double k = cells - 1, z = 3.09;
+  const double limit = k * std::pow(1 - 2 / (9 * k) + z * std::sqrt(2 / (9 * k)), 3);
+  const bool ok = chi < limit && greedy_ok;
+  std::printf("tree accept (E=%d, +%d nodes): chi-square %.1f over %d cells (99.9%% limit %.1f), greedy walk %s %s\n", E,
+              extra, chi, cells, limit, greedy_ok ? "ok" : "WRONG", ok ? "ok" : "FAIL");
+  return ok;
+}
+
+// build_tree and describe_tree on random drafter outputs: the chain is rows 0 .. E, parents precede children, every
+// row's variant path holds it at its depth, and each gdn path advances parent to child with leaves after their parent,
+// writing every row exactly once.
+bool check_tree_desc(uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  std::uniform_real_distribution<float> u(-4.f, 4.f);
+  bool ok = true;
+  for (int trial = 0; trial < 2000 && ok; ++trial) {
+    const int E = 1 + trial % 15, K16 = 16;
+    std::vector<int> cand(size_t(E) * K16);
+    for (size_t i = 0; i < cand.size(); ++i) cand[i] = int(i % K16) * 100 + int(i / K16);  // distinct per position
+    std::vector<float> scores(size_t(E) * K16 * K16);
+    for (float& x : scores) x = u(rng);
+    std::vector<int> toks, picks;
+    for (int e = 0, prev = 0; e < E; ++e) {
+      const float* sc = scores.data() + (size_t(e) * K16 + (e ? prev : 0)) * K16;
+      int pick = 0;
+      for (int k = 1; k < K16; ++k)
+        if (sc[k] > sc[pick]) pick = k;
+      toks.push_back(cand[size_t(e) * K16 + pick]);
+      picks.push_back(pick);
+      prev = pick;
+    }
+    ling::TreeShape shape;
+    shape.nodes = int(rng() % 32);
+    shape.width = 1 + int(rng() % 4);
+    shape.temp = 0.5 + (rng() % 3);
+    shape.chain = trial % 3 == 0 ? 1 + int(rng() % E) : 1000;
+    const int Ec = std::min(E, shape.chain);
+    const ling::DraftTree t = ling::build_tree(7, cand.data(), scores.data(), E, K16, toks, picks, shape);
+    ling::kernels::TreeDesc d;
+    ling::describe_tree(t, d);
+    const int n = t.rows();
+    ok &= n <= ling::kernels::kMaxStreamRows && n >= Ec + 1 && t.E == Ec;
+    for (int r = 1; r <= Ec; ++r) ok &= t.parent[r] == r - 1;
+    for (int r = 1; r < n; ++r) ok &= t.parent[r] < r && t.depth[r] == t.depth[t.parent[r]] + 1 && t.depth[r] <= E;
+    for (int r = 0; r < n; ++r) ok &= d.var[r] >= 0 && d.var[r] < d.nvar && d.path[d.var[r]][t.depth[r]] == r;
+    std::vector<int> writes(n, 0);
+    for (int p = 0; p < d.ngdn; ++p) {
+      int last = -1;  // the last advanced row
+      for (int i = 0; i < d.gdn_len[p]; ++i) {
+        const int st = d.gdn_step[p][i], r = st & 0xff;
+        if (st & ling::kernels::TreeDesc::kWrite) ++writes[r];
+        if (st & ling::kernels::TreeDesc::kLeaf) {
+          ok &= t.children[r].empty() && t.parent[r] == last;
+        } else {
+          ok &= t.parent[r] == last;
+          last = r;
+        }
+      }
+    }
+    for (int r = 0; r < n; ++r) ok &= writes[r] == 1;
+  }
+  std::printf("tree descriptions %s\n", ok ? "ok" : "FAIL");
+  return ok;
+}
+
 bool check_lookup() {
   bool ok = true;
   // "a b c d e f a b c" -> the last "a b c" occurred at 0; propose "d e f a" (max 4), match 3.
@@ -121,6 +307,10 @@ int main() {
   ok &= check_accept(false, 3, 2);
   ok &= check_accept(true, 2, 3);
   ok &= check_accept(true, 4, 4);
+  ok &= check_tree_desc(11);
+  ok &= check_tree(1, 3, 5);
+  ok &= check_tree(3, 6, 6);
+  ok &= check_tree(4, 12, 7);
   std::printf(ok ? "all spec tests passed\n" : "SPEC TESTS FAILED\n");
   return ok ? 0 : 1;
 }
