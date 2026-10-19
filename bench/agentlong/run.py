@@ -61,6 +61,21 @@ def metrics_after(url, before, timeout=10.0):
         time.sleep(0.2)
 
 
+def spec_stats(url):
+    """ling-serve's /spec_stats (draft, verify and commit seconds); None for a server without it (SGLang)."""
+    try:
+        u = urllib.parse.urlparse(url)
+        c = http.client.HTTPConnection(u.hostname, u.port, timeout=10)
+        c.request("GET", "/spec_stats")
+        r = c.getresponse()
+        return json.loads(r.read()) if r.status == 200 else None
+    except (OSError, ValueError):
+        return None
+
+
+SPEC_KEYS = ("steps", "accepted", "draft_seconds", "verify_seconds", "commit_seconds")
+
+
 def send(url, body):
     u = urllib.parse.urlparse(url)
     c = http.client.HTTPConnection(u.hostname, u.port, timeout=7200)
@@ -113,7 +128,19 @@ def summarize(recs):
             "ms_per_step": round(1000 * dec / ver, 2) if ver else None,
             "tokens_per_step": round(gen / ver, 3) if ver else None,
             "prefill_s": round(sum(r["srv"]["ttft_s"] for r in ok), 2),
+            **phase_ms(ok),
             "prompt_tokens": sum(r["srv"]["prompt"] for r in ok)}
+
+
+def phase_ms(recs):
+    """ling-serve's own split of a step (ms per step, from /spec_stats): draft (the host's wall time from the step's
+    start to the drafter's candidates and lattice back on the host), verify, commit."""
+    sp = [r["spec"] for r in recs if r.get("spec")]
+    steps = sum(x["steps"] for x in sp)
+    if not steps:
+        return {}
+    return {f"{k[:-8]}_ms": round(1000 * sum(x[k] for x in sp) / steps, 3)
+            for k in ("draft_seconds", "verify_seconds", "commit_seconds")}
 
 
 def load(path):
@@ -187,15 +214,18 @@ def main():
             body["temperature"] = 0.0
         else:
             body["seed"] = 1 + zlib.crc32(f"{seed0}:{b['id']}".encode()) % (2**31 - 1)
-        m0 = metrics(a.url)
+        m0, s0 = metrics(a.url), spec_stats(a.url)
         res = send(a.url, body)
         m1 = metrics_after(a.url, m0)
+        s1 = spec_stats(a.url)
         d = {k: m1[k] - m0[k] for k in COUNTERS}
         e2e, ttft = d["sglang:e2e_request_latency_seconds_sum"], d["sglang:time_to_first_token_seconds_sum"]
         rec = {"id": b["id"], "rec_in": man[b["id"]]["rec_in"], "rec_out": man[b["id"]]["rec_out"], **res,
                "srv": {"prompt": int(d["sglang:prompt_tokens_total"]), "cached": int(d["sglang:cached_tokens_total"]),
                        "gen": int(d["sglang:generation_tokens_total"]), "verify": int(d["sglang:spec_verify_calls_total"]),
                        "ttft_s": ttft, "decode_s": e2e - ttft}}
+        if s0 and s1:
+            rec["spec"] = {k: s1.get(k, 0) - s0.get(k, 0) for k in SPEC_KEYS}
         g, v, ds = rec["srv"]["gen"], rec["srv"]["verify"], rec["srv"]["decode_s"]
         recs.append(rec)
         out.write(json.dumps(rec, ensure_ascii=False) + "\n")
