@@ -201,6 +201,15 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     commit_core_ = alloc<float>(size_t(kernels::kMaxStreamRows) * Vs);
     std::fprintf(stderr, "commit beside the next draft\n");
   }
+  if (const char* e = std::getenv("LING_GDN_FORK")) fork_ = std::atoi(e);
+  if (fork_ > 0) {
+    int lo = 0, hi = 0;
+    check(cudaDeviceGetStreamPriorityRange(&lo, &hi), "priority range");
+    check(cudaStreamCreateWithPriority(&fork_stream_, cudaStreamNonBlocking, fork_ >= 2 ? hi : lo), "fork stream");
+    for (cudaEvent_t* ev : {&fork_xn_, &fork_qkv_, &fork_done_})
+      check(cudaEventCreateWithFlags(ev, cudaEventDisableTiming), "fork event");
+    std::fprintf(stderr, "probe: the DeltaNet chain beside the in_z projection (LING_GDN_FORK=%d)\n", fork_);
+  }
   if (const char* e = std::getenv("LING_SIDE_PREFILL")) opts_.side_prefill = std::atoi(e);
   if (opts_.side_prefill != 0) {
     // The side set: its own scratch (as the main set's), the drafter's feature and context rows, a pinned buffer for
@@ -263,6 +272,9 @@ Engine::~Engine() {
   for (void* p : buffers_) cudaFree(p);
   if (commit_done_) cudaEventDestroy(commit_done_);
   if (commit_stream_) cudaStreamDestroy(commit_stream_);
+  for (cudaEvent_t ev : {fork_xn_, fork_qkv_, fork_done_})
+    if (ev) cudaEventDestroy(ev);
+  if (fork_stream_) cudaStreamDestroy(fork_stream_);
   if (stream_) cudaStreamDestroy(stream_);
 }
 
@@ -811,6 +823,34 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       float* mixed = verify ? v_post_[slot] : mixed_;
       float* g = verify ? v_g_[slot] : g_;
       float* beta = verify ? v_beta_[slot] : beta_;
+      const bool fork = fork_ > 0 && verify && !multi && !quantized_ && L.in_a.N == L.in_b.N;
+      if (fork) {
+        // The overlap probe (LING_GDN_FORK): in_qkv alone, then in_z on stream_ while the chain runs on fork_stream_
+        // (a matrix's result does not depend on its launch companions, so splitting the launch changes no bit).
+        const Seg& sg = segs[0];
+        cudaStream_t fs = fork_stream_;
+        check(cudaEventRecord(fork_xn_, stream_), "fork");
+        check(cudaStreamWaitEvent(fs, fork_xn_), "fork");
+        kernels::bf16_rows(xn_, M, L.in_a.w, a_, L.in_a.N, L.in_a.K, fs, L.in_b.w, b_);
+        kernels::gdn_gating(a_, b_, L.A_log, L.dt_bias, g, beta, M, c.lin_v_heads, fs);
+        linear_fp8_multi({{&L.in_qkv, v_pre_[slot]}}, xn_, M, xn_half);
+        check(cudaEventRecord(fork_qkv_, stream_), "fork");
+        linear_fp8_multi({{&L.in_z, z_}}, xn_, M, true);
+        kernels::l2_prefetch_weights(L.out.w, false, false, L.out.N, L.out.K, hint_gdn, stream_);
+        check(cudaStreamWaitEvent(fs, fork_qkv_), "fork");
+        check(cudaMemcpyAsync(mixed, v_pre_[slot], size_t(M) * C * sizeof(float), cudaMemcpyDeviceToDevice, fs),
+              "verify inputs");
+        check(cudaMemcpyAsync(conv_tmp_, sg.s->conv[slot], size_t(C) * (c.conv_kernel - 1) * sizeof(float),
+                              cudaMemcpyDeviceToDevice, fs),
+              "verify conv");
+        kernels::gdn_conv(mixed, conv_tmp_, L.conv, M, C, fs);
+        kernels::gdn_recurrent(mixed, g, beta, sg.s->gdn[slot], nullptr, core_, M, c.lin_k_heads, c.lin_v_heads, fs);
+        check(cudaEventRecord(fork_done_, fs), "fork");
+        check(cudaStreamWaitEvent(stream_, fork_done_), "fork");
+        kernels::gated_rmsnorm(core_, z_, L.lin_norm, normed_, M * c.lin_v_heads, c.lin_v_dim, c.eps, stream_);
+        linear_fp8_residual(L.out, normed_, M, false);
+        mark("gdn_proj");
+      } else {
       // The prefill path convolves out of place: the projection goes to t2_ (free until the MLP).
       linear_fp8_multi({{&L.in_qkv, verify ? v_pre_[slot] : quantized_ ? t2_ : mixed}, {&L.in_z, z_}}, xn_, M, xn_half);
       if (!quantized_) kernels::l2_prefetch_weights(L.out.w, false, false, L.out.N, L.out.K, hint_gdn, stream_);
@@ -871,6 +911,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       }
       linear_fp8_residual(L.out, normed_, M, quantized_);
       mark("gdn_proj");
+      }  // not forked
     }
     {
       NvtxRange r("mlp");
