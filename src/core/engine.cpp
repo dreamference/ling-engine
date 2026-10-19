@@ -201,6 +201,15 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     commit_core_ = alloc<float>(size_t(kernels::kMaxStreamRows) * Vs);
     std::fprintf(stderr, "commit beside the next draft\n");
   }
+  if (const char* e = std::getenv("LING_MK_FFN")) mk_ffn_ = std::atoi(e);
+  if (mk_ffn_ > 0) {
+    xh2_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * c.intermediate);
+    xinv2_ = alloc<float>(kernels::kMaxStreamRows);
+    const size_t words = size_t(c.layers) * kernels::kMkFfnWords;
+    mk_counters_ = reinterpret_cast<unsigned*>(alloc<int>(words));
+    check(cudaMemset(mk_counters_, 0, words * sizeof(unsigned)), "megakernel counters");
+    std::fprintf(stderr, "megakernel stage 1: the rows path's FFN as one persistent kernel (LING_MK_FFN=%d)\n", mk_ffn_);
+  }
   if (const char* e = std::getenv("LING_GDN_FORK")) fork_ = std::atoi(e);
   if (fork_ > 0) {
     int lo = 0, hi = 0;
@@ -916,7 +925,13 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
     {
       NvtxRange r("mlp");
       const bool post_half = norm_rows(h_, L.post_norm, xn_, M, L.gate.in_scale, true, L.up.in_scale != L.gate.in_scale);
-      if (!quantized_) {
+      const kernels::StreamTarget mk_g{L.gate.w, L.gate.table, L.gate.scale2, t1_, L.gate.N},
+          mk_u{L.up.w, L.up.table, L.up.scale2, t2_, L.up.N}, mk_d{L.down.w, L.down.table, L.down.scale2, t2_, L.down.N};
+      if (!quantized_ && mk_ffn_ > 0 && post_half &&
+          kernels::ffn_persistent(xh_, xinv_, M, mk_g, mk_u, mk_d, H, I, t1_, t2_, xh2_, xinv2_,
+                                  mk_counters_ + size_t(li) * kernels::kMkFfnWords, stream_)) {
+        kernels::add_inplace(h_, t2_, M * H, stream_);
+      } else if (!quantized_) {
         linear_fp4_multi({{&L.gate, t1_}, {&L.up, t2_}}, xn_, M, post_half);
         kernels::l2_prefetch_weights(L.down.w, true, L.down.table != nullptr, L.down.N, L.down.K, hint_mlp, stream_);
         kernels::silu_mul(t1_, t2_, t1_, M * I, stream_);

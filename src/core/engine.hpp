@@ -356,6 +356,12 @@ class Engine {
   // projection's weight stream on stream_; the same kernels on the same inputs, so the same bits. 1: a plain stream;
   // 2: the highest stream priority, and the step graphs instantiated with node priorities.
   int fork_ = 0;
+  // The megakernel's stage 1 in the step (LING_MK_FFN=1, off by default): the rows path's FFN as one persistent kernel
+  // (kernels::ffn_persistent), with its own FP16 buffer for the down projection's input and one counter set per layer.
+  int mk_ffn_ = 0;
+  unsigned* mk_counters_ = nullptr;
+  __half* xh2_ = nullptr;
+  float* xinv2_ = nullptr;
   cudaStream_t fork_stream_ = nullptr;
   cudaEvent_t fork_xn_ = nullptr, fork_qkv_ = nullptr, fork_done_ = nullptr;
   // The commit's two halves: the DeltaNet replay (on commit_stream_ when overlapped) and the drafter's context KV.

@@ -207,6 +207,14 @@ struct StreamTarget {
 };
 void stream_gemm_multi(bool nvfp4, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K,
                        cudaStream_t s);
+// The megakernel's stage 1 in the step (LING_MK_FFN): the rows path's FFN (gate|up from xh, silu(g) * u into g, its FP16
+// copy into xh2 with xinv2, down into down.y) as one persistent kernel, bit for bit the four kernels. `counters` is
+// kMkFfnWords zeroed words, owned by this call site (the kernel leaves them zeroed). False: a shape or a stream GEMM
+// override (LING_SG_*, LING_KSPLIT) the kernel does not reproduce; nothing was launched.
+constexpr int kMkFfnWords = 4 + kMaxStreamRows;
+bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarget& gate, const StreamTarget& up,
+                    const StreamTarget& down, int H, int I, float* g, float* u, __half* xh2, float* xinv2,
+                    unsigned* counters, cudaStream_t s);
 // The megakernel probe (BACKLOG 28): about `bytes` of a tiled weight blob (the first chunks of every tile, what a stream
 // GEMM's blocks read first) prefetched into L2 by one PDL launch, so the latency-bound kernels before that GEMM run
 // beside its first bytes. Writes nothing; the GEMM computes the same bits.

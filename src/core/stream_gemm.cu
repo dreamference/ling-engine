@@ -26,6 +26,7 @@
 #include <cuda_fp8.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -629,6 +630,168 @@ __global__ void l2_prefetch_tiles_kernel(const uint8_t* __restrict__ w, int tile
   pdl_begin();
 }
 
+// ---- The megakernel's stage 1 in the step (B32 measured in place; BACKLOG 28's record) ----
+//
+// The FFN of the rows path (gate|up, SiLU-multiply, the FP16 copy of the result with its per-row power-of-two scale,
+// the down projection) as one persistent kernel: every block takes gate|up blocks b, b + G, ...; then the row step over
+// every block (B32's distributed form: silu_mul's expression element by element, each row's maximum of |value| with an
+// order-free atomic maximum, then each element to FP16 under to_half_rows' scale); then down blocks b, b + G, ....
+// The tiles are the stream GEMM's bodies with the launch shapes dispatch() picks (TILES 2, PF 2, NT by M), so every
+// element is the four-kernel path's bit for bit. Dependencies are counters (release/acquire); a wait past its 50 ms
+// deadline prints a record and traps (a launch error, never a hang). The last block out resets the counters, so a
+// captured graph needs no memset node. The down projection's FP16 input has its own buffer (xh2): the gate|up tiles
+// read xh through the non-coherent path earlier in the same kernel, and a stale line must never be returned.
+__device__ __forceinline__ unsigned long long mk_now() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+__device__ __forceinline__ unsigned mk_ld_acquire(const unsigned* p) {
+  unsigned v;
+  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+__device__ __forceinline__ void mk_red_release(unsigned* p, unsigned v) {
+  asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+constexpr unsigned long long kMkDeadlineNs = 50'000'000ull;
+
+// Thread 0 waits until *c >= target, then the block goes on.
+__device__ __forceinline__ void mk_wait(const unsigned* c, unsigned target) {
+  if (threadIdx.x == 0) {
+    const unsigned long long t0 = mk_now();
+    unsigned v;
+    while ((v = mk_ld_acquire(c)) < target) {
+      if (mk_now() - t0 > kMkDeadlineNs) {
+        printf("megakernel: block %d waited past the deadline (counter at %u of %u)\n", blockIdx.x, v, target);
+        __trap();
+      }
+      __nanosleep(32);
+    }
+  }
+  __syncthreads();
+}
+// Every thread's writes of the item are made visible, then thread 0 counts it.
+__device__ __forceinline__ void mk_done(unsigned* c) {
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) mk_red_release(c, 1u);
+}
+
+struct NoWaitMk {
+  __device__ __forceinline__ void operator()() const {}
+};
+struct FirstPdl {  // the block's first tile waits for the predecessor (PDL) after its first weight loads
+  bool first;
+  __device__ __forceinline__ void operator()() const {
+    if (first) pdl_begin();
+  }
+};
+struct CounterWaitMk {
+  const unsigned* c;
+  unsigned target;
+  bool first;
+  __device__ __forceinline__ void operator()() const {
+    if (first) mk_wait(c, target);
+  }
+};
+
+struct MkFfnArgs {
+  const __half* xh;  // the FFN's input [M][H] in FP16 with its row scales (rmsnorm_half's)
+  const float* xinv;
+  StreamProblems up;  // gate (matrix 0) and up (matrix 1)
+  int n_up;
+  float *g, *u;  // their outputs [M][I]; g becomes silu(g) * u
+  __half* xh2;   // the down projection's input [M][I] and its row scales
+  float* xinv2;
+  StreamProblems down;
+  int n_down;
+  int M, H, I;
+  unsigned* c;  // kMkFfnWords: [0] blocks past gate|up, [1] past the SiLU pass, [2] past the FP16 pass, [3] exits,
+                // [4..4 + 32) the rows' maxima (as float bits)
+};
+
+template <int NT, bool CODED>
+// Two blocks per SM at NT <= 2 (the stream GEMM's own occupancy there, 128 registers), one at NT = 4.
+__global__ void __launch_bounds__(kWarps * 32, NT == 4 ? 1 : 2) ffn_persistent_kernel(MkFfnArgs a) {
+  const int G = gridDim.x;
+  unsigned* c = a.c;
+  if (static_cast<int>(blockIdx.x) >= a.n_up) pdl_begin();  // never with the grids used, kept for the rule
+  for (int i = blockIdx.x; i < a.n_up; i += G) {
+    __syncthreads();  // the body's shared memory is reused by the next tile
+    stream_gemm_body<NT, 2, true, 2, CODED>(a.xh, a.xinv, a.M, a.up, a.H, 1, nullptr, i, 0,
+                                            FirstPdl{i == static_cast<int>(blockIdx.x)});
+  }
+  mk_done(&c[0]);
+  mk_wait(&c[0], G);
+  // The row step over every block.
+  const size_t n = size_t(a.M) * a.I, stride = size_t(G) * blockDim.x;
+  unsigned* rowmax = c + 4;
+  __shared__ unsigned smax[kMaxStreamRows];
+  __shared__ float sc[kMaxStreamRows];
+  if (threadIdx.x < kMaxStreamRows) smax[threadIdx.x] = 0u;
+  __syncthreads();
+  for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride) {
+    const float x = a.g[i];
+    const float v = x / (1.f + __expf(-x)) * a.u[i];  // kernels.cu's silu(g) * u
+    a.g[i] = v;
+    const float m = fabsf(v);
+    if (!isnan(m)) atomicMax(&smax[i / a.I], __float_as_uint(m));  // fmaxf ignores NaN; a maximum has no order
+  }
+  __syncthreads();
+  if (threadIdx.x < a.M && smax[threadIdx.x]) atomicMax(&rowmax[threadIdx.x], smax[threadIdx.x]);
+  mk_done(&c[1]);
+  mk_wait(&c[1], G);
+  if (threadIdx.x < a.M) {
+    const float mx = __uint_as_float(mk_ld_acquire(&rowmax[threadIdx.x]));
+    int e = 0;
+    if (mx > 0.f && isfinite(mx)) frexpf(mx, &e);  // as to_half_rows
+    sc[threadIdx.x] = ldexpf(1.f, 15 - e);
+    if (blockIdx.x == 0) a.xinv2[threadIdx.x] = ldexpf(1.f, e - 15);
+  }
+  __syncthreads();
+  for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride)
+    a.xh2[i] = __float2half_rn(a.g[i] * sc[i / a.I]);
+  mk_done(&c[2]);
+  for (int i = blockIdx.x; i < a.n_down; i += G) {
+    __syncthreads();
+    stream_gemm_body<NT, 2, true, 2, CODED>(a.xh2, a.xinv2, a.M, a.down, a.I, 1, nullptr, i, 0,
+                                            CounterWaitMk{&c[2], static_cast<unsigned>(G), i == static_cast<int>(blockIdx.x)});
+  }
+  if (static_cast<int>(blockIdx.x) >= a.n_down) mk_wait(&c[2], G);  // (no block idles with the grids used)
+  // The last block out resets the counters for the next launch (ordered after this kernel's completion).
+  __syncthreads();
+  if (threadIdx.x == 0 && atomicAdd(&c[3], 1u) == static_cast<unsigned>(G) - 1u) {
+    for (int k = 0; k < kMkFfnWords; ++k) c[k] = 0u;
+    __threadfence();
+  }
+}
+
+template <int NT, bool CODED>
+int mk_resident() {
+  static const int r = [] {
+    int per_sm = 0, sms = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, ffn_persistent_kernel<NT, CODED>, kWarps * 32, 0);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    return per_sm * sms;
+  }();
+  return r;
+}
+
+template <int NT, bool CODED>
+void mk_ffn_launch(MkFfnArgs& a, cudaStream_t s) {
+  static const int blocks_env = sg_env("LING_MK_BLOCKS", 0);
+  const int resident = mk_resident<NT, CODED>();
+  const int G = blocks_env > 0 ? std::min(blocks_env, resident) : resident;
+  if (G < 1) throw std::runtime_error("ffn_persistent: no resident block");
+  static bool told = false;
+  if (!told) {
+    told = true;
+    std::fprintf(stderr, "megakernel stage 1: ffn_persistent<%d> on %d blocks (%d resident)\n", NT, G, resident);
+  }
+  launch_kernel("ffn_persistent", ffn_persistent_kernel<NT, CODED>, dim3(G), dim3(kWarps * 32), 0, s, a);
+}
+
 int grid_of(size_t n) { return static_cast<int>(std::min<size_t>((n + 255) / 256, 65535 * 4)); }
 
 void check_shape(int N, int K, const char* what) {
@@ -734,6 +897,54 @@ void stream_gemm_multi(bool nvfp4, const __half* x, const float* xinv, int M, co
                        cudaStream_t s) {
   if (nvfp4) dispatch<true>(x, xinv, M, t, n, K, s);
   else dispatch<false>(x, xinv, M, t, n, K, s);
+}
+
+bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarget& gate, const StreamTarget& up,
+                    const StreamTarget& down, int H, int I, float* g, float* u, __half* xh2, float* xinv2,
+                    unsigned* counters, cudaStream_t s) {
+  const bool coded = gate.wscale != nullptr;
+  // Only the shapes dispatch() gives the four-kernel path: TILES 2 and PF 2 everywhere, one kind of blob.
+  if ((up.wscale != nullptr) != coded || (down.wscale != nullptr) != coded) return false;
+  if (M < 1 || M > kMaxStreamRows || H % kChunk || I % kChunk || gate.N != I || up.N != I || down.N != H) return false;
+  if (sg_env("LING_SG_PF", kInFlight) != 2 || sg_env("LING_SG_TW", kTilesWide) != 2 || sg_env("LING_SG_TN", kTilesNarrow) != 2 ||
+      sg_env("LING_SG_TW4", kTilesWide4) != 2 || sg_env("LING_SG_TN4", kTilesNarrow4) != 2 || sg_env("LING_KSPLIT", 0) != 0)
+    return false;
+  MkFfnArgs a{};
+  a.xh = xh;
+  a.xinv = xinv;
+  const StreamTarget* ut[2] = {&gate, &up};
+  int blocks = 0;
+  for (int i = 0; i < 2; ++i) {
+    a.up.w[i] = ut[i]->w;
+    a.up.gscale[i] = ut[i]->scale;
+    a.up.y[i] = i == 0 ? g : u;
+    a.up.N[i] = ut[i]->N;
+    a.up.table[i] = ut[i]->wscale;
+    a.up.block0[i] = blocks;
+    blocks += ut[i]->N / 32;
+  }
+  a.up.count = 2;
+  a.n_up = blocks;
+  a.g = g;
+  a.u = u;
+  a.xh2 = xh2;
+  a.xinv2 = xinv2;
+  a.down.w[0] = down.w;
+  a.down.gscale[0] = down.scale;
+  a.down.y[0] = down.y;
+  a.down.N[0] = down.N;
+  a.down.table[0] = down.wscale;
+  a.down.block0[0] = 0;
+  a.down.count = 1;
+  a.n_down = down.N / 32;
+  a.M = M;
+  a.H = H;
+  a.I = I;
+  a.c = counters;
+  if (M <= 8) coded ? mk_ffn_launch<1, true>(a, s) : mk_ffn_launch<1, false>(a, s);
+  else if (M <= 16) coded ? mk_ffn_launch<2, true>(a, s) : mk_ffn_launch<2, false>(a, s);
+  else coded ? mk_ffn_launch<4, true>(a, s) : mk_ffn_launch<4, false>(a, s);
+  return true;
 }
 
 }  // namespace ling::kernels
