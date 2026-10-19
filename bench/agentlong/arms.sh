@@ -7,7 +7,7 @@
 # DRAFTER rtn (the RTNcal file production loads) or ss (the ScaleSearch re-quantization); MODE greedy or seedN.
 # Holds the GPU lock for the whole list (logging when it was taken and released); m0-prod8000 is stopped first and
 # started again at the end, unless KEEP_M0_DOWN=1 or another job is waiting for the lock. Lock hold times are appended
-# to ~/.ling-gpu-holds.log. ONLY=t03,t09 replays only those turns. Run it with setsid nohup ... < /dev/null &.
+# to ~/.ling-gpu-holds.log. ONLY=t03,t09 replays only those turns (per engine item: ONLY=t03+t09 in its ENV). Run it with setsid nohup ... < /dev/null &.
 set -u
 O=$1; shift; mkdir -p "$O"
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -23,12 +23,14 @@ for item in "$@"; do
   IFS=: read -r kind a b c d e f <<< "$item"
   if [ "$kind" = engine ]; then
     B=$a; D=$([ "$b" = ss ] && echo "$SS" || echo "$RTN"); mode=$c; label=$d; extra=${e:-}; envs=${f:-}
+    # ONLY=t00+t08 among an item's ENV: that item replays only those turns (overrides the global ONLY).
+    only=${ONLY:-}; [[ ",$envs," =~ ,ONLY=([^,]*), ]] && only=${BASH_REMATCH[1]//+/,} && envs=$(sed -E 's/(^|,)ONLY=[^,]*//' <<< "$envs")
     env ${envs//,/ } setsid "$B"/build/ling-serve --model "$M" --draft "$D" --port 8300 --served-model-name RadixArk/Qwen3.8-27B-NVFP4 \
       --max-context 65536 --draft-block 12 --graphs --pdl ${extra//,/ } > "$O/$label.serve.log" 2>&1 8>&- < /dev/null &
     SRV=$!
     for i in $(seq 1 120); do curl -sf -m 2 localhost:8300/health > /dev/null && break; sleep 3; done
     python3 "$HERE/run.py" --url http://127.0.0.1:8300 --mode "$mode" --label "$label" --out "$O/$label.jsonl" \
-      ${ONLY:+--only $ONLY} > "$O/$label.log" 2>&1 8>&-
+      ${only:+--only $only} > "$O/$label.log" 2>&1 8>&-
     curl -s -m 10 localhost:8300/spec_stats > "$O/$label.spec.json" 2>/dev/null
     kill $SRV; wait $SRV 2>/dev/null
   else
