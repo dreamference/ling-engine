@@ -4,7 +4,8 @@
 Each kernel belongs to the "draft" or "commit" NVTX range open on the CPU when it (or its graph) was launched.
 Every range instance launches the same kernel sequence, so kernels are averaged by position in it and labelled
 with the role draft_launch gives that position (per layer: conv projection, q/k/v, o, gate/up, down, ...).
-Printed: per role the ms per step, the sum of kernel time, the range's GPU span (first start to last end) and
+Printed: per role the ms per step (exclusive: under PDL a kernel starts early and waits for its predecessor, so
+each is charged from the later of its start and the previous kernel's end), the sum of kernel durations, the range's GPU span (first start to last end) and
 the gaps inside it (launch and dependency bubbles).
 
 Usage: drafter_breakdown.py TRACE.sqlite [--positions]     (nsys export --type sqlite TRACE.nsys-rep)
@@ -98,10 +99,14 @@ def main():
         for j in use:
             ks = sorted(inst[j])
             roles = []
+            prev_end = ks[0][0]
             for p, (s, e, n) in enumerate(ks):
                 r = role(n, roles) if nm == "draft" else commit_role(n)
                 roles.append(r)
-                per_role[r] += (e - s) / 1e6
+                # Exclusive time: from the later of its start and the previous kernel's end to its end. Under PDL a
+                # kernel starts before its predecessor ends and waits in pdl_begin, so its own duration overstates.
+                per_role[r] += max(0, e - max(s, prev_end)) / 1e6
+                prev_end = max(prev_end, e)
                 pos_ms[p] += (e - s) / 1e6
                 pos_name[p] = (r, n[:90])
             busy += sum(e - s for s, e, _ in ks) / 1e6
@@ -120,7 +125,7 @@ def main():
         print(f"== {nm}: {k} steps of {modal} kernels (counts seen {dict(cnt)})")
         for r, ms in sorted(per_role.items(), key=lambda x: -x[1]):
             print(f"  {r:40s} {ms / k:7.3f} ms")
-        print(f"  {'kernel time':40s} {busy / k:7.3f} ms")
+        print(f"  {'kernel time (overlapping under PDL)':40s} {busy / k:7.3f} ms")
         print(f"  {'GPU span (first start to last end)':40s} {span / k:7.3f} ms")
         print(f"  {'gaps inside the span':40s} {gaps / k:7.3f} ms")
         if "--positions" in sys.argv:
