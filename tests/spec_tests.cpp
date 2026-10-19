@@ -249,12 +249,14 @@ bool check_tree_desc(uint64_t seed) {
     shape.nodes = int(rng() % 32);
     shape.width = 1 + int(rng() % 4);
     shape.temp = 0.5 + (rng() % 3);
+    shape.chain = trial % 3 == 0 ? 1 + int(rng() % E) : 1000;
+    const int Ec = std::min(E, shape.chain);
     const ling::DraftTree t = ling::build_tree(7, cand.data(), scores.data(), E, K16, toks, picks, shape);
     ling::kernels::TreeDesc d;
     ling::describe_tree(t, d);
     const int n = t.rows();
-    ok &= n <= ling::kernels::kMaxStreamRows && n >= E + 1;
-    for (int r = 1; r <= E; ++r) ok &= t.parent[r] == r - 1;
+    ok &= n <= ling::kernels::kMaxStreamRows && n >= Ec + 1 && t.E == Ec;
+    for (int r = 1; r <= Ec; ++r) ok &= t.parent[r] == r - 1;
     for (int r = 1; r < n; ++r) ok &= t.parent[r] < r && t.depth[r] == t.depth[t.parent[r]] + 1 && t.depth[r] <= E;
     for (int r = 0; r < n; ++r) ok &= d.var[r] >= 0 && d.var[r] < d.nvar && d.path[d.var[r]][t.depth[r]] == r;
     std::vector<int> writes(n, 0);

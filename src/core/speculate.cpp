@@ -189,6 +189,7 @@ void Engine::alloc_drafter() {
   if (const char* e = std::getenv("LING_TREE_T")) opts_.tree_temp = std::atof(e);
   if (const char* e = std::getenv("LING_TREE_W")) opts_.tree_width = std::atoi(e);
   if (const char* e = std::getenv("LING_TREE_DEPTH")) opts_.tree_max_depth = std::atoi(e);
+  if (const char* e = std::getenv("LING_TREE_CHAIN")) opts_.tree_chain = std::atoi(e);
   tree_dev_ = reinterpret_cast<kernels::TreeDesc*>(alloc<uint8_t>(sizeof(kernels::TreeDesc)));
   gather_rows_dev_ = alloc<int>(kernels::kMaxStreamRows);
   tree_grid_ = std::min(kernels::kMaxTreeVariants, 1 + std::max(0, opts_.tree_nodes));
@@ -218,14 +219,15 @@ void Engine::alloc_drafter() {
     check(cudaMemcpy(s.gather, g.data(), g.size() * sizeof(kernels::GatherBuf), cudaMemcpyHostToDevice), "tree gather");
   }
   if (opts_.tree_nodes > 0)
-    std::fprintf(stderr, "tree verification: %d nodes beyond the chain, temperature %.2f, width %d, depth %d\n",
-                 opts_.tree_nodes, opts_.tree_temp, opts_.tree_width, opts_.tree_max_depth);
+    std::fprintf(stderr, "tree verification: %d nodes beyond the chain (chain %d), temperature %.2f, width %d, depth %d\n",
+                 opts_.tree_nodes, opts_.tree_chain, opts_.tree_temp, opts_.tree_width, opts_.tree_max_depth);
 }
 
 bool Engine::tree_step(const SamplingParams& p, bool use_lookup, bool want_logits, int B) const {
   (void)p;
+  const int rows = std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes;
   return opts_.tree_nodes > 0 && !use_lookup && !want_logits && B == opts_.draft_block &&
-         B + opts_.tree_nodes <= kernels::kMaxStreamRows + 0 && s_->pos + B + opts_.tree_nodes <= opts_.max_context;
+         rows <= kernels::kMaxStreamRows && s_->pos + rows <= opts_.max_context;
 }
 
 bool Engine::can_speculate(const SamplingParams& p) const {
@@ -695,9 +697,10 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
     shape.temp = opts_.tree_temp;
     shape.width = opts_.tree_width;
     shape.max_depth = opts_.tree_max_depth;
+    shape.chain = opts_.tree_chain;
     sp.tr = build_tree(anchor, sp.cand.data(), pin_->scores, sp.E, K16,
                        std::vector<int>(sp.rows.begin() + 1, sp.rows.end()), sp.picks, shape);
-    if (sp.tr.rows() == B + opts_.tree_nodes) {  // a full tree (the graph's shape); else the chain alone
+    if (sp.tr.rows() == std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes) {  // a full tree (the graph's shape)
       describe_tree(sp.tr, pin_->tree);
       sp.tree = true;
       sp.rows = sp.tr.token;

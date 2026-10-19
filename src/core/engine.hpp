@@ -95,6 +95,7 @@ struct EngineOptions {
   double tree_temp = 1.0;
   int tree_width = 16;
   int tree_max_depth = 1000;
+  int tree_chain = 1000;  // LING_TREE_CHAIN: the chain's length within the block (the rest are tree nodes)
 };
 
 struct EngineStats {

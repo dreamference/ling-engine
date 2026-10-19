@@ -33,10 +33,12 @@ struct TreeShape {
   double temp = 1.0;     // the priority's temperature over the lattice scores
   int width = 16;        // at most this many children per node
   int max_depth = 1000;  // extra nodes only at depths up to this
+  int chain = 1000;      // the chain verified: its first this many drafted tokens (the rest of the block's positions
+                         // can still hold extra nodes)
 };
 
 struct DraftTree {
-  int E = 0;                            // the chain's drafted tokens: rows 1 .. E
+  int E = 0;                            // the chain's drafted tokens: rows 1 .. E (at most the block's positions)
   std::vector<int> parent, depth, token, pick;  // per row; pick: the node's candidate index at its position
   std::vector<std::vector<int>> children;       // per row, in row order
   int rows() const { return static_cast<int>(parent.size()); }
