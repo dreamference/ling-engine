@@ -360,6 +360,8 @@ class Engine {
   // (kernels::ffn_persistent), with its own FP16 buffer for the down projection's input and one counter set per layer.
   int mk_ffn_ = 0;
   unsigned* mk_counters_ = nullptr;
+  int mk_gdn_ = 0;  // stage 2 (LING_MK_GDN=1): a verify's DeltaNet mixer as one persistent kernel
+  unsigned* mk_gdn_counters_ = nullptr;
   __half* xh2_ = nullptr;
   float* xinv2_ = nullptr;
   cudaStream_t fork_stream_ = nullptr;
