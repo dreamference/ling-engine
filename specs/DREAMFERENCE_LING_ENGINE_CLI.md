@@ -8,7 +8,7 @@ Four programs are built from the repository (`CMakeLists.txt`): `ling-serve`, th
 
 ```
 ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N]
-           [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]]
+           [--draft DIR [--draft-block N] [--tree N] [--lookup 0|1|2] [--lookup-min N]]
            [--pretokenizer production|checkpoint] [--prefix-checkpoints N]
            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N]
            [--prefill-bf16] [--sessions N] [--session-protect-seconds S]
@@ -24,6 +24,7 @@ ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-cont
 | `--max-context N` | `65536` | The context length: `max_model_len` in `/v1/models`, the limit of `context_length_exceeded`, and the size of the KV and state allocations. |
 | `--draft DIR` | none | The DFlash2 drafter's checkpoint. Without it every request decodes plainly. |
 | `--draft-block N` | `12` | Draft tokens per speculative step. The default follows production, which runs 12 since 2026-10-09 (measured +7% single-stream over the drafter's published block of 16; the owner's decision of 2026-10-10 made 12 the code default too). The M0 reference container on the development machine keeps 16 on purpose. |
+| `--tree N` | `7` | Tree verification ([BACKLOG §19](./DREAMFERENCE_LING_ENGINE_BACKLOG.md) item 26): N of the drafter's candidates beyond the chain verified as a tree in the same pass, on one-stream steps of a full block (batches, lookup chains and `logprobs` requests take the chain). The default shape, on since 2026-10-19 (the owner's decision), is the chain's first 8 drafts plus 7 nodes at temperature 1.5 (16 rows); `0` verifies the chain alone. Exact (`ling-run --spec-check`; `tests/tree_tests.cu`). `LING_TREE` overrides it, and `LING_TREE_T`, `LING_TREE_CHAIN`, `LING_TREE_W`, `LING_TREE_DEPTH` and `LING_TREE_MIN` set the rest of the shape (section 4). |
 | `--lookup 0\|1\|2` | `1` | The context-lookup draft source ([SPECULATION §10](./DREAMFERENCE_LING_ENGINE_SPECULATION.md)): 0 off, 1 on, 2 shadow mode (counted in `/spec_stats`, not used). |
 | `--lookup-min N` | `8` | The shortest match the lookup accepts. |
 | `--pretokenizer production\|checkpoint` | `production` | The pre-tokenizer pattern: production's (how SGLang tokenizes this checkpoint) or the checkpoint's own `tokenizer.json` pattern. Any other value exits 2. |
@@ -109,6 +110,10 @@ Read by the engine at start (`src/core/engine.cpp`) and by two kernels, and the 
 | `LING_GEMM_SHAPE` | Selects the prefill GEMM tile shape (`src/core/prefill_gemm.cu`); a tuning switch for the benchmarks. |
 | `LING_ATTN_CHUNK` | The decode attention's key chunk (`src/core/kernels.cu`); a tuning switch. |
 | `LING_PDL_ATTN` | Programmatic dependent launch for the attention kernel alone (`src/core/kernels.cu`). |
+| `LING_TREE=N` | Overrides `--tree` (`ling-run` too, which has no flag for it): `0` switches tree verification off. |
+| `LING_TREE_T`, `LING_TREE_CHAIN`, `LING_TREE_W`, `LING_TREE_DEPTH`, `LING_TREE_MIN` | The tree's shape: the temperature of its priority over the drafter's lattice scores (default `1.5`), the chain's drafts kept in the block (`8`), children per node (`16`), the deepest level for extra nodes (no limit), and the summed path probability below which a step verifies the chain alone (`0`). |
+| `LING_MK_FFN=0\|1` | The megakernel's stage 1 ([BACKLOG §19](./DREAMFERENCE_LING_ENGINE_BACKLOG.md) item 28): the rows path's FFN (gate\|up, SiLU-multiply, the FP16 copy, down) as one persistent kernel per layer. On by default since 2026-10-19; `0` takes the four kernels. Exact (bit for bit the four kernels). |
+| `LING_MK_GDN=0\|1` | The megakernel's stage 2: a chain verify's DeltaNet mixer (input norm's output to the out-projection) as one persistent kernel per layer; a tree verify and a batched verify keep the graph path's mixer. On by default since 2026-10-19; `0` switches it off. Exact. `LING_MK_CHAIN` (default 24, the blocks that run a/b, the conv and the recurrence), `LING_MK_PREF_KB` (default 0) and `LING_MK_TIMES` (a timings store summarized on stderr at exit) are tuning and measurement switches. |
 | `LING_KEEPALIVE_SECONDS=N` | Overrides `--keepalive-seconds` (read by `ling-serve`, `src/serve/main.cpp`). |
 
 Only the last is read by the HTTP layer; the rest of the server's behaviour towards clients is the flags' alone.

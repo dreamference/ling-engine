@@ -89,15 +89,16 @@ struct EngineOptions {
   // The same kernels on the same inputs, so the same bits (--interleave-check with --side-prefill).
   int side_prefill = 0;
   // Tree verification (BACKLOG 26): this many drafter candidates beyond the chain verified in the same pass, as a
-  // tree (core/tree.hpp), on one-stream steps; 0: the chain alone. LING_TREE, LING_TREE_T, LING_TREE_W and
-  // LING_TREE_DEPTH override these four.
-  int tree_nodes = 0;
-  double tree_temp = 1.0;
+  // tree (core/tree.hpp), on one-stream steps; 0: the chain alone. On by default since 2026-10-19 (the owner's
+  // decision) at the measured shape: the chain's first 8 drafts plus 7 nodes at temperature 1.5, 16 rows.
+  // LING_TREE (or ling-serve's --tree; 0 turns it off), LING_TREE_T, LING_TREE_W, LING_TREE_DEPTH, LING_TREE_CHAIN
+  // and LING_TREE_MIN override these.
+  int tree_nodes = 7;
+  double tree_temp = 1.5;
   int tree_width = 16;
   int tree_max_depth = 1000;
-  int tree_chain = 1000;
-  double tree_min_mass = 0;  // LING_TREE_MIN: a step whose extra nodes' summed path probability is below this
-                             // verifies the chain alone  // LING_TREE_CHAIN: the chain's length within the block (the rest are tree nodes)
+  int tree_chain = 8;        // the chain's length within the block (the block's later positions hold tree nodes)
+  double tree_min_mass = 0;  // a step whose extra nodes' summed path probability is below this verifies the chain alone
 };
 
 struct EngineStats {
@@ -369,11 +370,14 @@ class Engine {
   // projection's weight stream on stream_; the same kernels on the same inputs, so the same bits. 1: a plain stream;
   // 2: the highest stream priority, and the step graphs instantiated with node priorities.
   int fork_ = 0;
-  // The megakernel's stage 1 in the step (LING_MK_FFN=1, off by default): the rows path's FFN as one persistent kernel
-  // (kernels::ffn_persistent), with its own FP16 buffer for the down projection's input and one counter set per layer.
-  int mk_ffn_ = 0;
+  // The megakernel's stage 1 in the step (LING_MK_FFN, on by default since 2026-10-19; LING_MK_FFN=0 turns it off):
+  // the rows path's FFN as one persistent kernel (kernels::ffn_persistent), with its own FP16 buffer for the down
+  // projection's input and one counter set per layer.
+  int mk_ffn_ = 1;
   unsigned* mk_counters_ = nullptr;
-  int mk_gdn_ = 0;  // stage 2 (LING_MK_GDN=1): a verify's DeltaNet mixer as one persistent kernel
+  // Stage 2 (LING_MK_GDN, on by default since 2026-10-19; LING_MK_GDN=0 turns it off): a chain verify's DeltaNet
+  // mixer as one persistent kernel (a tree verify keeps the graph path's mixer).
+  int mk_gdn_ = 1;
   unsigned* mk_gdn_counters_ = nullptr;
   // LING_MK_TIMES=1: the persistent kernels' timings store ([layer][kMkTimesBlocks][kMkTimesPerBlock] globaltimer
   // stamps of each layer's last launch), summarized on stderr when the engine is destroyed.
