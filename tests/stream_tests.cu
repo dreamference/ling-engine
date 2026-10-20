@@ -205,7 +205,7 @@ bool test_gemm() {
       }
     run(fp4, dx, MMAX, K, xh, xinv, fp4 ? dw4 : dw8, ds4, fp4 ? gs4 : gs8, dy, N);
     const std::vector<float> full = download(dy, size_t(MMAX) * N);
-    for (int M : {1, 2, 7, 8, 9, 15, 16, 17, 24, 32}) {
+    for (int M : {1, 2, 7, 8, 9, 15, 16, 17, 20, 24, 25, 32}) {
       run(fp4, dx, M, K, xh, xinv, fp4 ? dw4 : dw8, ds4, fp4 ? gs4 : gs8, dy, N);
       const std::vector<float> got = download(dy, size_t(M) * N);
       double worst = 0;
@@ -802,8 +802,19 @@ void bench_groups() {
       {"ffn gate|up fp4", true, 5120, 2, 64, {17408, 17408}},       {"ffn down fp4", true, 17408, 1, 64, {5120}},
       {"lm head fp4", true, 5120, 1, 1, {248320}},
   };
-  const int Ms[] = {1, 12, 16, 24, 32};
-  double step_ms[5] = {}, step_gb = 0;
+  // LING_BENCH_MS=1,12,16,...: the row counts timed (at most 16 of them; default 1, 12, 16, 24, 32).
+  std::vector<int> Ms{1, 12, 16, 24, 32};
+  if (const char* e = std::getenv("LING_BENCH_MS")) {
+    Ms.clear();
+    for (const char* p = e; *p && Ms.size() < 16;) {
+      Ms.push_back(std::atoi(p));
+      while (*p && *p != ',') ++p;
+      if (*p == ',') ++p;
+    }
+  }
+  const int nM = static_cast<int>(Ms.size());
+  std::vector<double> step_ms(nM, 0.0);
+  double step_gb = 0;
   // LING_BENCH_CODED=1: the NVFP4 groups as B26's coded blobs (random codes, a 64-entry table).
   const bool coded = std::getenv("LING_BENCH_CODED") && std::atoi(std::getenv("LING_BENCH_CODED")) != 0;
   uint8_t* dtab = nullptr;
@@ -833,7 +844,7 @@ void bench_groups() {
     cudaEventCreate(&a), cudaEventCreate(&b);
     std::printf("group %-17s %6.1f MB x%-2d", gr.name, bytes / 1e6, gr.count);
     step_gb += double(bytes) * gr.count / 1e9;
-    for (int mi = 0; mi < 5; ++mi) {
+    for (int mi = 0; mi < nM; ++mi) {
       const int M = Ms[mi];
       const int iters = std::max(40, copies * 4);
       float best = 1e30f;
@@ -868,7 +879,7 @@ void bench_groups() {
     for (int i = 0; i < gr.n; ++i) cudaFree(y[i]);
   }
   std::printf("step GEMMs (%.2f GB):", step_gb);
-  for (int mi = 0; mi < 5; ++mi) std::printf("  M=%-2d %6.2f ms %4.0f GB/s", Ms[mi], step_ms[mi], step_gb / step_ms[mi] * 1e3);
+  for (int mi = 0; mi < nM; ++mi) std::printf("  M=%-2d %6.2f ms %4.0f GB/s", Ms[mi], step_ms[mi], step_gb / step_ms[mi] * 1e3);
   std::printf("\n");
 }
 

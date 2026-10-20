@@ -564,11 +564,18 @@ int sg_env(const char* n, int d) {
   return e ? std::atoi(e) : d;
 }
 
+// BACKLOG 26 (tree/rows): 17 to 24 rows as three 8-token column groups instead of four (LING_SG_NT3=0: four, as
+// before). Each element's arithmetic is unchanged (the MMA's columns are independent), so the bits are the same.
+bool nt3_on() {
+  static const bool on = sg_env("LING_SG_NT3", 1) != 0;
+  return on;
+}
+
 template <int NT, bool FP4, int PF, bool CODED>
 void launch_t(int tiles, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
   if (tiles == 1) launch<NT, 1, FP4, PF, CODED>(x, xinv, M, t, n, K, s);
-  else if (tiles == 2 || NT == 4) launch<NT, 2, FP4, PF, CODED>(x, xinv, M, t, n, K, s);  // NT = 4 x 4 tiles: no room
-  else launch<NT, (NT == 4 ? 2 : 4), FP4, PF, CODED>(x, xinv, M, t, n, K, s);
+  else if (tiles == 2 || NT >= 3) launch<NT, 2, FP4, PF, CODED>(x, xinv, M, t, n, K, s);  // NT >= 3 x 4 tiles: no room
+  else launch<NT, (NT >= 3 ? 2 : 4), FP4, PF, CODED>(x, xinv, M, t, n, K, s);
 }
 
 template <int NT, bool FP4>
@@ -620,6 +627,7 @@ void dispatch(const __half* x, const float* xinv, int M, const StreamTarget* t, 
   const bool narrow = total < 8192;
   if (M <= 8) launch_k<1, FP4>(narrow ? tn : tw, x, xinv, M, t, n, K, s);
   else if (M <= 16) launch_k<2, FP4>(narrow ? tn : tw, x, xinv, M, t, n, K, s);
+  else if (M <= 24 && nt3_on()) launch_k<3, FP4>(narrow ? tn4 : tw4, x, xinv, M, t, n, K, s);
   else launch_k<4, FP4>(narrow ? tn4 : tw4, x, xinv, M, t, n, K, s);
   const cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) throw std::runtime_error(std::string("stream_gemm: ") + cudaGetErrorString(e));
@@ -963,8 +971,8 @@ __device__ __forceinline__ void ffn_body(const MkFfnArgs& a) {
 }
 
 template <int NT, bool CODED, bool TAIL = false, int PF = 2>
-// Two blocks per SM at NT <= 2 (the stream GEMM's own occupancy there, 128 registers), one at NT = 4.
-__global__ void __launch_bounds__(kWarps * 32, NT == 4 || PF > 2 ? 1 : 2) ffn_persistent_kernel(MkFfnArgs a) {
+// Two blocks per SM at NT <= 2 (the stream GEMM's own occupancy there, 128 registers), one at NT >= 3 (and at PF > 2).
+__global__ void __launch_bounds__(kWarps * 32, NT >= 3 || PF > 2 ? 1 : 2) ffn_persistent_kernel(MkFfnArgs a) {
   ffn_body<NT, CODED, TAIL, PF, false>(a);
 }
 
@@ -1908,6 +1916,7 @@ bool gdn_persistent(const MkGdnParams& p, cudaStream_t s) {
   if (p.tail) mk_gdn_launch<2, true>(a, s);
   else if (p.M <= 8) mk_gdn_launch<1>(a, s);
   else if (p.M <= 16) mk_gdn_launch<2>(a, s);
+  else if (p.M <= 24 && nt3_on()) mk_gdn_launch<3>(a, s);
   else mk_gdn_launch<4>(a, s);
   return true;
 }
@@ -1989,6 +1998,7 @@ bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarg
   }
   if (M <= 8) coded ? mk_ffn_launch<1, true>(a, s) : mk_ffn_launch<1, false>(a, s);
   else if (M <= 16) coded ? mk_ffn_launch<2, true>(a, s) : mk_ffn_launch<2, false>(a, s);
+  else if (M <= 24 && nt3_on()) coded ? mk_ffn_launch<3, true>(a, s) : mk_ffn_launch<3, false>(a, s);
   else coded ? mk_ffn_launch<4, true>(a, s) : mk_ffn_launch<4, false>(a, s);
   return true;
 }
