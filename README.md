@@ -35,6 +35,8 @@ Six levers, the first four in order of payoff on one agent's session:
 
 Greedy output stays identical to non-speculative decoding.
 
+The drafter only proposes, so it may be lossy: by default its fc and conv kernel projections run as NVFP4 copies rounded at load, not in BF16 (since 2026-10-20, [BACKLOG §19](specs/DREAMFERENCE_LING_ENGINE_BACKLOG.md) item 33; `--draft-bf16` turns them off). The target's weights are the checkpoint's.
+
 ## Milestones
 
 ![Roadmap](images/roadmap.svg)
