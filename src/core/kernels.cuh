@@ -463,6 +463,10 @@ void draft_store_kv(const float* k, const float* v, int rows, int kv_size, DevPo
 // rings kc/vc (position p in row p % ring, ring > window_left).
 void draft_attention(const float* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, int ring, const float* kb,
                      const float* vb, DevPos L, int B, int window_left, int Hq, int Hkv, float* out, cudaStream_t s);
+// How a warp of draft_attention walks the context (LING_DRAFT_ATTN_KEYS): 1, 2, 4 or 8 keys a load, or 0 (the
+// default) eight keys with the dot products reduce-scattered across the warp. 1 is the one-key-at-a-time loop; every
+// choice gives the same bits. For tests and timings.
+void set_draft_attention_keys(int u);
 // The drafter over several sequences' blocks at once (M4 stage 4): draft_qk_rope with each row at its sequence's
 // position, and draft_attention with each sequence's queries over its own ring and its own block (b's rows).
 void draft_qk_rope_seqs(float* x, int heads, int row_stride, const __nv_bfloat16* norm, const SeqBatch& b, float theta,
