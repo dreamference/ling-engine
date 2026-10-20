@@ -1270,7 +1270,7 @@ class Factory : public proxygen::RequestHandlerFactory {
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "0.0.0.0", name;
-  int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 0;
+  int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 7;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40;
@@ -1339,7 +1339,7 @@ int main(int argc, char** argv) {
   opts.max_context = max_context;
   opts.draft_dir = draft_dir;
   opts.draft_block = draft_block;
-  opts.tree_nodes = tree_nodes;  // BACKLOG 26 (LING_TREE overrides)
+  opts.tree_nodes = tree_nodes;  // BACKLOG 26: 7 by default, 0 the chain alone (LING_TREE overrides)
   opts.lookup_mode = lookup;
   opts.lookup_min_match = lookup_min;
   opts.prefix_checkpoints = checkpoints;
