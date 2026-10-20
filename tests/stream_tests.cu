@@ -4,6 +4,7 @@
 //
 //   ling-stream-tests            correctness only
 //   ling-stream-tests --bench    plus timings
+//   ling-stream-tests --bench-draft  the drafter attention's time per call
 //   ling-stream-tests --bench-half  the FP16 copy's time per call (LING_HALF_BLOCKS=0: the one-block-per-row kernel)
 //   LING_PDL=1 ling-stream-tests  the same with programmatic dependent launch (launch.cuh)
 //   LING_NO_TIMING=1 ling-stream-tests  skips the attention timings (under compute-sanitizer)
@@ -701,6 +702,50 @@ void bench_half() {
   cudaFree(x), cudaFree(xh), cudaFree(xinv);
 }
 
+// BACKLOG 28: the drafter's attention per call at the step's shape (a block of 12, 32 query and 8 KV heads, the
+// 2,048 window, the engine's ring of 8,224), 100 calls in one graph, with 1, 2, 4 and 8 context keys a load and the
+// warp-exchanged eight (0, the default); five
+// copies of the rings, one per drafter layer, so L2 holds no more than the step would.
+void bench_draft() {
+  namespace k = ling::kernels;
+  const int Hkv = 8, Hq = 32, dd = 128, ring = 8224, window = 2048, B = 12, layers = 5, L = 30000;
+  const size_t rb = size_t(ring) * Hkv * dd;
+  __nv_bfloat16 *kc, *vc;
+  float *q, *kb, *vb, *out;
+  cudaMalloc(&kc, rb * layers * 2), cudaMalloc(&vc, rb * layers * 2);
+  cudaMemset(kc, 0x3c, rb * layers * 2), cudaMemset(vc, 0x3c, rb * layers * 2);
+  cudaMalloc(&q, size_t(B) * Hq * dd * 4), cudaMalloc(&kb, size_t(B) * Hkv * dd * 4), cudaMalloc(&vb, size_t(B) * Hkv * dd * 4);
+  cudaMemset(q, 0, size_t(B) * Hq * dd * 4), cudaMemset(kb, 0, size_t(B) * Hkv * dd * 4), cudaMemset(vb, 0, size_t(B) * Hkv * dd * 4);
+  cudaMalloc(&out, size_t(B) * Hq * dd * 4);
+  cudaStream_t st;
+  cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+  cudaEvent_t a, b;
+  cudaEventCreate(&a), cudaEventCreate(&b);
+  for (int u : {1, 2, 4, 8, 0}) {
+    k::set_draft_attention_keys(u);
+    cudaGraph_t g;
+    cudaGraphExec_t ge;
+    cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+    for (int i = 0; i < 100; ++i)
+      k::draft_attention(q, kc + rb * (i % layers), vc + rb * (i % layers), ring, kb, vb, L, B, window - 1, Hq, Hkv, out, st);
+    cudaStreamEndCapture(st, &g);
+    cudaGraphInstantiate(&ge, g, 0);
+    cudaGraphLaunch(ge, st);
+    cudaEventRecord(a, st);
+    for (int rep = 0; rep < 3; ++rep) cudaGraphLaunch(ge, st);
+    cudaEventRecord(b, st);
+    cudaEventSynchronize(b);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, a, b);
+    const double us = ms * 1e3 / 300, bytes = 2.0 * window * Hkv * dd * 2;
+    std::printf("bench draft_attention keys %d (0: eight exchanged): %7.1f us a layer (%5.1f GB/s of unique K and V), %5.3f ms for %d layers\n",
+                u, us, bytes / (us * 1e-6) / 1e9, us * layers / 1e3, layers);
+    cudaGraphExecDestroy(ge), cudaGraphDestroy(g);
+  }
+  k::set_draft_attention_keys(0);
+  for (void* p : {(void*)kc, (void*)vc, (void*)q, (void*)kb, (void*)vb, (void*)out}) cudaFree(p);
+}
+
 __global__ void fill_random_kernel(uint32_t* p, size_t n, uint32_t seed) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
     uint32_t h = static_cast<uint32_t>(i) * 2654435761u ^ seed;
@@ -1147,6 +1192,35 @@ bool test_batched_state_kernels() {
     ok &= rope && datt;
     std::printf("draft_qk_rope and draft_attention over two blocks in one launch identical to per sequence: %s, %s\n",
                 rope ? "yes ok" : "NO FAIL", datt ? "yes ok" : "NO FAIL");
+    // The context keys a warp loads at once (BACKLOG 28's drafter lead): every batch the same bits as one at a time,
+    // at the two blocks' positions (one past the ring) and at a short context (inside the first window).
+    {
+      const auto want = download(a1, size_t(R) * Hq * dd);
+      bool keys = true;
+      for (int u : {1, 2, 4, 8, 0}) {
+        k::set_draft_attention_keys(u);
+        for (int s = 0; s < 2; ++s) {
+          const size_t r0 = size_t(s) * B;
+          k::draft_attention(x1 + r0 * Hq * dd, s ? r1k : r0k, s ? r1v : r0v, ring, kb + r0 * Hkv * dd,
+                             vb + r0 * Hkv * dd, db.pos[s], B, window - 1, Hq, Hkv, a2 + r0 * Hq * dd, nullptr);
+        }
+        keys &= same(want.data(), download(a2, size_t(R) * Hq * dd).data(), size_t(R) * Hq * dd * 4);
+        k::draft_attention_seqs(x1, rk, rv, ring, kb, vb, db, window - 1, Hq, Hkv, a2, nullptr);
+        keys &= same(want.data(), download(a2, size_t(R) * Hq * dd).data(), size_t(R) * Hq * dd * 4);
+      }
+      for (int L : {0, 5, 37, 300}) {  // short contexts: the batches' edges
+        std::vector<std::vector<float>> outs;
+        for (int u : {1, 4, 8, 0}) {
+          k::set_draft_attention_keys(u);
+          k::draft_attention(x1, r0k, r0v, ring, kb, vb, L, B, window - 1, Hq, Hkv, a2, nullptr);
+          outs.push_back(download(a2, size_t(B) * Hq * dd));
+        }
+        for (size_t i = 1; i < outs.size(); ++i) keys &= same(outs[0].data(), outs[i].data(), size_t(B) * Hq * dd * 4);
+      }
+      ok &= keys;
+      std::printf("draft_attention with 2, 4 and 8 context keys a load and eight exchanged identical to one at a time: %s\n",
+                  keys ? "yes ok" : "NO FAIL");
+    }
     for (void* p : {(void*)x1, (void*)x2, (void*)nw, (void*)kb, (void*)vb, (void*)r0k, (void*)r0v, (void*)r1k, (void*)r1v,
                     (void*)a1, (void*)a2})
       cudaFree(p);
@@ -1164,6 +1238,10 @@ int main(int argc, char** argv) {
   }
   if (argc > 1 && std::string(argv[1]) == "--bench-half") {  // timings only (BACKLOG 28's FP16 copies)
     bench_half();
+    return cudaDeviceSynchronize() == cudaSuccess ? 0 : 1;
+  }
+  if (argc > 1 && std::string(argv[1]) == "--bench-draft") {  // timings only (BACKLOG 28's drafter attention)
+    bench_draft();
     return cudaDeviceSynchronize() == cudaSuccess ? 0 : 1;
   }
   bool ok = test_to_half_rows();
