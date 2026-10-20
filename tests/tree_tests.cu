@@ -9,6 +9,7 @@
 #include <tuple>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "core/kernels.cuh"
@@ -32,7 +33,7 @@ std::vector<T> download(const T* d, size_t n) {
   return h;
 }
 
-ling::DraftTree random_tree(std::mt19937_64& rng, int E, int nodes, int width) {
+ling::DraftTree random_tree(std::mt19937_64& rng, int E, int nodes, int width, int chain = 1000) {
   const int K16 = 16;
   std::uniform_real_distribution<float> u(-3.f, 3.f);
   std::vector<int> cand(size_t(E) * K16);
@@ -52,6 +53,7 @@ ling::DraftTree random_tree(std::mt19937_64& rng, int E, int nodes, int width) {
   ling::TreeShape shape;
   shape.nodes = nodes;
   shape.width = width;
+  shape.chain = chain;
   return ling::build_tree(0, cand.data(), scores.data(), E, K16, toks, picks, shape);
 }
 
@@ -185,16 +187,114 @@ bool check_gdn(std::mt19937_64& rng, int E, int nodes, int width) {
   return ok;
 }
 
+// tree/rows: the recurrence's time over 48 layers by tree size, on trees of the engine's shape (12 drafted positions, the
+// chain's first 8, N nodes), each launch on the next of 48 states. (A depth-first walk with the state saved at branch
+// points, every row computed once, measured slower, 2026-10-20: 1.77-1.98 ms at 16 rows and 3.03-3.27 at 32 against the
+// paths' 1.63-1.65 and 2.21-2.29: the paths run side by side, the walk is one sequence of every row.)
+void bench_gdn() {
+  const int H = 16, HV = 48, Dk = 128, Dv = 128, C = 2 * H * Dk + HV * Dv, L = 48, reps = 20;
+  std::mt19937_64 rng(7);
+  std::normal_distribution<float> nd(0.f, 1.f);
+  std::uniform_real_distribution<float> uu(0.f, 1.f);
+  std::vector<float> pre(size_t(k::kMaxStreamRows) * C), g(size_t(k::kMaxStreamRows) * HV), beta(g.size());
+  for (float& x : pre) x = nd(rng);
+  for (float& x : g) x = -0.5f * uu(rng);
+  for (float& x : beta) x = uu(rng);
+  std::vector<float> state(size_t(L) * HV * Dk * Dv);
+  for (float& x : state) x = 0.05f * nd(rng);
+  float *dpre = upload(pre), *dg = upload(g), *dbeta = upload(beta), *dstate = upload(state), *dout = nullptr;
+  cudaMalloc(&dout, size_t(k::kMaxStreamRows) * HV * Dv * 4);
+  cudaEvent_t a, b;
+  cudaEventCreate(&a), cudaEventCreate(&b);
+  for (int nodes : {0, 3, 7, 11, 15, 19, 23}) {
+    for (int trial = 0; trial < 3; ++trial) {
+      const ling::DraftTree t = random_tree(rng, 12, nodes, 16, nodes ? 8 : 1000);
+      k::TreeDesc td;
+      const int ngdn = ling::describe_tree(t, td);
+      k::TreeDesc* dtd = upload(std::vector<k::TreeDesc>{td});
+      float ms = 0;
+      for (int pass = 0; pass < 2; ++pass) {
+        cudaEventRecord(a);
+        for (int r = 0; r < reps; ++r)
+          for (int l = 0; l < L; ++l)
+            k::gdn_recurrent_tree(dpre, dg, dbeta, dstate + size_t(l) * HV * Dk * Dv, dout, H, HV, dtd, ngdn, 0);
+        cudaEventRecord(b);
+        cudaEventSynchronize(b);
+        cudaEventElapsedTime(&ms, a, b);
+      }
+      std::printf("bench gdn %2d rows, %d paths: %.3f ms per 48 layers\n", t.rows(), ngdn, ms / reps);
+      cudaFree(dtd);
+    }
+  }
+  cudaFree(dpre), cudaFree(dg), cudaFree(dbeta), cudaFree(dstate), cudaFree(dout);
+}
+
+// tree/rows: the attention's time per full-attention layer at agentlong's contexts, by rows (one block of 96 query rows
+// holds 16 tree rows; 17 to 32 take a second block), on trees of the engine's shape.
+void bench_attention() {
+  const int Hq = 24, Hkv = 4, D = 256, rot = 64, ctx = 65536, reps = 20;
+  const float theta = 1e7f, eps = 1e-6f;
+  std::mt19937_64 rng(11);
+  std::normal_distribution<float> nd(0.f, 1.f);
+  std::vector<__nv_bfloat16> kc(size_t(Hkv) * ctx * D);
+  for (auto& x : kc) x = __float2bfloat16(nd(rng));
+  k::set_kv_layout(size_t(ctx) * D, D);
+  __nv_bfloat16 *dkc = upload(kc), *dvc = upload(kc);
+  std::vector<float> qg(size_t(k::kMaxStreamRows) * Hq * 2 * D), kk(size_t(k::kMaxStreamRows) * Hkv * D);
+  for (float& x : qg) x = nd(rng);
+  for (float& x : kk) x = nd(rng);
+  std::vector<__nv_bfloat16> qn(D), kn(D);
+  for (int i = 0; i < D; ++i) qn[i] = __float2bfloat16(0.1f * nd(rng)), kn[i] = __float2bfloat16(0.1f * nd(rng));
+  __nv_bfloat16 *dqn = upload(qn), *dkn = upload(kn);
+  float *dqg = upload(qg), *dk = upload(kk), *dv = upload(kk), *dq, *dgate, *dout, *dscr;
+  cudaMalloc(&dq, size_t(k::kMaxStreamRows) * Hq * D * 4);
+  cudaMalloc(&dgate, size_t(k::kMaxStreamRows) * Hq * D * 4);
+  cudaMalloc(&dout, size_t(k::kMaxStreamRows) * Hq * D * 4);
+  cudaMalloc(&dscr, k::attention_rows_scratch_floats(k::kMaxStreamRows, Hq, D, ctx) * 4);
+  cudaEvent_t a, b;
+  cudaEventCreate(&a), cudaEventCreate(&b);
+  for (int pos0 : {28000, 57000})
+    for (int nodes : {0, 7, 8, 11, 15, 23}) {
+      const ling::DraftTree t = random_tree(rng, 12, nodes, 16, nodes ? 8 : 1000);
+      k::TreeDesc td;
+      ling::describe_tree(t, td);
+      k::TreeDesc* dtd = upload(std::vector<k::TreeDesc>{td});
+      const int V = t.rows();
+      k::attn_prepare(dqg, dk, dv, dqn, dkn, pos0, V, Hq, Hkv, D, rot, theta, eps, dq, dgate, dkc, dvc, 0, dtd);
+      float ms = 0;
+      for (int pass = 0; pass < 2; ++pass) {
+        cudaEventRecord(a);
+        for (int r = 0; r < reps; ++r) k::attention_rows(dq, dkc, dvc, pos0, V, Hq, Hkv, D, dscr, dout, 0, 0, dtd);
+        cudaEventRecord(b);
+        cudaEventSynchronize(b);
+        cudaEventElapsedTime(&ms, a, b);
+      }
+      std::printf("bench attention pos %d, %2d rows, %2d variants: %.3f ms per layer (x16 layers %.2f ms)\n", pos0, V,
+                  td.nvar, ms / reps, 16 * ms / reps);
+      cudaFree(dtd);
+    }
+  cudaFree(dkc), cudaFree(dvc), cudaFree(dqn), cudaFree(dkn), cudaFree(dqg), cudaFree(dk), cudaFree(dv);
+  cudaFree(dq), cudaFree(dgate), cudaFree(dout), cudaFree(dscr);
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc > 1 && std::string(argv[1]) == "--bench") {
+    k::prepare_kernels();
+    bench_gdn();
+    bench_attention();
+    return 0;
+  }
   std::mt19937_64 rng(26);
   k::prepare_kernels();
   bool ok = true;
   for (int pos0 : {100, 3000, 4090, 4085, 8150})
     for (auto [E, nodes, width] : {std::tuple{11, 20, 4}, std::tuple{11, 4, 16}, std::tuple{7, 24, 2}, std::tuple{11, 0, 1}})
       if (pos0 + E + 1 + nodes <= 8192) ok &= check_attention(rng, pos0, E, nodes, width);
-  for (auto [E, nodes, width] : {std::tuple{11, 20, 4}, std::tuple{11, 4, 16}, std::tuple{7, 24, 2}, std::tuple{15, 16, 3}})
+  for (auto [E, nodes, width] : {std::tuple{11, 20, 4}, std::tuple{11, 4, 16}, std::tuple{7, 24, 2}, std::tuple{15, 16, 3},
+                                 std::tuple{8, 7, 16}, std::tuple{8, 23, 16}, std::tuple{11, 0, 1}, std::tuple{3, 28, 2},
+                                 std::tuple{1, 30, 16}, std::tuple{15, 16, 16}})
     ok &= check_gdn(rng, E, nodes, width);
   std::printf(ok ? "all tree tests passed\n" : "TREE TESTS FAILED\n");
   return ok ? 0 : 1;
