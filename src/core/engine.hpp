@@ -385,6 +385,10 @@ class Engine {
   // mixer as one persistent kernel (a tree verify keeps the graph path's mixer).
   int mk_gdn_ = 1;
   unsigned* mk_gdn_counters_ = nullptr;
+  int mk_attn_ = 0;  // stage 3 (LING_MK_ATTN=1): a verify's attention layer as one persistent kernel
+  unsigned* mk_attn_counters_ = nullptr;
+  unsigned long long* mk_attn_times_ = nullptr;  // LING_MK_TIMES: [layer][kernels::kMkAttnEvents]
+  int mk_layers_ = 0;  // stage 4 (LING_MK_LAYERS=1): the residual adds and the next norms inside the persistent kernels
   // LING_MK_TIMES=1: the persistent kernels' timings store ([layer][kMkTimesBlocks][kMkTimesPerBlock] globaltimer
   // stamps of each layer's last launch), summarized on stderr when the engine is destroyed.
   static constexpr int kMkTimesBlocks = 128;

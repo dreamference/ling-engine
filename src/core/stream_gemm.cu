@@ -21,6 +21,7 @@
 // for the weights (A) and the activations (B) alike.
 #include "core/kernels.cuh"
 #include "core/launch.cuh"
+#include "core/attention_body.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -142,8 +143,9 @@ __device__ __forceinline__ uint32_t word_of(const uint4& v, int i) {
 // The kernel's body as a device function of its block coordinates (bx, by) and of what it waits on before it reads
 // x (`wait`: pdl_begin() in the kernel; a dependency counter in a persistent kernel, megakernel B32): one body, so
 // every launcher computes the same bits. PF: chunks each warp keeps in flight ahead of the one it computes; CODED
-// (NVFP4 only): 6-bit scale codes (B26).
-template <int NT, int TILES, bool FP4, int PF, bool CODED, typename Wait>
+// (NVFP4 only): 6-bit scale codes (B26). RESID (the megakernel's fused residual, LING_MK_LAYERS): y is the residual
+// stream and the output is added into it, y + (sum * gscale * xinv) rounded as add_inplace rounds it (no contraction).
+template <int NT, int TILES, bool FP4, int PF, bool CODED, bool RESID = false, typename Wait>
 __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, const float* __restrict__ xinv, int M,
                                                  const StreamProblems& pr, int K, int ksplit, float* __restrict__ part,
                                                  int bx, int by, Wait&& wait) {
@@ -267,9 +269,14 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
     float sum = 0.f;
 #pragma unroll
     for (int wi = 0; wi < kWarps; ++wi) sum += red[wi][r][n];
-    if (ksplit == 1)
-      y[static_cast<size_t>(n) * N + row0 + r] = sum * gscale * xinv[n];
-    else
+    if (ksplit == 1) {
+      if constexpr (RESID) {
+        float* p = y + static_cast<size_t>(n) * N + row0 + r;
+        *p = __fadd_rn(*p, __fmul_rn(__fmul_rn(sum, gscale), xinv[n]));
+      } else {
+        y[static_cast<size_t>(n) * N + row0 + r] = sum * gscale * xinv[n];
+      }
+    } else
       part[(static_cast<size_t>(by) * M + n) * N + row0 + r] = sum;
   }
 }
@@ -334,6 +341,64 @@ __global__ void __launch_bounds__(1024) rmsnorm_half_kernel(const float* __restr
   const float sc = ldexpf(1.f, 15 - e);
   for (int h = threadIdx.x; h < H; h += blockDim.x) xh[r * H + h] = __float2half_rn(out[r * H + h] * sc);
   if (threadIdx.x == 0) xinv[r] = ldexpf(1.f, e - 15);
+}
+
+// rmsnorm_half_kernel's row r (its launch: 1,024 threads) by a block of kWarps * 32 = 256 threads, bit for bit (the
+// megakernel's layer boundary, LING_MK_LAYERS): thread t computes the kernel's threads t + 256 j (j < 4), whose warps
+// are this block's warp w + 8 j with the same lanes: each one's strided sum of squares (the kernel's FFMA), its
+// butterfly, red[w + 8 j], then the kernel's serial sum over the 32. The maximum for the FP16 copy has no order. The
+// row is read through the coherent path (written in the same launch by the fused residual). `add` (or nullptr): the
+// residual add first, x += add as add_inplace rounds it, each element by the thread that later reads it back.
+__device__ __forceinline__ void mk_rmsnorm_half_row(float* x, const __nv_bfloat16* __restrict__ w, float* out,
+                                                    __half* xh, float* xinv, int H, float eps, bool gemma, int r,
+                                                    const float* add = nullptr) {
+  constexpr int V = 1024 / (kWarps * 32);
+  __shared__ float red[32];
+  float* row = x + static_cast<size_t>(r) * H;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  float ss[V];
+#pragma unroll
+  for (int j = 0; j < V; ++j) {
+    ss[j] = 0.f;
+    for (int h = tid + j * kWarps * 32; h < H; h += 1024) {
+      float v = __ldcg(row + h);
+      if (add) {
+        v = __fadd_rn(v, __ldcg(add + static_cast<size_t>(r) * H + h));
+        row[h] = v;
+      }
+      ss[j] = __fmaf_rn(v, v, ss[j]);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss[j] += __shfl_xor_sync(0xffffffffu, ss[j], o);
+  }
+  __syncthreads();  // red is free (an earlier row's readers are done)
+  if (lane == 0)
+#pragma unroll
+    for (int j = 0; j < V; ++j) red[warp + j * kWarps] = ss[j];
+  __syncthreads();
+  float tot = 0.f;
+  for (int i = 0; i < 32; ++i) tot += red[i];
+  const float rstd = rsqrtf(tot / H + eps);
+  float mx = 0.f;
+  for (int h = tid; h < H; h += kWarps * 32) {
+    const float wv = __bfloat162float(w[h]);
+    const float v = __ldcg(row + h) * rstd * (gemma ? 1.f + wv : wv);
+    out[static_cast<size_t>(r) * H + h] = v;
+    mx = fmaxf(mx, fabsf(v));
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+  __syncthreads();
+  if (lane == 0) red[warp] = mx;
+  __syncthreads();
+  mx = 0.f;
+  for (int i = 0; i < kWarps; ++i) mx = fmaxf(mx, red[i]);
+  int e = 0;
+  if (mx > 0.f && isfinite(mx)) frexpf(mx, &e);
+  const float sc = ldexpf(1.f, 15 - e);
+  for (int h = tid; h < H; h += kWarps * 32)
+    xh[static_cast<size_t>(r) * H + h] = __float2half_rn(__ldcg(out + static_cast<size_t>(r) * H + h) * sc);
+  if (tid == 0) xinv[r] = ldexpf(1.f, e - 15);
 }
 
 // One block per row: a power-of-two scale that puts the row's largest magnitude in [2^14, 2^15).
@@ -734,12 +799,21 @@ struct MkFfnArgs {
   int pref;     // LING_MK_PREF_KB in bytes
   unsigned long long* times;  // LING_MK_TIMES: per block kMkFfnStamps globaltimer stamps, or nullptr
   unsigned* c;  // kMkFfnWords: [0] blocks past gate|up, [1] past the SiLU pass, [2] past the FP16 pass, [3] exits,
-                // [4..4 + 32) the rows' maxima (as float bits)
+                // [4..4 + 32) the rows' maxima (as float bits), [36] down tiles done (TAIL)
+  // TAIL (stage 4, LING_MK_LAYERS): down adds into the residual stream (down.y), then, with norm_w, the next norm.
+  const __nv_bfloat16* norm_w;
+  float* norm_out;
+  __half* norm_xh;
+  float* norm_xinv;
+  float eps;
 };
+constexpr int kMkFfnDownDone = 4 + kMaxStreamRows;
 
-template <int NT, bool CODED>
+// PF (LING_MK_FFN_PF, the occupancy probe for stage 4's layer-spanning kernels): chunks in flight per warp; above 2 the
+// registers allow one block per SM, the occupancy a kernel holding a mixer's bodies has. The same arithmetic.
+template <int NT, bool CODED, bool TAIL = false, int PF = 2>
 // Two blocks per SM at NT <= 2 (the stream GEMM's own occupancy there, 128 registers), one at NT = 4.
-__global__ void __launch_bounds__(kWarps * 32, NT == 4 ? 1 : 2) ffn_persistent_kernel(MkFfnArgs a) {
+__global__ void __launch_bounds__(kWarps * 32, NT == 4 || PF > 2 ? 1 : 2) ffn_persistent_kernel(MkFfnArgs a) {
   const int G = gridDim.x;
   unsigned* c = a.c;
 #define MK_STAMP(k) \
@@ -748,7 +822,7 @@ __global__ void __launch_bounds__(kWarps * 32, NT == 4 ? 1 : 2) ffn_persistent_k
   if (static_cast<int>(blockIdx.x) >= a.n_up) pdl_begin();  // never with the grids used, kept for the rule
   for (int i = blockIdx.x; i < a.n_up; i += G) {
     __syncthreads();  // the body's shared memory is reused by the next tile
-    stream_gemm_body<NT, 2, true, 2, CODED>(a.xh, a.xinv, a.M, a.up, a.H, 1, nullptr, i, 0,
+    stream_gemm_body<NT, 2, true, PF, CODED>(a.xh, a.xinv, a.M, a.up, a.H, 1, nullptr, i, 0,
                                             FirstPdl{i == static_cast<int>(blockIdx.x)});
   }
   MK_STAMP(1)
@@ -789,10 +863,17 @@ __global__ void __launch_bounds__(kWarps * 32, NT == 4 ? 1 : 2) ffn_persistent_k
   mk_done(&c[2]);
   for (int i = blockIdx.x; i < a.n_down; i += G) {
     __syncthreads();
-    stream_gemm_body<NT, 2, true, 2, CODED>(a.xh2, a.xinv2, a.M, a.down, a.I, 1, nullptr, i, 0,
-                                            CounterWaitMk{&c[2], static_cast<unsigned>(G), i == static_cast<int>(blockIdx.x)});
+    stream_gemm_body<NT, 2, true, PF, CODED, TAIL>(a.xh2, a.xinv2, a.M, a.down, a.I, 1, nullptr, i, 0,
+                                                  CounterWaitMk{&c[2], static_cast<unsigned>(G), i == static_cast<int>(blockIdx.x)});
+    if constexpr (TAIL) mk_done(&c[kMkFfnDownDone]);
   }
   if (static_cast<int>(blockIdx.x) >= a.n_down) mk_wait(&c[2], G);  // (no block idles with the grids used)
+  if constexpr (TAIL) {  // the next norm, row b on block b, once every down tile has added into the residual stream
+    if (a.norm_w && static_cast<int>(blockIdx.x) < a.M) {
+      mk_wait(&c[kMkFfnDownDone], static_cast<unsigned>(a.n_down));
+      mk_rmsnorm_half_row(a.down.y[0], a.norm_w, a.norm_out, a.norm_xh, a.norm_xinv, a.H, a.eps, true, blockIdx.x);
+    }
+  }
   MK_STAMP(5)
   // The last block out resets the counters for the next launch (ordered after this kernel's completion).
   __syncthreads();
@@ -802,29 +883,30 @@ __global__ void __launch_bounds__(kWarps * 32, NT == 4 ? 1 : 2) ffn_persistent_k
   }
 }
 
-template <int NT, bool CODED>
+template <int NT, bool CODED, bool TAIL = false, int PF = 2>
 int mk_resident() {
   static const int r = [] {
     int per_sm = 0, sms = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, ffn_persistent_kernel<NT, CODED>, kWarps * 32, 0);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, ffn_persistent_kernel<NT, CODED, TAIL, PF>, kWarps * 32, 0);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
     return per_sm * sms;
   }();
   return r;
 }
 
-template <int NT, bool CODED>
+template <int NT, bool CODED, bool TAIL = false, int PF = 2>
 void mk_ffn_launch(MkFfnArgs& a, cudaStream_t s) {
   static const int blocks_env = sg_env("LING_MK_BLOCKS", 0);
-  const int resident = mk_resident<NT, CODED>();
+  const int resident = mk_resident<NT, CODED, TAIL, PF>();
   const int G = blocks_env > 0 ? std::min(blocks_env, resident) : resident;
   if (G < 1) throw std::runtime_error("ffn_persistent: no resident block");
   static bool told = false;
   if (!told) {
     told = true;
-    std::fprintf(stderr, "megakernel stage 1: ffn_persistent<%d> on %d blocks (%d resident)\n", NT, G, resident);
+    std::fprintf(stderr, "megakernel stage 1: ffn_persistent<%d, PF %d> on %d blocks (%d resident)\n", NT, PF, G, resident);
   }
-  launch_kernel("ffn_persistent", ffn_persistent_kernel<NT, CODED>, dim3(G), dim3(kWarps * 32), 0, s, a);
+  if (TAIL && G < a.M) throw std::runtime_error("ffn_persistent: fewer blocks than rows for the fused norm");
+  launch_kernel("ffn_persistent", ffn_persistent_kernel<NT, CODED, TAIL, PF>, dim3(G), dim3(kWarps * 32), 0, s, a);
 }
 
 // ---- The megakernel's stage 2 in the step: a DeltaNet layer's mixer as one persistent kernel (LING_MK_GDN) ----
@@ -872,7 +954,17 @@ struct MkGdnArgs {
   int pref;  // LING_MK_PREF_KB in bytes
   unsigned long long* times;  // LING_MK_TIMES: per block kMkStamps globaltimer stamps, or nullptr
   unsigned* c;
+  // TAIL (stage 4, LING_MK_LAYERS): the out-projection adds into the residual stream (outp.y), then, with t_norm_w,
+  // the next norm (the post-attention norm) into t_out, t_xh, t_xinv.
+  const __nv_bfloat16* t_norm_w;
+  float* t_out;
+  __half* t_xh;
+  float* t_xinv;
+  // A tree verify (BACKLOG 26), or nullptr: the conv takes each row's taps from its ancestors (gdn_conv_tree_kernel's)
+  // and the recurrence runs per gdn path (gdn_recurrent_tree_body), as the graph path's tree kernels.
+  const TreeDesc* td;
 };
+constexpr int kMkGdnOutDone = 10;  // a spare word of kMkGdnWords: out-projection tiles done (TAIL)
 
 __device__ __forceinline__ float mk_silu(float x) { return x / (1.f + __expf(-x)); }  // kernels.cu's silu
 __device__ __forceinline__ float mk_warp_sum(float v) {
@@ -996,7 +1088,7 @@ struct MaybePdl {  // pdl_begin() once per block, at the first read of the prede
   }
 };
 
-template <int NT>
+template <int NT, bool TAIL = false>
 __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArgs a) {
   const int G = gridDim.x, bid = blockIdx.x;
   unsigned* c = a.c;
@@ -1036,8 +1128,24 @@ __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArg
   MK_STAMP(2)
   if (chain) {
     mk_wait(&c[kQkvDone], a.n_qkv);
+    // A tree: gdn_conv_tree_kernel's channel c, each row from its path's taps (the window, unwritten, before depth 0).
+    for (int ch = bid * blockDim.x + threadIdx.x; a.td && ch < a.C; ch += a.chain * blockDim.x) {
+      const float w0 = __bfloat162float(a.conv_w[ch * 4]), w1 = __bfloat162float(a.conv_w[ch * 4 + 1]);
+      const float w2 = __bfloat162float(a.conv_w[ch * 4 + 2]), w3 = __bfloat162float(a.conv_w[ch * 4 + 3]);
+      for (int t = 0; t < a.M; ++t) {
+        const int d = a.td->depth[t];
+        const int* path = a.td->path[a.td->var[t]];
+        auto tap = [&](int j) {  // the input at depth j < d
+          return j >= 0 ? a.vpre[static_cast<size_t>(path[j]) * a.C + ch] : a.conv_state[ch * 3 + 3 + j];
+        };
+        const float s0 = tap(d - 3), s1 = tap(d - 2), s2 = tap(d - 1);
+        const float xv = a.vpre[static_cast<size_t>(t) * a.C + ch];
+        const float o = w0 * s0 + w1 * s1 + w2 * s2 + w3 * xv;
+        a.mixed[static_cast<size_t>(t) * a.C + ch] = mk_silu(o);
+      }
+    }
     // gdn_conv_kernel's channel c over the rows, from the session's window, out of place (vpre -> mixed).
-    for (int ch = bid * blockDim.x + threadIdx.x; ch < a.C; ch += a.chain * blockDim.x) {
+    for (int ch = bid * blockDim.x + threadIdx.x; !a.td && ch < a.C; ch += a.chain * blockDim.x) {
       float s0 = a.conv_state[ch * 3], s1 = a.conv_state[ch * 3 + 1], s2 = a.conv_state[ch * 3 + 2];
       const float w0 = __bfloat162float(a.conv_w[ch * 4]), w1 = __bfloat162float(a.conv_w[ch * 4 + 1]);
       const float w2 = __bfloat162float(a.conv_w[ch * 4 + 2]), w3 = __bfloat162float(a.conv_w[ch * 4 + 3]);
@@ -1056,8 +1164,16 @@ __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArg
     MK_STAMP(3)
     // The recurrence: item w of HV x 4 on warp w of the chain's blocks.
     const int warp = threadIdx.x >> 5;
-    for (int it = bid * kWarps + warp; it < a.HV * 4; it += a.chain * kWarps)
-      mk_recurrent(a.mixed, a.g, a.beta, a.state, a.core, a.M, a.H, a.HV, it, qk[warp][0], qk[warp][1]);
+    if (a.td) {  // a tree: item w of HV x 4 x (its gdn paths), as gdn_recurrent_tree_kernel's blocks (bx, path)
+      __shared__ int steps[kWarps][2 * kMaxStreamRows];
+      const int items = a.HV * 4 * a.td->ngdn;
+      for (int it = bid * kWarps + warp; it < items; it += a.chain * kWarps)
+        gdn_recurrent_tree_body(a.mixed, a.g, a.beta, a.state, a.core, a.H, a.HV, a.td, it % (a.HV * 4), it / (a.HV * 4),
+                                threadIdx.x & 31, qk[warp][0], qk[warp][1], steps[warp]);
+    } else {
+      for (int it = bid * kWarps + warp; it < a.HV * 4; it += a.chain * kWarps)
+        mk_recurrent(a.mixed, a.g, a.beta, a.state, a.core, a.M, a.H, a.HV, it, qk[warp][0], qk[warp][1]);
+    }
     mk_done(&c[kRecDone]);
     MK_STAMP(4)
   }
@@ -1123,10 +1239,17 @@ __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArg
   // The out-projection, b, b + G, ... after every block's FP16 rows.
   for (int i = bid; i < a.n_out; i += G) {
     __syncthreads();
-    stream_gemm_body<NT, 2, false, 2, false>(a.xh2, a.xinv2, a.M, a.outp, a.Vs, 1, nullptr, i, 0,
-                                             CounterWaitMk{&c[kHalfDone], static_cast<unsigned>(G), i == bid});
+    stream_gemm_body<NT, 2, false, 2, false, TAIL>(a.xh2, a.xinv2, a.M, a.outp, a.Vs, 1, nullptr, i, 0,
+                                                   CounterWaitMk{&c[kHalfDone], static_cast<unsigned>(G), i == bid});
+    if constexpr (TAIL) mk_done(&c[kMkGdnOutDone]);
   }
   if (bid >= a.n_out) mk_wait(&c[kHalfDone], G);
+  if constexpr (TAIL) {  // the post-attention norm, row b on block b, once every tile has added into the residual
+    if (a.t_norm_w && bid < a.M) {
+      mk_wait(&c[kMkGdnOutDone], static_cast<unsigned>(a.n_out));
+      mk_rmsnorm_half_row(a.outp.y[0], a.t_norm_w, a.t_out, a.t_xh, a.t_xinv, a.K, a.eps, true, bid);
+    }
+  }
   MK_STAMP(9)
   __syncthreads();
   if (threadIdx.x == 0 && atomicAdd(&c[kExit], 1u) == static_cast<unsigned>(G) - 1u) {
@@ -1135,27 +1258,291 @@ __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArg
   }
 }
 
-template <int NT>
+template <int NT, bool TAIL = false>
 int mk_gdn_resident() {
   static const int r = [] {
     int per_sm = 0, sms = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_persistent_kernel<NT>, kWarps * 32, 0);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_persistent_kernel<NT, TAIL>, kWarps * 32, 0);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
     return per_sm * sms;
   }();
   return r;
 }
 
-template <int NT>
+template <int NT, bool TAIL = false>
 void mk_gdn_launch(MkGdnArgs& a, cudaStream_t s) {
-  const int G = mk_gdn_resident<NT>();
-  if (G < 2 * a.chain || G < 1) throw std::runtime_error("gdn_persistent: too few resident blocks");
+  const int G = mk_gdn_resident<NT, TAIL>();
+  if (G < 2 * a.chain || G < 1 || (TAIL && G < a.M)) throw std::runtime_error("gdn_persistent: too few resident blocks");
   static bool told = false;
   if (!told) {
     told = true;
     std::fprintf(stderr, "megakernel stage 2: gdn_persistent<%d> on %d blocks, %d of them the chain's\n", NT, G, a.chain);
   }
-  launch_kernel("gdn_persistent", gdn_persistent_kernel<NT>, dim3(G), dim3(kWarps * 32), 0, s, a);
+  launch_kernel("gdn_persistent", gdn_persistent_kernel<NT, TAIL>, dim3(G), dim3(kWarps * 32), 0, s, a);
+}
+
+// ---- The megakernel's stage 3 in the step: a full-attention layer as one persistent kernel (LING_MK_ATTN) ----
+//
+// One verify sequence's attention layer from the input norm's FP16 copy to the out-projection (BACKLOG 28's design
+// note): the q|k|v tiles (FP8 stream GEMMs), the prepare step (q/k norms, RoPE, the rows' K and V into the caches),
+// the attention over the session's 4096-key ranges, the combine with the sigmoid gate, the FP16 copy of each row under
+// its power-of-two scale, and the out-projection's tiles. Work comes from one ordered ticket queue; per KV group j (its
+// query heads with their gates, k_j, v_j): the group's tiles, then (after the next group's tiles, so a taker rarely
+// waits) its prepare items and its attention ranges; then every combine row, every FP16 row and the out-projection's
+// tiles. An item waits only on items with smaller tickets, through the group counters, so the launch completes with
+// any number of resident blocks. The point is the bus: the first groups' attention reads KV while the next groups'
+// q|k|v weights stream beside it, where the graph path's attention runs 24 blocks at ~200 GB/s with nothing beside it
+// (at 24K). Every element is the graph path's: stream_gemm_body, attn_prepare_body (256 threads, as attn_prepare
+// launches it), attention_mma_body (its rows per warp, its ranges, its tiles; the partials into scratch with the real
+// range count as their stride), attention_combine_body (the ranges in order, the empty ones skipped as the combine
+// skips them) and sigmoid_mul's expression, to_half_rows' maximum and conversion. One block per SM (the attention
+// body's ~190 accumulator registers); its tiles may keep more chunks in flight (PF, LING_MK_ATTN_PF), the same
+// arithmetic. Buffers this launch writes and then reads: through ld.global.cg, or lines one block wrote whole, or (the
+// row scales, which several blocks write into one line) written by atomics, which never leave a line in the writer's
+// L1.
+constexpr int kMkMaxKv = 4;  // KV groups the counters have room for
+enum MkAttnCounter {
+  kAtTicket = 0,
+  kAtExit = 1,
+  kAtQkv = 2,                   // + j: group j's q|k|v tiles done
+  kAtPrep = kAtQkv + kMkMaxKv,  // + j: its prepare items done
+  kAtAttn = kAtPrep + kMkMaxKv,  // + j: its attention ranges done
+  kAtComb = kAtAttn + kMkMaxKv,  // combine rows done
+  kAtHalf,                       // FP16 rows done
+  kAtOut,                        // out-projection tiles done
+  kAtWords
+};
+static_assert(kAtWords <= kMkAttnWords, "kMkAttnWords");
+constexpr int kMkAttnRows = 96, kMkAttnTk = 32, kMkAttnNs = 2;  // kernels.cu's kAttnRows, kAttnTk, kAttnNs
+
+struct MkAttnArgs {
+  const __half* xh;
+  const float* xinv;
+  StreamProblems qkv;  // q|gate (matrix 0), k (1), v (2)
+  int qtiles, kvtiles;  // 32-row tiles per query head (of q|gate) and per KV head
+  const float *qg, *kk, *vv;  // their outputs
+  const __nv_bfloat16 *q_norm, *k_norm;
+  float *q, *gate;
+  __nv_bfloat16 *kcache, *vcache;
+  size_t hs, ps;
+  DevPos pos0 = DevPos(0);
+  const TreeDesc* td;  // a tree verify, or nullptr
+  int M, K, Hq, Hkv, D, rot;
+  float theta, eps;
+  int chunk, pf;
+  float* scratch;
+  float* attn;
+  __half* xh2;
+  float* xinv2;
+  StreamProblems outp;
+  int n_out;
+  unsigned* c;
+  unsigned long long* times;  // LING_MK_TIMES: kMkAttnEvents stamps, or nullptr
+  // The tail (stage 4, LING_MK_LAYERS; t_h nullptr: none): per row, the residual add of the out-projection's output
+  // into t_h, then the post-attention norm into t_out, t_xh, t_xinv.
+  float* t_h;
+  const __nv_bfloat16* t_norm_w;
+  float* t_out;
+  __half* t_xh;
+  float* t_xinv;
+  float t_eps;
+};
+
+// Every thread's writes of the item visible, then thread 0 counts it; with LING_MK_TIMES the block that completes the
+// count (to `target`) stamps the event.
+__device__ __forceinline__ void mk_done_ev(unsigned* c, unsigned target, unsigned long long* ev) {
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (ev) {
+      if (atomicAdd(c, 1u) + 1u == target) *ev = mk_now();
+    } else {
+      mk_red_release(c, 1u);
+    }
+  }
+}
+
+struct MkAttnItem {
+  int kind, j, i;  // kind: 0 q|k|v tile, 1 prepare, 2 attention range, 3 combine row, 4 FP16 row, 5 out tile,
+                   // 6 tail row (stage 4), 7 none
+};
+
+// Ticket t's item: Q_0, then (Q_j, P_{j-1}, A_{j-1}) for j = 1 .. G - 1, then P_{G-1}, A_{G-1}, the combine rows
+// (group-major), the FP16 rows, the out-projection's tiles and (with a tail) the tail rows.
+__device__ __forceinline__ MkAttnItem mk_attn_item(int t, int TQ, int NP, int NA, int G, int M, int n_out, bool tail) {
+  if (t < TQ) return {0, 0, t};
+  t -= TQ;
+  const int B = TQ + NP + NA;
+  if (t < (G - 1) * B) {
+    const int jj = t / B + 1, r = t % B;
+    if (r < TQ) return {0, jj, r};
+    if (r < TQ + NP) return {1, jj - 1, r - TQ};
+    return {2, jj - 1, r - TQ - NP};
+  }
+  t -= (G - 1) * B;
+  if (t < NP) return {1, G - 1, t};
+  t -= NP;
+  if (t < NA) return {2, G - 1, t};
+  t -= NA;
+  if (t < G * M) return {3, t / M, t % M};
+  t -= G * M;
+  if (t < M) return {4, 0, t};
+  t -= M;
+  if (t < n_out) return {5, 0, t};
+  t -= n_out;
+  if (tail && t < M) return {6, 0, t};
+  return {7, 0, 0};
+}
+
+// A tile's wait: the predecessor (PDL) once per block, then, unless c is null, the counter. One type for both of the
+// kernel's GEMMs, so they share one instantiation of the body and its shared memory.
+struct MkTileWait {
+  const unsigned* c;
+  unsigned target;
+  bool* waited;
+  __device__ __forceinline__ void operator()() const {
+    MaybePdl{waited}();
+    if (c) mk_wait(c, target);
+  }
+};
+
+// The attention range and the GEMM tiles as calls, not inlined: each then has the register file to itself, as in its own
+// kernel (the attention body alone takes 253 registers), instead of spilling inside its loops around the queue's live
+// values; only those few values are saved around the call. One tile function for both GEMMs (one shared buffer).
+__device__ __noinline__ void mk_attn_range(const float* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, int p0, int M,
+                                           int Hq, int Hkv, int S, int chunk, float* scratch, size_t hs, size_t ps, int pf,
+                                           int rb, int j, int s, const TreeDesc* td) {
+  attention_mma_body<kMkAttnRows, kMkAttnTk, kMkAttnNs, false, true>(q, kc, vc, p0, M, Hq, Hkv, S, chunk, scratch, hs, ps,
+                                                                    pf, rb, j, s, td);
+}
+template <int NT, int PF>
+__device__ __noinline__ void mk_attn_tile(const __half* x, const float* xinv, int M, const StreamProblems& pr, int K,
+                                          int bx, const unsigned* c, unsigned target, bool* waited) {
+  stream_gemm_body<NT, 2, false, PF, false>(x, xinv, M, pr, K, 1, nullptr, bx, 0, MkTileWait{c, target, waited});
+}
+
+template <int NT, int PF>
+__global__ void __launch_bounds__(kWarps * 32, 1) attn_persistent_kernel(MkAttnArgs a) {
+  unsigned* c = a.c;
+  bool waited = false;
+  const int p0 = pos_value(a.pos0);  // written before the graph (or the eager launch), never by the predecessor
+  const int G = a.Hkv, hpg = a.Hq / a.Hkv, D = a.D;
+  const int TQ = hpg * a.qtiles + 2 * a.kvtiles;
+  const int nrq = (a.M + 3) / 4, NP = (hpg + 2) * nrq;  // prepare items: (slot, four rows)
+  const int nrb = (a.M * hpg + kMkAttnRows - 1) / kMkAttnRows;
+  const int S = (p0 + a.M + a.chunk - 1) / a.chunk;  // the ranges covering the rows' keys
+  const int NA = nrb * S;
+  unsigned long long* ev = a.times;
+  if (ev && blockIdx.x == 0) {
+    MaybePdl{&waited}();
+    if (threadIdx.x == 0) ev[0] = mk_now();
+  }
+  for (;;) {
+    const int t = mk_take(&c[kAtTicket]);
+    const MkAttnItem it = mk_attn_item(t, TQ, NP, NA, G, a.M, a.n_out, a.t_h != nullptr);
+    if (it.kind == 7) break;
+    const int j = it.j;
+    if (it.kind == 0) {  // a q|k|v tile of group j: its query heads' q|gate rows, then k_j's, then v_j's
+      const int nq = hpg * a.qtiles;
+      const int bx = it.i < nq ? j * nq + it.i
+                     : it.i < nq + a.kvtiles ? a.qkv.block0[1] + j * a.kvtiles + (it.i - nq)
+                                             : a.qkv.block0[2] + j * a.kvtiles + (it.i - nq - a.kvtiles);
+      mk_attn_tile<NT, PF>(a.xh, a.xinv, a.M, a.qkv, a.K, bx, nullptr, 0u, &waited);
+      mk_done_ev(&c[kAtQkv + j], TQ, ev ? ev + 1 + j : nullptr);
+    } else if (it.kind == 1) {  // prepare: one slot of group j for four rows
+      MaybePdl{&waited}();
+      mk_wait(&c[kAtQkv + j], TQ);
+      const int sl = it.i / nrq, m0 = (it.i % nrq) * 4;
+      const int slot = sl < hpg ? j * hpg + sl : sl == hpg ? a.Hq + j : a.Hq + a.Hkv + j;
+      for (int m = m0; m < min(a.M, m0 + 4); ++m)
+        // a tree's row sits at its depth's position; its key and value still go to slot p0 + m (attn_prepare_kernel)
+        attn_prepare_body(a.qg, a.kk, a.vv, a.q_norm, a.k_norm, m, a.td ? p0 + a.td->depth[m] : p0 + m, a.Hq, a.Hkv, D,
+                          a.rot, a.theta, a.eps, a.q, a.gate, a.kcache, a.vcache, a.hs, a.ps, p0 + m, slot);
+      mk_done_ev(&c[kAtPrep + j], NP, ev ? ev + 1 + kMkMaxKv + j : nullptr);
+    } else if (it.kind == 2) {  // attention: row block rb of group j over key range s
+      MaybePdl{&waited}();
+      mk_wait(&c[kAtPrep + j], NP);
+      const int rb = it.i % nrb, s = it.i / nrb;
+      mk_attn_range(a.q, a.kcache, a.vcache, p0, a.M, a.Hq, a.Hkv, S, a.chunk, a.scratch, a.hs, a.ps, a.pf, rb, j, s, a.td);
+      mk_done_ev(&c[kAtAttn + j], NA, ev ? ev + 1 + 2 * kMkMaxKv + j : nullptr);
+    } else if (it.kind == 3) {  // combine row m of group j's query heads, with the sigmoid gate (sigmoid_mul's expression)
+      MaybePdl{&waited}();
+      mk_wait(&c[kAtAttn + j], NA);
+      const int m = it.i, d = threadIdx.x;
+      for (int hh = 0; hh < hpg; ++hh) {
+        const int mh = m * a.Hq + j * hpg + hh;
+        float o = attention_combine_body<true>(a.scratch, S, D, mh, d);
+        o *= 1.f / (1.f + __expf(-__ldcg(a.gate + static_cast<size_t>(mh) * D + d)));
+        a.attn[static_cast<size_t>(mh) * D + d] = o;
+      }
+      mk_done_ev(&c[kAtComb], G * a.M, ev ? ev + 1 + 3 * kMkMaxKv : nullptr);
+    } else if (it.kind == 4) {  // the FP16 copy of row m (to_half_rows_body's maximum and conversion)
+      MaybePdl{&waited}();
+      mk_wait(&c[kAtComb], G * a.M);
+      const int m = it.i, Kq = a.Hq * D;
+      __shared__ float hred[32];
+      const float* row = a.attn + static_cast<size_t>(m) * Kq;
+      float mx = 0.f;
+      for (int k = threadIdx.x; k < Kq; k += blockDim.x) mx = fmaxf(mx, fabsf(__ldcg(row + k)));
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+      if ((threadIdx.x & 31) == 0) hred[threadIdx.x >> 5] = mx;
+      __syncthreads();
+      mx = 0.f;
+      for (int i = 0; i < (blockDim.x + 31) / 32; ++i) mx = fmaxf(mx, hred[i]);
+      int e = 0;
+      if (mx > 0.f && isfinite(mx)) frexpf(mx, &e);  // mx < 2^e
+      const float sc = ldexpf(1.f, 15 - e);
+      for (int k = threadIdx.x; k < Kq; k += blockDim.x)
+        a.xh2[static_cast<size_t>(m) * Kq + k] = __float2half_rn(__ldcg(row + k) * sc);
+      if (threadIdx.x == 0) atomicExch(a.xinv2 + m, ldexpf(1.f, e - 15));
+      mk_done_ev(&c[kAtHalf], a.M, ev ? ev + 2 + 3 * kMkMaxKv : nullptr);
+    } else if (it.kind == 5) {  // an out-projection tile, after every FP16 row
+      mk_attn_tile<NT, PF>(a.xh2, a.xinv2, a.M, a.outp, a.Hq * D, it.i, &c[kAtHalf], static_cast<unsigned>(a.M), &waited);
+      mk_done_ev(&c[kAtOut], a.n_out, ev ? ev + 3 + 3 * kMkMaxKv : nullptr);
+    } else {  // the tail's row m, after every out-projection tile: the residual add, then the post-attention norm
+      MaybePdl{&waited}();
+      mk_wait(&c[kAtOut], a.n_out);
+      mk_rmsnorm_half_row(a.t_h, a.t_norm_w, a.t_out, a.t_xh, a.t_xinv, a.K, a.t_eps, true, it.i, a.outp.y[0]);
+    }
+  }
+  MaybePdl{&waited}();  // every block reaches pdl_begin (launch.cuh)
+  // The last block out resets the counters for the next launch (ordered after this kernel's completion).
+  __syncthreads();
+  if (threadIdx.x == 0 && atomicAdd(&c[kAtExit], 1u) == gridDim.x - 1u) {
+    for (int k = 0; k < kMkAttnWords; ++k) c[k] = 0u;
+    __threadfence();
+  }
+}
+
+constexpr size_t kMkAttnSmem = mma_smem(kMkAttnTk, kMkAttnNs);  // the attention ring; the prepare step's row too
+
+template <int NT, int PF>
+int mk_attn_resident() {
+  static const int r = [] {
+    cudaFuncSetAttribute(attn_persistent_kernel<NT, PF>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(kMkAttnSmem));
+    int per_sm = 0, sms = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, attn_persistent_kernel<NT, PF>, kWarps * 32, kMkAttnSmem);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    return per_sm * sms;
+  }();
+  return r;
+}
+
+template <int NT, int PF>
+void mk_attn_launch(MkAttnArgs& a, cudaStream_t s) {
+  static const int blocks_env = sg_env("LING_MK_ATTN_BLOCKS", 0);
+  const int resident = mk_attn_resident<NT, PF>();
+  const int G = blocks_env > 0 ? std::min(blocks_env, resident) : resident;
+  if (G < 1) throw std::runtime_error("attn_persistent: no resident block");
+  static bool told = false;
+  if (!told) {
+    told = true;
+    std::fprintf(stderr, "megakernel stage 3: attn_persistent<%d, PF %d> on %d blocks (%d resident)\n", NT, PF, G,
+                 resident);
+  }
+  launch_kernel("attn_persistent", attn_persistent_kernel<NT, PF>, dim3(G), dim3(kWarps * 32), kMkAttnSmem, s, a);
 }
 
 int grid_of(size_t n) { return static_cast<int>(std::min<size_t>((n + 255) / 256, 65535 * 4)); }
@@ -1330,6 +1717,17 @@ bool gdn_persistent(const MkGdnParams& p, cudaStream_t s) {
   a.pref = sg_env("LING_MK_PREF_KB", 0) * 1024;
   a.times = p.times;
   a.c = p.counters;
+  a.td = p.td;
+  if (p.tail) {  // stage 4: rows 9 to 16 only (mk_tail_rows)
+    if (!mk_tail_rows(p.M) || p.tail->eps != p.eps) return false;
+    a.outp.y[0] = p.tail->h;
+    a.t_norm_w = p.tail->norm_w;
+    a.t_out = p.tail->out;
+    a.t_xh = p.tail->xh;
+    a.t_xinv = p.tail->xinv;
+    mk_gdn_launch<2, true>(a, s);
+    return true;
+  }
   if (p.M <= 8) mk_gdn_launch<1>(a, s);
   else if (p.M <= 16) mk_gdn_launch<2>(a, s);
   else mk_gdn_launch<4>(a, s);
@@ -1338,8 +1736,10 @@ bool gdn_persistent(const MkGdnParams& p, cudaStream_t s) {
 
 bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarget& gate, const StreamTarget& up,
                     const StreamTarget& down, int H, int I, float* g, float* u, __half* xh2, float* xinv2,
-                    unsigned* counters, cudaStream_t s, unsigned long long* times) {
+                    unsigned* counters, cudaStream_t s, unsigned long long* times, const MkTail* tail) {
   const bool coded = gate.wscale != nullptr;
+  if (tail && !mk_tail_rows(M)) return false;
+  static const int ffn_pf = sg_env("LING_MK_FFN_PF", 2);
   // Only the shapes dispatch() gives the four-kernel path: TILES 2 and PF 2 everywhere, one kind of blob.
   if ((up.wscale != nullptr) != coded || (down.wscale != nullptr) != coded) return false;
   if (M < 1 || M > kMaxStreamRows || H % kChunk || I % kChunk || gate.N != I || up.N != I || down.N != H) return false;
@@ -1380,9 +1780,114 @@ bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarg
   a.pref = sg_env("LING_MK_PREF_KB", 0) * 1024;
   a.times = times;
   a.c = counters;
+  if (tail) {  // stage 4: the down projection into the residual stream, then the next norm
+    a.down.y[0] = tail->h;
+    a.norm_w = tail->norm_w;
+    a.norm_out = tail->out;
+    a.norm_xh = tail->xh;
+    a.norm_xinv = tail->xinv;
+    a.eps = tail->eps;
+    if (ffn_pf == 4) coded ? mk_ffn_launch<2, true, true, 4>(a, s) : mk_ffn_launch<2, false, true, 4>(a, s);
+    else coded ? mk_ffn_launch<2, true, true>(a, s) : mk_ffn_launch<2, false, true>(a, s);
+    return true;
+  }
+  if (ffn_pf == 4 && M > 8 && M <= 16) {
+    coded ? mk_ffn_launch<2, true, false, 4>(a, s) : mk_ffn_launch<2, false, false, 4>(a, s);
+    return true;
+  }
   if (M <= 8) coded ? mk_ffn_launch<1, true>(a, s) : mk_ffn_launch<1, false>(a, s);
   else if (M <= 16) coded ? mk_ffn_launch<2, true>(a, s) : mk_ffn_launch<2, false>(a, s);
   else coded ? mk_ffn_launch<4, true>(a, s) : mk_ffn_launch<4, false>(a, s);
+  return true;
+}
+
+
+void attn_persistent_prepare() {  // the dynamic shared memory attribute, once, outside any graph capture
+  mk_attn_resident<1, 2>();
+  mk_attn_resident<2, 2>();
+  mk_attn_resident<2, 3>();
+  mk_attn_resident<2, 4>();
+}
+
+bool attn_persistent(const MkAttnParams& p, cudaStream_t s) {
+  static const int pf = sg_env("LING_MK_ATTN_PF", 2);
+  if (attention_bulk_enabled() || p.D != kMmaD || p.D != kWarps * 32 || p.Hq != 6 * p.Hkv || p.Hkv > kMkMaxKv) return false;
+  // M <= 16: one row block of attention, and the NT = 4 GEMM's reduction buffer would not fit beside the ring.
+  if (p.M < 1 || p.M > 16 || p.K % kChunk || (p.Hq * p.D) % kChunk) return false;
+  if (p.q.N != p.Hq * 2 * p.D || p.k.N != p.Hkv * p.D || p.v.N != p.Hkv * p.D || p.o.N != p.K || p.D % 32) return false;
+  if (sg_env("LING_SG_PF", kInFlight) != 2 || sg_env("LING_SG_TW", kTilesWide) != 2 || sg_env("LING_SG_TN", kTilesNarrow) != 2 ||
+      sg_env("LING_SG_TW4", kTilesWide4) != 2 || sg_env("LING_SG_TN4", kTilesNarrow4) != 2 || sg_env("LING_KSPLIT", 0) != 0)
+    return false;
+  MkAttnArgs a{};
+  a.xh = p.xh;
+  a.xinv = p.xinv;
+  const StreamTarget* it[3] = {&p.q, &p.k, &p.v};
+  int blocks = 0;
+  for (int i = 0; i < 3; ++i) {
+    a.qkv.w[i] = it[i]->w;
+    a.qkv.gscale[i] = it[i]->scale;
+    a.qkv.y[i] = it[i]->y;
+    a.qkv.N[i] = it[i]->N;
+    a.qkv.table[i] = nullptr;
+    a.qkv.block0[i] = blocks;
+    blocks += it[i]->N / 32;
+  }
+  a.qkv.count = 3;
+  a.qtiles = 2 * p.D / 32;
+  a.kvtiles = p.D / 32;
+  a.qg = p.q.y;
+  a.kk = p.k.y;
+  a.vv = p.v.y;
+  a.q_norm = p.q_norm;
+  a.k_norm = p.k_norm;
+  a.q = p.q_out;
+  a.gate = p.gate;
+  a.kcache = p.kcache;
+  a.vcache = p.vcache;
+  a.hs = kv_head_stride(p.D);
+  a.ps = kv_pos_stride(p.Hkv, p.D);
+  a.pos0 = p.pos0;
+  a.td = p.td;
+  a.M = p.M;
+  a.K = p.K;
+  a.Hq = p.Hq;
+  a.Hkv = p.Hkv;
+  a.D = p.D;
+  a.rot = p.rot;
+  a.theta = p.theta;
+  a.eps = p.eps;
+  a.chunk = attention_chunk();
+  a.pf = attention_prefetch_tiles();
+  a.scratch = p.scratch;
+  a.attn = p.attn;
+  a.xh2 = p.xh2;
+  a.xinv2 = p.xinv2;
+  a.outp.w[0] = p.o.w;
+  a.outp.gscale[0] = p.o.scale;
+  a.outp.y[0] = p.o.y;
+  a.outp.N[0] = p.o.N;
+  a.outp.table[0] = nullptr;
+  a.outp.block0[0] = 0;
+  a.outp.count = 1;
+  a.n_out = p.o.N / 32;
+  a.c = p.counters;
+  a.times = p.times;
+  if (p.tail) {  // stage 4
+    if (!mk_tail_rows(p.M) || !p.tail->norm_w) return false;
+    a.t_h = p.tail->h;
+    a.t_norm_w = p.tail->norm_w;
+    a.t_out = p.tail->out;
+    a.t_xh = p.tail->xh;
+    a.t_xinv = p.tail->xinv;
+    a.t_eps = p.tail->eps;
+  }
+  if (p.M <= 8) {
+    mk_attn_launch<1, 2>(a, s);
+  } else {
+    if (pf == 4) mk_attn_launch<2, 4>(a, s);
+    else if (pf == 3) mk_attn_launch<2, 3>(a, s);
+    else mk_attn_launch<2, 2>(a, s);
+  }
   return true;
 }
 
