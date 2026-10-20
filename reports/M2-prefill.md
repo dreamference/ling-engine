@@ -1,6 +1,6 @@
 # M2 (prefill first): prompts, prefill and prefix checkpoints
 
-October 9, 2026 · measured on the development GB10 (`second-puffin`) against production's SGLang on the same machine (M0's reference container, production flags). Recorded sessions are replayed locally and never leave it; only aggregates are reported.
+October 9, 2026 · measured on the development GB10 (`node-b`) against production's SGLang on the same machine (M0's reference container, production flags). Recorded sessions are replayed locally and never leave it; only aggregates are reported.
 
 ../specs/DREAMFERENCE_LING_ENGINE_MILESTONES.md §14 puts FP4 prefill and shared-prefix checkpoints in M4 and tree speculation in M2. M1 left decode at 97% of production and a whole request at twice production's time because of v0's prefill, so prefill came first; tree speculation (the spec's M2) is still open, and M1 §6 already measured its lookup half at +4% at best.
 

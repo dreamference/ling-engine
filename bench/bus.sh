@@ -1,5 +1,5 @@
 #!/bin/bash
-# BACKLOG §19.25: decode beside a CPU neighbour on second-puffin. The seeded replay (M0's main set, seed 1013) at one
+# BACKLOG §19.25: decode beside a CPU neighbour on node-b. The seeded replay (M0's main set, seed 1013) at one
 # and two streams on BUILD, alone and beside: a synthetic memory stream at 5, 10 and 20 GB/s of traffic
 # (bench/bus_neighbour.c, five threads pinned to the A725 cores 0-4, away from the X925 cores), the
 # real ling-code indexer (re-indexing REPO in a loop), and a pytest container (python:3-slim with Mightling's Python

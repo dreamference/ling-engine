@@ -128,7 +128,7 @@ Files that change: `src/core/engine.hpp`, `src/core/engine.cpp` (Session, the sl
 - **Memory**: 4.77 GB per session at 65,536 (the table above with the built ring); two sessions 9.5 GB against one history's 5.9 GB before.
 - **Gauges**: `sglang:max_total_num_tokens` = sessions × `max_context` = 131,072 (⌊131,072 / 49,152⌋ = 2 tasks); new `ling:sessions`, `ling:sessions_resident`, `ling:session_evictions_total`, `ling:session_protect_seconds`.
 
-Measured on second-puffin, branch `m4/sessions`:
+Measured on node-b, branch `m4/sessions`:
 
 | Check | Result |
 | --- | --- |
@@ -149,7 +149,7 @@ Measured on second-puffin, branch `m4/sessions`:
 - **The contended chunk and question 3's bound.** Measured below at 34K tokens: even a 128-token chunk adds about 150 ms to the decoding stream's period (252 ms against its 98 ms step), most of it what any pass costs (every weight is read once per chunk), so the bound of about twice the normal step (~200 ms against the ~100 ms single-stream step) is out of reach of the chunk size alone; it needs the chunk and the step in one pass (a mixed batch, after stage 3's batched verify) or the prefill on a second stream (stage 6). 256 tokens is the default, the knee of the curve: against 512 the prefill's rate is a third lower and the period a quarter shorter (286 ms against 376 mean); 128 makes the prefill 1.7 times slower again for 12% off the period. The bound against the two-stream period instead (~220 ms, section 6's stage-2 rate): 256 keeps the mean at about 1.3 times it and the maximum at about 1.8 times. **Decided (the owner, 2026-10-12):** for stage 2 the bound is read against the two-stream period, which 256 meets; stage 2 is merged into main with 256 as the default, and the bound against the single-stream step returns once the mixed batch (a prefill chunk and the decode step in one pass, after stage 3) exists.
 - **Not done.** A request whose client leaves during its prefill is noticed at its first token, as before (the prefill runs to its end); the harness itself has not run a two-task night against this build; the agreement run at concurrency 2 and the soak are stage 5's.
 
-Measured on second-puffin, branch `m4/stage2` (commits `e6f119a` engine, `3d9d5e6` scheduler), the production flags (`--draft-block 12 --max-context 65536 --graphs --pdl`):
+Measured on node-b, branch `m4/stage2` (commits `e6f119a` engine, `3d9d5e6` scheduler), the production flags (`--draft-block 12 --max-context 65536 --graphs --pdl`):
 
 | Check | Result |
 | --- | --- |
@@ -173,7 +173,7 @@ Measured on second-puffin, branch `m4/stage2` (commits `e6f119a` engine, `3d9d5e
 - **Eager.** The batch path runs eagerly; with `--graphs` a request's steps outside a batch still replay its session's graphs. Graphs for the batch path, one launch per state kernel and the drafter over 2B rows are stage 4.
 - **The checkpoint store's full rule (the owner's decision, 2026-10-12).** The least recently used entry gives way instead of the latest position, so a store full of other prompts' entries still saves a new prompt's checkpoints (`test_used_checkpoint_store_still_saves`: after a dozen low entries from unrelated chats, the identical resend of a 2,080-token prompt reuses 2,048 tokens; on main it reused nothing). An entry is used when it is saved and when a prefill resumes from it or extends its prefix. One refinement of the decision as worded ("so new checkpoints always get saved"), **confirmed by the owner on 2026-10-13**: a prefill never evicts an entry on its own prompt's prefix, so a prompt longer than the store's slots × 2,048 tokens keeps its earliest checkpoints (the ones other sessions share, the system prompt's) and skips its latest, as stage 1 did for one prompt; pure LRU would make a cold 30K-token prompt evict its own system-prompt checkpoint. Visible in `--prefix-check --sessions 2`: prompt 6 (A again, in a new slot) now resumes at 11,360 instead of 11,488, because C's checkpoints, more recent, took the place of A's 11,488 one; every state is still identical to a prefill from scratch.
 
-Measured on second-puffin, branch `m4/stage3` (commits `4056276` checkpoint store, `2701300` batched verify), the production flags (`--draft-block 12 --max-context 65536 --graphs --pdl`). The machine ran about 4% faster than on stage 2's day: main (`17b292b`) replayed the same evening gives the like-for-like reference.
+Measured on node-b, branch `m4/stage3` (commits `4056276` checkpoint store, `2701300` batched verify), the production flags (`--draft-block 12 --max-context 65536 --graphs --pdl`). The machine ran about 4% faster than on stage 2's day: main (`17b292b`) replayed the same evening gives the like-for-like reference.
 
 | Check | Result |
 | --- | --- |
@@ -198,7 +198,7 @@ The descriptor is `kernels::SeqBatch` (`src/core/kernels.cuh`): the number of se
 - **Graphs for the batch path.** Per order of sessions in the batch (`batch_graphs_`): one draft graph and one verify graph per pair of top-K values; per sequence, its session's commit graph keyed by its slot in the batch and its accepted count (slot 0's is the one-row step's own commit graph: the same rows, the same position slot). With two sessions that is at most 2 draft and 8 verify graphs, and 13 more commit graphs per session at a block of 12: bounded, captured on first use, as section 2 asked for the 8-hour run.
 - **Commit** stays per sequence (each has its own accepted count): `commit_launch(row0, n)` at `dpos_slot_ = i`, so a captured commit reads its sequence's position.
 
-Measured on second-puffin, branch `m4/stage4` (commit `e0b3d89`; the binary measured was built from the same sources before its rebase onto main), the production flags:
+Measured on node-b, branch `m4/stage4` (commit `e0b3d89`; the binary measured was built from the same sources before its rebase onto main), the production flags:
 
 | Check | Result |
 | --- | --- |
@@ -268,7 +268,7 @@ The first two-stream pair (2026-10-14) did not count: main's run took 17,483 tok
 
 ### Stage 5, the gate run, as measured (2026-10-15)
 
-On main `f549b0e` (the kept step savings) with B31's knob cherry-picked for the block-16 arm (branch `steps/stage5`, `5f03234`); the moonshot's P1 missed its own gate and is not in. One production-down session on second-puffin; production's reference is a scratch SGLang with production's flags (12 drafts, request logging) in the same session, seed 1013 for both. Engine figures are ling-serve's request lines pooled per stream (decode tokens over decode seconds; step period = decode seconds over passes); production's are SGLang's request log by the same definition (`bench/replay/server_stats.py`).
+On main `f549b0e` (the kept step savings) with B31's knob cherry-picked for the block-16 arm (branch `steps/stage5`, `5f03234`); the moonshot's P1 missed its own gate and is not in. One production-down session on node-b; production's reference is a scratch SGLang with production's flags (12 drafts, request logging) in the same session, seed 1013 for both. Engine figures are ling-serve's request lines pooled per stream (decode tokens over decode seconds; step period = decode seconds over passes); production's are SGLang's request log by the same definition (`bench/replay/server_stats.py`).
 
 | Line (§5) | Requirement | Engine | Production, same session | |
 | --- | --- | --- | --- | --- |

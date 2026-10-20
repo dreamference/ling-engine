@@ -50,7 +50,7 @@ prefill path's numerics, which the exactness policy (MILESTONES §14) does not a
 Two-stream aggregate at least production's lower run (50.6), per-stream decode no lower than today's, and the
 other stream's period during a 35K prefill no longer than today's 282 ms.
 
-## 4. Measurements (2026-10-17, second-puffin; M0's main set, seeded 1013, two streams, custom tools dropped)
+## 4. Measurements (2026-10-17, node-b; M0's main set, seeded 1013, two streams, custom tools dropped)
 
 | Configuration | Aggregate | Server prefill | Decode per stream | 35K prefill beside a decode | Other stream during it |
 | --- | --- | --- | --- | --- | --- |

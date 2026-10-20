@@ -190,7 +190,7 @@ P0's gate (draft §5): long copies must add **≥20% tokens per millisecond on a
 
 ## 6. The GPU half: script and steps (not yet run)
 
-`bench/rowsweep.py` measures, on second-puffin with nothing else on the GPU:
+`bench/rowsweep.py` measures, on node-b with nothing else on the GPU:
 
 - **A, the verify itself, rows path:** blocks 8, 12, 16, 24, 32 (`ling-run --spec --block B`, greedy, production's `--graphs --pdl`) at ~8K, ~32K and ~56K context, two repetitions. It reads the step's draft, verify and commit milliseconds.
   - **Why it stops at 32:** today's rows path stops at 32 rows (`kMaxStreamRows`), so 64 and 128 cannot be verified yet.
@@ -206,7 +206,7 @@ Prompts are filler built from this repository's own specs and sources; no record
 **Steps (≈1.5–2 GPU hours):**
 
 ```bash
-ssh second-puffin
+ssh node-b
 cd ~/ling-engine && git fetch -q && git checkout --detach origin/main && cmake --build build -j
 # one model server on the machine: stop the reference server, say so in the chat, restart it after
 docker stop m0-prod8000
@@ -230,7 +230,7 @@ python3 bench/replay/spec_report.py /tmp/c-before.json /tmp/c-after.json   # "sh
 bench/serve_bg.sh stop 18081
 ```
 
-Then, here: `scp second-puffin:/tmp/rowsweep/'*.log' DIR && python3 bench/rowsweep.py --summarize DIR --stats reports/moonshot-p0-copy-stats-2026-10-13.json`. The decision rule:
+Then, here: `scp node-b:/tmp/rowsweep/'*.log' DIR && python3 bench/rowsweep.py --summarize DIR --stats reports/moonshot-p0-copy-stats-2026-10-13.json`. The decision rule:
 
 - **First, C.** If the drafter accepts ≤ 7.5 drafts per step in the 32+ bucket at block 12 (≤ 8.5 tokens per step), read §3's `m1_16` column; above ~9.5 drafts, the `m1` column. Between, interpolate.
 - **A copy step at K=64 costs ≤1.0× a production step** (the extrapolated column at ~32K): the edit-span feature is worth +14–26% on those spans (realistic to oracle). Session-level stays below +20% (§4).

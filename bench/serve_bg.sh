@@ -1,10 +1,10 @@
 #!/bin/bash
-# Start ling-serve in the background on second-puffin and return once it answers /health, so that a
+# Start ling-serve in the background on node-b and return once it answers /health, so that a
 # caller over ssh gets its prompt back:
 #
-#   ssh second-puffin '~/ling-engine/bench/serve_bg.sh 18081'                      # main's build
-#   ssh second-puffin '~/ling-engine/bench/serve_bg.sh 18081 ~/ling-engine-x/build --draft-block 16'
-#   ssh second-puffin '~/ling-engine/bench/serve_bg.sh stop 18081'
+#   ssh node-b '~/ling-engine/bench/serve_bg.sh 18081'                      # main's build
+#   ssh node-b '~/ling-engine/bench/serve_bg.sh 18081 ~/ling-engine-x/build --draft-block 16'
+#   ssh node-b '~/ling-engine/bench/serve_bg.sh stop 18081'
 #
 # Arguments: the port, then optionally a build directory, then extra ling-serve flags (they replace
 # the defaults below only where ling-serve lets a later flag win). Log: /tmp/ling-serve-<port>.log.

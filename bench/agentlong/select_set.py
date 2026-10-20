@@ -1,7 +1,7 @@
 """The fixed long-context replay set (agentlong): sixteen `ling` agent-coding turns at 25K-64K tokens of context.
 
 Every engine and SGLang number on long agent turns is measured on this set, so that two runs never
-compare different prompts. The turns come from M0's recorded SWE-bench sessions on second-puffin
+compare different prompts. The turns come from M0's recorded SWE-bench sessions on node-b
 (`~/m0/traces/swe-bench`, real `ling` sessions: shell commands, file edits through the shell, code-index
 calls). Prompt contents never leave that machine: the repository holds only `manifest.json`, which names
 each turn (its rollout, relative to the traces root, and its request index), its recorded sizes and
@@ -18,7 +18,7 @@ and the capture's custom tool (`exec`) dropped, which is the prompt SGLang rende
 prefill the same tokens. `run.py` adds `temperature: 0` (greedy) or a per-turn seed (sampled at the
 model's defaults, as `ling` sends it).
 
-Usage (on second-puffin):
+Usage (on node-b):
   select_set.py [--traces ~/m0/traces/swe-bench] [--tools ~/m0/tools-capture.json]
                 [--tools-index ~/m0/tools-index.json] [--bodies ~/bench-sets/agentlong/bodies.jsonl]
                 [--manifest bench/agentlong/manifest.json] [--check]

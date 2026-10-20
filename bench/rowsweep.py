@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Moonshot P0, the GPU half: what a pass of 16-128 rows costs on the GB10, at ~8K, ~32K and ~56K context.
 
-Runs on second-puffin with the GPU otherwise idle (no model server resident: stop the reference server
+Runs on node-b with the GPU otherwise idle (no model server resident: stop the reference server
 first and restart it afterwards, as the one-model-server policy says). Uses only `ling-run` from a
 build of main; nothing here changes the engine.
 
@@ -26,7 +26,7 @@ is compared with.
 The prompts are filler text from this repository's own files (no recorded session leaves its machine,
 and timing does not depend on content except through the KV, which real text fills realistically).
 
-Usage (on second-puffin, from the repository root of a build of main):
+Usage (on node-b, from the repository root of a build of main):
   python3 bench/rowsweep.py --build build --out /tmp/rowsweep [--reps 2] [--dry-run]
   python3 bench/rowsweep.py --summarize /tmp/rowsweep [--stats p0-stats.json]
 """
