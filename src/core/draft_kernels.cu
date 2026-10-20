@@ -3,7 +3,10 @@
 #include "core/kernels.cuh"
 #include "core/launch.cuh"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -262,11 +265,92 @@ __global__ void bf16_to_half_rows_kernel(const __nv_bfloat16* __restrict__ x, in
   if (threadIdx.x == 0) xinv[blockIdx.x] = ldexpf(1.f, e - 15);
 }
 
+// The wide copy (BACKLOG 28's lead 1, as to_half_rows_wide_kernel in stream_gemm.cu): row blockIdx.x over gridDim.y
+// blocks, each finding the whole row's largest magnitude (exact in any order) and converting its slice of K, so the
+// values are the one-block kernel's bit for bit. VEC: x and out aligned to 16 bytes, K and slice multiples of 8.
+__device__ __forceinline__ float abs_max8(float m, const uint4& v) {
+  const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&v);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) m = fmaxf(m, fabsf(__bfloat162float(b[i])));
+  return m;
+}
+
+template <bool VEC>
+__global__ void __launch_bounds__(256) bf16_to_half_rows_wide_kernel(const __nv_bfloat16* __restrict__ x, int K,
+                                                                     int slice, __half* __restrict__ out,
+                                                                     float* __restrict__ xinv) {
+  pdl_begin();  // first statement: see launch.cuh
+  __shared__ float red[8];
+  const size_t r = blockIdx.x;
+  const __nv_bfloat16* row = x + r * K;
+  const int tid = threadIdx.x;
+  float m0 = 0.f, m1 = 0.f;
+  if constexpr (VEC) {
+    const uint4* row8 = reinterpret_cast<const uint4*>(row);
+    const int K8 = K / 8;
+    int k = tid;
+    for (; k + 3 * 256 < K8; k += 4 * 256) {
+      uint4 v[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) v[i] = row8[k + i * 256];
+      m0 = abs_max8(m0, v[0]), m1 = abs_max8(m1, v[1]), m0 = abs_max8(m0, v[2]), m1 = abs_max8(m1, v[3]);
+    }
+    for (; k < K8; k += 256) m0 = abs_max8(m0, row8[k]);
+  } else {
+    for (int k = tid; k < K; k += 256) m0 = fmaxf(m0, fabsf(__bfloat162float(row[k])));
+  }
+  float mx = fmaxf(m0, m1);
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+  if ((tid & 31) == 0) red[tid >> 5] = mx;
+  __syncthreads();
+  mx = 0.f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) mx = fmaxf(mx, red[i]);
+  int e = 0;
+  if (mx > 0.f && isfinite(mx)) frexpf(mx, &e);  // mx < 2^e
+  const float s = ldexpf(1.f, 15 - e);
+  const int k0 = blockIdx.y * slice, k1 = min(K, k0 + slice);
+  if constexpr (VEC) {
+    const uint4* row8 = reinterpret_cast<const uint4*>(row);
+    uint4* out8 = reinterpret_cast<uint4*>(out + r * K);
+    for (int k = k0 / 8 + tid; k < k1 / 8; k += 256) {
+      const uint4 v = row8[k];
+      const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&v);
+      uint4 o;
+      __half* h = reinterpret_cast<__half*>(&o);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) h[i] = __float2half_rn(__bfloat162float(b[i]) * s);
+      out8[k] = o;
+    }
+  } else {
+    for (int k = k0 + tid; k < k1; k += 256) out[r * K + k] = __float2half_rn(__bfloat162float(row[k]) * s);
+  }
+  if (blockIdx.y == 0 && tid == 0) xinv[r] = ldexpf(1.f, e - 15);
+}
+
 }  // namespace
 
+// About LING_HALF_BLOCKS (default 96) blocks in all, as to_half_rows; LING_HALF_BLOCKS=0: one block per row.
 void bf16_to_half_rows(const __nv_bfloat16* x, int M, int K, __half* out, float* xinv, cudaStream_t s) {
   if (M <= 0) return;
-  launch_kernel("bf16_to_half_rows", bf16_to_half_rows_kernel, dim3(M), dim3(256), 0, s, x, K, out, xinv);
+  static const int target = [] {
+    const char* e = std::getenv("LING_HALF_BLOCKS");
+    return e ? std::atoi(e) : 96;
+  }();
+  if (target <= 0) {
+    launch_kernel("bf16_to_half_rows", bf16_to_half_rows_kernel, dim3(M), dim3(256), 0, s, x, K, out, xinv);
+    return;
+  }
+  const bool vec = K % 8 == 0 && reinterpret_cast<uintptr_t>(x) % 16 == 0 && reinterpret_cast<uintptr_t>(out) % 16 == 0;
+  const int split = std::max(1, std::min((target + M - 1) / M, std::max(1, K / 1024)));
+  int slice = (K + split - 1) / split;
+  if (vec) slice = (slice + 7) / 8 * 8;
+  const dim3 grid(M, (K + slice - 1) / slice);
+  if (vec)
+    launch_kernel("bf16_to_half_rows", bf16_to_half_rows_wide_kernel<true>, grid, dim3(256), 0, s, x, K, slice, out, xinv);
+  else
+    launch_kernel("bf16_to_half_rows", bf16_to_half_rows_wide_kernel<false>, grid, dim3(256), 0, s, x, K, slice, out, xinv);
 }
 
 void copy_rows_bf16(const float* src, int rows, int H, __nv_bfloat16* dst, int dst_stride, cudaStream_t s) {

@@ -61,20 +61,22 @@ void run(bool fp4, const float* dx, int M, int K, __half* xh, float* xinv, const
   else ling::kernels::stream_gemm_fp8(xh, xinv, M, w, gs, dy, N, K, nullptr);
 }
 
-// The FP16 copy (the wide kernel, BACKLOG 28) against the host's exact reference: a power-of-two scale putting the
+// The FP16 copies (the wide kernels, BACKLOG 28; to_half_rows from FP32, bf16_to_half_rows from BF16) against the host's exact reference: a power-of-two scale putting the
 // row's largest magnitude in [2^14, 2^15), each value rounded to nearest. Every bit, for the step's shapes, a zero
 // row, a row with one huge value, an infinite one, and an unaligned input (the scalar path).
 bool test_to_half_rows() {
   std::mt19937 rng(5);
   std::normal_distribution<float> normal(0.f, 1.f);
-  const int Ms[] = {1, 2, 8, 12, 16, 24, 32}, Ks[] = {128, 1000, 4096, 5120, 6144, 17408};
-  const int MMAX = 32, KMAX = 17408;
+  const int Ms[] = {1, 2, 8, 12, 16, 24, 32}, Ks[] = {128, 1000, 4096, 5120, 6144, 17408, 25600};
+  const int MMAX = 32, KMAX = 25600;
   std::vector<float> x(size_t(MMAX) * KMAX + 1);
   float* dx;
   __half* dh;
   float* dinv;
   cudaMalloc(&dx, x.size() * sizeof(float));
   cudaMalloc(&dh, size_t(MMAX) * KMAX * sizeof(__half));
+  __nv_bfloat16* dxb;
+  cudaMalloc(&dxb, x.size() * sizeof(__nv_bfloat16));
   cudaMalloc(&dinv, MMAX * sizeof(float));
   bool ok = true;
   int cases = 0;
@@ -110,10 +112,33 @@ bool test_to_half_rows() {
             }
           }
         }
+        // bf16_to_half_rows (BACKLOG 33's copy, widened the same way) on the BF16 rounding of the same rows.
+        std::vector<__nv_bfloat16> xb(x.size());
+        for (size_t i = 0; i < x.size(); ++i) xb[i] = __float2bfloat16(x[i]);
+        cudaMemcpy(dxb, xb.data(), xb.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+        ling::kernels::bf16_to_half_rows(dxb + off, M, K, dh, dinv, nullptr);
+        const auto hb = download(dh, size_t(M) * K);
+        const auto invb = download(dinv, M);
+        for (int m = 0; m < M && ok; ++m) {
+          const __nv_bfloat16* row = xb.data() + off + size_t(m) * K;
+          float mx = 0.f;
+          for (int k = 0; k < K; ++k) mx = std::fmax(mx, std::fabs(__bfloat162float(row[k])));
+          int e = 0;
+          if (mx > 0.f && std::isfinite(mx)) std::frexp(mx, &e);
+          const float s = std::ldexp(1.f, 15 - e);
+          if (invb[m] != std::ldexp(1.f, e - 15)) ok = false;
+          for (int k = 0; k < K && ok; ++k) {
+            const __half want = __float2half_rn(__bfloat162float(row[k]) * s), got = hb[size_t(m) * K + k];
+            if (std::memcmp(&want, &got, sizeof(__half)) != 0) {
+              std::printf("bf16_to_half_rows M=%d K=%d off=%d row %d col %d differs FAIL\n", M, K, off, m, k);
+              ok = false;
+            }
+          }
+        }
         ++cases;
       }
-  cudaFree(dx), cudaFree(dh), cudaFree(dinv);
-  std::printf("to_half_rows: %d shapes bit for bit against the host %s\n", cases, ok ? "ok" : "FAIL");
+  cudaFree(dx), cudaFree(dxb), cudaFree(dh), cudaFree(dinv);
+  std::printf("to_half_rows and bf16_to_half_rows: %d shapes bit for bit against the host %s\n", cases, ok ? "ok" : "FAIL");
   return ok;
 }
 
@@ -644,6 +669,34 @@ void bench_half() {
       cudaGraphExecDestroy(ge), cudaGraphDestroy(g);
     }
     std::printf("\n");
+  }
+  {  // the drafter's NVFP4 fc input (BACKLOG 33): BF16 rows of 5 x 5,120
+    const int K = 25600;
+    __nv_bfloat16* xb;
+    __half* xh2;
+    cudaMalloc(&xb, size_t(32) * K * 2);
+    cudaMalloc(&xh2, size_t(32) * K * 2);
+    cudaMemset(xb, 0x3c, size_t(32) * K * 2);
+    std::printf("bench bf16_to_half_rows K=%-5d", K);
+    for (int M : {1, 8, 12, 16, 24, 32}) {
+      cudaGraph_t g;
+      cudaGraphExec_t ge;
+      cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+      for (int i = 0; i < 200; ++i) ling::kernels::bf16_to_half_rows(xb, M, K, xh2, xinv, st);
+      cudaStreamEndCapture(st, &g);
+      cudaGraphInstantiate(&ge, g, 0);
+      cudaGraphLaunch(ge, st);
+      cudaEventRecord(a, st);
+      for (int rep = 0; rep < 5; ++rep) cudaGraphLaunch(ge, st);
+      cudaEventRecord(b, st);
+      cudaEventSynchronize(b);
+      float ms = 0;
+      cudaEventElapsedTime(&ms, a, b);
+      std::printf("  M=%-2d %6.2f us", M, ms * 1e3f / 1000.f);
+      cudaGraphExecDestroy(ge), cudaGraphDestroy(g);
+    }
+    std::printf("\n");
+    cudaFree(xb), cudaFree(xh2);
   }
   cudaFree(x), cudaFree(xh), cudaFree(xinv);
 }
