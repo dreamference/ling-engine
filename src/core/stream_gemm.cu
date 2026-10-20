@@ -145,7 +145,9 @@ __device__ __forceinline__ uint32_t word_of(const uint4& v, int i) {
 // every launcher computes the same bits. PF: chunks each warp keeps in flight ahead of the one it computes; CODED
 // (NVFP4 only): 6-bit scale codes (B26). RESID (the megakernel's fused residual, LING_MK_LAYERS): y is the residual
 // stream and the output is added into it, y + (sum * gscale * xinv) rounded as add_inplace rounds it (no contraction).
-template <int NT, int TILES, bool FP4, int PF, bool CODED, bool RESID = false, typename Wait>
+// DYNRED (the megakernel's spanning kernel): the warps' reduction buffer is the launch's dynamic shared memory instead
+// of a static array of this instantiation, so several instantiations in one kernel share it; the same arithmetic.
+template <int NT, int TILES, bool FP4, int PF, bool CODED, bool RESID = false, bool DYNRED = false, typename Wait>
 __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, const float* __restrict__ xinv, int M,
                                                  const StreamProblems& pr, int K, int ksplit, float* __restrict__ part,
                                                  int bx, int by, Wait&& wait) {
@@ -156,7 +158,10 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
   const float gscale = pr.gscale[pi];
   float* __restrict__ y = pr.y[pi];
   const int N = pr.N[pi];
-  __shared__ float red[kWarps][TILES * 16][NT * 8 + 1];
+  using Red = float[kWarps][TILES * 16][NT * 8 + 1];
+  __shared__ float red_static[DYNRED ? 1 : kWarps][TILES * 16][NT * 8 + 1];
+  extern __shared__ __align__(16) unsigned char mk_dyn_smem[];
+  Red& red = DYNRED ? *reinterpret_cast<Red*>(mk_dyn_smem) : *reinterpret_cast<Red*>(&red_static);
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int g = lane >> 2, t = lane & 3;
   const int row0 = (bx - pr.block0[pi]) * TILES * 16;
@@ -272,7 +277,7 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
     if (ksplit == 1) {
       if constexpr (RESID) {
         float* p = y + static_cast<size_t>(n) * N + row0 + r;
-        *p = __fadd_rn(*p, __fmul_rn(__fmul_rn(sum, gscale), xinv[n]));
+        *p = __fadd_rn(__ldcg(p), __fmul_rn(__fmul_rn(sum, gscale), xinv[n]));
       } else {
         y[static_cast<size_t>(n) * N + row0 + r] = sum * gscale * xinv[n];
       }
@@ -398,7 +403,7 @@ __device__ __forceinline__ void mk_rmsnorm_half_row(float* x, const __nv_bfloat1
   const float sc = ldexpf(1.f, 15 - e);
   for (int h = tid; h < H; h += kWarps * 32)
     xh[static_cast<size_t>(r) * H + h] = __float2half_rn(__ldcg(out + static_cast<size_t>(r) * H + h) * sc);
-  if (tid == 0) xinv[r] = ldexpf(1.f, e - 15);
+  if (tid == 0) atomicExch(xinv + r, ldexpf(1.f, e - 15));  // an atomic: other rows' blocks write the same line
 }
 
 // One block per row: a power-of-two scale that puts the row's largest magnitude in [2^14, 2^15).
@@ -806,24 +811,35 @@ struct MkFfnArgs {
   __half* norm_xh;
   float* norm_xinv;
   float eps;
+  // SPAN (the stage-4 spanning kernel): the first gate|up tiles wait for *start_c >= start_target (the mixer's tail
+  // norm), and the last block out resets c2's c2_words too (the mixer's counters).
+  const unsigned* start_c;
+  unsigned start_target;
+  unsigned* c2;
+  int c2_words;
 };
 constexpr int kMkFfnDownDone = 4 + kMaxStreamRows;
 
 // PF (LING_MK_FFN_PF, the occupancy probe for stage 4's layer-spanning kernels): chunks in flight per warp; above 2 the
 // registers allow one block per SM, the occupancy a kernel holding a mixer's bodies has. The same arithmetic.
-template <int NT, bool CODED, bool TAIL = false, int PF = 2>
-// Two blocks per SM at NT <= 2 (the stream GEMM's own occupancy there, 128 registers), one at NT = 4.
-__global__ void __launch_bounds__(kWarps * 32, NT == 4 || PF > 2 ? 1 : 2) ffn_persistent_kernel(MkFfnArgs a) {
-  const int G = gridDim.x;
-  unsigned* c = a.c;
 #define MK_STAMP(k) \
   if (a.times && threadIdx.x == 0) a.times[blockIdx.x * kMkStamps + (k)] = mk_now();
+// The kernel's body; SPAN: in the spanning kernel, after a DeltaNet mixer (see MkFfnArgs), its tiles' reduction buffer
+// in dynamic shared memory.
+template <int NT, bool CODED, bool TAIL, int PF, bool SPAN>
+__device__ __forceinline__ void ffn_body(const MkFfnArgs& a) {
+  const int G = gridDim.x;
+  unsigned* c = a.c;
   MK_STAMP(0)
-  if (static_cast<int>(blockIdx.x) >= a.n_up) pdl_begin();  // never with the grids used, kept for the rule
+  if (!SPAN && static_cast<int>(blockIdx.x) >= a.n_up) pdl_begin();  // never with the grids used, kept for the rule
   for (int i = blockIdx.x; i < a.n_up; i += G) {
     __syncthreads();  // the body's shared memory is reused by the next tile
-    stream_gemm_body<NT, 2, true, PF, CODED>(a.xh, a.xinv, a.M, a.up, a.H, 1, nullptr, i, 0,
-                                            FirstPdl{i == static_cast<int>(blockIdx.x)});
+    const bool first = i == static_cast<int>(blockIdx.x);
+    if constexpr (SPAN)
+      stream_gemm_body<NT, 2, true, PF, CODED, false, true>(a.xh, a.xinv, a.M, a.up, a.H, 1, nullptr, i, 0,
+                                                            CounterWaitMk{a.start_c, a.start_target, first});
+    else
+      stream_gemm_body<NT, 2, true, PF, CODED>(a.xh, a.xinv, a.M, a.up, a.H, 1, nullptr, i, 0, FirstPdl{first});
   }
   MK_STAMP(1)
   mk_done(&c[0]);
@@ -863,7 +879,7 @@ __global__ void __launch_bounds__(kWarps * 32, NT == 4 || PF > 2 ? 1 : 2) ffn_pe
   mk_done(&c[2]);
   for (int i = blockIdx.x; i < a.n_down; i += G) {
     __syncthreads();
-    stream_gemm_body<NT, 2, true, PF, CODED, TAIL>(a.xh2, a.xinv2, a.M, a.down, a.I, 1, nullptr, i, 0,
+    stream_gemm_body<NT, 2, true, PF, CODED, TAIL, SPAN>(a.xh2, a.xinv2, a.M, a.down, a.I, 1, nullptr, i, 0,
                                                   CounterWaitMk{&c[2], static_cast<unsigned>(G), i == static_cast<int>(blockIdx.x)});
     if constexpr (TAIL) mk_done(&c[kMkFfnDownDone]);
   }
@@ -879,8 +895,16 @@ __global__ void __launch_bounds__(kWarps * 32, NT == 4 || PF > 2 ? 1 : 2) ffn_pe
   __syncthreads();
   if (threadIdx.x == 0 && atomicAdd(&c[3], 1u) == static_cast<unsigned>(G) - 1u) {
     for (int k = 0; k < kMkFfnWords; ++k) c[k] = 0u;
+    if (SPAN && a.c2)
+      for (int k = 0; k < a.c2_words; ++k) a.c2[k] = 0u;
     __threadfence();
   }
+}
+
+template <int NT, bool CODED, bool TAIL = false, int PF = 2>
+// Two blocks per SM at NT <= 2 (the stream GEMM's own occupancy there, 128 registers), one at NT = 4.
+__global__ void __launch_bounds__(kWarps * 32, NT == 4 || PF > 2 ? 1 : 2) ffn_persistent_kernel(MkFfnArgs a) {
+  ffn_body<NT, CODED, TAIL, PF, false>(a);
 }
 
 template <int NT, bool CODED, bool TAIL = false, int PF = 2>
@@ -1088,8 +1112,12 @@ struct MaybePdl {  // pdl_begin() once per block, at the first read of the prede
   }
 };
 
-template <int NT, bool TAIL = false>
-__global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArgs a) {
+// The kernel's body. PF: its tiles' chunks in flight (2 in its own kernel); SPAN (the stage-4 spanning kernel, an FFN
+// after it in the same launch): the tiles' reduction buffer in dynamic shared memory, the tail's norm counted (word
+// kMkGdnNormDone, which the FFN's first tiles wait for), and the counters left for the spanning kernel to reset.
+constexpr int kMkGdnNormDone = 11;  // the other spare word of kMkGdnWords
+template <int NT, bool TAIL, int PF, bool SPAN>
+__device__ __forceinline__ void gdn_mixer_body(const MkGdnArgs& a) {
   const int G = gridDim.x, bid = blockIdx.x;
   unsigned* c = a.c;
   const bool chain = bid < a.chain;
@@ -1122,7 +1150,8 @@ __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArg
   for (;;) {
     const int i = mk_take(&c[kQkvQueue]);
     if (i >= a.n_qkv) break;
-    stream_gemm_body<NT, 2, false, 2, false>(a.xh, a.xinv, a.M, a.inp, a.K, 1, nullptr, i, 0, MaybePdl{&waited});
+    stream_gemm_body<NT, 2, false, PF, false, false, SPAN>(a.xh, a.xinv, a.M, a.inp, a.K, 1, nullptr, i, 0,
+                                                          MaybePdl{&waited});
     mk_done(&c[kQkvDone]);
   }
   MK_STAMP(2)
@@ -1181,8 +1210,8 @@ __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArg
   for (;;) {
     const int j = mk_take(&c[kZQueue]);
     if (j >= a.n_z) break;
-    stream_gemm_body<NT, 2, false, 2, false>(a.xh, a.xinv, a.M, a.inp, a.K, 1, nullptr, a.n_qkv + j, 0,
-                                             MaybePdl{&waited});
+    stream_gemm_body<NT, 2, false, PF, false, false, SPAN>(a.xh, a.xinv, a.M, a.inp, a.K, 1, nullptr, a.n_qkv + j, 0,
+                                                          MaybePdl{&waited});
     mk_done(&c[kZDone]);
   }
   MaybePdl{&waited}();
@@ -1239,8 +1268,8 @@ __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArg
   // The out-projection, b, b + G, ... after every block's FP16 rows.
   for (int i = bid; i < a.n_out; i += G) {
     __syncthreads();
-    stream_gemm_body<NT, 2, false, 2, false, TAIL>(a.xh2, a.xinv2, a.M, a.outp, a.Vs, 1, nullptr, i, 0,
-                                                   CounterWaitMk{&c[kHalfDone], static_cast<unsigned>(G), i == bid});
+    stream_gemm_body<NT, 2, false, PF, false, TAIL, SPAN>(a.xh2, a.xinv2, a.M, a.outp, a.Vs, 1, nullptr, i, 0,
+                                                         CounterWaitMk{&c[kHalfDone], static_cast<unsigned>(G), i == bid});
     if constexpr (TAIL) mk_done(&c[kMkGdnOutDone]);
   }
   if (bid >= a.n_out) mk_wait(&c[kHalfDone], G);
@@ -1248,14 +1277,22 @@ __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArg
     if (a.t_norm_w && bid < a.M) {
       mk_wait(&c[kMkGdnOutDone], static_cast<unsigned>(a.n_out));
       mk_rmsnorm_half_row(a.outp.y[0], a.t_norm_w, a.t_out, a.t_xh, a.t_xinv, a.K, a.eps, true, bid);
+      if constexpr (SPAN) mk_done(&c[kMkGdnNormDone]);
     }
   }
   MK_STAMP(9)
-  __syncthreads();
-  if (threadIdx.x == 0 && atomicAdd(&c[kExit], 1u) == static_cast<unsigned>(G) - 1u) {
-    for (int k = 0; k < kMkGdnWords; ++k) c[k] = 0u;
-    __threadfence();
+  if constexpr (!SPAN) {
+    __syncthreads();
+    if (threadIdx.x == 0 && atomicAdd(&c[kExit], 1u) == static_cast<unsigned>(G) - 1u) {
+      for (int k = 0; k < kMkGdnWords; ++k) c[k] = 0u;
+      __threadfence();
+    }
   }
+}
+
+template <int NT, bool TAIL = false>
+__global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArgs a) {
+  gdn_mixer_body<NT, TAIL, 2, false>(a);
 }
 
 template <int NT, bool TAIL = false>
@@ -1545,6 +1582,51 @@ void mk_attn_launch(MkAttnArgs& a, cudaStream_t s) {
   launch_kernel("attn_persistent", attn_persistent_kernel<NT, PF>, dim3(G), dim3(kWarps * 32), kMkAttnSmem, s, a);
 }
 
+
+// ---- The megakernel's stage 4, a DeltaNet layer in one launch (LING_MK_SPAN) ----
+//
+// The DeltaNet mixer (gdn_mixer_body, its out-projection added into the residual stream, then the post-attention norm
+// on blocks 0 .. M - 1) and the FFN (ffn_body, its first gate|up tiles waiting for those norm rows, its down projection
+// added into the residual stream, then the next layer's input norm) as one persistent kernel at one block per SM (the
+// mixer's recurrence holds 128 state registers per thread), so the FFN's first weights stream while the mixer's last
+// out-projection tiles and its norm finish, with no launch between them. The FFN's tiles keep more chunks in flight
+// (PFF; 4 brought the FFN on 48 blocks to the 96-block kernel's speed); the mixer's PFG. Every element is the two
+// kernels' (their bodies, unchanged); the buffers one writes and the other reads after it are its own (the norm's FP16
+// copy, the down projection's FP16 input), never a buffer the launch read before through the non-coherent path. The
+// mixer's counters are reset with the FFN's by the last block out.
+template <int NT, bool CODED, int PFG, int PFF>
+__global__ void __launch_bounds__(kWarps * 32, 1) gdn_ffn_persistent_kernel(MkGdnArgs g, MkFfnArgs f) {
+  gdn_mixer_body<NT, true, PFG, true>(g);
+  ffn_body<NT, CODED, true, PFF, true>(f);
+}
+
+constexpr size_t kMkSpanSmem = sizeof(float) * kWarps * 2 * 16 * (2 * 8 + 1);  // the tiles' reduction buffer at NT 2
+
+template <int NT, bool CODED, int PFG, int PFF>
+int mk_span_resident() {
+  static const int r = [] {
+    int per_sm = 0, sms = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_ffn_persistent_kernel<NT, CODED, PFG, PFF>, kWarps * 32,
+                                                  kMkSpanSmem);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    return per_sm * sms;
+  }();
+  return r;
+}
+
+template <int NT, bool CODED, int PFG, int PFF>
+void mk_span_launch(MkGdnArgs& g, MkFfnArgs& f, cudaStream_t s) {
+  const int G = mk_span_resident<NT, CODED, PFG, PFF>();
+  if (G < 2 * g.chain || G < g.M) throw std::runtime_error("gdn_ffn_persistent: too few resident blocks");
+  static bool told = false;
+  if (!told) {
+    told = true;
+    std::fprintf(stderr, "megakernel stage 4: gdn_ffn_persistent<%d, PF %d/%d> on %d blocks\n", NT, PFG, PFF, G);
+  }
+  launch_kernel("gdn_ffn_persistent", gdn_ffn_persistent_kernel<NT, CODED, PFG, PFF>, dim3(G), dim3(kWarps * 32),
+                kMkSpanSmem, s, g, f);
+}
+
 int grid_of(size_t n) { return static_cast<int>(std::min<size_t>((n + 255) / 256, 65535 * 4)); }
 
 void check_shape(int N, int K, const char* what) {
@@ -1652,7 +1734,8 @@ void stream_gemm_multi(bool nvfp4, const __half* x, const float* xinv, int M, co
   else dispatch<false>(x, xinv, M, t, n, K, s);
 }
 
-bool gdn_persistent(const MkGdnParams& p, cudaStream_t s) {
+// The arguments of a mixer launch (false: a shape or override the kernel does not reproduce).
+static bool gdn_build(const MkGdnParams& p, MkGdnArgs& a) {
   static const int chain_env = sg_env("LING_MK_CHAIN", 24);
   const int chain = chain_env;
   if (p.M < 1 || p.M > kMaxStreamRows || p.Dk != kGdnK || p.Dv != kGdnK || p.HV % p.H != 0) return false;
@@ -1661,7 +1744,7 @@ bool gdn_persistent(const MkGdnParams& p, cudaStream_t s) {
   if (sg_env("LING_SG_PF", kInFlight) != 2 || sg_env("LING_SG_TW", kTilesWide) != 2 || sg_env("LING_SG_TN", kTilesNarrow) != 2 ||
       sg_env("LING_SG_TW4", kTilesWide4) != 2 || sg_env("LING_SG_TN4", kTilesNarrow4) != 2 || sg_env("LING_KSPLIT", 0) != 0)
     return false;
-  MkGdnArgs a{};
+  a = MkGdnArgs{};
   a.xh = p.xh;
   a.xinv = p.xinv;
   a.xn = p.xn;
@@ -1725,28 +1808,33 @@ bool gdn_persistent(const MkGdnParams& p, cudaStream_t s) {
     a.t_out = p.tail->out;
     a.t_xh = p.tail->xh;
     a.t_xinv = p.tail->xinv;
-    mk_gdn_launch<2, true>(a, s);
-    return true;
   }
-  if (p.M <= 8) mk_gdn_launch<1>(a, s);
+  return true;
+}
+
+bool gdn_persistent(const MkGdnParams& p, cudaStream_t s) {
+  MkGdnArgs a;
+  if (!gdn_build(p, a)) return false;
+  if (p.tail) mk_gdn_launch<2, true>(a, s);
+  else if (p.M <= 8) mk_gdn_launch<1>(a, s);
   else if (p.M <= 16) mk_gdn_launch<2>(a, s);
   else mk_gdn_launch<4>(a, s);
   return true;
 }
 
-bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarget& gate, const StreamTarget& up,
-                    const StreamTarget& down, int H, int I, float* g, float* u, __half* xh2, float* xinv2,
-                    unsigned* counters, cudaStream_t s, unsigned long long* times, const MkTail* tail) {
+// The arguments of an FFN launch (false: a shape or override the kernel does not reproduce).
+static bool ffn_build(const __half* xh, const float* xinv, int M, const StreamTarget& gate, const StreamTarget& up,
+                      const StreamTarget& down, int H, int I, float* g, float* u, __half* xh2, float* xinv2,
+                      unsigned* counters, unsigned long long* times, const MkTail* tail, MkFfnArgs& a) {
   const bool coded = gate.wscale != nullptr;
   if (tail && !mk_tail_rows(M)) return false;
-  static const int ffn_pf = sg_env("LING_MK_FFN_PF", 2);
   // Only the shapes dispatch() gives the four-kernel path: TILES 2 and PF 2 everywhere, one kind of blob.
   if ((up.wscale != nullptr) != coded || (down.wscale != nullptr) != coded) return false;
   if (M < 1 || M > kMaxStreamRows || H % kChunk || I % kChunk || gate.N != I || up.N != I || down.N != H) return false;
   if (sg_env("LING_SG_PF", kInFlight) != 2 || sg_env("LING_SG_TW", kTilesWide) != 2 || sg_env("LING_SG_TN", kTilesNarrow) != 2 ||
       sg_env("LING_SG_TW4", kTilesWide4) != 2 || sg_env("LING_SG_TN4", kTilesNarrow4) != 2 || sg_env("LING_KSPLIT", 0) != 0)
     return false;
-  MkFfnArgs a{};
+  a = MkFfnArgs{};
   a.xh = xh;
   a.xinv = xinv;
   const StreamTarget* ut[2] = {&gate, &up};
@@ -1787,6 +1875,18 @@ bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarg
     a.norm_xh = tail->xh;
     a.norm_xinv = tail->xinv;
     a.eps = tail->eps;
+  }
+  return true;
+}
+
+bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarget& gate, const StreamTarget& up,
+                    const StreamTarget& down, int H, int I, float* g, float* u, __half* xh2, float* xinv2,
+                    unsigned* counters, cudaStream_t s, unsigned long long* times, const MkTail* tail) {
+  static const int ffn_pf = sg_env("LING_MK_FFN_PF", 2);
+  MkFfnArgs a;
+  if (!ffn_build(xh, xinv, M, gate, up, down, H, I, g, u, xh2, xinv2, counters, times, tail, a)) return false;
+  const bool coded = gate.wscale != nullptr;
+  if (tail) {
     if (ffn_pf == 4) coded ? mk_ffn_launch<2, true, true, 4>(a, s) : mk_ffn_launch<2, false, true, 4>(a, s);
     else coded ? mk_ffn_launch<2, true, true>(a, s) : mk_ffn_launch<2, false, true>(a, s);
     return true;
@@ -1889,6 +1989,36 @@ bool attn_persistent(const MkAttnParams& p, cudaStream_t s) {
     else mk_attn_launch<2, 2>(a, s);
   }
   return true;
+}
+
+
+bool gdn_ffn_persistent(const MkGdnParams& gp, const StreamTarget& gate, const StreamTarget& up, const StreamTarget& down,
+                        int I, float* g, float* u, __half* xh2, float* xinv2, unsigned* counters,
+                        unsigned long long* times, const MkTail* tail, cudaStream_t s) {
+  static const int pfg = sg_env("LING_MK_SPAN_PFG", 2), pff = sg_env("LING_MK_SPAN_PFF", 3);
+  if (!gp.tail || !gp.tail->norm_w || !tail || !mk_tail_rows(gp.M)) return false;
+  if (gp.tail->xh == gp.xh2 || xh2 == gp.xh2 || xinv2 == gp.xinv2 || gp.tail->xh == gp.xh) return false;  // see the kernel
+  MkGdnArgs ga;
+  MkFfnArgs fa;
+  if (!gdn_build(gp, ga)) return false;
+  if (!ffn_build(gp.tail->xh, gp.tail->xinv, gp.M, gate, up, down, gp.K, I, g, u, xh2, xinv2, counters, times, tail, fa))
+    return false;
+  fa.start_c = gp.counters + kMkGdnNormDone;
+  fa.start_target = static_cast<unsigned>(gp.M);
+  fa.c2 = gp.counters;
+  fa.c2_words = kMkGdnWords;
+  const bool coded = gate.wscale != nullptr;
+#define LING_SPAN(PG, PFF_)                                                                              \
+  if (pfg == PG && pff == PFF_) {                                                                        \
+    coded ? mk_span_launch<2, true, PG, PFF_>(ga, fa, s) : mk_span_launch<2, false, PG, PFF_>(ga, fa, s); \
+    return true;                                                                                         \
+  }
+  LING_SPAN(2, 3)
+  LING_SPAN(2, 4)
+  LING_SPAN(3, 3)
+  LING_SPAN(3, 4)
+#undef LING_SPAN
+  return false;
 }
 
 }  // namespace ling::kernels

@@ -381,13 +381,18 @@ class Engine {
   // projection's input and one counter set per layer.
   int mk_ffn_ = 1;
   unsigned* mk_counters_ = nullptr;
-  // Stage 2 (LING_MK_GDN, on by default since 2026-10-19; LING_MK_GDN=0 turns it off): a chain verify's DeltaNet
-  // mixer as one persistent kernel (a tree verify keeps the graph path's mixer).
+  // Stage 2 (LING_MK_GDN, on by default since 2026-10-19; LING_MK_GDN=0 turns it off): a verify's DeltaNet
+  // mixer as one persistent kernel; a tree verify's too since 2026-10-20 (LING_MK_GDN_TREE=0: its graph path).
   int mk_gdn_ = 1;
   unsigned* mk_gdn_counters_ = nullptr;
   int mk_attn_ = 0;  // stage 3 (LING_MK_ATTN=1): a verify's attention layer as one persistent kernel
   unsigned* mk_attn_counters_ = nullptr;
   unsigned long long* mk_attn_times_ = nullptr;  // LING_MK_TIMES: [layer][kernels::kMkAttnEvents]
+  int mk_span_ = 0;  // stage 4 (LING_MK_SPAN=1): a verify's DeltaNet mixer and FFN in one persistent launch
+  __half* xh3_ = nullptr;  // its post-attention norm's FP16 copy and the FFN's down input (not the mixer's buffers)
+  float* xinv3_ = nullptr;
+  __half* xh4_ = nullptr;
+  float* xinv4_ = nullptr;
   int mk_layers_ = 0;  // stage 4 (LING_MK_LAYERS=1): the residual adds and the next norms inside the persistent kernels
   // LING_MK_TIMES=1: the persistent kernels' timings store ([layer][kMkTimesBlocks][kMkTimesPerBlock] globaltimer
   // stamps of each layer's last launch), summarized on stderr when the engine is destroyed.

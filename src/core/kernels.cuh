@@ -298,6 +298,13 @@ struct MkGdnParams {
   const TreeDesc* td = nullptr;  // a tree verify (BACKLOG 26): the tree conv and the per-path recurrence
 };
 bool gdn_persistent(const MkGdnParams& p, cudaStream_t s);
+// The megakernel's stage 4 (LING_MK_SPAN): a verify's DeltaNet layer, its mixer (as gdn_persistent with gp.tail) and
+// its FFN (as ffn_persistent with tail), in one persistent launch. gp.tail must carry the post-attention norm into its
+// own FP16 buffer (not gp.xh or gp.xh2), and xh2/xinv2 (the down projection's input) must not be the mixer's. False:
+// not built for these shapes or options (LING_MK_SPAN_PFG 2 or 3, LING_MK_SPAN_PFF 3 or 4); nothing launched.
+bool gdn_ffn_persistent(const MkGdnParams& gp, const StreamTarget& gate, const StreamTarget& up, const StreamTarget& down,
+                        int I, float* g, float* u, __half* xh2, float* xinv2, unsigned* counters,
+                        unsigned long long* times, const MkTail* tail, cudaStream_t s);
 // tail (stage 4): the down projection into tail->h, then tail's norm (down.y unused).
 bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarget& gate, const StreamTarget& up,
                     const StreamTarget& down, int H, int I, float* g, float* u, __half* xh2, float* xinv2,

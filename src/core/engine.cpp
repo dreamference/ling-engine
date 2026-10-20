@@ -211,6 +211,15 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   if (const char* e = std::getenv("LING_MK_GDN")) mk_gdn_ = std::atoi(e);
   if (const char* e = std::getenv("LING_MK_ATTN")) mk_attn_ = std::atoi(e);
   if (const char* e = std::getenv("LING_MK_LAYERS")) mk_layers_ = std::atoi(e);
+  if (const char* e = std::getenv("LING_MK_SPAN")) mk_span_ = std::atoi(e);
+  if (mk_span_ > 0) {  // the spanning kernel's own FP16 copies (see kernels::gdn_ffn_persistent)
+    xh3_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * c.hidden);
+    xinv3_ = alloc<float>(kernels::kMaxStreamRows);
+    xh4_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * c.intermediate);
+    xinv4_ = alloc<float>(kernels::kMaxStreamRows);
+    std::fprintf(stderr, "megakernel stage 4: a verify's DeltaNet mixer and FFN in one launch (LING_MK_SPAN=%d)\n",
+                 mk_span_);
+  }
   if (mk_layers_ > 0)
     std::fprintf(stderr, "megakernel stage 4: the residual adds and the next norms inside the persistent kernels "
                          "(LING_MK_LAYERS=%d)\n", mk_layers_);
@@ -851,12 +860,14 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   // norm (rmsnorm_half's, exactly) into xn_, xh_ and xinv_, so the add and the norm kernels are skipped. pre_normed: the
   // previous layer's FFN left this layer's input norm; post_normed: this layer's mixer left the post-attention norm.
   const bool tails = mk_layers_ > 0 && !quantized_ && kernels::mk_tail_rows(M);
+  const bool span = mk_span_ > 0 && !quantized_ && kernels::mk_tail_rows(M);
   bool pre_normed = false;
   for (int li = 0; li < c.layers; ++li) {
     const LayerWeights& L = model_->layers()[li];
     const int slot = layer_slot_[li];
     const kernels::MkTail post_tail{h_, L.post_norm, xn_, xh_, xinv_, c.eps};
     bool post_normed = false;
+    bool span_done = false, pre_normed_next = false;  // stage 4 (LING_MK_SPAN): this layer's mixer and FFN in one launch
     // --prefill-bf16 (B34): a DeltaNet layer of a prefill takes the BF16 branch below, which runs its own norm.
     const bool bf16_gdn = !L.full && quantized_ && prefill_bf16_;
     // The prefill path quantizes the norm's output for the projections that follow; the DeltaNet's a and b
@@ -1005,9 +1016,9 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       float* beta = verify ? v_beta_[slot] : beta_;
       const bool fork = fork_ > 0 && verify && !tree_ && !multi && !quantized_ && L.in_a.N == L.in_b.N;
       // The megakernel's stage 2 (LING_MK_GDN): the whole mixer of one verify sequence as one persistent kernel; a tree
-      // verify (BACKLOG 26) with LING_MK_GDN_TREE=1 (off until measured: the tree conv and the per-path recurrence;
-      // otherwise a tree keeps the graph path's mixer).
-      static const bool gdn_tree = std::getenv("LING_MK_GDN_TREE") && std::atoi(std::getenv("LING_MK_GDN_TREE")) != 0;
+      // verify (BACKLOG 26) too, with the tree conv and the per-path recurrence (on by default since 2026-10-20:
+      // -3.0 ms per tree step at 24K; LING_MK_GDN_TREE=0 gives a tree the graph path's mixer).
+      static const bool gdn_tree = !std::getenv("LING_MK_GDN_TREE") || std::atoi(std::getenv("LING_MK_GDN_TREE")) != 0;
       bool mk_gdn = mk_gdn_ > 0 && verify && (!tree_ || gdn_tree) && !multi && !quantized_ && xn_half && L.in_a.N == L.in_b.N &&
                     L.in_a.N == c.lin_v_heads;
       if (mk_gdn) {
@@ -1049,9 +1060,27 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         p.counters = mk_gdn_counters_ + size_t(slot) * kernels::kMkGdnWords;
         if (mk_gdn_times_) p.times = mk_gdn_times_ + size_t(li) * kMkTimesBlocks * kernels::kMkTimesPerBlock;
         if (tails) p.tail = &post_tail;
-        mk_gdn = L.in_qkv.K == H && L.in_z.K == H && L.out.K == Vs && L.in_a.K == H && kernels::gdn_persistent(p, stream_);
+        const bool shapes = L.in_qkv.K == H && L.in_z.K == H && L.out.K == Vs && L.in_a.K == H;
+        if (span && shapes && mk_ffn_ > 0) {  // stage 4 (LING_MK_SPAN): the mixer and the FFN in one launch
+          const kernels::MkTail span_post{h_, L.post_norm, xn_, xh3_, xinv3_, c.eps};
+          const kernels::MkTail span_next{h_, li + 1 < c.layers ? model_->layers()[li + 1].input_norm : nullptr, xn_,
+                                          xh_, xinv_, c.eps};
+          const kernels::StreamTarget sg_g{L.gate.w, L.gate.table, L.gate.scale2, t1_, L.gate.N},
+              sg_u{L.up.w, L.up.table, L.up.scale2, t2_, L.up.N},
+              sg_d{L.down.w, L.down.table, L.down.scale2, t2_, L.down.N};
+          p.tail = &span_post;
+          span_done = kernels::gdn_ffn_persistent(
+              p, sg_g, sg_u, sg_d, I, t1_, t2_, xh4_, xinv4_, mk_counters_ + size_t(li) * kernels::kMkFfnWords,
+              mk_ffn_times_ ? mk_ffn_times_ + size_t(li) * kMkTimesBlocks * kernels::kMkTimesPerBlock : nullptr,
+              &span_next, stream_);
+          p.tail = tails ? &post_tail : nullptr;
+          if (span_done) pre_normed_next = span_next.norm_w != nullptr;
+        }
+        mk_gdn = span_done || (shapes && kernels::gdn_persistent(p, stream_));
       }
-      if (mk_gdn) {
+      if (span_done) {
+        mark("gdn_proj");
+      } else if (mk_gdn) {
         if (tails) post_normed = true;
         else kernels::add_inplace(h_, t1_, M * H, stream_);
         mark("gdn_proj");
@@ -1149,7 +1178,9 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       mark("gdn_proj");
       }  // not forked
     }
-    {
+    if (span_done) {
+      pre_normed = pre_normed_next;  // the spanning kernel ran the FFN and left the next layer's input norm
+    } else {
       NvtxRange r("mlp");
       const bool post_half =
           post_normed || norm_rows(h_, L.post_norm, xn_, M, L.gate.in_scale, true, L.up.in_scale != L.gate.in_scale);

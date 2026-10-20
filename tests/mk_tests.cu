@@ -307,6 +307,134 @@ int ffn_tail(std::mt19937_64& rng, int M, bool norm) {
   return bad;
 }
 
+// Stage 4 (LING_MK_SPAN): a DeltaNet layer's mixer and FFN in one launch against gdn_persistent and ffn_persistent with
+// their tails (each checked against the graph path's kernels), bit for bit: the residual stream, the next norm and the
+// mixer's intermediates.
+int span_layer(std::mt19937_64& rng, int M) {
+  const int H = 5120, I = 17408, Hk = 16, HV = 48, Dk = 128, C = 2 * Hk * Dk + HV * Dk, Vs = HV * Dk;
+  const float eps = 1e-6f;
+  uint8_t* wqkv = fp8_matrix(rng, C, H, 0.4f);
+  uint8_t* wz = fp8_matrix(rng, Vs, H, 0.4f);
+  uint8_t* wout = fp8_matrix(rng, H, Vs, 0.4f);
+  uint8_t* wg = fp4_matrix(rng, I, H);
+  uint8_t* wu = fp4_matrix(rng, I, H);
+  uint8_t* wd = fp4_matrix(rng, H, I);
+  __nv_bfloat16* wa = upload(bf16_random(rng, size_t(HV) * H, -0.02f, 0.02f));
+  __nv_bfloat16* wb = upload(bf16_random(rng, size_t(HV) * H, -0.02f, 0.02f));
+  __nv_bfloat16* A_log = upload(bf16_random(rng, HV, -1.f, 1.f));
+  __nv_bfloat16* dt_bias = upload(bf16_random(rng, HV, -1.f, 1.f));
+  __nv_bfloat16* conv_w = upload(bf16_random(rng, size_t(C) * 4, -0.5f, 0.5f));
+  __nv_bfloat16* lin_norm = upload(bf16_random(rng, Dk, 0.5f, 1.5f));
+  __nv_bfloat16* in_norm = upload(bf16_random(rng, H, -0.3f, 0.3f));
+  __nv_bfloat16* post_norm = upload(bf16_random(rng, H, -0.3f, 0.3f));
+  __nv_bfloat16* next_norm = upload(bf16_random(rng, H, -0.3f, 0.3f));
+  std::normal_distribution<float> nd(0.f, 1.f);
+  std::vector<float> hcs(size_t(C) * 3), hst(size_t(HV) * Dk * Dk), hx(size_t(M) * H);
+  for (float& x : hcs) x = nd(rng);
+  for (float& x : hst) x = 0.05f * nd(rng);
+  for (float& x : hx) x = nd(rng);
+  float* conv_state = upload(hcs);
+  float* state = upload(hst);
+  struct Bufs {
+    float *h, *xn, *xinv, *vpre, *z, *a, *b, *g, *beta, *mixed, *core, *normed, *xinv2, *xinv3, *t1, *t2, *xinv4;
+    __half *xh, *xh2, *xh3, *xh4;
+    unsigned *cg, *cf;
+  } B[2];
+  for (Bufs& b : B) {
+    b.h = upload(hx);
+    b.xn = alloc<float>(size_t(M) * H);
+    b.xh = alloc<__half>(size_t(M) * H);
+    b.xinv = alloc<float>(32);
+    k::rmsnorm_half(b.h, in_norm, b.xn, b.xh, b.xinv, M, H, eps, true, nullptr);
+    b.vpre = alloc<float>(size_t(M) * C);
+    b.z = alloc<float>(size_t(M) * Vs);
+    for (float** p : {&b.a, &b.b, &b.g, &b.beta}) *p = alloc<float>(size_t(M) * HV);
+    b.mixed = alloc<float>(size_t(M) * C);
+    b.core = alloc<float>(size_t(M) * Vs);
+    b.normed = alloc<float>(size_t(M) * Vs);
+    b.xh2 = alloc<__half>(size_t(32) * Vs);
+    b.xinv2 = alloc<float>(32);
+    b.xh3 = alloc<__half>(size_t(32) * H);
+    b.xinv3 = alloc<float>(32);
+    b.t1 = alloc<float>(size_t(M) * I);
+    b.t2 = alloc<float>(size_t(M) * I);
+    b.xh4 = alloc<__half>(size_t(32) * I);
+    b.xinv4 = alloc<float>(32);
+    b.cg = alloc<unsigned>(k::kMkGdnWords);
+    b.cf = alloc<unsigned>(k::kMkFfnWords);
+  }
+  auto params = [&](Bufs& b, const k::MkTail* tail) {
+    k::MkGdnParams p{};
+    p.xh = b.xh;
+    p.xinv = b.xinv;
+    p.xn = b.xn;
+    p.M = M;
+    p.K = H;
+    p.in_qkv = {wqkv, nullptr, 0.003f, b.vpre, C};
+    p.in_z = {wz, nullptr, 0.0031f, b.z, Vs};
+    p.out = {wout, nullptr, 0.0029f, nullptr, H};
+    p.wa = wa;
+    p.wb = wb;
+    p.a = b.a;
+    p.b = b.b;
+    p.g = b.g;
+    p.beta = b.beta;
+    p.A_log = A_log;
+    p.dt_bias = dt_bias;
+    p.mixed = b.mixed;
+    p.conv_state = conv_state;
+    p.conv_w = conv_w;
+    p.state = state;
+    p.core = b.core;
+    p.norm_w = lin_norm;
+    p.eps = eps;
+    p.normed = b.normed;
+    p.xh2 = b.xh2;
+    p.xinv2 = b.xinv2;
+    p.C = C;
+    p.H = Hk;
+    p.HV = HV;
+    p.Dk = Dk;
+    p.Dv = Dk;
+    p.Vs = Vs;
+    p.counters = b.cg;
+    p.tail = tail;
+    return p;
+  };
+  const k::StreamTarget tg[2] = {{wg, nullptr, 0.9f, B[0].t1, I}, {wg, nullptr, 0.9f, B[1].t1, I}};
+  const k::StreamTarget tu[2] = {{wu, nullptr, 1.1f, B[0].t2, I}, {wu, nullptr, 1.1f, B[1].t2, I}};
+  const k::StreamTarget td[2] = {{wd, nullptr, 0.7f, B[0].t2, H}, {wd, nullptr, 0.7f, B[1].t2, H}};
+  // The two launches.
+  const k::MkTail post0{B[0].h, post_norm, B[0].xn, B[0].xh3, B[0].xinv3, eps};
+  const k::MkTail next0{B[0].h, next_norm, B[0].xn, B[0].xh, B[0].xinv, eps};
+  const k::MkGdnParams p0 = params(B[0], &post0);
+  bool ok = k::gdn_persistent(p0, nullptr) &&
+            k::ffn_persistent(B[0].xh3, B[0].xinv3, M, tg[0], tu[0], td[0], H, I, B[0].t1, B[0].t2, B[0].xh4,
+                              B[0].xinv4, B[0].cf, nullptr, nullptr, &next0);
+  // The spanning one.
+  const k::MkTail post1{B[1].h, post_norm, B[1].xn, B[1].xh3, B[1].xinv3, eps};
+  const k::MkTail next1{B[1].h, next_norm, B[1].xn, B[1].xh, B[1].xinv, eps};
+  const k::MkGdnParams p1 = params(B[1], &post1);
+  ok = ok && k::gdn_ffn_persistent(p1, tg[1], tu[1], td[1], I, B[1].t1, B[1].t2, B[1].xh4, B[1].xinv4, B[1].cf, nullptr,
+                                   &next1, nullptr);
+  if (!ok || cudaDeviceSynchronize() != cudaSuccess) {
+    std::printf("    %s\n", ok ? cudaGetErrorString(cudaGetLastError()) : "a launch refused the shape");
+    return 1;
+  }
+  int bad = same("in_qkv", B[0].vpre, B[1].vpre, size_t(M) * C);
+  bad += same("core", B[0].core, B[1].core, size_t(M) * Vs);
+  bad += same("post norm FP16", B[0].xh3, B[1].xh3, size_t(M) * H);
+  bad += same("residual", B[0].h, B[1].h, size_t(M) * H);
+  bad += same("next norm", B[0].xn, B[1].xn, size_t(M) * H);
+  bad += same("next norm FP16", B[0].xh, B[1].xh, size_t(M) * H);
+  bad += same("next norm scales", B[0].xinv, B[1].xinv, M);
+  for (const Bufs& b : B) {
+    for (unsigned w : download(b.cg, k::kMkGdnWords)) bad += w != 0;
+    for (unsigned w : download(b.cf, k::kMkFfnWords)) bad += w != 0;
+  }
+  return bad;  // (test buffers are left to the process's exit)
+}
+
 }  // namespace
 
 int main() {
@@ -333,6 +461,9 @@ int main() {
                   bad ? "DIFFERS" : "bit for bit");
       failed += bad != 0;
     }
+    bad = span_layer(rng, M);
+    std::printf("DeltaNet layer in one launch, %d rows: %s\n", M, bad ? "DIFFERS" : "bit for bit");
+    failed += bad != 0;
   }
   std::printf("%s\n", failed ? "FAILED" : "all passed");
   return failed ? 1 : 0;
