@@ -16,6 +16,40 @@ namespace ling::serve {
 
 using json = nlohmann::ordered_json;
 
+// The repetition stop rule (API §9; the owner's decision of 2026-10-20): a request ends with finish reason
+// "repetition" when its output, reasoning included, ends in a block of min_pattern_size .. max_pattern_size tokens
+// repeated min_count times back to back (vLLM's RepetitionDetectionParams, the same test on the tail), or in one
+// token repeated max_run times (an extension). max_pattern_size 0 turns the first test off, max_run 0 the second.
+// The output up to the token that completed the loop is sent unchanged.
+struct RepetitionDetection {
+  int max_pattern_size = 0, min_pattern_size = 0, min_count = 0, max_run = 0;
+  bool on() const { return max_pattern_size > 0 || max_run > 0; }
+};
+// The server's default (--repetition-detection; API §9 has the measurement): the production SWE-bench rollouts (43,832
+// responses, 5.9 M tokens, no reasoning text in them) and bench/agentlong's step dumps (reasoning included) repeat a
+// 2-token block at most 7 times, 3- to 7-token blocks 4 times, longer ones 3 times, and one token 14 times.
+inline constexpr RepetitionDetection kRepetitionDefault{256, 2, 12, 64};
+
+// Throws std::invalid_argument as vLLM validates its parameters: sizes >= 0, min <= max, min_count >= 2 when the
+// pattern test is on, max_run 0 or >= 2.
+void validate(const RepetitionDetection& r);
+
+// The rule over a request's tokens as they are produced: push() each one, true once the output ends in a loop.
+// For each period P a count of the trailing positions whose token equals the one P before, so the cost per token is
+// one comparison per period, and a block of P repeated R times is a count of at least (R - 1) P.
+class RepetitionDetector {
+ public:
+  explicit RepetitionDetector(const RepetitionDetection& r);
+  bool push(int token);
+
+ private:
+  RepetitionDetection r_;
+  std::vector<int> tail_;  // the last max_pattern_size tokens, a ring
+  std::vector<int> run_;   // run_[P]: trailing positions i with token[i] == token[i - P]
+  long n_ = 0;
+  int last_ = -1, same_ = 0;
+};
+
 struct Request {
   bool chat = true;
   bool stream = false;
@@ -36,7 +70,13 @@ struct Request {
   // resident session first, and which sessions are protected from eviction (M4 §1). A hint only: the
   // token prefix decides what is reused. Empty when the request carries none.
   std::string session_key;
+  // `repetition_detection` (API §9): the fields the request set, -1 for those it left to the server's
+  // default; `false` sets them all to 0 (off). resolve_repetition() makes the rule the request runs with.
+  RepetitionDetection repetition{-1, -1, -1, -1};
 };
+
+// The request's repetition rule: its own fields over the server's default, validated (std::invalid_argument).
+RepetitionDetection resolve_repetition(const Request& r, const RepetitionDetection& server);
 
 constexpr int kMaxTopLogprobs = 20;  // vLLM's --max-logprobs default
 

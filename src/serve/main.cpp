@@ -6,7 +6,8 @@
 //              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
-//              [--side-prefill N] [--draft-bf16]
+//              [--side-prefill N] [--draft-bf16] [--repetition-detection P,p,R,K|off]
+//              [--repetition-report incomplete|completed]
 //
 // --sessions N (default 2; M4 §1) keeps N resident sessions, each with its own KV cache and state, so N
 // agent tasks that alternate keep their histories warm. A request runs in the session it extends (its
@@ -37,6 +38,12 @@
 // --draft-bf16 reads the drafter's fc and conv kernel projections in BF16, as its file has them, instead of the
 // NVFP4 copies rounded at load (BACKLOG 33; the default since 2026-10-20; LING_DRAFT_NVFP4=0/1 overrides). Only the
 // drafter's proposals change, so only acceptance can move: the verify decides every token either way.
+//
+// --repetition-detection P,p,R,K (API §9; default 256,2,12,64; `off` or 0,0,0,0 switches it off) is the repetition
+// stop rule a request runs with unless its `repetition_detection` says otherwise: an output (reasoning included) that
+// ends in a block of p .. P tokens repeated R times, or in one token repeated K times, ends with finish reason
+// "repetition". --repetition-report completed reports such a stop on /v1/responses as a completed response with
+// `stop_reason: "repetition"` instead of the default `response.incomplete` (reason "repetition"), which Codex retries.
 //
 // With --draft, requests decode speculatively with the DFlash2 drafter (requests that set penalties
 // decode plainly). GET /metrics exports SGLang's counter names, so M0's replay harness reads them as is.
@@ -83,6 +90,7 @@ struct Metrics {
   double e2e_sum = 0, e2e_count = 0, ttft_sum = 0, ttft_count = 0;
   double accepted_drafts = 0, drafted = 0;
   double nonfinite = 0;  // requests ended because the logits were not finite
+  double repetition_stops = 0;  // requests ended by the repetition stop rule (API §9)
   SpecStats spec;  // the engine's speculation counters after the last request
   // Gauges the benchmark harness reads (its admission and its parallelism): requests running (up to
   // --batch at once, M4 §3) and queued, and the token pool a night's tasks are budgeted
@@ -139,6 +147,7 @@ struct Metrics {
     counter("ling:spec_drafted_tokens_total", drafted, "Drafted tokens offered to the verify.");
     counter("ling:spec_accepted_tokens_total", accepted_drafts, "Drafted tokens accepted.");
     counter("ling:nonfinite_logits_total", nonfinite, "Requests ended because the logits were NaN or inf.");
+    counter("ling:repetition_stops_total", repetition_stops, "Requests ended by the repetition stop rule.");
     counter("ling:session_evictions_total", session_evictions, "Resident sessions replaced by a new session.");
     counter("ling:prefill_chunks_interleaved_total", prefill_chunks_interleaved,
             "Prefill chunks run between another request's decode steps.");
@@ -176,6 +185,10 @@ struct ServerContext {
   int think_end = -1, newline = -1, blank_line = -1;
   // How often a streamed request that has produced no token yet is sent a keep-alive (0: never).
   int keepalive_ms = 15000;
+  // The repetition stop rule's default (--repetition-detection), and whether /v1/responses reports its stop as a
+  // completed response (--repetition-report completed) rather than response.incomplete.
+  RepetitionDetection repetition = kRepetitionDefault;
+  bool repetition_completed = false;
   Metrics metrics;
 };
 
@@ -234,6 +247,7 @@ struct Running {
   std::vector<int> pending;   // chosen tokens not yet emitted
   std::optional<StreamDecoder> dec;
   std::optional<StopScanner> stops;
+  std::optional<RepetitionDetector> repeat;  // the request's repetition stop rule, when on (API §9)
   std::string finish = "length";
   int produced = 0, passes = 0, reasoning = 0;
   bool in_think = false;
@@ -578,6 +592,7 @@ class Scheduler {
     r.t_decode = r.last_step = std::chrono::steady_clock::now();
     r.dec.emplace(*ctx_.tok);
     r.stops.emplace(j.req.stop);
+    if (j.req.repetition.on()) r.repeat.emplace(j.req.repetition);
     r.in_think = j.req.reasoning;  // the prompt ends inside <think>
     r.logits = eng.logits();
     // `pending` holds chosen tokens not yet emitted: the first from the prefill's logits, then a
@@ -632,6 +647,14 @@ class Scheduler {
       if (!ready.empty()) job.sink.text(ready);
       if (r.stops->stopped()) {
         r.finish = "stop";
+        return true;
+      }
+      // The repetition stop rule (API §9): on the produced tokens, reasoning included; the token that completes the
+      // loop has been sent, nothing after it is.
+      if (r.repeat && r.repeat->push(t)) {
+        r.finish = "repetition";
+        std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+        ctx_.metrics.repetition_stops += 1;
         return true;
       }
       if (r.produced >= r.limit) return true;
@@ -845,6 +868,7 @@ class Handler : public proxygen::RequestHandler {
       if (auto buf = body_.move()) text = buf->moveToFbString().toStdString();
       json body = json::parse(text);
       job.req = parse_request(body, chat);
+      job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
     } catch (const std::exception& e) {
       send_json(downstream_, 400, error_body(e.what(), "invalid_request_error"));
       return;
@@ -1061,6 +1085,7 @@ class Handler : public proxygen::RequestHandler {
       std::string text;
       if (auto buf = body_.move()) text = buf->moveToFbString().toStdString();
       job.req = parse_responses_request(json::parse(text));
+      job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
     } catch (const std::exception& e) {
       send_json(downstream_, 400, error_body(e.what(), "invalid_request_error"));
       return;
@@ -1068,6 +1093,7 @@ class Handler : public proxygen::RequestHandler {
     job.prompt = ctx_.tok->encode(job.req.prompt_text);
     job.cancelled = ex_->cancelled;
     const Request req = job.req;
+    const bool repetition_completed = ctx_.repetition_completed;
     auto ex = ex_;
     const std::string model = ctx_.model_name;
     const long created = std::time(nullptr);
@@ -1218,8 +1244,14 @@ class Handler : public proxygen::RequestHandler {
       deliver(st->parser.finish());
       close_reasoning();
       close_message();
-      json resp = response_obj(finish == "length" ? "incomplete" : "completed");
+      // A repetition stop (API §9) is response.incomplete with reason "repetition" (the ling launcher's loop guard
+      // reads it; Codex alone retries it), or with --repetition-report completed a completed response; either way
+      // the response says stop_reason "repetition", and every delta up to the loop's last token went out first.
+      const bool repeated = finish == "repetition", rep_incomplete = repeated && !repetition_completed;
+      json resp = response_obj(finish == "length" || rep_incomplete ? "incomplete" : "completed");
       if (finish == "length") resp["incomplete_details"] = {{"reason", "max_output_tokens"}};
+      if (rep_incomplete) resp["incomplete_details"] = {{"reason", "repetition"}};
+      if (repeated) resp["stop_reason"] = "repetition";
       resp["usage"] = {{"input_tokens", prompt_tokens},
                        {"input_tokens_details", {{"cached_tokens", cached}}},
                        {"output_tokens", completion_tokens},
@@ -1228,7 +1260,7 @@ class Handler : public proxygen::RequestHandler {
       if (req.stream) {
         // A response cut at max_output_tokens still ends with response.completed: the agent treats
         // response.incomplete as a failed turn and discards what was written.
-        event("response.completed", {{"response", resp}});
+        event(rep_incomplete ? "response.incomplete" : "response.completed", {{"response", resp}});
         post(ex, [](proxygen::ResponseHandler* d) { ResponseBuilder(d).sendWithEOM(); });
       } else {
         post(ex, [resp](proxygen::ResponseHandler* d) { send_json(d, 200, resp); });
@@ -1279,6 +1311,7 @@ int main(int argc, char** argv) {
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40;
   double protect_seconds = 30;
   bool draft_bf16 = false;
+  std::string repetition_arg, repetition_report = "incomplete";
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -1312,13 +1345,15 @@ int main(int argc, char** argv) {
     else if (a == "--batch") batch = std::stoi(next());
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else if (a == "--side-prefill") side_prefill = std::stoi(next());
+    else if (a == "--repetition-detection") repetition_arg = next();
+    else if (a == "--repetition-report") repetition_report = next();
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--draft-bf16]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]\n";
     return 2;
   }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
@@ -1337,6 +1372,30 @@ int main(int argc, char** argv) {
   // --pretokenizer checkpoint asks for the checkpoint's own pattern.
   if (pretokenizer != "production" && pretokenizer != "checkpoint") {
     std::cerr << "--pretokenizer is production or checkpoint\n";
+    return 2;
+  }
+  ling::serve::RepetitionDetection repetition = ling::serve::kRepetitionDefault;
+  if (!repetition_arg.empty()) {
+    if (repetition_arg == "off") {
+      repetition = {0, 0, 0, 0};
+    } else {
+      int v[4];
+      char tail = 0;
+      if (std::sscanf(repetition_arg.c_str(), "%d,%d,%d,%d%c", &v[0], &v[1], &v[2], &v[3], &tail) != 4) {
+        std::cerr << "--repetition-detection is P,p,R,K (max and min pattern size, min count, max run) or off\n";
+        return 2;
+      }
+      repetition = {v[0], v[1], v[2], v[3]};
+    }
+    try {
+      ling::serve::validate(repetition);
+    } catch (const std::exception& e) {
+      std::cerr << "--repetition-detection: " << e.what() << "\n";
+      return 2;
+    }
+  }
+  if (repetition_report != "incomplete" && repetition_report != "completed") {
+    std::cerr << "--repetition-report is incomplete or completed\n";
     return 2;
   }
   ling::Tokenizer tok(model_dir + "/tokenizer.json", pretokenizer == "production" ? ling::kProductionPretokenizer : "");
@@ -1380,6 +1439,11 @@ int main(int argc, char** argv) {
   ctx.metrics.batch = batch;
   ctx.metrics.prefill_chunk_contended = contended;
   ctx.keepalive_ms = keepalive_seconds > 0 ? keepalive_seconds * 1000 : 0;
+  ctx.repetition = repetition;
+  ctx.repetition_completed = repetition_report == "completed";
+  if (ctx.repetition.on())
+    std::cerr << "repetition stop: blocks of " << ctx.repetition.min_pattern_size << "-" << ctx.repetition.max_pattern_size
+              << " tokens repeated " << ctx.repetition.min_count << " times, runs of " << ctx.repetition.max_run << "\n";
   ctx.think_end = tok.token_id("</think>");
   {
     const std::vector<int> one = tok.encode("\n"), two = tok.encode("\n\n");
