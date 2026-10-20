@@ -10,6 +10,8 @@ Why DFlash2 and not EAGLE-3. An autoregressive drafter makes one pass per draft 
 
 Changes to how the drafter runs (production already uses the NVFP4 build, so its weights are not a lever):
 
+- *(Done 2026-10-20, [BACKLOG §19](./DREAMFERENCE_LING_ENGINE_BACKLOG.md) item 33.)* The BF16 matrices the NVFP4 build left, the fc over the target's features and the conv kernel projections, read as NVFP4 copies rounded at load, on by default (`--draft-bf16` turns them off). Lossy in the drafter only: the verify stays exact, so the output is unchanged and only acceptance can move.
+
 - *(Superseded 2026-10-12 by [BACKLOG §19.19](./DREAMFERENCE_LING_ENGINE_BACKLOG.md), the context-aware sparse head: a static list cost −5.7% acceptance on average and −33% on multilingual prompts where it was measured.)* Give it a reduced-vocabulary head over the 32k most frequent tokens, 0.16 GB in FP8, instead of a second pass over the 0.72 GB target head. Candidate selection runs over that subset; its top-K codebooks stay in BF16 as in the W8 recipe. M3 measures the acceptance cost and falls back to a 64k head if it exceeds 0.2 accepted tokens.
 - Keep its features resident: the target hidden states it conditions on are written by the target's own kernels at layers 5, 19, 33, 47 and 61, so the drafter never recomputes anything over the context.
 - Capture it in the same CUDA graph as the verify, so a step is one graph launch.
