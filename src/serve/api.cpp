@@ -307,11 +307,9 @@ RepetitionDetector::RepetitionDetector(const RepetitionDetection& r) : r_(r) {
 
 bool RepetitionDetector::push(int token) {
   bool hit = false;
-  if (r_.max_run > 0) {
-    same_ = token == last_ ? same_ + 1 : 1;
-    last_ = token;
-    hit = same_ >= r_.max_run;
-  }
+  same_ = token == last_ ? same_ + 1 : 1;
+  last_ = token;
+  if (r_.max_run > 0) hit = same_ >= r_.max_run;
   const int Pmax = r_.max_pattern_size;
   if (Pmax > 0) {
     // run_[P] counts the trailing positions i (within the output) with token[i] == token[i - P]; the output ends in a
@@ -319,7 +317,10 @@ bool RepetitionDetector::push(int token) {
     for (int P = 1; P <= Pmax; ++P) {
       const bool eq = n_ >= P && tail_[(n_ - P) % Pmax] == token;
       run_[P] = eq ? run_[P] + 1 : 0;
-      if (P >= r_.min_pattern_size && run_[P] >= static_cast<long>(r_.min_count - 1) * P) hit = true;
+      // With max_run on, a run of one token (which is a block of any size P repeated) is max_run's to judge: the
+      // block test sees it only when the window holds two different tokens.
+      const bool one_token = r_.max_run > 0 && same_ >= static_cast<long>(r_.min_count) * P;
+      if (P >= r_.min_pattern_size && !one_token && run_[P] >= static_cast<long>(r_.min_count - 1) * P) hit = true;
     }
     tail_[n_ % Pmax] = token;
   }
