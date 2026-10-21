@@ -209,7 +209,21 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   }
   if (const char* e = std::getenv("LING_MK_FFN")) mk_ffn_ = std::atoi(e);
   if (const char* e = std::getenv("LING_MK_GDN")) mk_gdn_ = std::atoi(e);
-  if (mk_ffn_ > 0 || mk_gdn_ > 0) {
+  if (const char* e = std::getenv("LING_MK_ATTN")) mk_attn_ = std::atoi(e);
+  if (const char* e = std::getenv("LING_MK_LAYERS")) mk_layers_ = std::atoi(e);
+  if (const char* e = std::getenv("LING_MK_SPAN")) mk_span_ = std::atoi(e);
+  if (mk_span_ > 0) {  // the spanning kernel's own FP16 copies (see kernels::gdn_ffn_persistent)
+    xh3_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * c.hidden);
+    xinv3_ = alloc<float>(kernels::kMaxStreamRows);
+    xh4_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * c.intermediate);
+    xinv4_ = alloc<float>(kernels::kMaxStreamRows);
+    std::fprintf(stderr, "megakernel stage 4: a verify's DeltaNet mixer and FFN in one launch (LING_MK_SPAN=%d)\n",
+                 mk_span_);
+  }
+  if (mk_layers_ > 0)
+    std::fprintf(stderr, "megakernel stage 4: the residual adds and the next norms inside the persistent kernels "
+                         "(LING_MK_LAYERS=%d)\n", mk_layers_);
+  if (mk_ffn_ > 0 || mk_gdn_ > 0 || mk_attn_ > 0) {
     xh2_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * std::max(c.intermediate, Vs));
     xinv2_ = alloc<float>(kernels::kMaxStreamRows);
   }
@@ -225,6 +239,19 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
       *t = reinterpret_cast<unsigned long long*>(alloc<uint8_t>(n * sizeof(unsigned long long)));
       check(cudaMemset(*t, 0, n * sizeof(unsigned long long)), "megakernel timings");
     }
+  }
+  if (mk_attn_ > 0) {
+    const size_t words = size_t(c.layers) * kernels::kMkAttnWords;
+    mk_attn_counters_ = reinterpret_cast<unsigned*>(alloc<int>(words));
+    check(cudaMemset(mk_attn_counters_, 0, words * sizeof(unsigned)), "megakernel counters");
+    kernels::attn_persistent_prepare();
+    if (std::getenv("LING_MK_TIMES") && std::atoi(std::getenv("LING_MK_TIMES")) != 0) {
+      const size_t n = size_t(c.layers) * kernels::kMkAttnEvents;
+      mk_attn_times_ = reinterpret_cast<unsigned long long*>(alloc<uint8_t>(n * sizeof(unsigned long long)));
+      check(cudaMemset(mk_attn_times_, 0, n * sizeof(unsigned long long)), "megakernel timings");
+    }
+    std::fprintf(stderr, "megakernel stage 3: a verify's attention layer as one persistent kernel (LING_MK_ATTN=%d)\n",
+                 mk_attn_);
   }
   if (mk_gdn_ > 0) {
     const size_t words = size_t(c.layers) * kernels::kMkGdnWords;
@@ -328,10 +355,36 @@ void Engine::mk_times_report() {
       std::fprintf(stderr, "\n");
     }
   }
+  // Stage 3: each counter's completion, the mean over the attention layers of its offset from the start, in us.
+  std::vector<unsigned long long> e(size_t(c.layers) * kernels::kMkAttnEvents);
+  if (mk_attn_times_ &&
+      cudaMemcpy(e.data(), mk_attn_times_, e.size() * sizeof(e[0]), cudaMemcpyDeviceToHost) == cudaSuccess) {
+    constexpr int E = kernels::kMkAttnEvents;
+    double sum[E] = {}, cnt[E] = {};
+    int nl = 0;
+    for (int l = 0; l < c.layers; ++l) {
+      const unsigned long long* L = e.data() + size_t(l) * E;
+      if (!L[0]) continue;
+      ++nl;
+      for (int k = 1; k < E; ++k)
+        if (L[k] >= L[0] && L[k] - L[0] < 100'000'000ull) {
+          sum[k] += double(L[k] - L[0]) / 1e3;
+          cnt[k] += 1;
+        }
+    }
+    static const char* names[E] = {"start", "qkv0", "qkv1", "qkv2", "qkv3", "prep0", "prep1", "prep2", "prep3",
+                                   "attn0", "attn1", "attn2", "attn3", "combine", "half", "out"};
+    if (nl > 0) {
+      std::fprintf(stderr, "megakernel timings (attn_persistent, %d layers, last step; us from the start):", nl);
+      for (int k = 1; k < E; ++k)
+        if (cnt[k] > 0) std::fprintf(stderr, " %s %.1f", names[k], sum[k] / cnt[k]);
+      std::fprintf(stderr, "\n");
+    }
+  }
 }
 
 Engine::~Engine() {
-  if (mk_ffn_times_ || mk_gdn_times_) {
+  if (mk_ffn_times_ || mk_gdn_times_ || mk_attn_times_) {
     cudaDeviceSynchronize();
     mk_times_report();
   }
@@ -803,20 +856,75 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   check(cudaMemcpyAsync(ids_dev_, ids, M * sizeof(int), cudaMemcpyHostToDevice, stream_), "ids");
   kernels::embed(model_->embed(), ids_dev_, M, H, h_, stream_);
 
+  // The megakernel's stage 4 (LING_MK_LAYERS): a persistent kernel adds its output into h_ itself and computes the next
+  // norm (rmsnorm_half's, exactly) into xn_, xh_ and xinv_, so the add and the norm kernels are skipped. pre_normed: the
+  // previous layer's FFN left this layer's input norm; post_normed: this layer's mixer left the post-attention norm.
+  const bool tails = mk_layers_ > 0 && !quantized_ && kernels::mk_tail_rows(M);
+  const bool span = mk_span_ > 0 && !quantized_ && kernels::mk_tail_rows(M);
+  bool pre_normed = false;
   for (int li = 0; li < c.layers; ++li) {
     const LayerWeights& L = model_->layers()[li];
     const int slot = layer_slot_[li];
+    const kernels::MkTail post_tail{h_, L.post_norm, xn_, xh_, xinv_, c.eps};
+    bool post_normed = false;
+    bool span_done = false, pre_normed_next = false;  // stage 4 (LING_MK_SPAN): this layer's mixer and FFN in one launch
     // --prefill-bf16 (B34): a DeltaNet layer of a prefill takes the BF16 branch below, which runs its own norm.
     const bool bf16_gdn = !L.full && quantized_ && prefill_bf16_;
     // The prefill path quantizes the norm's output for the projections that follow; the DeltaNet's a and b
     // projections (BF16) also read it in FP32.
     // (FP32 too wherever the projections' input scales differ, so the others can quantize it themselves.)
     const bool xn_half =
-        bf16_gdn ? false
-        : L.full ? norm_rows(h_, L.input_norm, xn_, M, L.q.in_scale, false,
-                             L.k.in_scale != L.q.in_scale || L.v.in_scale != L.q.in_scale)
-                 : norm_rows(h_, L.input_norm, xn_, M, L.in_qkv.in_scale, false, true);
-    if (L.full) {
+        pre_normed ? true
+        : bf16_gdn ? false
+        : L.full   ? norm_rows(h_, L.input_norm, xn_, M, L.q.in_scale, false,
+                               L.k.in_scale != L.q.in_scale || L.v.in_scale != L.q.in_scale)
+                   : norm_rows(h_, L.input_norm, xn_, M, L.in_qkv.in_scale, false, true);
+    pre_normed = false;
+    // The megakernel's stage 3 (LING_MK_ATTN): the whole attention layer of one chain verify as one persistent kernel.
+    bool mk_attn = L.full && mk_attn_ > 0 && verify && !multi && !quantized_ && xn_half && L.q.K == H &&
+                   L.k.K == H && L.v.K == H && L.o.K == qsize && L.o.N == H;
+    if (mk_attn) {
+      const Seg& g = segs[0];
+      kernels::MkAttnParams p{};
+      p.xh = xh_;
+      p.xinv = xinv_;
+      p.M = M;
+      p.K = H;
+      p.q = {L.q.w, nullptr, L.q.scale, q_gate_, L.q.N};
+      p.k = {L.k.w, nullptr, L.k.scale, k_, L.k.N};
+      p.v = {L.v.w, nullptr, L.v.scale, v_, L.v.N};
+      p.o = {L.o.w, nullptr, L.o.scale, t1_, L.o.N};
+      p.Hq = c.heads;
+      p.Hkv = c.kv_heads;
+      p.D = c.head_dim;
+      p.rot = c.rotary_dim;
+      p.theta = c.rope_theta;
+      p.eps = c.eps;
+      p.q_norm = L.q_norm;
+      p.k_norm = L.k_norm;
+      p.q_out = q_;
+      p.gate = gate_;
+      p.kcache = g.s->kcache[slot];
+      p.vcache = g.s->vcache[slot];
+      p.pos0 = seg_pos(g, 0);
+      p.td = tree_;  // a tree verify's rows (BACKLOG 26), or nullptr
+      p.scratch = attn_scratch_;
+      p.attn = attn_;
+      p.xh2 = xh2_;
+      p.xinv2 = xinv2_;
+      p.counters = mk_attn_counters_ + size_t(li) * kernels::kMkAttnWords;
+      if (mk_attn_times_) p.times = mk_attn_times_ + size_t(li) * kernels::kMkAttnEvents;
+      if (tails) p.tail = &post_tail;
+      NvtxRange r("attention");
+      mk_attn = kernels::attn_persistent(p, stream_);
+      if (mk_attn) {
+        if (tails) post_normed = true;
+        else kernels::add_inplace(h_, t1_, M * H, stream_);
+        mark("attn_proj");
+      }
+    }
+    if (mk_attn) {
+    } else if (L.full) {
       NvtxRange r("attention");
       linear_fp8_multi({{&L.q, q_gate_}, {&L.k, k_}, {&L.v, v_}}, xn_, M, xn_half);
       if (!quantized_) kernels::l2_prefetch_weights(L.o.w, false, false, L.o.N, L.o.K, hint_attn, stream_);
@@ -907,10 +1015,11 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       float* g = verify ? v_g_[slot] : g_;
       float* beta = verify ? v_beta_[slot] : beta_;
       const bool fork = fork_ > 0 && verify && !tree_ && !multi && !quantized_ && L.in_a.N == L.in_b.N;
-      // The megakernel's stage 2 (LING_MK_GDN): the whole mixer of one verify sequence as one persistent kernel. A tree
-      // verify (BACKLOG 26) keeps the graph path's mixer: its conv taps and recurrence follow the tree's paths
-      // (gdn_conv_tree, gdn_recurrent_tree), which the persistent kernel's chain conv and recurrence do not.
-      bool mk_gdn = mk_gdn_ > 0 && verify && !tree_ && !multi && !quantized_ && xn_half && L.in_a.N == L.in_b.N &&
+      // The megakernel's stage 2 (LING_MK_GDN): the whole mixer of one verify sequence as one persistent kernel; a tree
+      // verify (BACKLOG 26) too, with the tree conv and the per-path recurrence (on by default since 2026-10-20:
+      // -2.2 to -2.6 ms per step with trees at 24K and 59K; LING_MK_GDN_TREE=0 gives a tree the graph path's mixer).
+      static const bool gdn_tree = !std::getenv("LING_MK_GDN_TREE") || std::atoi(std::getenv("LING_MK_GDN_TREE")) != 0;
+      bool mk_gdn = mk_gdn_ > 0 && verify && (!tree_ || gdn_tree) && !multi && !quantized_ && xn_half && L.in_a.N == L.in_b.N &&
                     L.in_a.N == c.lin_v_heads;
       if (mk_gdn) {
         const Seg& sg = segs[0];
@@ -947,12 +1056,33 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         p.Dk = c.lin_k_dim;
         p.Dv = c.lin_v_dim;
         p.Vs = Vs;
+        p.td = tree_;
         p.counters = mk_gdn_counters_ + size_t(slot) * kernels::kMkGdnWords;
         if (mk_gdn_times_) p.times = mk_gdn_times_ + size_t(li) * kMkTimesBlocks * kernels::kMkTimesPerBlock;
-        mk_gdn = L.in_qkv.K == H && L.in_z.K == H && L.out.K == Vs && L.in_a.K == H && kernels::gdn_persistent(p, stream_);
+        if (tails) p.tail = &post_tail;
+        const bool shapes = L.in_qkv.K == H && L.in_z.K == H && L.out.K == Vs && L.in_a.K == H;
+        if (span && shapes && mk_ffn_ > 0) {  // stage 4 (LING_MK_SPAN): the mixer and the FFN in one launch
+          const kernels::MkTail span_post{h_, L.post_norm, xn_, xh3_, xinv3_, c.eps};
+          const kernels::MkTail span_next{h_, li + 1 < c.layers ? model_->layers()[li + 1].input_norm : nullptr, xn_,
+                                          xh_, xinv_, c.eps};
+          const kernels::StreamTarget sg_g{L.gate.w, L.gate.table, L.gate.scale2, t1_, L.gate.N},
+              sg_u{L.up.w, L.up.table, L.up.scale2, t2_, L.up.N},
+              sg_d{L.down.w, L.down.table, L.down.scale2, t2_, L.down.N};
+          p.tail = &span_post;
+          span_done = kernels::gdn_ffn_persistent(
+              p, sg_g, sg_u, sg_d, I, t1_, t2_, xh4_, xinv4_, mk_counters_ + size_t(li) * kernels::kMkFfnWords,
+              mk_ffn_times_ ? mk_ffn_times_ + size_t(li) * kMkTimesBlocks * kernels::kMkTimesPerBlock : nullptr,
+              &span_next, stream_);
+          p.tail = tails ? &post_tail : nullptr;
+          if (span_done) pre_normed_next = span_next.norm_w != nullptr;
+        }
+        mk_gdn = span_done || (shapes && kernels::gdn_persistent(p, stream_));
       }
-      if (mk_gdn) {
-        kernels::add_inplace(h_, t1_, M * H, stream_);
+      if (span_done) {
+        mark("gdn_proj");
+      } else if (mk_gdn) {
+        if (tails) post_normed = true;
+        else kernels::add_inplace(h_, t1_, M * H, stream_);
         mark("gdn_proj");
       } else if (fork) {
         // The overlap probe (LING_GDN_FORK): in_qkv alone, then in_z on stream_ while the chain runs on fork_stream_
@@ -1048,17 +1178,24 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       mark("gdn_proj");
       }  // not forked
     }
-    {
+    if (span_done) {
+      pre_normed = pre_normed_next;  // the spanning kernel ran the FFN and left the next layer's input norm
+    } else {
       NvtxRange r("mlp");
-      const bool post_half = norm_rows(h_, L.post_norm, xn_, M, L.gate.in_scale, true, L.up.in_scale != L.gate.in_scale);
+      const bool post_half =
+          post_normed || norm_rows(h_, L.post_norm, xn_, M, L.gate.in_scale, true, L.up.in_scale != L.gate.in_scale);
+      const kernels::MkTail next_tail{h_, li + 1 < c.layers ? model_->layers()[li + 1].input_norm : nullptr, xn_, xh_,
+                                      xinv_, c.eps};
       const kernels::StreamTarget mk_g{L.gate.w, L.gate.table, L.gate.scale2, t1_, L.gate.N},
           mk_u{L.up.w, L.up.table, L.up.scale2, t2_, L.up.N}, mk_d{L.down.w, L.down.table, L.down.scale2, t2_, L.down.N};
       if (!quantized_ && mk_ffn_ > 0 && post_half &&
           kernels::ffn_persistent(xh_, xinv_, M, mk_g, mk_u, mk_d, H, I, t1_, t2_, xh2_, xinv2_,
                                   mk_counters_ + size_t(li) * kernels::kMkFfnWords, stream_,
                                   mk_ffn_times_ ? mk_ffn_times_ + size_t(li) * kMkTimesBlocks * kernels::kMkTimesPerBlock
-                                                : nullptr)) {
-        kernels::add_inplace(h_, t2_, M * H, stream_);
+                                                : nullptr,
+                                  tails ? &next_tail : nullptr)) {
+        if (tails) pre_normed = next_tail.norm_w != nullptr;
+        else kernels::add_inplace(h_, t2_, M * H, stream_);
       } else if (!quantized_) {
         linear_fp4_multi({{&L.gate, t1_}, {&L.up, t2_}}, xn_, M, post_half);
         kernels::l2_prefetch_weights(L.down.w, true, L.down.table != nullptr, L.down.N, L.down.K, hint_mlp, stream_);
