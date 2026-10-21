@@ -247,6 +247,7 @@ void Engine::set_step_graphs(bool on) {
 
 void Engine::clear_graphs() {
   if (commit_stream_) cudaStreamSynchronize(commit_stream_);  // a replay may still run there
+  if (stream_) cudaStreamSynchronize(stream_);  // and, with commit_async_, the last step's commit graph
   for (Session& s : sessions_) {
     if (s.draft_graph) cudaGraphExecDestroy(s.draft_graph);
     s.draft_graph = nullptr;
@@ -483,9 +484,29 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B) {
 void Engine::draft_propose(int anchor, int B, bool graph) {
   pin_->draft_ids[0] = anchor;
   for (int i = 1; i < B; ++i) pin_->draft_ids[i] = draft_->config().mask_token;
+  gap_mark(5);  // LING_STEP_GAPS: the stream reaches the draft (idle since the last commit's end, mark 4)
   if (graph) run_graph(s_->draft_graph, "draft", [&] { draft_launch(B); });
   else draft_launch(B);
+  gap_mark(0);
   check(cudaStreamSynchronize(stream_), "draft");
+  gap_take(2, 3, 1);
+  gap_take(4, 5, 2);
+}
+
+// LING_STEP_GAPS=1 (a measurement aid, BACKLOG 34): timing events between a step's graphs on stream_, so the GPU's idle
+// time while the host walks the lattice, builds the tree, accepts and launches is known per step. Off: no event.
+void Engine::gap_mark(int i) {
+  if (gap_ev_[0]) check(cudaEventRecord(gap_ev_[i], stream_), "gap event");
+  if (gap_ev_[0]) gap_live_[i] = true;
+}
+void Engine::gap_take(int a, int b, int slot) {
+  if (!gap_ev_[0] || !gap_live_[a] || !gap_live_[b]) return;
+  float ms = 0.f;
+  if (cudaEventElapsedTime(&ms, gap_ev_[a], gap_ev_[b]) == cudaSuccess && ms >= 0.f) {
+    gap_ms_[slot] += ms;
+    gap_n_[slot] += 1;
+  }
+  gap_live_[a] = false;
 }
 
 void Engine::verify_launch(int V, int K, bool tree) {
@@ -729,13 +750,16 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   // 2. Verify, with each row's top K (the argmax when greedy) on the GPU.
   std::copy(sp.rows.begin(), sp.rows.end(), pin_->rows);
   join_commit();  // the previous step's DeltaNet replay, beside this step's draft until here
+  gap_mark(1);
   if (graph) {
     cudaGraphExec_t& g = (sp.tree ? s_->tree_verify_graphs : s_->verify_graphs)[K];
     run_graph(g, "verify", [&] { verify_launch(V, K, sp.tree); });
   } else {
     verify_launch(V, K, sp.tree);
   }
+  gap_mark(2);
   check(cudaStreamSynchronize(stream_), "verify");
+  gap_take(0, 1, 0);
   plan_accept(sp, pin_->topk_vals, pin_->topk_ids);  // 3. accept
   if (sp.tree) {
     // The accepted path's rows to rows 0 .. n - 1 (KV slots, DeltaNet inputs, target features), so the commit is
@@ -748,7 +772,14 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
       check(cudaMemcpyAsync(gather_rows_dev_, pin_->gather_rows, n * sizeof(int), cudaMemcpyHostToDevice, stream_),
             "tree path");
       kernels::tree_gather(s_->gather, s_->ngather, gather_rows_dev_, n, kernels::DevPos(s_->pos), stream_);
-      check(cudaStreamSynchronize(stream_), "tree gather");
+      // With commit_async_ (BACKLOG 34) the host does not wait: the commit graph follows on stream_, and the DeltaNet
+      // replay on commit_stream_ (which reads the gathered inputs) waits for gather_done_.
+      if (commit_async_) {
+        check(cudaEventRecord(gather_done_, stream_), "gather event");
+        if (commit_overlap_) check(cudaStreamWaitEvent(commit_stream_, gather_done_, 0), "gather wait");
+      } else {
+        check(cudaStreamSynchronize(stream_), "tree gather");
+      }
     }
     std::vector<int> toks(n);
     for (int j = 0; j < n; ++j) toks[j] = sp.tr.token[sp.path[j]];
@@ -778,6 +809,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
           "row logits");
     check(cudaStreamSynchronize(stream_), "row logits");
   }
+  gap_mark(3);
   if (commit_overlap_) commit_state_async(0, n, graph);
   if (graph) {
     if (s_->commit_graphs.size() < size_t(V) + 1) s_->commit_graphs.resize(size_t(V) + 1, nullptr);
@@ -787,7 +819,12 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   }
   s_->history.insert(s_->history.end(), sp.rows.begin(), sp.rows.begin() + n);
   s_->pos += n;
-  check(cudaStreamSynchronize(stream_), "commit");
+  // BACKLOG 34: with commit_async_ the host returns the tokens without waiting for the commit (the drafter's context
+  // KV), which runs while the host emits them and prepares the next step; everything after it on stream_ (the next
+  // draft, a prefill, a state copy) is ordered behind it, and nothing on the host reads what it writes. Its GPU time
+  // then counts in the next step's draft seconds, and commit_seconds is the launch.
+  gap_mark(4);
+  if (!commit_async_) check(cudaStreamSynchronize(stream_), "commit");
   s_->spec.commit_seconds += seconds_since(t2);
   plan_count(sp);
 

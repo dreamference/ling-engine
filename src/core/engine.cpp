@@ -207,6 +207,14 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     commit_core_ = alloc<float>(size_t(kernels::kMaxStreamRows) * Vs);
     std::fprintf(stderr, "commit beside the next draft\n");
   }
+  commit_async_ = opts_.commit_async && draft_ != nullptr;
+  if (const char* e = std::getenv("LING_COMMIT_ASYNC")) commit_async_ = draft_ != nullptr && std::atoi(e) != 0;
+  if (commit_async_) {
+    check(cudaEventCreateWithFlags(&gather_done_, cudaEventDisableTiming), "gather event");
+    std::fprintf(stderr, "commit without a host wait\n");
+  }
+  if (const char* e = std::getenv("LING_STEP_GAPS"); e && std::atoi(e) != 0)
+    for (cudaEvent_t& ev : gap_ev_) check(cudaEventCreate(&ev), "gap event");
   if (const char* e = std::getenv("LING_MK_FFN")) mk_ffn_ = std::atoi(e);
   if (const char* e = std::getenv("LING_MK_GDN")) mk_gdn_ = std::atoi(e);
   if (const char* e = std::getenv("LING_MK_ATTN")) mk_attn_ = std::atoi(e);
@@ -389,6 +397,7 @@ Engine::~Engine() {
     mk_times_report();
   }
   if (commit_stream_) cudaStreamSynchronize(commit_stream_);
+  if (stream_) cudaStreamSynchronize(stream_);  // commit_async_: the last step's commit may still run
   if (side_.stream_) {
     cudaStreamSynchronize(side_.stream_);
     if (side_.logits_host_) cudaFreeHost(side_.logits_host_);
@@ -403,6 +412,13 @@ Engine::~Engine() {
   }
   for (void* p : buffers_) cudaFree(p);
   if (commit_done_) cudaEventDestroy(commit_done_);
+  if (gather_done_) cudaEventDestroy(gather_done_);
+  if (gap_ev_[0]) {
+    std::fprintf(stderr, "step gaps (GPU idle on the main stream per step): draft->verify %.3f ms (%ld), verify->commit %.3f ms (%ld), commit->next draft %.3f ms (%ld)\n",
+                 gap_n_[0] ? gap_ms_[0] / gap_n_[0] : 0.0, gap_n_[0], gap_n_[1] ? gap_ms_[1] / gap_n_[1] : 0.0, gap_n_[1],
+                 gap_n_[2] ? gap_ms_[2] / gap_n_[2] : 0.0, gap_n_[2]);
+    for (cudaEvent_t ev : gap_ev_) cudaEventDestroy(ev);
+  }
   if (commit_stream_) cudaStreamDestroy(commit_stream_);
   for (cudaEvent_t ev : {fork_xn_, fork_qkv_, fork_done_})
     if (ev) cudaEventDestroy(ev);
