@@ -1901,7 +1901,7 @@ bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarg
                     const StreamTarget& down, int H, int I, float* g, float* u, __half* xh2, float* xinv2,
                     unsigned* counters, cudaStream_t s, unsigned long long* times, const MkTail* tail) {
   // PF 4 by default since 2026-10-21 (one block per SM, 48 blocks: -0.6 to -1.6 ms per step against PF 2 on 96 in
-  // windows 2 and 4); LING_MK_FFN_PF=2 gives the two-blocks-per-SM kernel.
+  // windows 2, 4 and 5; agentlong 63.74 -> 64.03 tokens/s); LING_MK_FFN_PF=2 gives the two-blocks-per-SM kernel.
   static const int ffn_pf = sg_env("LING_MK_FFN_PF", 4);
   MkFfnArgs a;
   if (!ffn_build(xh, xinv, M, gate, up, down, H, I, g, u, xh2, xinv2, counters, times, tail, a)) return false;
