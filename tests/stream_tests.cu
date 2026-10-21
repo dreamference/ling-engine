@@ -4,6 +4,8 @@
 //
 //   ling-stream-tests            correctness only
 //   ling-stream-tests --bench    plus timings
+//   ling-stream-tests --bench-draft  the drafter attention's time per call
+//   ling-stream-tests --bench-half  the FP16 copy's time per call (LING_HALF_BLOCKS=0: the one-block-per-row kernel)
 //   LING_PDL=1 ling-stream-tests  the same with programmatic dependent launch (launch.cuh)
 //   LING_NO_TIMING=1 ling-stream-tests  skips the attention timings (under compute-sanitizer)
 //   ling-stream-tests --nvfp4-oracle DIR  only: the at-load NVFP4 rounding (BACKLOG 33) against the "<name>.nvfp4.*"
@@ -58,6 +60,87 @@ void run(bool fp4, const float* dx, int M, int K, __half* xh, float* xinv, const
   ling::kernels::to_half_rows(dx, M, K, xh, xinv, nullptr);
   if (fp4) ling::kernels::stream_gemm_nvfp4(xh, xinv, M, w, nullptr, gs, dy, N, K, nullptr);
   else ling::kernels::stream_gemm_fp8(xh, xinv, M, w, gs, dy, N, K, nullptr);
+}
+
+// The FP16 copies (the wide kernels, BACKLOG 28; to_half_rows from FP32, bf16_to_half_rows from BF16) against the host's exact reference: a power-of-two scale putting the
+// row's largest magnitude in [2^14, 2^15), each value rounded to nearest. Every bit, for the step's shapes, a zero
+// row, a row with one huge value, an infinite one, and an unaligned input (the scalar path).
+bool test_to_half_rows() {
+  std::mt19937 rng(5);
+  std::normal_distribution<float> normal(0.f, 1.f);
+  const int Ms[] = {1, 2, 8, 12, 16, 24, 32}, Ks[] = {128, 1000, 4096, 5120, 6144, 17408, 25600};
+  const int MMAX = 32, KMAX = 25600;
+  std::vector<float> x(size_t(MMAX) * KMAX + 1);
+  float* dx;
+  __half* dh;
+  float* dinv;
+  cudaMalloc(&dx, x.size() * sizeof(float));
+  cudaMalloc(&dh, size_t(MMAX) * KMAX * sizeof(__half));
+  __nv_bfloat16* dxb;
+  cudaMalloc(&dxb, x.size() * sizeof(__nv_bfloat16));
+  cudaMalloc(&dinv, MMAX * sizeof(float));
+  bool ok = true;
+  int cases = 0;
+  for (int K : Ks)
+    for (int M : Ms)
+      for (int off = 0; off < 2; ++off) {
+        for (size_t i = 0; i < x.size(); ++i) x[i] = normal(rng) * (i % 89 == 0 ? 200.f : 1.f);
+        if (M > 2) {
+          for (int k = 0; k < K; ++k) x[off + size_t(1) * K + k] = 0.f;  // a zero row
+          x[off + size_t(2) * K + K / 3] = 3.0e30f;                       // one huge value: the rest underflows
+        }
+        if (M > 3) x[off + size_t(3) * K + K - 1] = INFINITY;
+        cudaMemcpy(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice);
+        ling::kernels::to_half_rows(dx + off, M, K, dh, dinv, nullptr);
+        const auto h = download(dh, size_t(M) * K);
+        const auto inv = download(dinv, M);
+        for (int m = 0; m < M && ok; ++m) {
+          const float* row = x.data() + off + size_t(m) * K;
+          float mx = 0.f;
+          for (int k = 0; k < K; ++k) mx = std::fmax(mx, std::fabs(row[k]));
+          int e = 0;
+          if (mx > 0.f && std::isfinite(mx)) std::frexp(mx, &e);
+          const float s = std::ldexp(1.f, 15 - e);
+          if (inv[m] != std::ldexp(1.f, e - 15)) {
+            std::printf("to_half_rows M=%d K=%d off=%d row %d: scale differs FAIL\n", M, K, off, m);
+            ok = false;
+          }
+          for (int k = 0; k < K && ok; ++k) {
+            const __half want = __float2half_rn(row[k] * s), got = h[size_t(m) * K + k];
+            if (std::memcmp(&want, &got, sizeof(__half)) != 0) {
+              std::printf("to_half_rows M=%d K=%d off=%d row %d col %d differs FAIL\n", M, K, off, m, k);
+              ok = false;
+            }
+          }
+        }
+        // bf16_to_half_rows (BACKLOG 33's copy, widened the same way) on the BF16 rounding of the same rows.
+        std::vector<__nv_bfloat16> xb(x.size());
+        for (size_t i = 0; i < x.size(); ++i) xb[i] = __float2bfloat16(x[i]);
+        cudaMemcpy(dxb, xb.data(), xb.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+        ling::kernels::bf16_to_half_rows(dxb + off, M, K, dh, dinv, nullptr);
+        const auto hb = download(dh, size_t(M) * K);
+        const auto invb = download(dinv, M);
+        for (int m = 0; m < M && ok; ++m) {
+          const __nv_bfloat16* row = xb.data() + off + size_t(m) * K;
+          float mx = 0.f;
+          for (int k = 0; k < K; ++k) mx = std::fmax(mx, std::fabs(__bfloat162float(row[k])));
+          int e = 0;
+          if (mx > 0.f && std::isfinite(mx)) std::frexp(mx, &e);
+          const float s = std::ldexp(1.f, 15 - e);
+          if (invb[m] != std::ldexp(1.f, e - 15)) ok = false;
+          for (int k = 0; k < K && ok; ++k) {
+            const __half want = __float2half_rn(__bfloat162float(row[k]) * s), got = hb[size_t(m) * K + k];
+            if (std::memcmp(&want, &got, sizeof(__half)) != 0) {
+              std::printf("bf16_to_half_rows M=%d K=%d off=%d row %d col %d differs FAIL\n", M, K, off, m, k);
+              ok = false;
+            }
+          }
+        }
+        ++cases;
+      }
+  cudaFree(dx), cudaFree(dxb), cudaFree(dh), cudaFree(dinv);
+  std::printf("to_half_rows and bf16_to_half_rows: %d shapes bit for bit against the host %s\n", cases, ok ? "ok" : "FAIL");
+  return ok;
 }
 
 bool test_gemm() {
@@ -554,6 +637,115 @@ void bench() {
   }
 }
 
+// BACKLOG 28: the FP16 copy's time per call at the step's shapes, 200 calls in one graph (LING_HALF_BLOCKS=0 for
+// the one-block-per-row kernel). The input stays in L2, as in the step, where its producer has just written it.
+void bench_half() {
+  float *x, *xinv;
+  __half* xh;
+  cudaMalloc(&x, size_t(32) * 17408 * sizeof(float));
+  cudaMalloc(&xh, size_t(32) * 17408 * sizeof(__half));
+  cudaMalloc(&xinv, 32 * sizeof(float));
+  cudaMemset(x, 0x3c, size_t(32) * 17408 * sizeof(float));
+  cudaStream_t st;
+  cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+  cudaEvent_t a, b;
+  cudaEventCreate(&a), cudaEventCreate(&b);
+  for (int K : {5120, 6144, 17408}) {
+    std::printf("bench to_half_rows K=%-5d", K);
+    for (int M : {1, 8, 12, 16, 24, 32}) {
+      cudaGraph_t g;
+      cudaGraphExec_t ge;
+      cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+      for (int i = 0; i < 200; ++i) ling::kernels::to_half_rows(x, M, K, xh, xinv, st);
+      cudaStreamEndCapture(st, &g);
+      cudaGraphInstantiate(&ge, g, 0);
+      cudaGraphLaunch(ge, st);
+      cudaEventRecord(a, st);
+      for (int rep = 0; rep < 5; ++rep) cudaGraphLaunch(ge, st);
+      cudaEventRecord(b, st);
+      cudaEventSynchronize(b);
+      float ms = 0;
+      cudaEventElapsedTime(&ms, a, b);
+      std::printf("  M=%-2d %6.2f us", M, ms * 1e3f / 1000.f);
+      cudaGraphExecDestroy(ge), cudaGraphDestroy(g);
+    }
+    std::printf("\n");
+  }
+  {  // the drafter's NVFP4 fc input (BACKLOG 33): BF16 rows of 5 x 5,120
+    const int K = 25600;
+    __nv_bfloat16* xb;
+    __half* xh2;
+    cudaMalloc(&xb, size_t(32) * K * 2);
+    cudaMalloc(&xh2, size_t(32) * K * 2);
+    cudaMemset(xb, 0x3c, size_t(32) * K * 2);
+    std::printf("bench bf16_to_half_rows K=%-5d", K);
+    for (int M : {1, 8, 12, 16, 24, 32}) {
+      cudaGraph_t g;
+      cudaGraphExec_t ge;
+      cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+      for (int i = 0; i < 200; ++i) ling::kernels::bf16_to_half_rows(xb, M, K, xh2, xinv, st);
+      cudaStreamEndCapture(st, &g);
+      cudaGraphInstantiate(&ge, g, 0);
+      cudaGraphLaunch(ge, st);
+      cudaEventRecord(a, st);
+      for (int rep = 0; rep < 5; ++rep) cudaGraphLaunch(ge, st);
+      cudaEventRecord(b, st);
+      cudaEventSynchronize(b);
+      float ms = 0;
+      cudaEventElapsedTime(&ms, a, b);
+      std::printf("  M=%-2d %6.2f us", M, ms * 1e3f / 1000.f);
+      cudaGraphExecDestroy(ge), cudaGraphDestroy(g);
+    }
+    std::printf("\n");
+    cudaFree(xb), cudaFree(xh2);
+  }
+  cudaFree(x), cudaFree(xh), cudaFree(xinv);
+}
+
+// BACKLOG 28: the drafter's attention per call at the step's shape (a block of 12, 32 query and 8 KV heads, the
+// 2,048 window, the engine's ring of 8,224), 100 calls in one graph, with 1, 2, 4 and 8 context keys a load and the
+// warp-exchanged eight (0, the default); five
+// copies of the rings, one per drafter layer, so L2 holds no more than the step would.
+void bench_draft() {
+  namespace k = ling::kernels;
+  const int Hkv = 8, Hq = 32, dd = 128, ring = 8224, window = 2048, B = 12, layers = 5, L = 30000;
+  const size_t rb = size_t(ring) * Hkv * dd;
+  __nv_bfloat16 *kc, *vc;
+  float *q, *kb, *vb, *out;
+  cudaMalloc(&kc, rb * layers * 2), cudaMalloc(&vc, rb * layers * 2);
+  cudaMemset(kc, 0x3c, rb * layers * 2), cudaMemset(vc, 0x3c, rb * layers * 2);
+  cudaMalloc(&q, size_t(B) * Hq * dd * 4), cudaMalloc(&kb, size_t(B) * Hkv * dd * 4), cudaMalloc(&vb, size_t(B) * Hkv * dd * 4);
+  cudaMemset(q, 0, size_t(B) * Hq * dd * 4), cudaMemset(kb, 0, size_t(B) * Hkv * dd * 4), cudaMemset(vb, 0, size_t(B) * Hkv * dd * 4);
+  cudaMalloc(&out, size_t(B) * Hq * dd * 4);
+  cudaStream_t st;
+  cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+  cudaEvent_t a, b;
+  cudaEventCreate(&a), cudaEventCreate(&b);
+  for (int u : {1, 2, 4, 8, 0}) {
+    k::set_draft_attention_keys(u);
+    cudaGraph_t g;
+    cudaGraphExec_t ge;
+    cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+    for (int i = 0; i < 100; ++i)
+      k::draft_attention(q, kc + rb * (i % layers), vc + rb * (i % layers), ring, kb, vb, L, B, window - 1, Hq, Hkv, out, st);
+    cudaStreamEndCapture(st, &g);
+    cudaGraphInstantiate(&ge, g, 0);
+    cudaGraphLaunch(ge, st);
+    cudaEventRecord(a, st);
+    for (int rep = 0; rep < 3; ++rep) cudaGraphLaunch(ge, st);
+    cudaEventRecord(b, st);
+    cudaEventSynchronize(b);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, a, b);
+    const double us = ms * 1e3 / 300, bytes = 2.0 * window * Hkv * dd * 2;
+    std::printf("bench draft_attention keys %d (0: eight exchanged): %7.1f us a layer (%5.1f GB/s of unique K and V), %5.3f ms for %d layers\n",
+                u, us, bytes / (us * 1e-6) / 1e9, us * layers / 1e3, layers);
+    cudaGraphExecDestroy(ge), cudaGraphDestroy(g);
+  }
+  k::set_draft_attention_keys(0);
+  for (void* p : {(void*)kc, (void*)vc, (void*)q, (void*)kb, (void*)vb, (void*)out}) cudaFree(p);
+}
+
 __global__ void fill_random_kernel(uint32_t* p, size_t n, uint32_t seed) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
     uint32_t h = static_cast<uint32_t>(i) * 2654435761u ^ seed;
@@ -1000,6 +1192,35 @@ bool test_batched_state_kernels() {
     ok &= rope && datt;
     std::printf("draft_qk_rope and draft_attention over two blocks in one launch identical to per sequence: %s, %s\n",
                 rope ? "yes ok" : "NO FAIL", datt ? "yes ok" : "NO FAIL");
+    // The context keys a warp loads at once (BACKLOG 28's drafter lead): every batch the same bits as one at a time,
+    // at the two blocks' positions (one past the ring) and at a short context (inside the first window).
+    {
+      const auto want = download(a1, size_t(R) * Hq * dd);
+      bool keys = true;
+      for (int u : {1, 2, 4, 8, 0}) {
+        k::set_draft_attention_keys(u);
+        for (int s = 0; s < 2; ++s) {
+          const size_t r0 = size_t(s) * B;
+          k::draft_attention(x1 + r0 * Hq * dd, s ? r1k : r0k, s ? r1v : r0v, ring, kb + r0 * Hkv * dd,
+                             vb + r0 * Hkv * dd, db.pos[s], B, window - 1, Hq, Hkv, a2 + r0 * Hq * dd, nullptr);
+        }
+        keys &= same(want.data(), download(a2, size_t(R) * Hq * dd).data(), size_t(R) * Hq * dd * 4);
+        k::draft_attention_seqs(x1, rk, rv, ring, kb, vb, db, window - 1, Hq, Hkv, a2, nullptr);
+        keys &= same(want.data(), download(a2, size_t(R) * Hq * dd).data(), size_t(R) * Hq * dd * 4);
+      }
+      for (int L : {0, 5, 37, 300}) {  // short contexts: the batches' edges
+        std::vector<std::vector<float>> outs;
+        for (int u : {1, 4, 8, 0}) {
+          k::set_draft_attention_keys(u);
+          k::draft_attention(x1, r0k, r0v, ring, kb, vb, L, B, window - 1, Hq, Hkv, a2, nullptr);
+          outs.push_back(download(a2, size_t(B) * Hq * dd));
+        }
+        for (size_t i = 1; i < outs.size(); ++i) keys &= same(outs[0].data(), outs[i].data(), size_t(B) * Hq * dd * 4);
+      }
+      ok &= keys;
+      std::printf("draft_attention with 2, 4 and 8 context keys a load and eight exchanged identical to one at a time: %s\n",
+                  keys ? "yes ok" : "NO FAIL");
+    }
     for (void* p : {(void*)x1, (void*)x2, (void*)nw, (void*)kb, (void*)vb, (void*)r0k, (void*)r0v, (void*)r1k, (void*)r1v,
                     (void*)a1, (void*)a2})
       cudaFree(p);
@@ -1015,7 +1236,16 @@ int main(int argc, char** argv) {
     bench_groups();
     return cudaDeviceSynchronize() == cudaSuccess ? 0 : 1;
   }
-  bool ok = test_gemm();
+  if (argc > 1 && std::string(argv[1]) == "--bench-half") {  // timings only (BACKLOG 28's FP16 copies)
+    bench_half();
+    return cudaDeviceSynchronize() == cudaSuccess ? 0 : 1;
+  }
+  if (argc > 1 && std::string(argv[1]) == "--bench-draft") {  // timings only (BACKLOG 28's drafter attention)
+    bench_draft();
+    return cudaDeviceSynchronize() == cudaSuccess ? 0 : 1;
+  }
+  bool ok = test_to_half_rows();
+  ok &= test_gemm();
   ok &= test_gemm_wide();
   ok &= test_bf16_rows();
   ok &= test_attention_rows();
