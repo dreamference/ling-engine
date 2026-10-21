@@ -229,7 +229,7 @@ void Engine::alloc_drafter() {
 }
 
 void Engine::alloc_sparse_head() {
-  // BACKLOG 19: the drafter's context-aware sparse head, off unless asked for.
+  // BACKLOG 19: the drafter's context-aware sparse head, on by default where its file is beside the drafter.
   if (const char* e = std::getenv("LING_DRAFT_HEAD")) opts_.draft_head = e;
   if (const char* e = std::getenv("LING_SPARSE_HEAD_DIR")) opts_.sparse_head_dir = e;
   if (opts_.draft_head == "full") return;
