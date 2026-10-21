@@ -69,8 +69,10 @@ struct EngineOptions {
   bool inpass_checkpoints = true;
   // BACKLOG 35: the prefix KV store (core/prefix_kv.hpp), the KV of the prompts' shared beginnings (up to the
   // furthest of the first two message ends and the branch point) kept beyond the resident sessions in a radix tree,
-  // with states at those positions, in at most this many MB; a prompt resumes from it as from another session's KV.
-  // Exact: the copies are the KV and states its own prefill computes. 0: off. LING_PREFIX_KV_MB overrides.
+  // with states at those positions, in at most this many MB, allocated once at start from what the engine's own
+  // memory leaves above a reserve (LING_PREFIX_KV_RESERVE_MB, 16 GB): it shrinks or stays off rather than grow the
+  // footprint while serving. A prompt resumes from it as from another session's KV. Exact: the copies are the KV and
+  // states its own prefill computes. 0: off. LING_PREFIX_KV_MB overrides.
   int prefix_kv_mb = 4096;
   // M3: run each part of a speculative step (draft, verify, commit) as a captured CUDA graph instead of
   // ~1,400 separate launches (speculate.cpp). Off by default until measured; LING_STEP_GRAPHS=0/1 overrides.
@@ -547,6 +549,8 @@ class Engine {
   const StateSlot* keep_slot_ = nullptr;  // where forward()'s keep_at state goes: the snap, unless set
   const StateSlot& keep_target() const { return keep_slot_ ? *keep_slot_ : s_->snap; }
   std::unique_ptr<PrefixKvTree> kv_tree_;  // EngineOptions::prefix_kv_mb
+  std::unique_ptr<ArenaAlloc> kv_arena_;   // its buffers, carved from one allocation made at start
+  void* kv_arena_base_ = nullptr;
   uint64_t kv_epoch_ = 0;
   StateSlot state_view(const void* p) const;  // a store state buffer as a slot
   // The active session's KV for positions [from, to) into (to_buf) or out of a store buffer.

@@ -2,9 +2,50 @@
 #include "core/prefix_kv.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <utility>
 
 namespace ling {
+
+ArenaAlloc::ArenaAlloc(size_t size, size_t align) : size_(size - size % align), align_(align) {
+  if (size_ > 0) free_[0] = size_;
+}
+
+bool ArenaAlloc::alloc(size_t bytes, size_t* offset) {
+  bytes = (bytes + align_ - 1) / align_ * align_;
+  for (auto it = free_.begin(); it != free_.end(); ++it)
+    if (it->second >= bytes) {
+      const size_t at = it->first, len = it->second;
+      free_.erase(it);
+      if (len > bytes) free_[at + bytes] = len - bytes;
+      used_[at] = bytes;
+      in_use_ += bytes;
+      *offset = at;
+      return true;
+    }
+  return false;
+}
+
+void ArenaAlloc::release(size_t offset) {
+  auto u = used_.find(offset);
+  if (u == used_.end()) return;
+  size_t at = u->first, len = u->second;
+  used_.erase(u);
+  in_use_ -= len;
+  auto next = free_.lower_bound(at);
+  if (next != free_.end() && at + len == next->first) {
+    len += next->second;
+    next = free_.erase(next);
+  }
+  if (next != free_.begin()) {
+    auto prev = std::prev(next);
+    if (prev->first + prev->second == at) {
+      prev->second += len;
+      return;
+    }
+  }
+  free_[at] = len;
+}
 
 PrefixKvTree::PrefixKvTree(size_t budget_bytes, size_t bytes_per_token, size_t state_bytes, Ops ops)
     : budget_(budget_bytes), per_token_(bytes_per_token), state_bytes_(state_bytes), ops_(std::move(ops)) {
