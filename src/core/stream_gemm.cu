@@ -1594,19 +1594,36 @@ void mk_attn_launch(MkAttnArgs& a, cudaStream_t s) {
 // kernels' (their bodies, unchanged); the buffers one writes and the other reads after it are its own (the norm's FP16
 // copy, the down projection's FP16 input), never a buffer the launch read before through the non-coherent path. The
 // mixer's counters are reset with the FFN's by the last block out.
-template <int NT, bool CODED, int PFG, int PFF>
-__global__ void __launch_bounds__(kWarps * 32, 1) gdn_ffn_persistent_kernel(MkGdnArgs g, MkFfnArgs f) {
+// The two halves as calls (LING_MK_SPAN=2, the default of the switch's on values: window 4 measured the inlined form
+// 0.6-1.5 ms slower than the two launches, its FFN tiles spilling around the mixer's live values); each then has the
+// register file to itself, as in its own kernel. NOINL false: both inlined (LING_MK_SPAN=1).
+template <int NT, int PFG>
+__device__ __noinline__ void mk_span_mixer(const MkGdnArgs& g) {
   gdn_mixer_body<NT, true, PFG, true>(g);
+}
+template <int NT, bool CODED, int PFF>
+__device__ __noinline__ void mk_span_ffn(const MkFfnArgs& f) {
   ffn_body<NT, CODED, true, PFF, true>(f);
+}
+template <int NT, bool CODED, int PFG, int PFF, bool NOINL = false>
+__global__ void __launch_bounds__(kWarps * 32, 1)
+    gdn_ffn_persistent_kernel(const __grid_constant__ MkGdnArgs g, const __grid_constant__ MkFfnArgs f) {
+  if constexpr (NOINL) {
+    mk_span_mixer<NT, PFG>(g);
+    mk_span_ffn<NT, CODED, PFF>(f);
+  } else {
+    gdn_mixer_body<NT, true, PFG, true>(g);
+    ffn_body<NT, CODED, true, PFF, true>(f);
+  }
 }
 
 constexpr size_t kMkSpanSmem = sizeof(float) * kWarps * 2 * 16 * (2 * 8 + 1);  // the tiles' reduction buffer at NT 2
 
-template <int NT, bool CODED, int PFG, int PFF>
+template <int NT, bool CODED, int PFG, int PFF, bool NOINL>
 int mk_span_resident() {
   static const int r = [] {
     int per_sm = 0, sms = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_ffn_persistent_kernel<NT, CODED, PFG, PFF>, kWarps * 32,
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_ffn_persistent_kernel<NT, CODED, PFG, PFF, NOINL>, kWarps * 32,
                                                   kMkSpanSmem);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
     return per_sm * sms;
@@ -1614,16 +1631,17 @@ int mk_span_resident() {
   return r;
 }
 
-template <int NT, bool CODED, int PFG, int PFF>
+template <int NT, bool CODED, int PFG, int PFF, bool NOINL>
 void mk_span_launch(MkGdnArgs& g, MkFfnArgs& f, cudaStream_t s) {
-  const int G = mk_span_resident<NT, CODED, PFG, PFF>();
+  const int G = mk_span_resident<NT, CODED, PFG, PFF, NOINL>();
   if (G < 2 * g.chain || G < g.M) throw std::runtime_error("gdn_ffn_persistent: too few resident blocks");
   static bool told = false;
   if (!told) {
     told = true;
-    std::fprintf(stderr, "megakernel stage 4: gdn_ffn_persistent<%d, PF %d/%d> on %d blocks\n", NT, PFG, PFF, G);
+    std::fprintf(stderr, "megakernel stage 4: gdn_ffn_persistent<%d, PF %d/%d%s> on %d blocks\n", NT, PFG, PFF,
+                 NOINL ? ", calls" : "", G);
   }
-  launch_kernel("gdn_ffn_persistent", gdn_ffn_persistent_kernel<NT, CODED, PFG, PFF>, dim3(G), dim3(kWarps * 32),
+  launch_kernel("gdn_ffn_persistent", gdn_ffn_persistent_kernel<NT, CODED, PFG, PFF, NOINL>, dim3(G), dim3(kWarps * 32),
                 kMkSpanSmem, s, g, f);
 }
 
@@ -1882,7 +1900,9 @@ static bool ffn_build(const __half* xh, const float* xinv, int M, const StreamTa
 bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarget& gate, const StreamTarget& up,
                     const StreamTarget& down, int H, int I, float* g, float* u, __half* xh2, float* xinv2,
                     unsigned* counters, cudaStream_t s, unsigned long long* times, const MkTail* tail) {
-  static const int ffn_pf = sg_env("LING_MK_FFN_PF", 2);
+  // PF 4 by default since 2026-10-21 (one block per SM, 48 blocks: -0.6 to -1.6 ms per step against PF 2 on 96 in
+  // windows 2 and 4); LING_MK_FFN_PF=2 gives the two-blocks-per-SM kernel.
+  static const int ffn_pf = sg_env("LING_MK_FFN_PF", 4);
   MkFfnArgs a;
   if (!ffn_build(xh, xinv, M, gate, up, down, H, I, g, u, xh2, xinv2, counters, times, tail, a)) return false;
   const bool coded = gate.wscale != nullptr;
@@ -1995,7 +2015,8 @@ bool attn_persistent(const MkAttnParams& p, cudaStream_t s) {
 bool gdn_ffn_persistent(const MkGdnParams& gp, const StreamTarget& gate, const StreamTarget& up, const StreamTarget& down,
                         int I, float* g, float* u, __half* xh2, float* xinv2, unsigned* counters,
                         unsigned long long* times, const MkTail* tail, cudaStream_t s) {
-  static const int pfg = sg_env("LING_MK_SPAN_PFG", 2), pff = sg_env("LING_MK_SPAN_PFF", 3);
+  static const int pfg = sg_env("LING_MK_SPAN_PFG", 2), pff = sg_env("LING_MK_SPAN_PFF", 4);
+  static const bool noinl = sg_env("LING_MK_SPAN", 0) != 1;
   if (!gp.tail || !gp.tail->norm_w || !tail || !mk_tail_rows(gp.M)) return false;
   if (gp.tail->xh == gp.xh2 || xh2 == gp.xh2 || xinv2 == gp.xinv2 || gp.tail->xh == gp.xh) return false;  // see the kernel
   MkGdnArgs ga;
@@ -2008,15 +2029,14 @@ bool gdn_ffn_persistent(const MkGdnParams& gp, const StreamTarget& gate, const S
   fa.c2 = gp.counters;
   fa.c2_words = kMkGdnWords;
   const bool coded = gate.wscale != nullptr;
-#define LING_SPAN(PG, PFF_)                                                                              \
-  if (pfg == PG && pff == PFF_) {                                                                        \
-    coded ? mk_span_launch<2, true, PG, PFF_>(ga, fa, s) : mk_span_launch<2, false, PG, PFF_>(ga, fa, s); \
-    return true;                                                                                         \
+#define LING_SPAN(PG, PFF_)                                                                                    \
+  if (pfg == PG && pff == PFF_) {                                                                              \
+    if (noinl) coded ? mk_span_launch<2, true, PG, PFF_, true>(ga, fa, s) : mk_span_launch<2, false, PG, PFF_, true>(ga, fa, s); \
+    else coded ? mk_span_launch<2, true, PG, PFF_, false>(ga, fa, s) : mk_span_launch<2, false, PG, PFF_, false>(ga, fa, s); \
+    return true;                                                                                               \
   }
   LING_SPAN(2, 3)
   LING_SPAN(2, 4)
-  LING_SPAN(3, 3)
-  LING_SPAN(3, 4)
 #undef LING_SPAN
   return false;
 }
