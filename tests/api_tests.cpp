@@ -1,4 +1,5 @@
 // Tests the output parsers and the chat template without a server or a GPU.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <optional>
@@ -66,7 +67,132 @@ static OutputParser::Delta feed(OutputParser& p, const std::string& text) {
   return all;
 }
 
+// vLLM's check_sequence_repetition (v1/core/sched/utils.py) on the whole output, the reference the incremental
+// RepetitionDetector must match at every token.
+static bool vllm_repetition(const std::vector<int>& t, int max_p, int min_p, int min_count) {
+  if (min_p <= 0) min_p = 1;
+  if (max_p <= 0 || min_count < 2 || min_p > max_p) return false;
+  const long n = static_cast<long>(t.size());
+  for (int P = min_p; P <= max_p; ++P) {
+    if (static_cast<long>(P) * min_count > n) return false;
+    bool rep = true;
+    for (int k = 1; k <= P && rep; ++k)
+      for (int m = 1; m < min_count && rep; ++m) rep = t[n - (static_cast<long>(P) * m + k)] == t[n - k];
+    if (rep) return true;
+  }
+  return false;
+}
+
+// API §9: the repetition stop rule, its parsing and its resolution against the server's default.
+static void test_repetition() {
+  using ling::serve::RepetitionDetection;
+  using ling::serve::RepetitionDetector;
+  // The incremental test is vLLM's at every token: random outputs over small alphabets (so loops happen), planted
+  // loops, every size range.
+  unsigned seed = 12345;
+  auto rnd = [&] { return seed = seed * 1103515245u + 12345u, (seed >> 16) & 0x7fff; };
+  int compared = 0, hits = 0;
+  for (int trial = 0; trial < 400; ++trial) {
+    const int alphabet = 2 + trial % 4, max_p = 1 + trial % 9, min_p = trial % 3 == 0 ? 0 : 1 + trial % std::max(1, max_p);
+    const int min_count = 2 + trial % 4;
+    RepetitionDetector d(RepetitionDetection{max_p, std::min(min_p, max_p), min_count, 0});
+    std::vector<int> out;
+    for (int i = 0; i < 120; ++i) {
+      int tok = static_cast<int>(rnd() % alphabet);
+      if (out.size() > 8 && rnd() % 3 == 0) tok = out[out.size() - 1 - rnd() % 4];  // echoes: periodic stretches
+      out.push_back(tok);
+      const bool got = d.push(tok), want = vllm_repetition(out, max_p, std::min(min_p, max_p), min_count);
+      EXPECT(got == want);
+      ++compared;
+      hits += want;
+    }
+  }
+  EXPECT(hits > 100);  // the comparison saw loops, not only their absence
+  std::printf("repetition detector: %d prefixes against vLLM's test, %d loops\n", compared, hits);
+  {  // a block of 3 repeated 4 times ends the output at its last token, not before
+    RepetitionDetector d(RepetitionDetection{8, 2, 4, 0});
+    const std::vector<int> t = {9, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2};
+    for (int x : t) EXPECT(!d.push(x));
+    EXPECT(d.push(3));
+  }
+  {  // with max_run on, a run of one token is max_run's alone, though it is also a block of 2 repeated (the block
+     // test, which would stop it at 2 x 3 = 6, leaves it); a two-token block still stops at its third copy
+    RepetitionDetector d(RepetitionDetection{8, 2, 3, 9});
+    for (int i = 0; i < 8; ++i) EXPECT(!d.push(7));
+    EXPECT(d.push(7));
+    RepetitionDetector e(RepetitionDetection{8, 2, 3, 9});
+    for (int x : {7, 7, 7, 1, 2, 1, 2, 1}) EXPECT(!e.push(x));
+    EXPECT(e.push(2));
+  }
+  {  // max_run off: vLLM's test as it is, the run stopped as a block of 2
+    RepetitionDetector d(RepetitionDetection{8, 2, 3, 0});
+    for (int i = 0; i < 5; ++i) EXPECT(!d.push(7));
+    EXPECT(d.push(7));
+  }
+  {  // off
+    RepetitionDetector d(RepetitionDetection{0, 0, 0, 0});
+    for (int i = 0; i < 1000; ++i) EXPECT(!d.push(i % 2));
+  }
+  {  // the default: a 40-token paragraph looping, stopped at its twelfth copy; ordinary repetition is not
+    RepetitionDetector d(ling::serve::kRepetitionDefault);
+    int stopped_at = -1;
+    for (int i = 0; i < 40 * 20 && stopped_at < 0; ++i)
+      if (d.push(1000 + i % 40)) stopped_at = i;
+    EXPECT(stopped_at == 40 * 12 - 1);
+    RepetitionDetector e(ling::serve::kRepetitionDefault), z(ling::serve::kRepetitionDefault);
+    bool any = false;
+    for (int i = 0; i < 4000; ++i) any |= e.push(i % 2 ? 11 : 100 + static_cast<int>(rnd() % 1000));  // "a, b, c, ..."
+    for (int i = 0; i < 11 * 2; ++i) any |= z.push(i % 2 ? 11 : 0);  // "0, " eleven times
+    RepetitionDetector h(ling::serve::kRepetitionDefault);  // " hello" alone: a run, stopped at 64, not at 24
+    for (int i = 0; i < 63; ++i) any |= h.push(42);
+    EXPECT(h.push(42));
+    EXPECT(!any);
+    const bool z0 = z.push(0), z1 = z.push(11);
+    EXPECT(!z0 && z1);  // the twelfth "0, "
+  }
+  // Parsing: absent leaves every field to the server, false switches it off, an object sets its fields.
+  const std::string msgs = R"("messages":[{"role":"user","content":"hi"}])";
+  auto req = [&](const std::string& extra) { return ling::serve::parse_request(json::parse("{" + msgs + extra + "}"), true); };
+  const RepetitionDetection server{256, 2, 12, 64};
+  {
+    const auto r = ling::serve::resolve_repetition(req(""), server);
+    EXPECT(r.max_pattern_size == 256 && r.min_pattern_size == 2 && r.min_count == 12 && r.max_run == 64);
+  }
+  {
+    const auto r = ling::serve::resolve_repetition(req(R"(,"repetition_detection":false)"), server);
+    EXPECT(!r.on());
+  }
+  {
+    const auto r = ling::serve::resolve_repetition(req(R"(,"repetition_detection":{"min_count":20,"max_run":0})"), server);
+    EXPECT(r.max_pattern_size == 256 && r.min_pattern_size == 2 && r.min_count == 20 && r.max_run == 0);
+  }
+  {  // max_pattern_size alone below the server's min_pattern_size: the minimum follows it down
+    const auto r = ling::serve::resolve_repetition(req(R"(,"repetition_detection":{"max_pattern_size":1})"), server);
+    EXPECT(r.max_pattern_size == 1 && r.min_pattern_size == 1);
+  }
+  auto refused = [&](const std::string& extra) {
+    try {
+      ling::serve::resolve_repetition(req(extra), server);
+    } catch (const std::invalid_argument&) {
+      return true;
+    }
+    return false;
+  };
+  EXPECT(refused(R"(,"repetition_detection":{"min_count":1})"));
+  EXPECT(refused(R"(,"repetition_detection":{"min_pattern_size":300})"));
+  EXPECT(refused(R"(,"repetition_detection":{"max_run":1})"));
+  EXPECT(refused(R"(,"repetition_detection":{"max_pattern_size":-1})"));
+  EXPECT(refused(R"(,"repetition_detection":"yes")"));
+  EXPECT(!refused(R"(,"repetition_detection":{"max_pattern_size":0,"min_pattern_size":0,"max_run":0})"));
+  {  // /v1/responses forwards the field
+    const auto r = ling::serve::parse_responses_request(
+        json::parse(R"({"input":"hi","repetition_detection":{"min_count":30}})"));
+    EXPECT(ling::serve::resolve_repetition(r, server).min_count == 30);
+  }
+}
+
 int main() {
+  test_repetition();
   const json tools = json::parse(R"([{"type":"function","function":{"name":"shell","parameters":{"type":"object",
     "properties":{"command":{"type":"array"},"timeout_ms":{"type":"integer"},"workdir":{"type":"string"}}}}}])");
   {
