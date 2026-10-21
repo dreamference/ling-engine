@@ -3,9 +3,13 @@
 #include "core/kernels.cuh"
 #include "core/launch.cuh"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace ling::kernels {
 namespace {
@@ -17,6 +21,8 @@ __device__ __forceinline__ float warp_sum(float v) {
 }
 
 constexpr int kDD = 128;  // drafter head dim
+// draft_attention_body's U for the warp-exchanged batches of eight keys (BACKLOG 28).
+constexpr int kExchange = 0;
 
 // Per-head RMSNorm (plain weight) and NeoX RoPE over the whole head, in place. One block per (row, head),
 // one thread per dim.
@@ -70,7 +76,7 @@ __global__ void draft_store_kv_kernel(const float* __restrict__ k, const float* 
 // block) and over the block itself. One block per (query row, KV head); 8 warps walk the keys with an online
 // softmax and are merged at the end. Lane l owns dims 4l .. 4l + 3.
 // Query row j of a block of B rows at positions L .. L + B - 1 (q, kb, vb and out start at the block's first row).
-template <int G>
+template <int G, int U>
 __device__ __forceinline__ void draft_attention_body(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
                                                      const __nv_bfloat16* __restrict__ vc, int ring,
                                                      const float* __restrict__ kb, const float* __restrict__ vb, int L,
@@ -94,7 +100,121 @@ __device__ __forceinline__ void draft_attention_body(const float* __restrict__ q
     mx[g] = -INFINITY;
     l[g] = 0.f;
   }
-  for (int kk = warp; kk < nk; kk += 8) {
+  int kk = warp;
+  // BACKLOG 28's lead (1.46 ms a step for ~42 MB): one key at a time, a warp waited for each key's load, then for
+  // its G dependent warp sums (5 shuffles each), and every lane computed the same two exponentials per key and head.
+  // U > 1: the context keys go U at a time, the U loads first, all in flight together, then the G x U dot products,
+  // then the online updates in key order. U = kExchange: eight keys, and the 32 (key, head) partial dot products are
+  // reduce-scattered across the warp, so lane j ends with pair j's sum after 31 shuffles instead of 160, and lane j
+  // alone computes pair j's two exponentials (the running maximum is a scan over the pairs of its head: a maximum is
+  // exact in any order); the scores, factors and maxima go to every lane through shared memory. Either way a warp
+  // takes the same keys in the same order, each sum adds the same operands in the same tree as warp_sum (the
+  // butterfly's stages in its order: lane j's sum is warp_sum's) and each update is the same expression, so the
+  // result is the old loop's bit for bit (U = 1). The tail of the context and the block's own keys go one at a time.
+  if constexpr (U > 1 || U == kExchange) {
+    constexpr bool XP = U == kExchange;
+    constexpr int NU = XP ? 8 : U;
+    static_assert(!XP || NU * G == 32, "the exchange takes 32 (key, head) pairs");
+    __shared__ float xs[XP ? 8 : 1][XP ? 4 : 1][32];  // per warp: scores, factors, weights, running maxima
+    for (; kk + 8 * (NU - 1) < nctx; kk += 8 * NU) {
+      const int p0 = (lo + kk) % ring;
+      uint2 kr[NU], vr[NU];
+#pragma unroll
+      for (int u = 0; u < NU; ++u) {
+        int p = p0 + 8 * u;
+        if (p >= ring) p -= ring;  // ring > 8 (NU - 1): the host checks
+        const size_t off = (static_cast<size_t>(p) * Hkv + kvh) * kDD + lane * 4;
+        kr[u] = *reinterpret_cast<const uint2*>(kc + off);
+        vr[u] = *reinterpret_cast<const uint2*>(vc + off);
+      }
+      float sc[NU][G];
+#pragma unroll
+      for (int u = 0; u < NU; ++u) {
+        const __nv_bfloat16* k16 = reinterpret_cast<const __nv_bfloat16*>(&kr[u]);
+        float kf[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) kf[i] = __bfloat162float(k16[i]);
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+          float dot = qv[g][0] * kf[0];
+          dot = fmaf(qv[g][1], kf[1], dot);
+          dot = fmaf(qv[g][2], kf[2], dot);
+          dot = fmaf(qv[g][3], kf[3], dot);
+          if constexpr (XP) sc[u][g] = dot;  // the lane's partial, reduced below
+          else sc[u][g] = warp_sum(dot);
+        }
+      }
+      if constexpr (XP) {
+        // Reduce-scatter: at offset o a lane keeps the half of its pairs whose index bit o matches its own and adds
+        // the partner's value of each (v_i + v_(i^o), warp_sum's operands in its order).
+        float* part = &sc[0][0];  // pair j = u * G + g
+#pragma unroll
+        for (int o = 16, n = 32; o > 0; o >>= 1, n >>= 1) {
+          const bool hi = lane & o;
+#pragma unroll
+          for (int k = 0; k < n / 2; ++k) {
+            const float keep = hi ? part[k + n / 2] : part[k], send = hi ? part[k] : part[k + n / 2];
+            part[k] = keep + __shfl_xor_sync(0xffffffffu, send, o);
+          }
+        }
+        const int g = lane % G;
+        const float s = part[0];
+        float m = s;  // the running maximum of head g over this batch's keys up to lane's: a scan over lanes g + 4u
+#pragma unroll
+        for (int o = G; o < 32; o <<= 1) {
+          const float up = __shfl_up_sync(0xffffffffu, m, o);
+          if (lane >= o) m = fmaxf(m, up);
+        }
+        float before = mx[0];
+#pragma unroll
+        for (int gg = 1; gg < G; ++gg) before = g == gg ? mx[gg] : before;
+        const float nm = fmaxf(before, m);
+        const float prev_in = __shfl_up_sync(0xffffffffu, nm, G), prev = lane >= G ? prev_in : before;
+        xs[warp][0][lane] = __expf(prev - nm);  // corr
+        xs[warp][1][lane] = __expf(s - nm);     // p
+        xs[warp][2][lane] = nm;
+        __syncwarp();
+#pragma unroll
+        for (int u = 0; u < NU; ++u) {
+          const __nv_bfloat16* v16 = reinterpret_cast<const __nv_bfloat16*>(&vr[u]);
+          float vf[4];
+#pragma unroll
+          for (int i = 0; i < 4; ++i) vf[i] = __bfloat162float(v16[i]);
+          const float4 c4 = *reinterpret_cast<const float4*>(&xs[warp][0][u * G]);
+          const float4 p4 = *reinterpret_cast<const float4*>(&xs[warp][1][u * G]);
+          const float cs[4] = {c4.x, c4.y, c4.z, c4.w}, ps[4] = {p4.x, p4.y, p4.z, p4.w};
+#pragma unroll
+          for (int gg = 0; gg < G; ++gg) {
+            const float corr = cs[gg], p = ps[gg];
+            l[gg] = l[gg] * corr + p;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[gg][i] = acc[gg][i] * corr + p * vf[i];
+          }
+        }
+        const float4 m4 = *reinterpret_cast<const float4*>(&xs[warp][2][(NU - 1) * G]);
+        mx[0] = m4.x, mx[1] = m4.y, mx[2] = m4.z, mx[3] = m4.w;
+        __syncwarp();  // before the next batch writes xs
+      } else {
+#pragma unroll
+        for (int u = 0; u < NU; ++u) {
+          const __nv_bfloat16* v16 = reinterpret_cast<const __nv_bfloat16*>(&vr[u]);
+          float vf[4];
+#pragma unroll
+          for (int i = 0; i < 4; ++i) vf[i] = __bfloat162float(v16[i]);
+#pragma unroll
+          for (int g = 0; g < G; ++g) {
+            const float nm = fmaxf(mx[g], sc[u][g]);
+            const float corr = __expf(mx[g] - nm), p = __expf(sc[u][g] - nm);
+            l[g] = l[g] * corr + p;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[g][i] = acc[g][i] * corr + p * vf[i];
+            mx[g] = nm;
+          }
+        }
+      }
+    }
+  }
+  for (; kk < nk; kk += 8) {
     float kf[4], vf[4];
     if (kk < nctx) {
       const size_t off = (static_cast<size_t>((lo + kk) % ring) * Hkv + kvh) * kDD + lane * 4;
@@ -158,18 +278,18 @@ __device__ __forceinline__ void draft_attention_body(const float* __restrict__ q
   }
 }
 
-template <int G>
+template <int G, int U>
 __global__ void __launch_bounds__(256)
     draft_attention_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
                            const __nv_bfloat16* __restrict__ vc, int ring, const float* __restrict__ kb,
                            const float* __restrict__ vb, DevPos L_arg, int window_left, int Hkv, float* __restrict__ out) {
   pdl_begin();  // first statement: see launch.cuh
-  draft_attention_body<G>(q, kc, vc, ring, kb, vb, pos_value(L_arg), window_left, Hkv, out, blockIdx.x, gridDim.x);
+  draft_attention_body<G, U>(q, kc, vc, ring, kb, vb, pos_value(L_arg), window_left, Hkv, out, blockIdx.x, gridDim.x);
 }
 
 // Several sequences' blocks in one launch (M4 stage 4): row jg belongs to sequence seq_of(jg), whose block is its
 // rows of b, over its own ring at its own position.
-template <int G>
+template <int G, int U>
 __global__ void __launch_bounds__(256)
     draft_attention_seqs_kernel(const float* __restrict__ q, SeqPtrs<const __nv_bfloat16> kc,
                                 SeqPtrs<const __nv_bfloat16> vc, int ring, const float* __restrict__ kb,
@@ -178,7 +298,7 @@ __global__ void __launch_bounds__(256)
   pdl_begin();  // first statement: see launch.cuh
   const int jg = blockIdx.x, sq = seq_of(b, jg);
   const size_t r0 = b.row0[sq], Hq = static_cast<size_t>(Hkv) * G;
-  draft_attention_body<G>(q + r0 * Hq * kDD, kc.p[sq], vc.p[sq], ring, kb + r0 * Hkv * kDD, vb + r0 * Hkv * kDD,
+  draft_attention_body<G, U>(q + r0 * Hq * kDD, kc.p[sq], vc.p[sq], ring, kb + r0 * Hkv * kDD, vb + r0 * Hkv * kDD,
                           seq_pos(b, sq), window_left, Hkv, out + r0 * Hq * kDD, jg - b.row0[sq],
                           b.row0[sq + 1] - b.row0[sq]);
 }
@@ -262,12 +382,112 @@ __global__ void bf16_to_half_rows_kernel(const __nv_bfloat16* __restrict__ x, in
   if (threadIdx.x == 0) xinv[blockIdx.x] = ldexpf(1.f, e - 15);
 }
 
+// The wide copy (BACKLOG 28's lead 1, as to_half_rows_wide_kernel in stream_gemm.cu): row blockIdx.x over gridDim.y
+// blocks, each finding the whole row's largest magnitude (exact in any order) and converting its slice of K, so the
+// values are the one-block kernel's bit for bit. VEC: x and out aligned to 16 bytes, K and slice multiples of 8.
+__device__ __forceinline__ float abs_max8(float m, const uint4& v) {
+  const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&v);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) m = fmaxf(m, fabsf(__bfloat162float(b[i])));
+  return m;
+}
+
+template <bool VEC>
+__global__ void __launch_bounds__(256) bf16_to_half_rows_wide_kernel(const __nv_bfloat16* __restrict__ x, int K,
+                                                                     int slice, __half* __restrict__ out,
+                                                                     float* __restrict__ xinv) {
+  pdl_begin();  // first statement: see launch.cuh
+  __shared__ float red[8];
+  const size_t r = blockIdx.x;
+  const __nv_bfloat16* row = x + r * K;
+  const int tid = threadIdx.x;
+  float m0 = 0.f, m1 = 0.f;
+  if constexpr (VEC) {
+    const uint4* row8 = reinterpret_cast<const uint4*>(row);
+    const int K8 = K / 8;
+    int k = tid;
+    for (; k + 3 * 256 < K8; k += 4 * 256) {
+      uint4 v[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) v[i] = row8[k + i * 256];
+      m0 = abs_max8(m0, v[0]), m1 = abs_max8(m1, v[1]), m0 = abs_max8(m0, v[2]), m1 = abs_max8(m1, v[3]);
+    }
+    for (; k < K8; k += 256) m0 = abs_max8(m0, row8[k]);
+  } else {
+    for (int k = tid; k < K; k += 256) m0 = fmaxf(m0, fabsf(__bfloat162float(row[k])));
+  }
+  float mx = fmaxf(m0, m1);
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+  if ((tid & 31) == 0) red[tid >> 5] = mx;
+  __syncthreads();
+  mx = 0.f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) mx = fmaxf(mx, red[i]);
+  int e = 0;
+  if (mx > 0.f && isfinite(mx)) frexpf(mx, &e);  // mx < 2^e
+  const float s = ldexpf(1.f, 15 - e);
+  const int k0 = blockIdx.y * slice, k1 = min(K, k0 + slice);
+  if constexpr (VEC) {
+    const uint4* row8 = reinterpret_cast<const uint4*>(row);
+    uint4* out8 = reinterpret_cast<uint4*>(out + r * K);
+    for (int k = k0 / 8 + tid; k < k1 / 8; k += 256) {
+      const uint4 v = row8[k];
+      const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&v);
+      uint4 o;
+      __half* h = reinterpret_cast<__half*>(&o);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) h[i] = __float2half_rn(__bfloat162float(b[i]) * s);
+      out8[k] = o;
+    }
+  } else {
+    for (int k = k0 + tid; k < k1; k += 256) out[r * K + k] = __float2half_rn(__bfloat162float(row[k]) * s);
+  }
+  if (blockIdx.y == 0 && tid == 0) xinv[r] = ldexpf(1.f, e - 15);
+}
+
+// draft_attention's batches (U above): LING_DRAFT_ATTN_KEYS or set_draft_attention_keys; 1, 2, 4 or 8 keys a load,
+// 0 (the default) eight keys exchanged across the warp.
+int draft_keys = [] {
+  const char* e = std::getenv("LING_DRAFT_ATTN_KEYS");
+  return e ? std::atoi(e) : 0;
+}();
+
+template <typename Launch>
+void with_keys(int ring, Launch&& launch) {
+  const int u = draft_keys == 0 ? (8 * 7 < ring ? 0 : 1) : draft_keys == 1 || 8 * (draft_keys - 1) >= ring ? 1 : draft_keys;
+  if (u == 0) launch(std::integral_constant<int, kExchange>());
+  else if (u == 2) launch(std::integral_constant<int, 2>());
+  else if (u == 4) launch(std::integral_constant<int, 4>());
+  else if (u == 8) launch(std::integral_constant<int, 8>());
+  else launch(std::integral_constant<int, 1>());
+}
+
 }  // namespace
 
+// About LING_HALF_BLOCKS (default 96) blocks in all, as to_half_rows; LING_HALF_BLOCKS=0: one block per row.
 void bf16_to_half_rows(const __nv_bfloat16* x, int M, int K, __half* out, float* xinv, cudaStream_t s) {
   if (M <= 0) return;
-  launch_kernel("bf16_to_half_rows", bf16_to_half_rows_kernel, dim3(M), dim3(256), 0, s, x, K, out, xinv);
+  static const int target = [] {
+    const char* e = std::getenv("LING_HALF_BLOCKS");
+    return e ? std::atoi(e) : 96;
+  }();
+  if (target <= 0) {
+    launch_kernel("bf16_to_half_rows", bf16_to_half_rows_kernel, dim3(M), dim3(256), 0, s, x, K, out, xinv);
+    return;
+  }
+  const bool vec = K % 8 == 0 && reinterpret_cast<uintptr_t>(x) % 16 == 0 && reinterpret_cast<uintptr_t>(out) % 16 == 0;
+  const int split = std::max(1, std::min((target + M - 1) / M, std::max(1, K / 1024)));
+  int slice = (K + split - 1) / split;
+  if (vec) slice = (slice + 7) / 8 * 8;
+  const dim3 grid(M, (K + slice - 1) / slice);
+  if (vec)
+    launch_kernel("bf16_to_half_rows", bf16_to_half_rows_wide_kernel<true>, grid, dim3(256), 0, s, x, K, slice, out, xinv);
+  else
+    launch_kernel("bf16_to_half_rows", bf16_to_half_rows_wide_kernel<false>, grid, dim3(256), 0, s, x, K, slice, out, xinv);
 }
+
+void set_draft_attention_keys(int u) { draft_keys = u; }
 
 void copy_rows_bf16(const float* src, int rows, int H, __nv_bfloat16* dst, int dst_stride, cudaStream_t s) {
   if (rows <= 0) return;
@@ -291,8 +511,10 @@ void draft_attention(const float* q, const __nv_bfloat16* kc, const __nv_bfloat1
                      const float* vb, DevPos L, int B, int window_left, int Hq, int Hkv, float* out, cudaStream_t s) {
   if (Hq != 4 * Hkv) throw std::runtime_error("draft_attention: built for 4 query heads per KV head");
   if (ring <= window_left) throw std::runtime_error("draft_attention: the ring is shorter than the window");
-  launch_kernel("draft_attention", draft_attention_kernel<4>, dim3(B, Hkv), dim3(256), 0, s, q, kc, vc, ring, kb, vb,
-                L, window_left, Hkv, out);
+  with_keys(ring, [&](auto u) {
+    launch_kernel("draft_attention", draft_attention_kernel<4, decltype(u)::value>, dim3(B, Hkv), dim3(256), 0, s, q, kc,
+                  vc, ring, kb, vb, L, window_left, Hkv, out);
+  });
 }
 
 void draft_qk_rope_seqs(float* x, int heads, int row_stride, const __nv_bfloat16* norm, const SeqBatch& b, float theta,
@@ -306,8 +528,10 @@ void draft_attention_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPt
                           float* out, cudaStream_t s) {
   if (Hq != 4 * Hkv) throw std::runtime_error("draft_attention: built for 4 query heads per KV head");
   if (ring <= window_left) throw std::runtime_error("draft_attention: the ring is shorter than the window");
-  launch_kernel("draft_attention_seqs", draft_attention_seqs_kernel<4>, dim3(b.row0[b.n], Hkv), dim3(256), 0, s, q, kc,
-                vc, ring, kb, vb, b, window_left, Hkv, out);
+  with_keys(ring, [&](auto u) {
+    launch_kernel("draft_attention_seqs", draft_attention_seqs_kernel<4, decltype(u)::value>, dim3(b.row0[b.n], Hkv),
+                  dim3(256), 0, s, q, kc, vc, ring, kb, vb, b, window_left, Hkv, out);
+  });
 }
 
 void grouped_conv(const float* h, const float* coef, const __nv_bfloat16* base, int side, float* out, int rows,
