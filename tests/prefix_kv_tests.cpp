@@ -148,6 +148,22 @@ int main() {
     EXPECT(t.match(sys).len == 100);
     EXPECT(h.live.size() <= before + 1);
   }
+  {
+    // The arena: first fit, alignment, merging on release, refusal when no range is large enough.
+    ling::ArenaAlloc a(100, 10);
+    size_t x, y, z, w;
+    EXPECT(a.alloc(25, &x) && x == 0);  // 30 with the alignment
+    EXPECT(a.alloc(30, &y) && y == 30);
+    EXPECT(a.alloc(40, &z) && z == 60);
+    EXPECT(!a.alloc(10, &w));           // full
+    a.release(y);
+    EXPECT(!a.alloc(40, &w));           // 30 free in one piece
+    a.release(x);                       // merges with y's range: 60 from 0
+    EXPECT(a.alloc(60, &w) && w == 0);
+    a.release(w);
+    a.release(z);
+    EXPECT(a.in_use() == 0 && a.alloc(100, &w) && w == 0);
+  }
   std::printf(failures ? "prefix kv tests: %d FAILED\n" : "all prefix kv tests passed\n", failures);
   return failures ? 1 : 0;
 }

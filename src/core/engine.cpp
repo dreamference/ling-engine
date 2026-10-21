@@ -205,30 +205,6 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   if (prefill_bf16_) std::fprintf(stderr, "prefill: BF16 DeltaNet intermediates (not the exact path)\n");
   branch_checkpoints_ = opts_.branch_checkpoints;
   if (const char* e = std::getenv("LING_BRANCH_CKPT")) branch_checkpoints_ = std::atoi(e) != 0;
-  {
-    int mb = opts_.prefix_kv_mb;
-    if (const char* e = std::getenv("LING_PREFIX_KV_MB")) mb = std::atoi(e);
-    if (mb > 0 && opts_.prefix_checkpoints > 0) {
-      const size_t per_token = size_t(c.layers - n_linear_) * 2 * c.kv_heads * c.head_dim * sizeof(__nv_bfloat16);
-      const size_t state = size_t(n_linear_) * (size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim +
-                                               size_t(c.lin_conv_channels()) * (c.conv_kernel - 1)) * sizeof(float);
-      PrefixKvTree::Ops ops;
-      ops.alloc = [this](size_t n) -> void* {
-        void* p = nullptr;
-        if (cudaMallocAsync(&p, n, stream_) != cudaSuccess) {
-          cudaGetLastError();
-          return nullptr;
-        }
-        return p;
-      };
-      ops.release = [this](void* p) { cudaFreeAsync(p, stream_); };
-      ops.store = [this](void* buf, int buf_start, int buf_len, int from, int to) {
-        kv_copy(buf, buf_start, buf_len, from, to, true);
-      };
-      kv_tree_ = std::make_unique<PrefixKvTree>(size_t(mb) << 20, per_token, state, std::move(ops));
-      std::fprintf(stderr, "prefix KV store: %d MB (%zu KB a token, %zu MB a state)\n", mb, per_token >> 10, state >> 20);
-    }
-  }
   inpass_ = opts_.inpass_checkpoints;
   if (const char* e = std::getenv("LING_CKPT_INPASS")) inpass_ = std::atoi(e) != 0;
   if (inpass_ && !ckpt_slots_.empty()) soft_slot_ = alloc_slot();
@@ -328,6 +304,46 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     std::fprintf(stderr, "prefill beside a decode: a second stream%s\n",
                  opts_.side_prefill > 0 ? (" on a green context of " + std::to_string(opts_.side_prefill) + " SMs").c_str() : "");
   }
+  // The prefix KV store (BACKLOG 35) last, from what the engine's own allocations left: one arena allocated now, so the
+  // footprint is fixed at start and never grows while serving. It takes at most prefix_kv_mb and leaves
+  // LING_PREFIX_KV_RESERVE_MB (default 16 GB) of the device's free memory untouched (the host's safety margin and what
+  // the step graphs and the stream pool still take); below 512 MB the store is off.
+  int mb = opts_.prefix_kv_mb;
+  if (const char* e = std::getenv("LING_PREFIX_KV_MB")) mb = std::atoi(e);
+  if (mb > 0 && opts_.prefix_checkpoints > 0) {
+    size_t free_b = 0, total_b = 0;
+    check(cudaMemGetInfo(&free_b, &total_b), "memory info");
+    size_t reserve = size_t(16384) << 20;
+    if (const char* e = std::getenv("LING_PREFIX_KV_RESERVE_MB")) reserve = size_t(std::atoll(e)) << 20;
+    const size_t want = size_t(mb) << 20, avail = free_b > reserve ? free_b - reserve : 0;
+    size_t size = std::min(want, avail);
+    size -= size % (size_t(2) << 20);
+    if (size >= (size_t(512) << 20) && cudaMalloc(&kv_arena_base_, size) == cudaSuccess) {
+      kv_arena_ = std::make_unique<ArenaAlloc>(size, size_t(2) << 20);
+      const size_t per_token = size_t(c.layers - n_linear_) * 2 * c.kv_heads * c.head_dim * sizeof(__nv_bfloat16);
+      const size_t state = size_t(n_linear_) * (size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim +
+                                               size_t(c.lin_conv_channels()) * (c.conv_kernel - 1)) * sizeof(float);
+      PrefixKvTree::Ops ops;
+      ops.alloc = [this](size_t n) -> void* {
+        size_t off = 0;
+        return kv_arena_->alloc(n, &off) ? static_cast<char*>(kv_arena_base_) + off : nullptr;
+      };
+      // Stream-ordered reuse: every copy into or out of a range is queued on stream_ (the main or, swapped, the side
+      // stream, which starts after the main stream's work and is joined before any other prefill), so a range given
+      // out again is written only after the copies that read it.
+      ops.release = [this](void* p) { kv_arena_->release(static_cast<char*>(p) - static_cast<char*>(kv_arena_base_)); };
+      ops.store = [this](void* buf, int buf_start, int buf_len, int from, int to) {
+        kv_copy(buf, buf_start, buf_len, from, to, true);
+      };
+      kv_tree_ = std::make_unique<PrefixKvTree>(size, per_token, state, std::move(ops));
+      std::fprintf(stderr, "prefix KV store: %zu MB of %d asked (%zu MB free after the engine's own memory, %zu kept free; %zu KB a token, %zu MB a state)\n",
+                   size >> 20, mb, free_b >> 20, reserve >> 20, per_token >> 10, state >> 20);
+    } else {
+      cudaGetLastError();
+      std::fprintf(stderr, "prefix KV store: off (%zu MB free after the engine's own memory, %zu kept free, %d asked)\n",
+                   free_b >> 20, reserve >> 20, mb);
+    }
+  }
 }
 
 void Engine::swap_side() {
@@ -424,7 +440,8 @@ Engine::~Engine() {
   }
   if (commit_stream_) cudaStreamSynchronize(commit_stream_);
   if (stream_) cudaStreamSynchronize(stream_);
-  kv_tree_.reset();  // its frees are queued on stream_, which goes below
+  kv_tree_.reset();
+  if (kv_arena_base_) cudaFree(kv_arena_base_);
   if (side_.stream_) {
     cudaStreamSynchronize(side_.stream_);
     if (side_.logits_host_) cudaFreeHost(side_.logits_host_);

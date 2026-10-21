@@ -13,9 +13,26 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <vector>
 
 namespace ling {
+
+// First-fit offsets in one region allocated once (the prefix KV store's arena: its footprint is fixed when the engine
+// starts and never grows while serving), freed ranges merged with their neighbours. Host bookkeeping only.
+class ArenaAlloc {
+ public:
+  ArenaAlloc(size_t size, size_t align);
+  bool alloc(size_t bytes, size_t* offset);  // false: no free range is large enough
+  void release(size_t offset);
+  size_t size() const { return size_; }
+  size_t in_use() const { return in_use_; }
+
+ private:
+  size_t size_, align_, in_use_ = 0;
+  std::map<size_t, size_t> free_;  // offset -> length
+  std::map<size_t, size_t> used_;  // offset -> length
+};
 
 class PrefixKvTree {
  public:
