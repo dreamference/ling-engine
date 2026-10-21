@@ -41,7 +41,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
+#include <string>
 
 #include <nvtx3/nvToolsExt.h>
 
@@ -49,6 +51,7 @@
 #include "core/kernels.cuh"
 #include "core/accept.hpp"
 #include "core/lookup.hpp"
+#include "core/safetensors.hpp"
 
 namespace ling {
 namespace {
@@ -225,6 +228,172 @@ void Engine::alloc_drafter() {
                  opts_.tree_nodes, opts_.tree_chain, opts_.tree_temp, opts_.tree_width, opts_.tree_max_depth);
 }
 
+void Engine::alloc_sparse_head() {
+  // BACKLOG 19: the drafter's context-aware sparse head, off unless asked for.
+  if (const char* e = std::getenv("LING_DRAFT_HEAD")) opts_.draft_head = e;
+  if (const char* e = std::getenv("LING_SPARSE_HEAD_DIR")) opts_.sparse_head_dir = e;
+  if (opts_.draft_head == "full") return;
+  if (opts_.draft_head != "sparse") throw std::runtime_error("the drafter's head is full or sparse, not " + opts_.draft_head);
+  auto env_i = [](const char* n, int& v) { if (const char* e = std::getenv(n)) v = std::atoi(e); };
+  auto env_d = [](const char* n, double& v) { if (const char* e = std::getenv(n)) v = std::atof(e); };
+  env_i("LING_SH_DYNAMIC", opts_.sparse_head_dynamic);
+  env_i("LING_SH_CONTEXT", opts_.sparse_head_context);
+  env_i("LING_SH_WINDOW", opts_.sparse_head_window);
+  env_d("LING_SH_HI", opts_.sparse_head_hi);
+  env_d("LING_SH_LO", opts_.sparse_head_lo);
+  env_d("LING_SH_ACCEPT_FLOOR", opts_.sparse_head_accept_floor);
+  opts_.sparse_head_window = std::clamp(opts_.sparse_head_window, 1, 4096);
+  opts_.sparse_head_context = std::max(0, opts_.sparse_head_context);
+  opts_.sparse_head_dynamic = std::max(0, opts_.sparse_head_dynamic);
+  const ModelConfig& c = model_->config();
+  const int V = c.vocab, H = c.hidden;
+  const std::string dir = opts_.sparse_head_dir.empty() ? opts_.draft_dir + "/sparse-head" : opts_.sparse_head_dir;
+  ling::Checkpoint sh(dir);
+  const TensorView &us = sh.get("us"), &vt = sh.get("vt"), &fixed = sh.get("fixed");
+  if (us.dtype != "BF16" || us.shape.size() != 2 || us.shape[0] != V || vt.dtype != "BF16" || vt.shape.size() != 2 ||
+      vt.shape[1] != H || vt.shape[0] != us.shape[1] || fixed.dtype != "I32")
+    throw std::runtime_error("sparse head: unexpected tensors in " + dir);
+  if (model_->lm_head().N != V || model_->lm_head().K != H) throw std::runtime_error("sparse head: the LM head's shape");
+  sh_rank_ = static_cast<int>(us.shape[1]);
+  auto put = [&](const TensorView& t) {
+    uint8_t* d = alloc<uint8_t>(t.bytes);
+    check(cudaMemcpy(d, t.data, t.bytes, cudaMemcpyHostToDevice), "sparse head upload");
+    return d;
+  };
+  sh_us_ = reinterpret_cast<__nv_bfloat16*>(put(us));
+  sh_vt_ = reinterpret_cast<__nv_bfloat16*>(put(vt));
+  sh_fixed_.assign(V, 0);
+  const int nf = static_cast<int>(fixed.numel());
+  for (int i = 0; i < nf; ++i) {
+    int id;
+    std::memcpy(&id, fixed.data + 4 * size_t(i), 4);
+    if (id >= 0 && id < V && !sh_fixed_[id]) sh_fixed_[id] = 1, ++sh_nfixed_;
+  }
+  // The capacity: the fixed rows, the context rows (at most sparse_head_context per session, two sessions' in a
+  // batched draft: at block 12 no more fit its 32 rows), the chosen ones and their ties, so the clamp (which drops the
+  // highest ids) never bites in practice. Columns past a step's count cost little: their GEMM blocks leave at once
+  // and the top 16 reads them as -inf.
+  const long per = std::min<long>(2, static_cast<long>(sessions_.size()));
+  const long cap = long(sh_nfixed_) + long(opts_.sparse_head_context) * per + opts_.sparse_head_dynamic + 256;
+  sh_cap_ = static_cast<int>(std::min<long>((cap + 31) / 32 * 32, (V + 31) / 32 * 32));
+  sh_p_ = alloc<float>(size_t(kernels::kMaxStreamRows) * sh_rank_);
+  sh_scratch_ = alloc<uint8_t>(kernels::sparse_head_scratch_bytes(V));
+  sh_rows_ = alloc<int>(V);
+  sh_nrows_ = alloc<int>(1);
+  sh_ids_dev_ = alloc<int>(kShMarkMax);
+  for (Session& s : sessions_) {
+    s.sh_mask = alloc<uint8_t>(V);
+    s.sh_dirty = true;
+  }
+  sparse_head_ = true;
+  std::fprintf(stderr,
+               "drafter head: sparse, %d fixed + up to %d context + %d chosen rows per step (rank %d, at most %d); full "
+               "head above %.3f of the last %d tokens outside them, sparse again below %.3f%s\n",
+               sh_nfixed_, opts_.sparse_head_context, opts_.sparse_head_dynamic, sh_rank_, sh_cap_, opts_.sparse_head_hi,
+               opts_.sparse_head_window, opts_.sparse_head_lo,
+               opts_.sparse_head_accept_floor > 0
+                   ? (", or below " + std::to_string(opts_.sparse_head_accept_floor) + " tokens per step").c_str()
+                   : "");
+}
+
+bool Engine::sparse_head_sync(Session& s) {
+  if (!sparse_head_) return false;
+  const int V = model_->config().vocab, W = opts_.sparse_head_window;
+  const std::vector<int>& h = s.history;
+  bool upload = false;
+  if (s.sh_dirty || h.size() < s.sh_synced) {  // a new history: the fixed list alone, the window empty
+    s.sh_seen = sh_fixed_;
+    s.sh_ctx = 0;
+    s.sh_synced = 0;
+    s.sh_win.assign(W, 0);
+    s.sh_win_pos = s.sh_win_n = s.sh_novel = 0;
+    s.sh_full = true;
+    s.sh_cool_until = 0;
+    s.sh_acc_ema = -1;
+    s.sh_dirty = false;
+    upload = true;
+  } else if (s.sh_rewin) {  // a new turn: the window and the head decided again from the tokens that follow the cut
+    s.sh_win.assign(W, 0);
+    s.sh_win_pos = s.sh_win_n = s.sh_novel = 0;
+    s.sh_full = true;
+    s.sh_cool_until = 0;
+    s.sh_acc_ema = -1;
+  }
+  s.sh_rewin = false;
+  // The acceptance floor's input: the last step's tokens, if it drafted with the sparse head.
+  if (s.sh_last_sparse && s.spec.steps == s.sh_last_steps + 1) {
+    const double a = double(s.spec.accepted - s.sh_last_acc) + 1;
+    s.sh_acc_ema = s.sh_acc_ema < 0 ? a : s.sh_acc_ema * (15.0 / 16) + a / 16;
+  }
+  s.sh_last_steps = s.spec.steps;
+  s.sh_last_acc = s.spec.accepted;
+  // The tokens since the last draft (the prompt's at the first): each new one joins the context (up to its cap) and
+  // counts as outside the selection in the window.
+  std::vector<int> fresh;
+  for (size_t i = s.sh_synced; i < h.size(); ++i) {
+    const int t = h[i];
+    if (t < 0 || t >= V) continue;
+    const uint8_t novel = s.sh_seen[t] ? 0 : 1;
+    if (novel && s.sh_ctx < opts_.sparse_head_context) {
+      s.sh_seen[t] = 1;
+      ++s.sh_ctx;
+      if (!upload) fresh.push_back(t);
+    }
+    s.sh_novel += novel - s.sh_win[s.sh_win_pos];
+    s.sh_win[s.sh_win_pos] = novel;
+    s.sh_win_pos = (s.sh_win_pos + 1) % W;
+    s.sh_win_n = std::min(s.sh_win_n + 1, W);
+  }
+  s.sh_synced = h.size();
+  if (upload || fresh.size() > size_t(kShMarkMax)) {
+    check(cudaMemcpyAsync(s.sh_mask, s.sh_seen.data(), V, cudaMemcpyHostToDevice, stream_), "sparse head mask");
+  } else if (!fresh.empty()) {
+    check(cudaMemcpyAsync(sh_ids_dev_, fresh.data(), fresh.size() * sizeof(int), cudaMemcpyHostToDevice, stream_),
+          "sparse head ids");
+    kernels::sparse_head_mark(s.sh_mask, sh_ids_dev_, static_cast<int>(fresh.size()), stream_);
+  }
+  // The fallback, with hysteresis: the full head while the window holds too few tokens or too many new ones.
+  const double share = s.sh_win_n ? double(s.sh_novel) / s.sh_win_n : 1.0;
+  const bool was_full = s.sh_full;
+  if (s.sh_win_n < std::min(W, 16)) s.sh_full = true;
+  else if (!s.sh_full && share > opts_.sparse_head_hi) s.sh_full = true;
+  else if (s.sh_full && share < opts_.sparse_head_lo && h.size() >= s.sh_cool_until) s.sh_full = false;
+  if (!s.sh_full && opts_.sparse_head_accept_floor > 0 && s.sh_acc_ema >= 0 &&
+      s.sh_acc_ema < opts_.sparse_head_accept_floor) {
+    s.sh_full = true;
+    s.sh_cool_until = h.size() + W;
+    s.sh_acc_ema = -1;
+  }
+  if (s.sh_full && !was_full) ++s.spec.sparse_fallbacks;
+  static const bool verbose = [] { const char* e = std::getenv("LING_SH_VERBOSE"); return e && std::atoi(e); }();
+  if (verbose && s.sh_full != was_full)
+    std::fprintf(stderr, "drafter head: %s at token %zu (%.3f of the last %d new, %d context rows, ema %.2f)\n",
+                 s.sh_full ? "full" : "sparse", h.size(), share, s.sh_win_n, s.sh_ctx, s.sh_acc_ema);
+  return !s.sh_full;
+}
+
+void Engine::draft_head(int E, const kernels::SelMasks* masks) {
+  const ModelConfig& c = model_->config();
+  const DraftConfig& d = draft_->config();
+  const int K16 = d.selector_top_k;
+  const Fp4Weight& lm = model_->lm_head();
+  if (!masks) {
+    linear_fp4(lm, dh_, E, dlogits_);
+    kernels::topk_rows(dlogits_, E, c.vocab, K16, topk_scratch_, dunary_, dcand_, stream_);
+    return;
+  }
+  // The rank-256 scores choose the rows beyond the masks'; their exact logits (the full head's bits, read from the
+  // same tiled blob) give the top 16, whose columns map back to token ids.
+  kernels::bf16_rows(dh_, E, sh_vt_, sh_p_, sh_rank_, d.hidden, stream_);
+  kernels::sparse_head_select(sh_p_, E, sh_us_, c.vocab, sh_rank_, *masks, opts_.sparse_head_dynamic, sh_cap_,
+                              sh_scratch_, sh_rows_, sh_nrows_, stream_);
+  kernels::to_half_rows(dh_, E, d.hidden, xh_, xinv_, stream_);
+  kernels::stream_gemm_gather_nvfp4(xh_, xinv_, E, lm.w, lm.table ? lm.scales : nullptr, lm.scale2, sh_rows_,
+                                    sh_nrows_, sh_cap_, dlogits_, d.hidden, stream_);
+  kernels::topk_rows(dlogits_, E, sh_cap_, K16, topk_scratch_, dunary_, dcand_, stream_);
+  kernels::sparse_head_ids(sh_rows_, dcand_, E * K16, stream_);
+}
+
 bool Engine::tree_step(const SamplingParams& p, bool use_lookup, bool want_logits, int B) const {
   (void)p;
   const int rows = std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes;
@@ -250,6 +419,8 @@ void Engine::clear_graphs() {
   for (Session& s : sessions_) {
     if (s.draft_graph) cudaGraphExecDestroy(s.draft_graph);
     s.draft_graph = nullptr;
+    if (s.draft_graph_sparse) cudaGraphExecDestroy(s.draft_graph_sparse);
+    s.draft_graph_sparse = nullptr;
     for (auto& [k, g] : s.verify_graphs) cudaGraphExecDestroy(g);
     s.verify_graphs.clear();
     for (auto& [k, g] : s.tree_verify_graphs) cudaGraphExecDestroy(g);
@@ -264,6 +435,7 @@ void Engine::clear_graphs() {
   }
   for (auto& [order, bg] : batch_graphs_) {
     if (bg.draft) cudaGraphExecDestroy(bg.draft);
+    if (bg.draft_sparse) cudaGraphExecDestroy(bg.draft_sparse);
     for (auto& [k, g] : bg.verify) cudaGraphExecDestroy(g);
   }
   batch_graphs_.clear();
@@ -360,7 +532,7 @@ void Engine::linear_draft_kproj(const Bf16Weight& w, const Fp4Weight& w4, const 
   kernels::stream_gemm_nvfp4(xh_, xinv_, M, w4.w, w4.table, w4.scale2, y, w4.N, w4.K, stream_);
 }
 
-void Engine::draft_launch(int B) {
+void Engine::draft_launch(int B, bool sparse) {
   NvtxRange range("draft");
   // The drafter's block always takes the rows path. quantized_ is whatever the last forward() left: after a
   // prefill it is set, which made the first draft after each prompt take the quantized prefill path (and a
@@ -401,8 +573,8 @@ void Engine::draft_launch(int B) {
   // Drafted positions 1 .. B - 1: the final norm, the target's LM head (no target final norm), the top 16,
   // the selector's projection and lattice (its first predecessor, the anchor, read from ids_dev_[0]).
   kernels::rmsnorm(dres_ + H, draft_->norm(), dh_, E, H, d.eps, false, stream_);
-  linear_fp4(model_->lm_head(), dh_, E, dlogits_);
-  kernels::topk_rows(dlogits_, E, c.vocab, K16, topk_scratch_, dunary_, dcand_, stream_);
+  kernels::SelMasks masks{{s_->sh_mask}, 1};
+  draft_head(E, sparse ? &masks : nullptr);
   linear_bf16_drafter(draft_->selector_projection(), dh_, E, dhp_);
   kernels::selector_lattice(dhp_, dcand_, dunary_, draft_->predecessor_codebook(), draft_->successor_codebook(),
                             pin_->draft_ids[0], E, dscores_, stream_, ids_dev_);
@@ -413,7 +585,7 @@ void Engine::draft_launch(int B) {
         "draft scores");
 }
 
-void Engine::draft_batch_launch(std::span<StepPlan> plans, int B) {
+void Engine::draft_batch_launch(std::span<StepPlan> plans, int B, bool sparse) {
   NvtxRange range("draft");
   quantized_ = false;  // the rows path (see draft_launch)
   const ModelConfig& c = model_->config();
@@ -465,8 +637,10 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B) {
   for (int i = 0; i < n; ++i)
     kernels::rmsnorm(dres_ + (size_t(i) * B + 1) * H, draft_->norm(), dh_ + size_t(i) * E * H, E, H, d.eps, false,
                      stream_);
-  linear_fp4(model_->lm_head(), dh_, n * E, dlogits_);
-  kernels::topk_rows(dlogits_, n * E, c.vocab, K16, topk_scratch_, dunary_, dcand_, stream_);
+  kernels::SelMasks masks{};  // the sparse head over the union of the sequences' masks (BACKLOG 19)
+  masks.n = n;
+  for (int i = 0; i < n; ++i) masks.m[i] = plans[i].s->sh_mask;
+  draft_head(n * E, sparse ? &masks : nullptr);
   linear_bf16_drafter(draft_->selector_projection(), dh_, n * E, dhp_);
   const int rank = d.selector_rank;
   for (int i = 0; i < n; ++i)
@@ -483,9 +657,26 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B) {
 void Engine::draft_propose(int anchor, int B, bool graph) {
   pin_->draft_ids[0] = anchor;
   for (int i = 1; i < B; ++i) pin_->draft_ids[i] = draft_->config().mask_token;
-  if (graph) run_graph(s_->draft_graph, "draft", [&] { draft_launch(B); });
-  else draft_launch(B);
+  const bool sparse = sparse_head_sync(*s_);  // BACKLOG 19: the head for this draft
+  if (graph) run_graph(sparse ? s_->draft_graph_sparse : s_->draft_graph, "draft", [&] { draft_launch(B, sparse); });
+  else draft_launch(B, sparse);
+  s_->sh_last_sparse = sparse;
+  if (sparse) ++s_->spec.sparse_steps;
   check(cudaStreamSynchronize(stream_), "draft");
+  // BACKLOG 19's offline input (bench/sparse_head): LING_DUMP_DRAFT_H=FILE appends each one-stream draft's rows' final
+  // hidden states (E x hidden floats, the LM head's input) and their top-16 candidates (E x 16 ints).
+  static FILE* dump = [] { const char* f = std::getenv("LING_DUMP_DRAFT_H"); return f ? std::fopen(f, "ab") : nullptr; }();
+  static long dump_left = [] { const char* n = std::getenv("LING_DUMP_DRAFT_H_STEPS"); return n ? std::atol(n) : 1L << 40; }();
+  if (dump && dump_left-- > 0) {
+    const int E = B - 1, H = draft_->config().hidden, K16 = draft_->config().selector_top_k;
+    std::vector<float> h(size_t(E) * H);
+    check(cudaMemcpy(h.data(), dh_, h.size() * sizeof(float), cudaMemcpyDeviceToHost), "dump");
+    const int hdr[3] = {E, H, K16};
+    std::fwrite(hdr, sizeof(int), 3, dump);
+    std::fwrite(h.data(), sizeof(float), h.size(), dump);
+    std::fwrite(pin_->cand, sizeof(int), size_t(E) * K16, dump);
+    std::fflush(dump);
+  }
 }
 
 void Engine::verify_launch(int V, int K, bool tree) {
@@ -871,8 +1062,15 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
       pin_->draft_ids[i * B] = plans[i].anchor;
       for (int j = 1; j < B; ++j) pin_->draft_ids[i * B + j] = draft_->config().mask_token;
     }
-    if (graph) run_graph(bg->draft, "draft", [&] { draft_batch_launch(plans, B); });
-    else draft_batch_launch(plans, B);
+    // BACKLOG 19: the sparse head only when every sequence's session takes it and the rows fit its gathered GEMM.
+    bool sparse = sparse_head_ && n * E <= kernels::kMaxStreamRows;
+    for (int i = 0; i < n; ++i) sparse = sparse_head_sync(*plans[i].s) && sparse;
+    if (graph) run_graph(sparse ? bg->draft_sparse : bg->draft, "draft", [&] { draft_batch_launch(plans, B, sparse); });
+    else draft_batch_launch(plans, B, sparse);
+    for (int i = 0; i < n; ++i) {
+      plans[i].s->sh_last_sparse = sparse;
+      if (sparse) ++plans[i].s->spec.sparse_steps;
+    }
     check(cudaStreamSynchronize(stream_), "draft");
     for (int i = 0; i < n; ++i)
       plan_walk(plans[i], B, pin_->cand + size_t(i) * E * K16, pin_->scores + size_t(i) * E * K16 * K16);

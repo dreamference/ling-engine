@@ -85,6 +85,8 @@ int main(int argc, char** argv) {
   std::string draft;
   int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256, side_prefill = 0;
   bool interleave_check = false, batch_check = false, batch_bench = false, draft_bf16 = false;
+  std::string draft_head = "full", sparse_head_dir;  // the drafter's head (BACKLOG 19)
+  int sparse_head_dynamic = 16384;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -119,6 +121,9 @@ int main(int argc, char** argv) {
     else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
     else if (a == "--prefill-bf16") prefill_bf16 = true;
     else if (a == "--draft-bf16") draft_bf16 = true;
+    else if (a == "--draft-head") draft_head = next();  // full (default) or sparse (BACKLOG 19)
+    else if (a == "--sparse-head-dir") sparse_head_dir = next();
+    else if (a == "--sparse-head-dynamic") sparse_head_dynamic = std::stoi(next());
     else if (a == "--sessions") sessions = std::stoi(next());
     else if (a == "--chunk-check") chunk_check = std::stoi(next());
     else if (a == "--interleave-check") interleave_check = true;
@@ -172,6 +177,9 @@ int main(int argc, char** argv) {
     opts.attention_prefetch = attn_prefetch;
     opts.prefill_bf16 = prefill_bf16;
     opts.draft_nvfp4 = !draft_bf16;
+    opts.draft_head = draft_head;
+    opts.sparse_head_dir = sparse_head_dir;
+    opts.sparse_head_dynamic = sparse_head_dynamic;
     opts.sessions = sessions;
     if (batch_check) opts.tree_nodes = 0;  // the chain alone, as a batch verifies (see --batch-check above)
     opts.side_prefill = side_prefill;
@@ -665,6 +673,9 @@ int main(int argc, char** argv) {
         if (st.tree_steps)
           std::fprintf(stderr, "tree: %ld steps, %ld left the chain (%ld off-chain tokens)\n", st.tree_steps,
                        st.tree_branch_steps, st.tree_off_chain);
+        if (st.sparse_steps || st.sparse_fallbacks)
+          std::fprintf(stderr, "sparse head: %ld of %ld steps, %ld fallbacks to the full head\n", st.sparse_steps,
+                       st.steps, st.sparse_fallbacks);
         if (st.lookup_steps)
           std::fprintf(stderr, "lookup: %ld steps verified its chain, %.2f tokens/step\n", st.lookup_steps,
                        double(st.lookup_accepted + st.lookup_steps) / st.lookup_steps);
