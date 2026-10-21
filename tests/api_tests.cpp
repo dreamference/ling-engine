@@ -115,9 +115,18 @@ static void test_repetition() {
     for (int x : t) EXPECT(!d.push(x));
     EXPECT(d.push(3));
   }
-  {  // single-token blocks are below min_pattern_size: only max_run sees a run
-    RepetitionDetector d(RepetitionDetection{8, 2, 3, 5});
-    for (int i = 0; i < 4; ++i) EXPECT(!d.push(7));
+  {  // with max_run on, a run of one token is max_run's alone, though it is also a block of 2 repeated (the block
+     // test, which would stop it at 2 x 3 = 6, leaves it); a two-token block still stops at its third copy
+    RepetitionDetector d(RepetitionDetection{8, 2, 3, 9});
+    for (int i = 0; i < 8; ++i) EXPECT(!d.push(7));
+    EXPECT(d.push(7));
+    RepetitionDetector e(RepetitionDetection{8, 2, 3, 9});
+    for (int x : {7, 7, 7, 1, 2, 1, 2, 1}) EXPECT(!e.push(x));
+    EXPECT(e.push(2));
+  }
+  {  // max_run off: vLLM's test as it is, the run stopped as a block of 2
+    RepetitionDetector d(RepetitionDetection{8, 2, 3, 0});
+    for (int i = 0; i < 5; ++i) EXPECT(!d.push(7));
     EXPECT(d.push(7));
   }
   {  // off
@@ -134,6 +143,9 @@ static void test_repetition() {
     bool any = false;
     for (int i = 0; i < 4000; ++i) any |= e.push(i % 2 ? 11 : 100 + static_cast<int>(rnd() % 1000));  // "a, b, c, ..."
     for (int i = 0; i < 11 * 2; ++i) any |= z.push(i % 2 ? 11 : 0);  // "0, " eleven times
+    RepetitionDetector h(ling::serve::kRepetitionDefault);  // " hello" alone: a run, stopped at 64, not at 24
+    for (int i = 0; i < 63; ++i) any |= h.push(42);
+    EXPECT(h.push(42));
     EXPECT(!any);
     const bool z0 = z.push(0), z1 = z.push(11);
     EXPECT(!z0 && z1);  // the twelfth "0, "

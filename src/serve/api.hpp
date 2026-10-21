@@ -20,6 +20,7 @@ using json = nlohmann::ordered_json;
 // "repetition" when its output, reasoning included, ends in a block of min_pattern_size .. max_pattern_size tokens
 // repeated min_count times back to back (vLLM's RepetitionDetectionParams, the same test on the tail), or in one
 // token repeated max_run times (an extension). max_pattern_size 0 turns the first test off, max_run 0 the second.
+// With max_run on, a run of one token counts against max_run only (to the block test it is a block of every size).
 // The output up to the token that completed the loop is sent unchanged.
 struct RepetitionDetection {
   int max_pattern_size = 0, min_pattern_size = 0, min_count = 0, max_run = 0;
