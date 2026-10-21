@@ -250,7 +250,21 @@ void stream_gemm_multi(bool nvfp4, const __half* x, const float* xinv, int M, co
 // copy into xh2 with xinv2, down into down.y) as one persistent kernel, bit for bit the four kernels. `counters` is
 // kMkFfnWords zeroed words, owned by this call site (the kernel leaves them zeroed). False: a shape or a stream GEMM
 // override (LING_SG_*, LING_KSPLIT) the kernel does not reproduce; nothing was launched.
-constexpr int kMkFfnWords = 4 + kMaxStreamRows;
+constexpr int kMkFfnWords = 5 + kMaxStreamRows;
+// The megakernel's stage 4 (LING_MK_LAYERS, BACKLOG 28): a persistent kernel's last GEMM adds its output into the
+// residual stream h itself (add_inplace's rounding), and, with norm_w, the next norm (rmsnorm_half's row, exactly)
+// follows in the same launch into out (FP32), xh and xinv. Passed as a pointer: nullptr keeps the separate kernels.
+struct MkTail {
+  float* h;
+  const __nv_bfloat16* norm_w = nullptr;  // nullptr: the residual add only
+  float* out = nullptr;
+  __half* xh = nullptr;
+  float* xinv = nullptr;
+  float eps = 0.f;
+};
+// The rows the fused tails are built for (9 to 16: the verify's draft blocks of 12 and 16); other row counts keep the
+// separate kernels (the persistent kernels then refuse a tail).
+inline bool mk_tail_rows(int M) { return M > 8 && M <= 16; }
 // The megakernel's stage 2 in the step (LING_MK_GDN): one verify sequence's DeltaNet mixer, from the input norm's output
 // (xn in FP32, xh/xinv its FP16 copy) to the out-projection's output (out.y), as one persistent kernel: in_qkv's output
 // into in_qkv.y (kept for the commit), in_z's into in_z.y, the a/b projections and the gating into a, b, g, beta, the
@@ -280,11 +294,22 @@ struct MkGdnParams {
   int C, H, HV, Dk, Dv, Vs;
   unsigned* counters;
   unsigned long long* times = nullptr;  // LING_MK_TIMES: [blocks][kMkTimesPerBlock] stamps of the last launch
+  const MkTail* tail = nullptr;  // stage 4: the out-projection into tail->h, then tail's norm
+  const TreeDesc* td = nullptr;  // a tree verify (BACKLOG 26): the tree conv and the per-path recurrence
 };
 bool gdn_persistent(const MkGdnParams& p, cudaStream_t s);
+// The megakernel's stage 4 (LING_MK_SPAN): a verify's DeltaNet layer, its mixer (as gdn_persistent with gp.tail) and
+// its FFN (as ffn_persistent with tail), in one persistent launch. gp.tail must carry the post-attention norm into its
+// own FP16 buffer (not gp.xh or gp.xh2), and xh2/xinv2 (the down projection's input) must not be the mixer's. False:
+// not built for these shapes or options (LING_MK_SPAN_PFG 2 or 3, LING_MK_SPAN_PFF 3 or 4); nothing launched.
+bool gdn_ffn_persistent(const MkGdnParams& gp, const StreamTarget& gate, const StreamTarget& up, const StreamTarget& down,
+                        int I, float* g, float* u, __half* xh2, float* xinv2, unsigned* counters,
+                        unsigned long long* times, const MkTail* tail, cudaStream_t s);
+// tail (stage 4): the down projection into tail->h, then tail's norm (down.y unused).
 bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarget& gate, const StreamTarget& up,
                     const StreamTarget& down, int H, int I, float* g, float* u, __half* xh2, float* xinv2,
-                    unsigned* counters, cudaStream_t s, unsigned long long* times = nullptr);
+                    unsigned* counters, cudaStream_t s, unsigned long long* times = nullptr,
+                    const MkTail* tail = nullptr);
 constexpr int kMkTimesPerBlock = 10;  // LING_MK_TIMES: globaltimer stamps per block of a persistent kernel
 // The megakernel probe (BACKLOG 28): about `bytes` of a tiled weight blob (the first chunks of every tile, what a stream
 // GEMM's blocks read first) prefetched into L2 by one PDL launch, so the latency-bound kernels before that GEMM run
@@ -382,6 +407,45 @@ void set_attention_bulk(bool on);
 // M3: attention_rows prefetches its KV tiles into L2 this many tiles past its shared-memory ring (head-major KV
 // only; 0 off). Moves data only: the output is bit for bit the same.
 void set_attention_prefetch(int tiles);
+// What attention_rows uses (for the megakernel's attention layer, which reproduces it): the KV strides, the L2
+// prefetch depth, whether the bulk-copy tiles are on, and the key range size (attention_chunk()).
+size_t kv_head_stride(int D);
+size_t kv_pos_stride(int Hkv, int D);
+int attention_prefetch_tiles();
+bool attention_bulk_enabled();
+int attention_chunk();
+// The megakernel's stage 3 in the step (LING_MK_ATTN, BACKLOG 28): one verify sequence's full-attention layer, from the
+// input norm's FP16 copy (xh/xinv) to the out-projection's output (o.y), as one persistent kernel: q|k|v into q.y,
+// k.y, v.y, the prepare step (q/k norms, RoPE, the rows' K and V into the caches at pos0 ..) into q_out, gate and the
+// caches, the attention over the session's real key ranges into scratch, the combine with the sigmoid gate into attn,
+// its FP16 copy into xh2/xinv2, then the out-projection. Bit for bit the graph path's kernels (attn_prepare,
+// attention_rows, sigmoid_mul, to_half_rows, the stream GEMMs); work is taken from one ordered ticket queue, so it
+// completes with any number of resident blocks. `counters` is kMkAttnWords zeroed words owned by the call site (left
+// zeroed). False: a shape or override it does not reproduce (bulk tiles, LING_SG_*, LING_KSPLIT); nothing launched.
+constexpr int kMkAttnWords = 32;
+constexpr int kMkAttnEvents = 16;  // LING_MK_TIMES: per launch, the globaltimer of each counter's completion
+struct MkAttnParams {
+  const __half* xh;
+  const float* xinv;
+  int M, K;                     // rows; the hidden size (q|k|v's K, o's N)
+  StreamTarget q, k, v, o;      // FP8; q is q|gate per head [Hq][2 D]
+  int Hq, Hkv, D, rot;
+  float theta, eps;
+  const __nv_bfloat16 *q_norm, *k_norm;
+  float *q_out, *gate;          // [M][Hq][D]
+  __nv_bfloat16 *kcache, *vcache;
+  DevPos pos0 = DevPos(0);
+  float* scratch;               // attention_rows_scratch_floats(M, Hq, D, the context) floats
+  float* attn;                  // [M][Hq D]
+  __half* xh2;                  // the out-projection's input and row scales
+  float* xinv2;
+  unsigned* counters;
+  unsigned long long* times = nullptr;  // LING_MK_TIMES: kMkAttnEvents stamps of the last launch
+  const TreeDesc* td = nullptr;  // a tree verify (BACKLOG 26): its rows' depths and the attention's per-variant tail
+  const MkTail* tail = nullptr;  // stage 4: the out-projection into tail->h (o.y unused), then tail's norm
+};
+bool attn_persistent(const MkAttnParams& p, cudaStream_t s);
+void attn_persistent_prepare();  // its shared-memory attribute, once, outside any graph capture
 // ---- The DFlash2 drafter (draft_kernels.cu). ----
 // dst[r][0..H) = bf16(src[r][0..H)), rows dst_stride apart (the target features the drafter conditions on).
 void copy_rows_bf16(const float* src, int rows, int H, __nv_bfloat16* dst, int dst_stride, cudaStream_t s);
