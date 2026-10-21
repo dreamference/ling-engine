@@ -922,7 +922,17 @@ template <int NT, bool CODED, bool TAIL = false, int PF = 2>
 void mk_ffn_launch(MkFfnArgs& a, cudaStream_t s) {
   static const int blocks_env = sg_env("LING_MK_BLOCKS", 0);
   const int resident = mk_resident<NT, CODED, TAIL, PF>();
-  const int G = blocks_env > 0 ? std::min(blocks_env, resident) : resident;
+  // BACKLOG 34, lever 3: as many blocks as give every block the same number of down tiles (the down projection's 160
+  // tiles on 80 of the 96 resident blocks, two each, instead of 64 blocks taking two and 32 one). Each tile is the same
+  // body over the same chunks whatever the grid, so no element changes. LING_MK_BLOCKS=N overrides; LING_MK_EVEN=0 keeps
+  // every resident block.
+  static const bool even = sg_env("LING_MK_EVEN", 1) != 0;
+  int G = blocks_env > 0 ? std::min(blocks_env, resident) : resident;
+  if (NT <= 2 && blocks_env <= 0 && even && a.n_down > 0) {  // two blocks per SM, as measured
+    const int waves = (a.n_down + resident - 1) / resident;
+    G = std::max(1, (a.n_down + waves - 1) / waves);
+    if (TAIL) G = std::max(G, a.M);
+  }
   if (G < 1) throw std::runtime_error("ffn_persistent: no resident block");
   static bool told = false;
   if (!told) {
