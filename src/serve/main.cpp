@@ -1313,7 +1313,7 @@ int main(int argc, char** argv) {
   double protect_seconds = 30;
   bool draft_bf16 = false;
   std::string repetition_arg, repetition_report = "incomplete";
-  std::string draft_head = "full", sparse_head_dir;  // the drafter's head (BACKLOG 19)
+  std::string draft_head = "sparse", sparse_head_dir;  // the drafter's head (BACKLOG 19)
   int sparse_head_dynamic = 16384;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -1343,7 +1343,7 @@ int main(int argc, char** argv) {
     else if (a == "--keepalive-seconds") keepalive_seconds = std::stoi(next());
     else if (a == "--prefill-bf16") prefill_bf16 = true;
     else if (a == "--draft-bf16") draft_bf16 = true;
-    else if (a == "--draft-head") draft_head = next();  // full (default) or sparse (BACKLOG 19)
+    else if (a == "--draft-head") draft_head = next();  // sparse (default) or full (BACKLOG 19)
     else if (a == "--sparse-head-dir") sparse_head_dir = next();
     else if (a == "--sparse-head-dynamic") sparse_head_dynamic = std::stoi(next());
     else if (a == "--sessions") sessions = std::stoi(next());
@@ -1359,7 +1359,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head full|sparse [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]\n";
     return 2;
   }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do

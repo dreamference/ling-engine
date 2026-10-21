@@ -103,16 +103,17 @@ struct EngineOptions {
   int tree_max_depth = 1000;
   int tree_chain = 8;        // the chain's length within the block (the block's later positions hold tree nodes)
   double tree_min_mass = 0;  // a step whose extra nodes' summed path probability is below this verifies the chain alone
-  // BACKLOG 19: the drafter's context-aware sparse head. "full" (the default): the target's whole LM head. "sparse":
+  // BACKLOG 19: the drafter's context-aware sparse head. "full": the target's whole LM head. "sparse" (the default):
   // per step the drafter scores the fixed list, the session's context vocabulary (the token ids of its prompt and
   // output) and the `sparse_head_dynamic` rows a rank-256 copy of the head rates best, and takes its top 16 among
   // them (the target verifies every token, so the output is the full head's; only the proposals change); a session
   // whose recent tokens are too often outside the fixed list and its context falls back to the full head.
   // sparse_head_dir: model.safetensors with `us` (BF16 [vocab][256], the head's left factor times its singular
   // values), `vt` (BF16 [256][hidden]) and `fixed` (I32, the rows always scored), bench/sparse_head/build.py's;
-  // empty: <draft_dir>/sparse-head. LING_DRAFT_HEAD (full|sparse) and LING_SPARSE_HEAD_DIR override these, and
+  // empty: <draft_dir>/sparse-head; without a usable file there the drafter keeps the full head (one line on stderr).
+  // LING_DRAFT_HEAD (full|sparse) and LING_SPARSE_HEAD_DIR override these, and
   // LING_SH_DYNAMIC, LING_SH_CONTEXT, LING_SH_WINDOW, LING_SH_HI, LING_SH_LO and LING_SH_ACCEPT_FLOOR the rest.
-  std::string draft_head = "full";
+  std::string draft_head = "sparse";
   std::string sparse_head_dir;
   int sparse_head_dynamic = 16384;
   int sparse_head_context = 32768;  // the most context rows beyond the fixed list a session adds (0: no union)

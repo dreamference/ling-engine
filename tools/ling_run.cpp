@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
   std::string draft;
   int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256, side_prefill = 0;
   bool interleave_check = false, batch_check = false, batch_bench = false, draft_bf16 = false;
-  std::string draft_head = "full", sparse_head_dir;  // the drafter's head (BACKLOG 19)
+  std::string draft_head = "sparse", sparse_head_dir;  // the drafter's head (BACKLOG 19)
   int sparse_head_dynamic = 16384;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -121,7 +121,7 @@ int main(int argc, char** argv) {
     else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
     else if (a == "--prefill-bf16") prefill_bf16 = true;
     else if (a == "--draft-bf16") draft_bf16 = true;
-    else if (a == "--draft-head") draft_head = next();  // full (default) or sparse (BACKLOG 19)
+    else if (a == "--draft-head") draft_head = next();  // sparse (default) or full (BACKLOG 19)
     else if (a == "--sparse-head-dir") sparse_head_dir = next();
     else if (a == "--sparse-head-dynamic") sparse_head_dynamic = std::stoi(next());
     else if (a == "--sessions") sessions = std::stoi(next());
