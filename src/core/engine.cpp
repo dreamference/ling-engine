@@ -1017,7 +1017,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       const bool fork = fork_ > 0 && verify && !tree_ && !multi && !quantized_ && L.in_a.N == L.in_b.N;
       // The megakernel's stage 2 (LING_MK_GDN): the whole mixer of one verify sequence as one persistent kernel; a tree
       // verify (BACKLOG 26) too, with the tree conv and the per-path recurrence (on by default since 2026-10-20:
-      // -3.0 ms per tree step at 24K; LING_MK_GDN_TREE=0 gives a tree the graph path's mixer).
+      // -2.2 to -2.6 ms per step with trees at 24K and 59K; LING_MK_GDN_TREE=0 gives a tree the graph path's mixer).
       static const bool gdn_tree = !std::getenv("LING_MK_GDN_TREE") || std::atoi(std::getenv("LING_MK_GDN_TREE")) != 0;
       bool mk_gdn = mk_gdn_ > 0 && verify && (!tree_ || gdn_tree) && !multi && !quantized_ && xn_half && L.in_a.N == L.in_b.N &&
                     L.in_a.N == c.lin_v_heads;
