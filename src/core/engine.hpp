@@ -57,6 +57,11 @@ struct EngineOptions {
   int prefix_checkpoints = 8;
   int boundary_token = -1;  // <|im_end|>
   int checkpoint_limit = 32768;
+  // BACKLOG 34: a checkpoint also where the prompt leaves the longest prefix it shares with another conversation (a
+  // resident session's history or a stored entry), so the next prompt of either branch resumes there. Exact (a kept
+  // state at a multiple of kResumeAlign, as every other). Off: measured without a gain (each branch point costs a short
+  // extra pass). LING_BRANCH_CKPT=0/1 overrides.
+  bool branch_checkpoints = false;
   // M3: run each part of a speculative step (draft, verify, commit) as a captured CUDA graph instead of
   // ~1,400 separate launches (speculate.cpp). Off by default until measured; LING_STEP_GRAPHS=0/1 overrides.
   bool step_graphs = false;
@@ -519,6 +524,7 @@ class Engine {
   uint64_t ckpt_clock_ = 0;
   std::vector<StateSlot> ckpt_slots_;
   std::vector<Checkpoint> ckpts_;  // sorted by position
+  bool branch_checkpoints_ = false;  // EngineOptions::branch_checkpoints
   bool ckpt_match(const Checkpoint& k, const std::vector<int>& prompt, const std::vector<uint64_t>& prefix_hash) const;
 
   // A verify's per-layer DeltaNet inputs, kept for commit(): the in-projection before and after the conv,
