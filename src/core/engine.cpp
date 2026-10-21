@@ -126,6 +126,10 @@ void Engine::alloc_scratch() {
 }
 
 Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
+  // BACKLOG 34: the prefill chunk (tokens per pass alone, a multiple of kResumeAlign); every scratch buffer is sized by
+  // it. A prompt's result does not depend on how its prefill is split (--chunk-check), so this changes no output bit.
+  if (const char* e = std::getenv("LING_PREFILL_CHUNK"))
+    opts_.prefill_chunk = std::max(kResumeAlign, std::atoi(e) - std::atoi(e) % kResumeAlign);
   model_ = std::make_unique<Model>(model_dir);
   const ModelConfig& c = model_->config();
   check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream");
@@ -199,6 +203,8 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   prefill_bf16_ = opts_.prefill_bf16;
   if (const char* e = std::getenv("LING_PREFILL_BF16")) prefill_bf16_ = std::atoi(e) != 0;
   if (prefill_bf16_) std::fprintf(stderr, "prefill: BF16 DeltaNet intermediates (not the exact path)\n");
+  branch_checkpoints_ = opts_.branch_checkpoints;
+  if (const char* e = std::getenv("LING_BRANCH_CKPT")) branch_checkpoints_ = std::atoi(e) != 0;
   commit_overlap_ = opts_.commit_overlap && draft_ != nullptr;
   if (const char* e = std::getenv("LING_COMMIT_OVERLAP")) commit_overlap_ = draft_ != nullptr && std::atoi(e) != 0;
   if (commit_overlap_) {
@@ -1302,6 +1308,29 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
       }
     }
   }
+  // The branch point (BACKLOG 34; the hybrid models' radix rule): where this prompt leaves the longest prefix it
+  // shares with another conversation, a resident session's history or a stored entry, taken before this prefill
+  // truncates or replaces the active session's history. A checkpoint there lets the next prompt of either branch
+  // resume at it instead of at the last chunk multiple before it (agents' system prompts share ~5-11K tokens and
+  // differ after). The active session's own history counts only when the prompt does not extend it (its snap
+  // covers that).
+  int branch_at = 0;
+  if (branch_checkpoints_ && !ckpt_slots_.empty()) {
+    auto lcp_of = [&](const std::vector<int>& h) {
+      const size_t n = std::min(h.size(), prompt.size());
+      size_t i = 0;
+      while (i < n && h[i] == prompt[i]) ++i;
+      return static_cast<int>(i);
+    };
+    for (const Session& s : sessions_) {
+      if (s.history.empty()) continue;
+      const int l = lcp_of(s.history);
+      if (&s == s_ && s.prompt_len > 0 && l >= s.turn_start) continue;
+      branch_at = std::max(branch_at, l);
+    }
+    for (const Checkpoint& k : ckpts_) branch_at = std::max(branch_at, lcp_of(k.tokens));
+    branch_at -= branch_at % kResumeAlign;
+  }
   // The store's clock (its LRU order): every entry on this prompt's prefix is used by this prefill, and the
   // entries it saves come after; save_checkpoint never evicts one of them for another.
   cur.ckpt_epoch = ++ckpt_clock_;
@@ -1330,7 +1359,25 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
       }
     for (int b = opts_.prefill_chunk; b < std::min(L, opts_.checkpoint_limit + 1); b += opts_.prefill_chunk)
       cur.bounds.push_back(b);
+    if (branch_at > reuse && branch_at < L && branch_at <= opts_.checkpoint_limit) cur.bounds.push_back(branch_at);
+    // LING_CKPT_TRIM=1 (BACKLOG 34, measured before any default): no chunk-multiple checkpoint past both the branch
+    // point and the message ends. Those positions serve only this conversation, whose own snap covers its next turn,
+    // and each one cuts a chunk short off the 2,048-token grid that the other bounds shift (one more pass).
+    static const bool trim = [] {
+      const char* e = std::getenv("LING_CKPT_TRIM");
+      return e && std::atoi(e) != 0;
+    }();
+    if (trim) {
+      int keep_to = branch_at;
+      for (int i = 0, messages = 0; i < L && i < opts_.checkpoint_limit && messages < 2; ++i)
+        if (prompt[i] == opts_.boundary_token) {
+          keep_to = std::max(keep_to, align(i + 1));
+          ++messages;
+        }
+      std::erase_if(cur.bounds, [&](int b) { return b > keep_to && b % opts_.prefill_chunk == 0; });
+    }
     std::sort(cur.bounds.begin(), cur.bounds.end());
+    cur.bounds.erase(std::unique(cur.bounds.begin(), cur.bounds.end()), cur.bounds.end());
   }
   cur.snap_at = align(L);  // the end-of-prompt state is kept here (the tokens after it are re-prefilled)
   cur.window = window;

@@ -128,6 +128,11 @@ def summarize(recs):
             "ms_per_step": round(1000 * dec / ver, 2) if ver else None,
             "tokens_per_step": round(gen / ver, 3) if ver else None,
             "prefill_s": round(sum(r["srv"]["ttft_s"] for r in ok), 2),
+            # The prefill: the tokens each turn prefilled beyond its cached prefix, and its time per 1,000 of them
+            # (time to first token, which also holds the first token's step; BACKLOG 34).
+            "prefill_new_tokens": sum(r["srv"]["prompt"] - r["srv"]["cached"] for r in ok),
+            "prefill_ms_per_1k_new": round(1e6 * sum(r["srv"]["ttft_s"] for r in ok) /
+                                           max(1, sum(r["srv"]["prompt"] - r["srv"]["cached"] for r in ok)), 1),
             **phase_ms(ok),
             "prompt_tokens": sum(r["srv"]["prompt"] for r in ok)}
 
