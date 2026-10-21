@@ -86,6 +86,10 @@ struct EngineOptions {
   // the next verify waits for it. The same kernels on the same inputs, so the same bits. LING_COMMIT_OVERLAP=0/1
   // overrides.
   bool commit_overlap = true;
+  // BACKLOG 34: a one-stream speculative step returns without waiting for its commit graph (the drafter's context KV)
+  // or the tree's gather, so they run while the host emits the tokens and prepares the next step (stream-ordered
+  // before it). The same kernels in the same order, so the same bits. LING_COMMIT_ASYNC=0/1 overrides.
+  bool commit_async = true;
   // The prefill beside a decode (drafts/M4-prefill-beside-decode-2026-10-17.md, option B): a prefill chunk runs on a
   // second stream with its own scratch while other sessions decode on the main stream (prefill_chunk_launch /
   // prefill_chunk_finish). > 0: the second stream belongs to a green context of that many SMs, so the chunk's
@@ -366,6 +370,16 @@ class Engine {
   // recurrent state, the verify's saved inputs or commit_core_ on stream_ (every forward pass, the state copies,
   // resets and hashes) joins first; the draft and the drafter's context KV (draft_materialize) do not need to.
   bool commit_overlap_ = false;
+  bool commit_async_ = false;            // EngineOptions::commit_async
+  // LING_STEP_GAPS (speculate.cpp, gap_mark): marks 0 draft end, 1 verify start, 2 verify end, 3 commit start,
+  // 4 commit end, 5 next draft start; slots: draft->verify, verify->commit, commit->next draft.
+  cudaEvent_t gap_ev_[6] = {};
+  bool gap_live_[6] = {};
+  double gap_ms_[3] = {};
+  long gap_n_[3] = {};
+  void gap_mark(int i);
+  void gap_take(int a, int b, int slot);
+  cudaEvent_t gather_done_ = nullptr;    // the tree gather on stream_, which the DeltaNet replay waits for
   bool commit_pending_ = false;
   cudaStream_t commit_stream_ = nullptr;
   cudaEvent_t commit_done_ = nullptr;
