@@ -251,7 +251,81 @@ Request parse_request(const json& body, bool chat) {
   }
   if (body.contains("prompt_cache_key") && body["prompt_cache_key"].is_string())
     r.session_key = body["prompt_cache_key"].get<std::string>();
+  if (body.contains("repetition_detection") && !body["repetition_detection"].is_null()) {
+    const json& d = body["repetition_detection"];
+    if (d.is_boolean()) {
+      if (!d.get<bool>()) r.repetition = {0, 0, 0, 0};  // `true`: the server's rule
+    } else if (d.is_object()) {
+      auto field = [&](const char* k, int& out) {
+        if (!d.contains(k) || d[k].is_null()) return;
+        if (!d[k].is_number_integer()) throw std::invalid_argument(std::string("repetition_detection.") + k + " must be an integer");
+        const long long v = d[k].get<long long>();
+        if (v < 0 || v > 1 << 20) throw std::invalid_argument(std::string("repetition_detection.") + k + " is out of range");
+        out = static_cast<int>(v);
+      };
+      field("max_pattern_size", r.repetition.max_pattern_size);
+      field("min_pattern_size", r.repetition.min_pattern_size);
+      field("min_count", r.repetition.min_count);
+      field("max_run", r.repetition.max_run);
+    } else {
+      throw std::invalid_argument("repetition_detection must be an object or a boolean");
+    }
+  }
   return r;
+}
+
+void validate(const RepetitionDetection& r) {
+  if (r.max_pattern_size < 0 || r.min_pattern_size < 0 || r.min_count < 0 || r.max_run < 0 ||
+      r.min_pattern_size > r.max_pattern_size)
+    throw std::invalid_argument(
+        "repetition_detection: max_pattern_size and min_pattern_size must be >= 0, with min_pattern_size <= "
+        "max_pattern_size (both 0 turn the pattern test off)");
+  if (r.max_pattern_size > 4096) throw std::invalid_argument("repetition_detection: max_pattern_size is at most 4096");
+  if (r.max_pattern_size > 0 && r.min_count < 2)
+    throw std::invalid_argument("repetition_detection: min_count must be >= 2 to detect repetitive patterns");
+  if (r.max_run == 1) throw std::invalid_argument("repetition_detection: max_run must be 0 (off) or >= 2");
+}
+
+RepetitionDetection resolve_repetition(const Request& req, const RepetitionDetection& server) {
+  const RepetitionDetection& q = req.repetition;
+  RepetitionDetection r{q.max_pattern_size >= 0 ? q.max_pattern_size : server.max_pattern_size,
+                        q.min_pattern_size >= 0 ? q.min_pattern_size : server.min_pattern_size,
+                        q.min_count >= 0 ? q.min_count : server.min_count, q.max_run >= 0 ? q.max_run : server.max_run};
+  // A request that sets max_pattern_size alone keeps the server's sizes only where they still fit.
+  if (q.max_pattern_size >= 0 && q.min_pattern_size < 0) r.min_pattern_size = std::min(r.min_pattern_size, r.max_pattern_size);
+  validate(r);
+  return r;
+}
+
+RepetitionDetector::RepetitionDetector(const RepetitionDetection& r) : r_(r) {
+  if (r_.max_pattern_size > 0) {
+    if (r_.min_pattern_size <= 0) r_.min_pattern_size = 1;  // as vLLM: 0 means 1
+    tail_.assign(r_.max_pattern_size, -1);
+    run_.assign(r_.max_pattern_size + 1, 0);
+  }
+}
+
+bool RepetitionDetector::push(int token) {
+  bool hit = false;
+  same_ = token == last_ ? same_ + 1 : 1;
+  last_ = token;
+  if (r_.max_run > 0) hit = same_ >= r_.max_run;
+  const int Pmax = r_.max_pattern_size;
+  if (Pmax > 0) {
+    // run_[P] counts the trailing positions i (within the output) with token[i] == token[i - P]; the output ends in a
+    // block of P tokens repeated min_count times exactly when (min_count - 1) * P of them do (vLLM's tail test).
+    for (int P = 1; P <= Pmax; ++P) {
+      const bool eq = n_ >= P && tail_[(n_ - P) % Pmax] == token;
+      run_[P] = eq ? run_[P] + 1 : 0;
+      // With max_run on, a run of one token (which is a block of any size P repeated) is max_run's to judge: the
+      // block test sees it only when the window holds two different tokens.
+      const bool one_token = r_.max_run > 0 && same_ >= static_cast<long>(r_.min_count) * P;
+      if (P >= r_.min_pattern_size && !one_token && run_[P] >= static_cast<long>(r_.min_count - 1) * P) hit = true;
+    }
+    tail_[n_ % Pmax] = token;
+  }
+  ++n_;
+  return hit;
 }
 
 std::vector<TokenLogprob> top_logprobs(std::span<const float> logits, int chosen, int k) {
@@ -697,7 +771,7 @@ Request parse_responses_request(const json& body) {
   }
   if (!tools.empty() && body.value("tool_choice", json("auto")) != "none") chat["tools"] = tools;
   for (const char* k : {"stream", "temperature", "top_p", "top_k", "min_p", "presence_penalty",
-                        "repetition_penalty", "seed", "stop", "chat_template_kwargs"})
+                        "repetition_penalty", "seed", "stop", "chat_template_kwargs", "repetition_detection"})
     if (body.contains(k)) chat[k] = body[k];
   if (body.contains("max_output_tokens") && body["max_output_tokens"].is_number()) chat["max_tokens"] = body["max_output_tokens"];
   if (body.contains("reasoning") && body["reasoning"].is_object() && body["reasoning"].contains("effort") &&
