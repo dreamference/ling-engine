@@ -32,6 +32,7 @@
 #include "core/drafter.hpp"
 #include "core/kernels.cuh"
 #include "core/model.hpp"
+#include "core/prefix_kv.hpp"
 #include "core/sampling.hpp"
 #include "core/tree.hpp"
 
@@ -57,6 +58,20 @@ struct EngineOptions {
   int prefix_checkpoints = 8;
   int boundary_token = -1;  // <|im_end|>
   int checkpoint_limit = 32768;
+  // BACKLOG 34: a checkpoint also where the prompt leaves the longest prefix it shares with another conversation (a
+  // resident session's history or a stored entry), so the next prompt of either branch resumes there. Exact (a kept
+  // state at a multiple of kResumeAlign, as every other). With inpass_checkpoints its state is captured inside a pass
+  // (alone it cost a short extra pass, BACKLOG 34). LING_BRANCH_CKPT=0/1 overrides.
+  bool branch_checkpoints = true;
+  // BACKLOG 35: the message ends' and the branch point's states captured inside the pass that crosses them (as the
+  // end-of-prompt snap is), so they cut no chunk short; a chunk holding the snap or a second such point still ends
+  // there. Exact: the captured state is the one a chunk ending there would leave. LING_CKPT_INPASS=0/1 overrides.
+  bool inpass_checkpoints = true;
+  // BACKLOG 35: the prefix KV store (core/prefix_kv.hpp), the KV of the prompts' shared beginnings (up to the
+  // furthest of the first two message ends and the branch point) kept beyond the resident sessions in a radix tree,
+  // with states at those positions, in at most this many MB; a prompt resumes from it as from another session's KV.
+  // Exact: the copies are the KV and states its own prefill computes. 0: off. LING_PREFIX_KV_MB overrides.
+  int prefix_kv_mb = 4096;
   // M3: run each part of a speculative step (draft, verify, commit) as a captured CUDA graph instead of
   // ~1,400 separate launches (speculate.cpp). Off by default until measured; LING_STEP_GRAPHS=0/1 overrides.
   bool step_graphs = false;
@@ -110,6 +125,7 @@ struct EngineStats {
   double compute_seconds = 0;  // the prefill's own chunks only
   int prefill_tokens = 0;
   int reused_tokens = 0;
+  int store_tokens = 0;  // of those, restored from the prefix KV store (BACKLOG 35)
   int chunks = 0;
 };
 
@@ -167,6 +183,10 @@ class Engine {
     int snap_at = 0;       // where the end-of-prompt state is kept
     int window = 0;        // the drafter's context starts here
     std::vector<int> bounds;  // chunk ends where checkpoints are saved
+    std::vector<int> soft;    // positions whose states are captured inside a pass and saved (BACKLOG 35)
+    int kv_q = 0;              // the prefix KV store gets prompt[0, kv_q) at the end (BACKLOG 35)
+    std::vector<int> kv_cuts;  // with states at these positions
+    uint64_t kv_epoch = 0;
     uint64_t ckpt_epoch = 0;  // the checkpoint store's clock at begin_prefill: entries used since are this prompt's
     std::chrono::steady_clock::time_point t0;
     EngineStats stats;
@@ -354,7 +374,8 @@ class Engine {
   // Keeps the state after history[0, pos) in the store. Full: the least recently used entry gives way, never one
   // on the current prompt's prefix (used at or after `epoch`), so a prompt longer than the store keeps its earliest
   // positions (the ones other sessions share); when every entry is the prompt's own, nothing is saved.
-  void save_checkpoint(int pos, uint64_t epoch);
+  // from: a slot, not the state; soft: a message end or branch point (BACKLOG 35), kept before chunk multiples
+  void save_checkpoint(int pos, uint64_t epoch, const StateSlot* from = nullptr, bool soft = false);
   void truncate_history(int n);  // forget the tokens from position n on, and every state past them
 
   // Speculation (speculate.cpp).
@@ -515,10 +536,24 @@ class Engine {
     uint64_t hash;
     std::vector<int> tokens;
     uint64_t used = 0;
+    bool soft = false;  // a message end or a branch point
   };
   uint64_t ckpt_clock_ = 0;
   std::vector<StateSlot> ckpt_slots_;
   std::vector<Checkpoint> ckpts_;  // sorted by position
+  bool branch_checkpoints_ = true;  // EngineOptions::branch_checkpoints
+  bool inpass_ = false;             // EngineOptions::inpass_checkpoints (with a checkpoint store)
+  StateSlot soft_slot_;             // a soft point's state, captured inside a pass, until chunk_end stores it
+  const StateSlot* keep_slot_ = nullptr;  // where forward()'s keep_at state goes: the snap, unless set
+  const StateSlot& keep_target() const { return keep_slot_ ? *keep_slot_ : s_->snap; }
+  std::unique_ptr<PrefixKvTree> kv_tree_;  // EngineOptions::prefix_kv_mb
+  uint64_t kv_epoch_ = 0;
+  StateSlot state_view(const void* p) const;  // a store state buffer as a slot
+  // The active session's KV for positions [from, to) into (to_buf) or out of a store buffer.
+  void kv_copy(void* buf, int buf_start, int buf_len, int from, int to, bool to_buf);
+  void kv_restore(const PrefixKvTree::Match& m, int n);
+  void kv_insert(const PrefillCursor& cur);  // the prompt's shared beginning into the store, at its prefill's end
+  void copy_slot(const StateSlot& dst, const StateSlot& src);
   bool ckpt_match(const Checkpoint& k, const std::vector<int>& prompt, const std::vector<uint64_t>& prefix_hash) const;
 
   // A verify's per-layer DeltaNet inputs, kept for commit(): the in-projection before and after the conv,
@@ -615,6 +650,7 @@ class Engine {
   float* logits_host_ = nullptr;  // where a pass copies its last row's logits: logits_'s data, or the side's pinned buffer
   struct ChunkRun {
     int i = 0, end = 0, keep_at = -1, n = 0, pos0 = 0;
+    int soft_at = -1;  // the soft point whose state the pass captured into soft_slot_ (-1: none, or the snap)
     std::chrono::steady_clock::time_point t;
   };
   ChunkRun chunk_begin(PrefillCursor& cur, int max_tokens);  // prefill_chunk's pass, launched

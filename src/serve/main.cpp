@@ -699,9 +699,10 @@ class Scheduler {
       std::snprintf(periods, sizeof periods, "; step period %.1f ms mean, %.1f max over %d; beside a prefill %.1f ms mean, %.1f max over %d",
                     r.alone.mean_ms(), 1e3 * r.alone.max, r.alone.n, r.beside.mean_ms(), 1e3 * r.beside.max, r.beside.n);
     std::fprintf(stderr,
-                 "request: session %d%s, %zu prompt tokens (%d reused), prefill %.2f s (%d chunks, %d beside a decode, "
+                 "request: session %d%s, %zu prompt tokens (%d reused%s), prefill %.2f s (%d chunks, %d beside a decode, "
                  "%.0f tok/s of compute); %d tokens in %.2f s (%.1f tok/s), %s; %d passes (%d batched)%s%s\n",
-                 job.session, job.fresh ? " (new)" : "", job.prompt.size(), stats.reused_tokens, stats.prefill_seconds,
+                 job.session, job.fresh ? " (new)" : "", job.prompt.size(), stats.reused_tokens,
+                 stats.store_tokens > 0 ? ", from the prefix KV store" : "", stats.prefill_seconds,
                  stats.chunks, r.chunks_beside,
                  stats.compute_seconds > 0 ? stats.prefill_tokens / stats.compute_seconds : 0.0, r.produced, decode_s,
                  decode_s > 0 ? r.produced / decode_s : 0.0, r.finish.c_str(), r.passes, r.batched,
@@ -1305,7 +1306,7 @@ class Factory : public proxygen::RequestHandlerFactory {
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "0.0.0.0", name;
-  int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 7;
+  int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 7, prefix_kv_mb = -1;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40;
@@ -1333,6 +1334,7 @@ int main(int argc, char** argv) {
     else if (a == "--lookup-min") lookup_min = std::stoi(next());
     else if (a == "--pretokenizer") pretokenizer = next();
     else if (a == "--prefix-checkpoints") checkpoints = std::stoi(next());
+    else if (a == "--prefix-kv-mb") prefix_kv_mb = std::stoi(next());
     else if (a == "--graphs") graphs = true;
     else if (a == "--pdl") pdl = true;
     else if (a == "--attn-bulk") attn_bulk = true;
@@ -1353,7 +1355,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]\n";
     return 2;
   }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
@@ -1407,6 +1409,7 @@ int main(int argc, char** argv) {
   opts.lookup_mode = lookup;
   opts.lookup_min_match = lookup_min;
   opts.prefix_checkpoints = checkpoints;
+  if (prefix_kv_mb >= 0) opts.prefix_kv_mb = prefix_kv_mb;
   opts.boundary_token = tok.token_id("<|im_end|>");
   opts.step_graphs = graphs;
   opts.pdl = pdl;
