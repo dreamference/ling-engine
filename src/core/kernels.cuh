@@ -246,6 +246,27 @@ struct StreamTarget {
 };
 void stream_gemm_multi(bool nvfp4, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K,
                        cudaStream_t s);
+// The drafter's sparse head (BACKLOG 19): y[M][cap] = scale2 * x . W[rows[i]]^T for i < *nrows, -inf after, W the
+// tiled NVFP4 blob the full head streams (raw, or coded with raw_scales its raw scales in block order: Fp4Weight's
+// w and scales). Each element's arithmetic is the tiled stream_gemm's, so a selected row's logit is bit for bit the
+// full head's. cap % 32 == 0.
+void stream_gemm_gather_nvfp4(const __half* x, const float* xinv, int M, const uint8_t* w, const uint8_t* raw_scales,
+                              float scale2, const int* rows, const int* nrows, int cap, float* y, int K, cudaStream_t s);
+// The sparse head's selection (sparse_head.cu): approx[n] = max over the M rows of p[m] . us[n] (p [M][R] FP32, us
+// [N][R] BF16, R = 256); then rows = every row any of the masks marks (the fixed list joined with each session's
+// context vocabulary) and the `dynamic` best of the others (ties at the threshold all taken), in id order, *nrows
+// their count (at most cap). `scratch` holds sparse_head_scratch_bytes(N).
+struct SelMasks {
+  const uint8_t* m[kMaxSeqs];
+  int n;
+};
+size_t sparse_head_scratch_bytes(int N);
+void sparse_head_select(const float* p, int M, const __nv_bfloat16* us, int N, int R, SelMasks masks, int dynamic,
+                        int cap, void* scratch, int* rows, int* nrows, cudaStream_t s);
+// ids[i] = rows[ids[i]] for the M x K top-K indices (the sparse head's columns back to token ids).
+void sparse_head_ids(const int* rows, int* ids, int n, cudaStream_t s);
+// mask[ids[i]] = 1 for i < n (a session's context vocabulary, BACKLOG 19).
+void sparse_head_mark(uint8_t* mask, const int* ids, int n, cudaStream_t s);
 // The megakernel's stage 1 in the step (LING_MK_FFN): the rows path's FFN (gate|up from xh, silu(g) * u into g, its FP16
 // copy into xh2 with xinv2, down into down.y) as one persistent kernel, bit for bit the four kernels. `counters` is
 // kMkFfnWords zeroed words, owned by this call site (the kernel leaves them zeroed). False: a shape or a stream GEMM

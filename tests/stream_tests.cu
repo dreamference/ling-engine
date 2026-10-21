@@ -267,6 +267,42 @@ bool test_gemm() {
     ok &= same;
     std::printf("stream_gemm nvfp4 with 6-bit scale codes identical to raw scales (M = 1 .. 32, dequant, mixed launch): %s\n",
                 same ? "yes ok" : "NO FAIL");
+    // BACKLOG 19: rows gathered from the tiled blob (raw, and coded with its raw scales) give each row's logits of
+    // the tiled launch bit for bit, the columns past the count are -inf (blocks wholly past it included), and an
+    // empty selection is all -inf.
+    {
+      std::vector<int> rows;
+      for (int n = N - 1; n >= 0; n -= 3) rows.push_back(n);  // a subset, not in order
+      const int cnt = static_cast<int>(rows.size()), cap = (cnt + 96 + 31) / 32 * 32;
+      int* drows = upload(rows);
+      bool gsame = true;
+      float* dg;
+      cudaMalloc(&dg, size_t(MMAX) * cap * sizeof(float));
+      for (int c : {cnt, 5, 0}) {
+        int* dcnt = upload(std::vector<int>{c});
+        for (int M : {1, 8, 11, 16, 22, 32}) {
+          ling::kernels::to_half_rows(dx, M, K, xh, xinv, nullptr);
+          ling::kernels::stream_gemm_nvfp4(xh, xinv, M, dw4, nullptr, gs4, dy, N, K, nullptr);
+          const auto full = download(dy, size_t(M) * N);
+          for (int blob = 0; blob < 2; ++blob) {
+            ling::kernels::stream_gemm_gather_nvfp4(xh, xinv, M, blob ? coded : dw4, blob ? raw : nullptr, gs4, drows,
+                                                    dcnt, cap, dg, K, nullptr);
+            const auto got = download(dg, size_t(M) * cap);
+            for (int m = 0; m < M; ++m)
+              for (int i = 0; i < cap; ++i) {
+                const float want = i < c ? full[size_t(m) * N + rows[i]] : -INFINITY;
+                gsame &= std::memcmp(&got[size_t(m) * cap + i], &want, sizeof(float)) == 0;
+              }
+          }
+        }
+        cudaFree(dcnt);
+      }
+      gsame &= cudaDeviceSynchronize() == cudaSuccess;
+      ok &= gsame;
+      std::printf("stream_gemm_gather nvfp4 (sparse head, raw and coded blobs) rows identical to the tiled launch's: %s\n",
+                  gsame ? "yes ok" : "NO FAIL");
+      cudaFree(drows), cudaFree(dg);
+    }
     cudaFree(map), cudaFree(dtab), cudaFree(coded), cudaFree(raw);
   }
   // Several matrices in one launch give exactly the separate launches' results.
@@ -339,6 +375,72 @@ bool test_gemm_wide() {
   }
   cudaFree(dw4), cudaFree(dw8), cudaFree(rw4), cudaFree(ds4), cudaFree(rw8), cudaFree(dx), cudaFree(xh), cudaFree(xinv),
       cudaFree(dy);
+  return ok;
+}
+
+// BACKLOG 19's selection: every row a mask marks (two sessions' masks joined), then the `dynamic` best other rows by
+// the rank-256 scores (checked against the scores the kernel computed: no unselected row scores above a selected one),
+// in id order; and the mark kernel sets exactly the rows it is given.
+bool test_sparse_select() {
+  const int N = 50000, R = 256, M = 11, D = 4000;
+  std::mt19937 rng(21);
+  std::normal_distribution<float> nd(0.f, 1.f);
+  std::vector<__nv_bfloat16> us(size_t(N) * R);
+  for (auto& v : us) v = __float2bfloat16(nd(rng));
+  std::vector<float> p(size_t(M) * R);
+  for (auto& v : p) v = nd(rng);
+  std::vector<uint8_t> fixed(N, 0), ctx(N, 0), want(N, 0);
+  int nf = 0;
+  for (int n = 0; n < N; n += 7) fixed[n] = 1;
+  std::vector<int> ctx_ids;
+  for (int n = 3; n < N; n += 101) ctx_ids.push_back(n);  // the second session's context, marked on the device
+  for (int n = 0; n < N; ++n) want[n] = fixed[n];
+  for (int id : ctx_ids) want[id] = 1;
+  for (int n = 0; n < N; ++n) nf += want[n];
+  const int cap = (nf + D + 256 + 31) / 32 * 32;
+  __nv_bfloat16* dus = upload(us);
+  float* dp = upload(p);
+  uint8_t *dfixed = upload(fixed), *dctx = upload(ctx);
+  int* dids = upload(ctx_ids);
+  ling::kernels::sparse_head_mark(dctx, dids, static_cast<int>(ctx_ids.size()), nullptr);
+  bool ok = download(dctx, size_t(N)) == [&] {
+    std::vector<uint8_t> m(N, 0);
+    for (int id : ctx_ids) m[id] = 1;
+    return m;
+  }();
+  void* scratch;
+  cudaMalloc(&scratch, ling::kernels::sparse_head_scratch_bytes(N));
+  int *rows, *cnt;
+  cudaMalloc(&rows, N * sizeof(int));
+  cudaMalloc(&cnt, sizeof(int));
+  ling::kernels::SelMasks ms{{dfixed, dctx}, 2};
+  ling::kernels::sparse_head_select(dp, M, dus, N, R, ms, D, cap, scratch, rows, cnt, nullptr);
+  const cudaError_t e = cudaDeviceSynchronize();
+  const int n = download(cnt, 1)[0];
+  const auto r = download(rows, size_t(std::max(n, 0)));
+  const auto keys = download(static_cast<const uint32_t*>(scratch), size_t(N));
+  std::vector<uint8_t> sel(N, 0);
+  ok &= e == cudaSuccess && n >= nf + D && n <= cap;
+  for (int i = 0; i < n; ++i) {
+    ok &= r[i] >= 0 && r[i] < N && (i == 0 || r[i] > r[i - 1]);
+    if (r[i] >= 0 && r[i] < N) sel[r[i]] = 1;
+  }
+  uint32_t worst_in = 0xffffffffu, best_out = 0;
+  int marked_missing = 0;
+  for (int i = 0; i < N; ++i) {
+    if (want[i]) {
+      marked_missing += !sel[i];
+      continue;
+    }
+    if (sel[i]) worst_in = std::min(worst_in, keys[i]);
+    else best_out = std::max(best_out, keys[i]);
+  }
+  ok &= marked_missing == 0 && best_out <= worst_in;
+  std::printf("sparse_head_select: %d rows (%d marked by two masks + %d chosen, capacity %d), marked all in: %s, ordered "
+              "by id, no unselected row above a selected one: %s %s\n",
+              n, nf, n - nf, cap, marked_missing ? "NO" : "yes", best_out <= worst_in ? "yes" : "NO", ok ? "ok" : "FAIL");
+  cudaFree(dus), cudaFree(dp), cudaFree(dfixed), cudaFree(dctx), cudaFree(dids), cudaFree(scratch), cudaFree(rows),
+      cudaFree(cnt);
   return ok;
 }
 
@@ -1248,6 +1350,7 @@ int main(int argc, char** argv) {
   ok &= test_gemm();
   ok &= test_gemm_wide();
   ok &= test_bf16_rows();
+  ok &= test_sparse_select();
   ok &= test_attention_rows();
   ok &= test_topk();
   ok &= test_batched_state_kernels();

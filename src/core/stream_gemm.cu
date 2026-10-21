@@ -27,6 +27,7 @@
 #include <cuda_fp8.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -82,6 +83,12 @@ struct StreamProblems {
   int block0[4];
   int count;
   const uint8_t* table[4];  // CODED: each matrix's scale-code table
+  // GATHER (BACKLOG 19, the drafter's sparse head): matrix 0's output column i is row rows[i] of the tiled NVFP4 blob
+  // w (a raw blob, or a coded one when graw, its raw scales in block order, is set), for i < *nrows; the columns past
+  // *nrows, up to N (the capacity), are -inf.
+  const int* rows = nullptr;
+  const int* nrows = nullptr;
+  const uint8_t* graw = nullptr;
 };
 
 // Per lane and chunk: the weights of rows g and g + 8 of every tile.
@@ -136,6 +143,30 @@ __device__ __forceinline__ void load_weights(WeightRegs<TILES, FP4, CODED>& r, c
   }
 }
 
+// GATHER: the lane's slots of rows grow[i][h] instead of the tile's rows g and g + 8: row n is slot (n % 16) * 4 + t
+// of its tile's block (retile_*), the same 16 value bytes and the same two E4M3 scale bytes the tiled launch loads
+// for it (a coded blob's from its raw scales, which hold exactly the bytes its codes stand for), so the arithmetic
+// after the load is the tiled launch's.
+template <int TILES>
+__device__ __forceinline__ void load_weights_gather(WeightRegs<TILES, true, false>& r, const uint8_t* __restrict__ w,
+                                                    const uint8_t* __restrict__ graw, int K, int chunk, int t,
+                                                    const int (&grow)[TILES][2]) {
+  const int chunks = K / kChunk;
+#pragma unroll
+  for (int i = 0; i < TILES; ++i)
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int n = grow[i][h], slot = (n & 15) * 4 + t;
+      const size_t blk = static_cast<size_t>(n >> 4) * chunks + chunk;
+      const uint8_t* p = w + blk * (graw ? kValueBytesFp4 : kTileBytesFp4) + slot * 16;
+      asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
+                   : "=r"(r.v[i][h][0].x), "=r"(r.v[i][h][0].y), "=r"(r.v[i][h][0].z), "=r"(r.v[i][h][0].w)
+                   : "l"(p));
+      r.sc[i][h] = graw ? *reinterpret_cast<const uint16_t*>(graw + blk * 128 + slot * 2)
+                        : *reinterpret_cast<const uint16_t*>(w + blk * kTileBytesFp4 + 1024 + slot * 2);
+    }
+}
+
 __device__ __forceinline__ uint32_t word_of(const uint4& v, int i) {
   return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
 }
@@ -147,7 +178,8 @@ __device__ __forceinline__ uint32_t word_of(const uint4& v, int i) {
 // stream and the output is added into it, y + (sum * gscale * xinv) rounded as add_inplace rounds it (no contraction).
 // DYNRED (the megakernel's spanning kernel): the warps' reduction buffer is the launch's dynamic shared memory instead
 // of a static array of this instantiation, so several instantiations in one kernel share it; the same arithmetic.
-template <int NT, int TILES, bool FP4, int PF, bool CODED, bool RESID = false, bool DYNRED = false, typename Wait>
+template <int NT, int TILES, bool FP4, int PF, bool CODED, bool RESID = false, bool DYNRED = false, bool GATHER = false,
+          typename Wait>
 __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, const float* __restrict__ xinv, int M,
                                                  const StreamProblems& pr, int K, int ksplit, float* __restrict__ part,
                                                  int bx, int by, Wait&& wait) {
@@ -177,10 +209,36 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
     for (int j = 0; j < NT; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
 
   WeightRegs<TILES, FP4, CODED> buf[PF + 1];  // buf[0]: the chunk being computed; buf[1..PF]: in flight
+  // GATHER: the row list is the previous kernel's output, so nothing is read before the wait; a block wholly past the
+  // count writes its -inf columns and leaves; a row past the count reads row 0 and is masked at the end.
+  int grow[TILES][2] = {};
+  int nrows = N;
+  if constexpr (GATHER) {
+    static_assert(FP4 && !CODED && !RESID && !DYNRED, "the gathered launch is the NVFP4 rows path's");
+    wait();
+    nrows = *pr.nrows;
+    if (row0 >= nrows) {
+      for (int e = threadIdx.x; e < TILES * 16 * M; e += blockDim.x) {
+        const int r = e % (TILES * 16), n = e / (TILES * 16);
+        if (row0 + r < N) y[static_cast<size_t>(n) * N + row0 + r] = -INFINITY;
+      }
+      return;
+    }
+#pragma unroll
+    for (int i = 0; i < TILES; ++i)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int r = row0 + 16 * i + g + 8 * h;
+        grow[i][h] = r < nrows ? pr.rows[r] : 0;
+      }
+  }
+  auto load = [&](WeightRegs<TILES, FP4, CODED>& r, int chunk) {
+    if constexpr (GATHER) load_weights_gather<TILES>(r, w, pr.graw, K, chunk, t, grow);
+    else load_weights<TILES, FP4, CODED>(r, w, row0, N, K, chunk, g, t);
+  };
 #pragma unroll
   for (int p = 0; p < PF; ++p)
-    if (cbeg + warp + p * kWarps < chunks)
-      load_weights<TILES, FP4, CODED>(buf[p], w, row0, N, K, cbeg + warp + p * kWarps, g, t);
+    if (cbeg + warp + p * kWarps < chunks) load(buf[p], cbeg + warp + p * kWarps);
   // CODED: the matrix's table (immutable, like the weights) in shared memory, and each slot's bit offset.
   __shared__ uint8_t tab[CODED ? kScaleCodes : 1];
 
@@ -190,9 +248,9 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
   }
   // PDL (launch.cuh): the first weight chunks above read only the weights, which never change, so they are
   // in flight while this block waits for the kernel that wrote x and xinv. Nothing else happens before this.
-  wait();
+  if constexpr (!GATHER) wait();
   for (int c = cbeg + warp; c < chunks; c += kWarps) {
-    if (c + PF * kWarps < chunks) load_weights<TILES, FP4, CODED>(buf[PF], w, row0, N, K, c + PF * kWarps, g, t);
+    if (c + PF * kWarps < chunks) load(buf[PF], c + PF * kWarps);
     const WeightRegs<TILES, FP4, CODED>& cur = buf[0];
     // This chunk's activations: 32 halves (16 words) per token for tokens g + 8j.
     uint32_t xw[NT][16];
@@ -274,6 +332,10 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
     float sum = 0.f;
 #pragma unroll
     for (int wi = 0; wi < kWarps; ++wi) sum += red[wi][r][n];
+    if constexpr (GATHER) {
+      y[static_cast<size_t>(n) * N + row0 + r] = row0 + r < nrows ? sum * gscale * xinv[n] : -INFINITY;
+      continue;
+    }
     if (ksplit == 1) {
       if constexpr (RESID) {
         float* p = y + static_cast<size_t>(n) * N + row0 + r;
@@ -295,6 +357,13 @@ __global__ void __launch_bounds__(kWarps * 32)
     stream_gemm_kernel(const __half* __restrict__ x, const float* __restrict__ xinv, int M, StreamProblems pr, int K,
                        int ksplit, float* __restrict__ part) {
   stream_gemm_body<NT, TILES, FP4, PF, CODED>(x, xinv, M, pr, K, ksplit, part, blockIdx.x, blockIdx.y, PdlBegin{});
+}
+
+template <int NT>
+__global__ void __launch_bounds__(kWarps * 32)
+    stream_gemm_gather_kernel(const __half* __restrict__ x, const float* __restrict__ xinv, int M, StreamProblems pr,
+                              int K) {
+  stream_gemm_body<NT, 2, true, 2, false, false, false, true>(x, xinv, M, pr, K, 1, nullptr, blockIdx.x, 0, PdlBegin{});
 }
 
 // The split-K partial sums, added in split order.
@@ -1816,6 +1885,29 @@ void stream_gemm_fp8(const __half* x, const float* xinv, int M, const uint8_t* w
                      int K, cudaStream_t s) {
   const StreamTarget t{w, nullptr, wscale, y, N};
   dispatch<false>(x, xinv, M, &t, 1, K, s);
+}
+
+void stream_gemm_gather_nvfp4(const __half* x, const float* xinv, int M, const uint8_t* w, const uint8_t* raw_scales,
+                              float scale2, const int* rows, const int* nrows, int cap, float* y, int K, cudaStream_t s) {
+  if (K % kChunk != 0 || cap % 32 != 0) throw std::runtime_error("stream_gemm_gather: K % 128 and cap % 32 must be 0");
+  if (M < 1 || M > kMaxStreamRows) throw std::runtime_error("stream_gemm_gather: M must be in [1, 32]");
+  StreamProblems pr{};
+  pr.w[0] = w;
+  pr.gscale[0] = scale2;
+  pr.y[0] = y;
+  pr.N[0] = cap;
+  pr.count = 1;
+  pr.rows = rows;
+  pr.nrows = nrows;
+  pr.graw = raw_scales;
+  // Two 16-row groups per block and two chunks in flight, dispatch()'s shape for the head; each output element's
+  // arithmetic is the tiled launch's in any shape.
+  const dim3 grid(cap / 32, 1);
+  if (M <= 8) launch_kernel("stream_gemm_gather", stream_gemm_gather_kernel<1>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K);
+  else if (M <= 16) launch_kernel("stream_gemm_gather", stream_gemm_gather_kernel<2>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K);
+  else launch_kernel("stream_gemm_gather", stream_gemm_gather_kernel<4>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K);
+  const cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess) throw std::runtime_error(std::string("stream_gemm_gather: ") + cudaGetErrorString(e));
 }
 
 void stream_gemm_multi(bool nvfp4, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K,
