@@ -433,9 +433,10 @@ class Engine {
   void draft_propose(int anchor, int B, bool graph);  // the drafter's block, top-16 candidates and lattice
   void alloc_drafter();
   void alloc_sparse_head();
-  // The drafter's head over its E rows of dh_: dunary_ and dcand_ (the top K16 values and token ids per row), from
-  // the full head (masks nullptr) or the sparse one over the rows the masks mark and the rank-256 picks (BACKLOG 19).
-  void draft_head(int E, const kernels::SelMasks* masks);
+  // The drafter's head over n sequences' E rows each of dh_: dunary_ and dcand_ (the top K16 values and token ids per
+  // row); sequence i's from the sparse head over masks[i] (its session's fixed list and context, BACKLOG 19), or the
+  // full head when masks[i] (or masks) is null, each bit for bit what the sequence gets drafted alone.
+  void draft_head(int n, int E, const uint8_t* const* masks);
   // Brings session s's context vocabulary up to its history and decides its head for the next draft (BACKLOG 19).
   // True: the sparse head.
   bool sparse_head_sync(Session& s);
@@ -458,14 +459,14 @@ class Engine {
   void verify_batch_launch(std::span<StepPlan> plans, int V);
   // The drafter over the blocks of every plan's session at once (M4 stage 4): pin_->draft_ids (B rows per
   // sequence) -> pin_->cand and pin_->scores (E = B - 1 rows per sequence, in order).
-  void draft_batch_launch(std::span<StepPlan> plans, int B, bool sparse = false);
+  void draft_batch_launch(std::span<StepPlan> plans, int B, unsigned sparse = 0);  // bit i: sequence i's sparse head
   // The batch path's graphs (M4 stage 4), per order of sessions in the batch: they bake the sessions' cache, state
   // and ring pointers and the row split. The draft graph has one shape (B rows per sequence); the verify graphs
   // are keyed by each sequence's top K; each sequence's commit graph is its session's, keyed by its slot in the
   // batch and its accepted count (slot 0 is the one-row step's own commit graph).
   struct BatchGraphs {
     cudaGraphExec_t draft = nullptr;
-    cudaGraphExec_t draft_sparse = nullptr;  // the same with the sparse head (BACKLOG 19)
+    std::map<unsigned, cudaGraphExec_t> draft_sparse;  // with the sparse head, by which sequences take it (BACKLOG 19)
     std::map<std::vector<int>, cudaGraphExec_t> verify;
   };
   std::map<std::vector<int>, BatchGraphs> batch_graphs_;
@@ -581,7 +582,8 @@ class Engine {
   std::vector<uint8_t> sh_fixed_;
   float* sh_p_ = nullptr;
   void* sh_scratch_ = nullptr;
-  int *sh_rows_ = nullptr, *sh_nrows_ = nullptr, *sh_ids_dev_ = nullptr, *sh_ids_pin_ = nullptr;
+  int *sh_rows_ = nullptr, *sh_nrows_ = nullptr, *sh_ids_dev_ = nullptr;
+  float* sh_xtmp_ = nullptr;  // a batch's full-head rows copied together (draft_head_rows)
   static constexpr int kShMarkMax = 4096;  // more new ids at once: the whole mask is uploaded
   float *topk_scratch_ = nullptr, *vals_dev_ = nullptr;
   int* ids_out_dev_ = nullptr;

@@ -267,6 +267,32 @@ void sparse_head_select(const float* p, int M, const __nv_bfloat16* us, int N, i
 void sparse_head_ids(const int* rows, int* ids, int n, cudaStream_t s);
 // mask[ids[i]] = 1 for i < n (a session's context vocabulary, BACKLOG 19).
 void sparse_head_mark(uint8_t* mask, const int* ids, int n, cudaStream_t s);
+// The drafter's head over n sequences' E drafted rows each (x [n * E][K] FP32), each sequence exactly as it is drafted
+// alone (BACKLOG 19): sequence i's rows get the sparse head over masks[i] (its session's fixed list and context) or,
+// with masks[i] null, the full head; vals and ids [n * E][K16] the top K16 logits and token ids. The full head's
+// sequences go through one stream GEMM per up to 32 rows (copied together in xtmp); every sparse sequence has its own
+// selection (its rank-256 scores from its own rows, its own mask), gathered GEMM and top K16. Every kernel's result
+// for a row depends only on that row and the sequence's selection, so a sequence's values and ids are bit for bit what
+// the same call with n = 1 on its rows gives (ling-stream-tests).
+struct SparseHeadBufs {
+  const uint8_t* w = nullptr;      // the target head's tiled blob (Fp4Weight::w)
+  const uint8_t* table = nullptr;  // a coded blob's code table (Fp4Weight::table), nullptr for a raw one
+  const uint8_t* raw = nullptr;    // a coded blob's raw scales (Fp4Weight::scales)
+  float scale2 = 0.f;
+  int N = 0, K = 0;                // vocab x hidden
+  const __nv_bfloat16 *us = nullptr, *vt = nullptr;
+  int R = 256, dynamic = 0, cap = 0;
+  float* p = nullptr;              // [32][R]
+  void* scratch = nullptr;         // sparse_head_scratch_bytes(N)
+  int *rows = nullptr, *nrows = nullptr;  // [N], [1]
+  float* xtmp = nullptr;           // [32][K]
+  __half* xh = nullptr;            // [32][K]
+  float* xinv = nullptr;           // [32]
+  float* logits = nullptr;         // [32][N]
+  float* topk_scratch = nullptr;   // topk_scratch_floats(32, 64)
+};
+void draft_head_rows(const SparseHeadBufs& b, const float* x, int n, int E, const uint8_t* const* masks, int K16,
+                     float* vals, int* ids, cudaStream_t s);
 // The megakernel's stage 1 in the step (LING_MK_FFN): the rows path's FFN (gate|up from xh, silu(g) * u into g, its FP16
 // copy into xh2 with xinv2, down into down.y) as one persistent kernel, bit for bit the four kernels. `counters` is
 // kMkFfnWords zeroed words, owned by this call site (the kernel leaves them zeroed). False: a shape or a stream GEMM

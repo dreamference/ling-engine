@@ -248,12 +248,22 @@ void Engine::alloc_sparse_head() {
   const ModelConfig& c = model_->config();
   const int V = c.vocab, H = c.hidden;
   const std::string dir = opts_.sparse_head_dir.empty() ? opts_.draft_dir + "/sparse-head" : opts_.sparse_head_dir;
-  ling::Checkpoint sh(dir);
-  const TensorView &us = sh.get("us"), &vt = sh.get("vt"), &fixed = sh.get("fixed");
-  if (us.dtype != "BF16" || us.shape.size() != 2 || us.shape[0] != V || vt.dtype != "BF16" || vt.shape.size() != 2 ||
-      vt.shape[1] != H || vt.shape[0] != us.shape[1] || fixed.dtype != "I32")
-    throw std::runtime_error("sparse head: unexpected tensors in " + dir);
-  if (model_->lm_head().N != V || model_->lm_head().K != H) throw std::runtime_error("sparse head: the LM head's shape");
+  // A missing or unusable file never stops the engine: the drafter then keeps the full head, said in one line.
+  std::unique_ptr<ling::Checkpoint> ck;
+  const TensorView *usp = nullptr, *vtp = nullptr, *fixedp = nullptr;
+  try {
+    ck = std::make_unique<ling::Checkpoint>(dir);
+    usp = &ck->get("us"), vtp = &ck->get("vt"), fixedp = &ck->get("fixed");
+    const TensorView &us = *usp, &vt = *vtp, &fixed = *fixedp;
+    if (us.dtype != "BF16" || us.shape.size() != 2 || us.shape[0] != V || us.shape[1] != 256 || vt.dtype != "BF16" ||
+        vt.shape.size() != 2 || vt.shape[1] != H || vt.shape[0] != us.shape[1] || fixed.dtype != "I32")
+      throw std::runtime_error("unexpected tensors (us [vocab][256] and vt [256][hidden] BF16, fixed I32)");
+    if (model_->lm_head().N != V || model_->lm_head().K != H) throw std::runtime_error("the LM head's shape");
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "drafter head: full (no sparse head from %s: %s)\n", dir.c_str(), e.what());
+    return;
+  }
+  const TensorView &us = *usp, &vt = *vtp, &fixed = *fixedp;
   sh_rank_ = static_cast<int>(us.shape[1]);
   auto put = [&](const TensorView& t) {
     uint8_t* d = alloc<uint8_t>(t.bytes);
@@ -269,18 +279,17 @@ void Engine::alloc_sparse_head() {
     std::memcpy(&id, fixed.data + 4 * size_t(i), 4);
     if (id >= 0 && id < V && !sh_fixed_[id]) sh_fixed_[id] = 1, ++sh_nfixed_;
   }
-  // The capacity: the fixed rows, the context rows (at most sparse_head_context per session, two sessions' in a
-  // batched draft: at block 12 no more fit its 32 rows), the chosen ones and their ties, so the clamp (which drops the
-  // highest ids) never bites in practice. Columns past a step's count cost little: their GEMM blocks leave at once
-  // and the top 16 reads them as -inf.
-  const long per = std::min<long>(2, static_cast<long>(sessions_.size()));
-  const long cap = long(sh_nfixed_) + long(opts_.sparse_head_context) * per + opts_.sparse_head_dynamic + 256;
+  // The capacity: the fixed rows, the session's context rows (at most sparse_head_context), the chosen ones and their
+  // ties, so the clamp (which drops the highest ids) never bites in practice. Columns past a step's count cost little:
+  // their GEMM blocks leave at once and the top 16 reads them as -inf. A batched draft selects per sequence.
+  const long cap = long(sh_nfixed_) + long(opts_.sparse_head_context) + opts_.sparse_head_dynamic + 256;
   sh_cap_ = static_cast<int>(std::min<long>((cap + 31) / 32 * 32, (V + 31) / 32 * 32));
   sh_p_ = alloc<float>(size_t(kernels::kMaxStreamRows) * sh_rank_);
   sh_scratch_ = alloc<uint8_t>(kernels::sparse_head_scratch_bytes(V));
   sh_rows_ = alloc<int>(V);
   sh_nrows_ = alloc<int>(1);
   sh_ids_dev_ = alloc<int>(kShMarkMax);
+  sh_xtmp_ = alloc<float>(size_t(kernels::kMaxStreamRows) * H);
   for (Session& s : sessions_) {
     s.sh_mask = alloc<uint8_t>(V);
     s.sh_dirty = true;
@@ -372,26 +381,25 @@ bool Engine::sparse_head_sync(Session& s) {
   return !s.sh_full;
 }
 
-void Engine::draft_head(int E, const kernels::SelMasks* masks) {
+void Engine::draft_head(int n, int E, const uint8_t* const* masks) {
   const ModelConfig& c = model_->config();
   const DraftConfig& d = draft_->config();
   const int K16 = d.selector_top_k;
   const Fp4Weight& lm = model_->lm_head();
-  if (!masks) {
-    linear_fp4(lm, dh_, E, dlogits_);
-    kernels::topk_rows(dlogits_, E, c.vocab, K16, topk_scratch_, dunary_, dcand_, stream_);
+  bool any_sparse = false;
+  for (int i = 0; i < n; ++i) any_sparse |= masks && masks[i];
+  if (!any_sparse) {  // the full head over every row, as before the sparse head (BACKLOG 19)
+    linear_fp4(lm, dh_, n * E, dlogits_);
+    kernels::topk_rows(dlogits_, n * E, c.vocab, K16, topk_scratch_, dunary_, dcand_, stream_);
     return;
   }
-  // The rank-256 scores choose the rows beyond the masks'; their exact logits (the full head's bits, read from the
-  // same tiled blob) give the top 16, whose columns map back to token ids.
-  kernels::bf16_rows(dh_, E, sh_vt_, sh_p_, sh_rank_, d.hidden, stream_);
-  kernels::sparse_head_select(sh_p_, E, sh_us_, c.vocab, sh_rank_, *masks, opts_.sparse_head_dynamic, sh_cap_,
-                              sh_scratch_, sh_rows_, sh_nrows_, stream_);
-  kernels::to_half_rows(dh_, E, d.hidden, xh_, xinv_, stream_);
-  kernels::stream_gemm_gather_nvfp4(xh_, xinv_, E, lm.w, lm.table ? lm.scales : nullptr, lm.scale2, sh_rows_,
-                                    sh_nrows_, sh_cap_, dlogits_, d.hidden, stream_);
-  kernels::topk_rows(dlogits_, E, sh_cap_, K16, topk_scratch_, dunary_, dcand_, stream_);
-  kernels::sparse_head_ids(sh_rows_, dcand_, E * K16, stream_);
+  // Each sequence as it is drafted alone: its own selection, or the full head for a session in fallback.
+  kernels::SparseHeadBufs b;
+  b.w = lm.w, b.table = lm.table, b.raw = lm.scales, b.scale2 = lm.scale2, b.N = c.vocab, b.K = d.hidden;
+  b.us = sh_us_, b.vt = sh_vt_, b.R = sh_rank_, b.dynamic = opts_.sparse_head_dynamic, b.cap = sh_cap_;
+  b.p = sh_p_, b.scratch = sh_scratch_, b.rows = sh_rows_, b.nrows = sh_nrows_, b.xtmp = sh_xtmp_;
+  b.xh = xh_, b.xinv = xinv_, b.logits = dlogits_, b.topk_scratch = topk_scratch_;
+  kernels::draft_head_rows(b, dh_, n, E, masks, K16, dunary_, dcand_, stream_);
 }
 
 bool Engine::tree_step(const SamplingParams& p, bool use_lookup, bool want_logits, int B) const {
@@ -435,7 +443,7 @@ void Engine::clear_graphs() {
   }
   for (auto& [order, bg] : batch_graphs_) {
     if (bg.draft) cudaGraphExecDestroy(bg.draft);
-    if (bg.draft_sparse) cudaGraphExecDestroy(bg.draft_sparse);
+    for (auto& [k, g] : bg.draft_sparse) cudaGraphExecDestroy(g);
     for (auto& [k, g] : bg.verify) cudaGraphExecDestroy(g);
   }
   batch_graphs_.clear();
@@ -573,8 +581,8 @@ void Engine::draft_launch(int B, bool sparse) {
   // Drafted positions 1 .. B - 1: the final norm, the target's LM head (no target final norm), the top 16,
   // the selector's projection and lattice (its first predecessor, the anchor, read from ids_dev_[0]).
   kernels::rmsnorm(dres_ + H, draft_->norm(), dh_, E, H, d.eps, false, stream_);
-  kernels::SelMasks masks{{s_->sh_mask}, 1};
-  draft_head(E, sparse ? &masks : nullptr);
+  const uint8_t* mask = sparse ? s_->sh_mask : nullptr;
+  draft_head(1, E, &mask);
   linear_bf16_drafter(draft_->selector_projection(), dh_, E, dhp_);
   kernels::selector_lattice(dhp_, dcand_, dunary_, draft_->predecessor_codebook(), draft_->successor_codebook(),
                             pin_->draft_ids[0], E, dscores_, stream_, ids_dev_);
@@ -585,7 +593,7 @@ void Engine::draft_launch(int B, bool sparse) {
         "draft scores");
 }
 
-void Engine::draft_batch_launch(std::span<StepPlan> plans, int B, bool sparse) {
+void Engine::draft_batch_launch(std::span<StepPlan> plans, int B, unsigned sparse) {
   NvtxRange range("draft");
   quantized_ = false;  // the rows path (see draft_launch)
   const ModelConfig& c = model_->config();
@@ -637,10 +645,11 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B, bool sparse) {
   for (int i = 0; i < n; ++i)
     kernels::rmsnorm(dres_ + (size_t(i) * B + 1) * H, draft_->norm(), dh_ + size_t(i) * E * H, E, H, d.eps, false,
                      stream_);
-  kernels::SelMasks masks{};  // the sparse head over the union of the sequences' masks (BACKLOG 19)
-  masks.n = n;
-  for (int i = 0; i < n; ++i) masks.m[i] = plans[i].s->sh_mask;
-  draft_head(n * E, sparse ? &masks : nullptr);
+  // BACKLOG 19: bit `i` of `sparse` set: sequence i drafts with the sparse head over its own session's mask, exactly
+  // as it does alone; clear: the full head.
+  const uint8_t* masks[kernels::kMaxSeqs] = {};
+  for (int i = 0; i < n; ++i) masks[i] = (sparse >> i) & 1u ? plans[i].s->sh_mask : nullptr;
+  draft_head(n, E, masks);
   linear_bf16_drafter(draft_->selector_projection(), dh_, n * E, dhp_);
   const int rank = d.selector_rank;
   for (int i = 0; i < n; ++i)
@@ -1062,14 +1071,16 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
       pin_->draft_ids[i * B] = plans[i].anchor;
       for (int j = 1; j < B; ++j) pin_->draft_ids[i * B + j] = draft_->config().mask_token;
     }
-    // BACKLOG 19: the sparse head only when every sequence's session takes it and the rows fit its gathered GEMM.
-    bool sparse = sparse_head_ && n * E <= kernels::kMaxStreamRows;
-    for (int i = 0; i < n; ++i) sparse = sparse_head_sync(*plans[i].s) && sparse;
-    if (graph) run_graph(sparse ? bg->draft_sparse : bg->draft, "draft", [&] { draft_batch_launch(plans, B, sparse); });
+    // BACKLOG 19: each sequence takes the head its session takes alone (bit i: the sparse one), and the graph is the
+    // batch's for that combination.
+    unsigned sparse = 0;
+    for (int i = 0; i < n; ++i) sparse |= sparse_head_sync(*plans[i].s) ? 1u << i : 0u;
+    if (graph) run_graph(sparse ? bg->draft_sparse[sparse] : bg->draft, "draft", [&] { draft_batch_launch(plans, B, sparse); });
     else draft_batch_launch(plans, B, sparse);
     for (int i = 0; i < n; ++i) {
-      plans[i].s->sh_last_sparse = sparse;
-      if (sparse) ++plans[i].s->spec.sparse_steps;
+      const bool si = (sparse >> i) & 1u;
+      plans[i].s->sh_last_sparse = si;
+      if (si) ++plans[i].s->spec.sparse_steps;
     }
     check(cudaStreamSynchronize(stream_), "draft");
     for (int i = 0; i < n; ++i)
