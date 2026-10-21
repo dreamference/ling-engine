@@ -444,6 +444,103 @@ bool test_sparse_select() {
   return ok;
 }
 
+// BACKLOG 19: the drafter's head over a batch (draft_head_rows) gives every sequence exactly what the same call gives it
+// alone, whichever sequences take the sparse head over their own masks and which the full one (contiguous and not,
+// raw and coded head blobs): values and ids bit for bit; and a sparse sequence's ids are all inside its selection.
+bool test_draft_head_batch() {
+  const int N = 4096, K = 512, R = 256, E = 10, K16 = 16, D = 300;
+  std::mt19937 rng(33);
+  std::uniform_int_distribution<int> byte(0, 255), scale_byte(0x28, 0x48);
+  std::normal_distribution<float> nd(0.f, 1.f);
+  std::vector<uint8_t> w4(size_t(N) * K / 2), s4(size_t(N) * K / 16);
+  for (auto& b : w4) b = byte(rng);
+  for (auto& b : s4) b = scale_byte(rng);
+  uint8_t *rw4 = upload(w4), *ds4 = upload(s4), *tiled, *coded, *raw;
+  cudaMalloc(&tiled, ling::kernels::tiled_bytes_nvfp4(N, K));
+  ling::kernels::retile_nvfp4(rw4, ds4, tiled, N, K, nullptr);
+  uint8_t table[ling::kernels::kScaleCodes], code_of[256];
+  bool ok = ling::kernels::scale_code_table(s4.data(), s4.size(), table, code_of);
+  uint8_t *map = upload(std::vector<uint8_t>(code_of, code_of + 256)), *dtab = upload(std::vector<uint8_t>(table, table + 64));
+  cudaMalloc(&coded, ling::kernels::tiled_bytes_nvfp4_coded(N, K));
+  cudaMalloc(&raw, s4.size());
+  ling::kernels::retile_nvfp4_coded(rw4, ds4, map, coded, raw, N, K, nullptr);
+  std::vector<__nv_bfloat16> us(size_t(N) * R), vt(size_t(R) * K);
+  for (auto& v : us) v = __float2bfloat16(nd(rng));
+  for (auto& v : vt) v = __float2bfloat16(0.05f * nd(rng));
+  const int nmax = 3;
+  std::vector<float> x(size_t(nmax) * E * K);
+  for (auto& v : x) v = nd(rng);
+  // Two sessions' masks: a fixed list (every 5th row) joined with each one's own context rows.
+  std::vector<uint8_t> ma(N, 0), mb(N, 0);
+  for (int n = 0; n < N; ++n) {
+    ma[n] = mb[n] = n % 5 == 0;
+    if (n % 37 == 3) ma[n] = 1;
+    if (n % 41 == 7) mb[n] = 1;
+  }
+  int na = 0, nb = 0;
+  for (int n = 0; n < N; ++n) na += ma[n], nb += mb[n];
+  ling::kernels::SparseHeadBufs b;
+  b.N = N, b.K = K, b.scale2 = 0.37f, b.R = R, b.dynamic = D, b.cap = (std::max(na, nb) + D + 256 + 31) / 32 * 32;
+  b.us = upload(us), b.vt = upload(vt);
+  cudaMalloc(&b.p, size_t(32) * R * 4);
+  cudaMalloc(&b.scratch, ling::kernels::sparse_head_scratch_bytes(N));
+  cudaMalloc(&b.rows, size_t(N) * 4);
+  cudaMalloc(&b.nrows, 4);
+  cudaMalloc(&b.xtmp, size_t(32) * K * 4);
+  cudaMalloc(&b.xh, size_t(32) * K * 2);
+  cudaMalloc(&b.xinv, 32 * 4);
+  cudaMalloc(&b.logits, size_t(32) * N * 4);
+  cudaMalloc(&b.topk_scratch, ling::kernels::topk_scratch_floats(32, 64) * 4);
+  uint8_t *dma = upload(ma), *dmb = upload(mb);
+  float* dx = upload(x);
+  float *bv, *av, *xi;
+  int *bi, *ai;
+  cudaMalloc(&bv, size_t(nmax) * E * K16 * 4);
+  cudaMalloc(&bi, size_t(nmax) * E * K16 * 4);
+  cudaMalloc(&av, size_t(E) * K16 * 4);
+  cudaMalloc(&ai, size_t(E) * K16 * 4);
+  cudaMalloc(&xi, size_t(E) * K * 4);
+  const std::vector<std::vector<const uint8_t*>> cases = {
+      {dma, dmb}, {nullptr, dmb}, {dma, nullptr}, {dma, nullptr, dmb}, {nullptr, dmb, nullptr}, {nullptr, nullptr, dma}};
+  int compared = 0, outside = 0;
+  for (int blob = 0; blob < 2; ++blob) {
+    b.w = blob ? coded : tiled, b.table = blob ? dtab : nullptr, b.raw = blob ? raw : nullptr;
+    for (const auto& ms : cases) {
+      const int n = static_cast<int>(ms.size());
+      ling::kernels::draft_head_rows(b, dx, n, E, ms.data(), K16, bv, bi, nullptr);
+      const auto gv = download(bv, size_t(n) * E * K16);
+      const auto gi = download(bi, size_t(n) * E * K16);
+      for (int i = 0; i < n; ++i) {
+        // Alone: its rows in a buffer of their own.
+        cudaMemcpy(xi, dx + size_t(i) * E * K, size_t(E) * K * 4, cudaMemcpyDeviceToDevice);
+        ling::kernels::draft_head_rows(b, xi, 1, E, &ms[i], K16, av, ai, nullptr);
+        const auto wv = download(av, size_t(E) * K16);
+        const auto wi = download(ai, size_t(E) * K16);
+        ok &= std::memcmp(wv.data(), gv.data() + size_t(i) * E * K16, wv.size() * 4) == 0;
+        ok &= std::memcmp(wi.data(), gi.data() + size_t(i) * E * K16, wi.size() * 4) == 0;
+        if (ms[i]) {
+          const auto& m = ms[i] == dma ? ma : mb;
+          const auto sel = download(b.rows, size_t(std::min(download(b.nrows, 1)[0], N)));
+          std::vector<uint8_t> in(N, 0);
+          for (int r : sel) in[r] = 1;
+          for (int r = 0; r < N; ++r) outside += m[r] && !in[r];  // every marked row selected
+          for (int id : wi) outside += id < 0 || id >= N || !in[id];
+        }
+        ++compared;
+      }
+    }
+  }
+  ok &= cudaDeviceSynchronize() == cudaSuccess && outside == 0;
+  std::printf("draft_head_rows: %d sequences of batches (sparse over their own masks, full, mixed; raw and coded heads) "
+              "identical to each drafted alone, marked rows and ids inside the selection: %s\n",
+              compared, ok ? "yes ok" : "NO FAIL");
+  for (void* p : std::initializer_list<void*>{rw4, ds4, tiled, coded, raw, map, dtab, const_cast<__nv_bfloat16*>(b.us),
+                                              const_cast<__nv_bfloat16*>(b.vt), b.p, b.scratch, b.rows, b.nrows, b.xtmp,
+                                              b.xh, b.xinv, b.logits, b.topk_scratch, dma, dmb, dx, bv, bi, av, ai, xi})
+    cudaFree(p);
+  return ok;
+}
+
 bool test_bf16_rows() {
   std::mt19937 rng(9);
   std::normal_distribution<float> normal(0.f, 1.f);
@@ -1351,6 +1448,7 @@ int main(int argc, char** argv) {
   ok &= test_gemm_wide();
   ok &= test_bf16_rows();
   ok &= test_sparse_select();
+  ok &= test_draft_head_batch();
   ok &= test_attention_rows();
   ok &= test_topk();
   ok &= test_batched_state_kernels();
