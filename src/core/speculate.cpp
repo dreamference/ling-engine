@@ -259,6 +259,7 @@ void Engine::alloc_sparse_head() {
         vt.shape.size() != 2 || vt.shape[1] != H || vt.shape[0] != us.shape[1] || fixed.dtype != "I32")
       throw std::runtime_error("unexpected tensors (us [vocab][256] and vt [256][hidden] BF16, fixed I32)");
     if (model_->lm_head().N != V || model_->lm_head().K != H) throw std::runtime_error("the LM head's shape");
+    if (H % 1024 != 0) throw std::runtime_error("a hidden size that is not a multiple of 1,024 (bf16_rows)");
   } catch (const std::exception& e) {
     std::fprintf(stderr, "drafter head: full (no sparse head from %s: %s)\n", dir.c_str(), e.what());
     return;
