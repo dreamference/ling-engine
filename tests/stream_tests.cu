@@ -448,7 +448,7 @@ bool test_sparse_select() {
 // alone, whichever sequences take the sparse head over their own masks and which the full one (contiguous and not,
 // raw and coded head blobs): values and ids bit for bit; and a sparse sequence's ids are all inside its selection.
 bool test_draft_head_batch() {
-  const int N = 4096, K = 512, R = 256, E = 10, K16 = 16, D = 300;
+  const int N = 4096, K = 1024, R = 256, E = 10, K16 = 16, D = 300;
   std::mt19937 rng(33);
   std::uniform_int_distribution<int> byte(0, 255), scale_byte(0x28, 0x48);
   std::normal_distribution<float> nd(0.f, 1.f);
