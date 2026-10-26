@@ -437,6 +437,50 @@ PreparedImage prepare_image(const DecodedImage& img, const ProcessorConfig& cfg)
   return out;
 }
 
+void attach_images(std::vector<int>& prompt, int image_pad, const std::vector<std::string>& urls, ImageRegistry& registry,
+                   const ProcessorConfig& cfg, std::vector<PromptImage>& images) {
+  int pads = 0;
+  for (int t : prompt) pads += t == image_pad;
+  if (pads != static_cast<int>(urls.size()))
+    throw ImageError("the prompt holds " + std::to_string(pads) + " image placeholders for " + std::to_string(urls.size()) +
+                         " images (is <|image_pad|> in the text?)",
+                     "invalid_image");
+  if (urls.size() > 64) throw ImageError("at most 64 images per request", "too_many_images");
+  std::vector<int> ids;
+  for (const std::string& url : urls) {
+    const DecodedImage img = decode_image(image_bytes_from_url(url));
+    PreparedImage prep = prepare_image(img, cfg);
+    const int id = registry.id_for(prep.hash);
+    ids.push_back(id);
+    bool known = false;
+    for (const PromptImage& p : images) known = known || p.token == id;
+    if (!known) {
+      PromptImage pi;
+      pi.token = id;
+      pi.grid_h = prep.grid_h;
+      pi.grid_w = prep.grid_w;
+      pi.patches = std::make_shared<const std::vector<uint16_t>>(std::move(prep.patches));
+      images.push_back(std::move(pi));
+    }
+  }
+  std::vector<int> out;
+  out.reserve(prompt.size());
+  size_t k = 0;
+  for (int t : prompt) {
+    if (t != image_pad) {
+      out.push_back(t);
+      continue;
+    }
+    const int id = ids[k++];
+    for (const PromptImage& p : images)
+      if (p.token == id) {
+        out.insert(out.end(), p.tokens(), id);
+        break;
+      }
+  }
+  prompt.swap(out);
+}
+
 int ImageRegistry::id_for(uint64_t hash) {
   std::lock_guard<std::mutex> lock(mu_);
   auto it = ids_.find(hash);

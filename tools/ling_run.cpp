@@ -49,6 +49,14 @@
 // a green context of N SMs, or a plain second stream for -1), each a full chunk launched while A goes on taking steps
 // on the main stream, finished when its pass is done; the same comparison with the runs alone.
 //
+// --vision-prompts F (images, VISION §20.8): one chat-completions request body (JSON) per line, image parts as data:
+// URLs or file paths, rendered and prepared as ling-serve does; the prompts take part in every check above with their
+// images (the vision tower on). --vision-check DIR compares the tower with reference dumps (bench/vision/reference.py):
+// for each DIR/NAME.json ({"image": path, "grid": [t, h, w], ...}) the preprocessing against production's pixel values
+// (NAME.pixel_values.bf16) and the tower's output from those pixel values against transformers' (NAME.hf_fp32.f32,
+// NAME.hf_bf16.bf16, and production's NAME.sgl.bf16 when present): relative L2 error and the worst token's cosine
+// against the FP32 tower, beside the reference's own. --vision-bench times the tower per image.
+//
 // --batch-check (M4 §4, stage 3; needs --draft and --sessions 2) takes the prompts in pairs (A, B) and decodes
 // each pair as a batch of two (Engine::speculate_batch: one verify pass over both sequences' rows), --max-tokens
 // each, greedily and sampled (--temperature, default 1, seeded by --seed or 1). Four runs per pair and mode: both
@@ -60,6 +68,10 @@
 // verification (BACKLOG 26, on by default) off: the runs alone then take the chain as well, step for step (LING_TREE
 // set in the environment still overrides this).
 #include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <iterator>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -71,8 +83,194 @@
 #include <vector>
 
 #include "core/engine.hpp"
+#include "serve/api.hpp"
+#include "serve/image_input.hpp"
 #include "tokenizer/chat_template.hpp"
 #include "tokenizer/tokenizer.hpp"
+
+namespace {
+
+std::string read_file(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) throw std::runtime_error("cannot read " + path);
+  return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+float bf16f(uint16_t b) {
+  uint32_t u = uint32_t(b) << 16;
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
+// relative L2 error of a against the truth t, and the worst row's cosine (rows of `width`)
+void compare(const std::vector<float>& a, const std::vector<float>& t, int width, double& rel, double& worst_cos) {
+  double num = 0, den = 0;
+  worst_cos = 1;
+  for (size_t r = 0; r * width < t.size(); ++r) {
+    double ab = 0, aa = 0, tt = 0;
+    for (int c = 0; c < width; ++c) {
+      const double x = a[r * width + c], y = t[r * width + c];
+      num += (x - y) * (x - y);
+      den += y * y;
+      ab += x * y;
+      aa += x * x;
+      tt += y * y;
+    }
+    worst_cos = std::min(worst_cos, ab / std::sqrt(aa * tt + 1e-30));
+  }
+  rel = std::sqrt(num / (den + 1e-30));
+}
+
+// --vision-check DIR (VISION §20.5 items 2 and 3).
+int vision_check_run(ling::Engine& engine, const std::string& dir, bool bench) {
+  ling::VisionTower* tower = engine.vision();
+  if (!tower) throw std::runtime_error("no vision tower");
+  const int OUT = tower->config().out, PD = tower->config().patch_dim();
+  int failures = 0;
+  std::vector<std::string> names;
+  for (const auto& e : std::filesystem::directory_iterator(dir))
+    if (e.path().extension() == ".json") names.push_back(e.path().stem().string());
+  std::sort(names.begin(), names.end());
+  __nv_bfloat16* dout = nullptr;
+  cudaMalloc(&dout, size_t(tower->max_patches() / 4) * OUT * 2);
+  for (const std::string& name : names) {
+    const std::string base = dir + "/" + name;
+    const nlohmann::json meta = nlohmann::json::parse(read_file(base + ".json"));
+    const int gh = meta["grid"][1], gw = meta["grid"][2], n = gh * gw;
+    std::string image = meta["image"];
+    if (!image.empty() && image[0] != '/') image = dir + "/" + image;
+    std::printf("%s: %dx%d patches, %d tokens\n", name.c_str(), gh, gw, n / 4);
+    // 1. Decoding, resizing, patches against production's.
+    const ling::serve::DecodedImage ours = ling::serve::decode_image(read_file(image));
+    if (meta.contains("decoded")) {
+      const std::string ref = read_file(base + ".decoded.u8");
+      long diff = 0;
+      int worst = 0;
+      if (ref.size() != ours.rgb.size()) {
+        std::printf("  decode: size %zu against production's %zu FAIL\n", ours.rgb.size(), ref.size());
+        ++failures;
+      } else {
+        for (size_t i = 0; i < ref.size(); ++i) {
+          const int d = std::abs(int(uint8_t(ref[i])) - int(ours.rgb[i]));
+          diff += d != 0;
+          worst = std::max(worst, d);
+        }
+        std::printf("  decode: %ld of %zu values differ from production's (max %d)\n", diff, ref.size(), worst);
+      }
+      if (meta.contains("resized")) {
+        const std::string rin = ref;
+        const int h = meta["decoded"][0], w = meta["decoded"][1], nh = meta["resized"][0], nw = meta["resized"][1];
+        const std::vector<uint8_t> mine = ling::serve::resize_bicubic_aa(reinterpret_cast<const uint8_t*>(rin.data()), h, w, nh, nw);
+        const std::string rref = read_file(base + ".resized.u8");
+        long rd = 0;
+        int rw = 0;
+        for (size_t i = 0; i < mine.size() && i < rref.size(); ++i) {
+          const int d = std::abs(int(uint8_t(rref[i])) - int(mine[i]));
+          rd += d != 0;
+          rw = std::max(rw, d);
+        }
+        const bool ok = rref.size() == mine.size() && rw <= 1 && rd * 1000 <= long(mine.size());
+        failures += !ok;
+        std::printf("  resize (from production's pixels): %ld of %zu values differ (max %d) %s\n", rd, mine.size(), rw,
+                    ok ? "ok" : "FAIL");
+      }
+    }
+    const ling::serve::PreparedImage prep = ling::serve::prepare_image(ours);
+    const std::string pv = read_file(base + ".pixel_values.bf16");
+    std::vector<uint16_t> ref_patches(pv.size() / 2);
+    std::memcpy(ref_patches.data(), pv.data(), pv.size());
+    if (prep.grid_h != gh || prep.grid_w != gw) {
+      std::printf("  grid %dx%d against production's %dx%d FAIL\n", prep.grid_h, prep.grid_w, gh, gw);
+      ++failures;
+    } else {
+      long pd = 0;
+      float pw = 0;
+      for (size_t i = 0; i < ref_patches.size(); ++i)
+        if (ref_patches[i] != prep.patches[i]) {
+          ++pd;
+          pw = std::max(pw, std::abs(bf16f(ref_patches[i]) - bf16f(prep.patches[i])));
+        }
+      std::printf("  patches: %ld of %zu BF16 values differ from production's pixel_values (max %.4f)\n", pd,
+                  ref_patches.size(), pw);
+    }
+    // 2. The tower on production's pixel values against the references.
+    if (ref_patches.size() != size_t(n) * PD) throw std::runtime_error(name + ": pixel_values has the wrong size");
+    tower->forward(ref_patches.data(), gh, gw, dout, nullptr);
+    cudaDeviceSynchronize();
+    std::vector<uint16_t> ob(size_t(n / 4) * OUT);
+    cudaMemcpy(ob.data(), dout, ob.size() * 2, cudaMemcpyDeviceToHost);
+    std::vector<float> eng(ob.size());
+    for (size_t i = 0; i < ob.size(); ++i) eng[i] = bf16f(ob[i]);
+    auto load_f32 = [&](const std::string& path) {
+      const std::string b = read_file(path);
+      std::vector<float> v(b.size() / 4);
+      std::memcpy(v.data(), b.data(), b.size());
+      return v;
+    };
+    auto load_bf16 = [&](const std::string& path) {
+      const std::string b = read_file(path);
+      std::vector<float> v(b.size() / 2);
+      for (size_t i = 0; i < v.size(); ++i) {
+        uint16_t u;
+        std::memcpy(&u, b.data() + 2 * i, 2);
+        v[i] = bf16f(u);
+      }
+      return v;
+    };
+    const std::vector<float> truth = load_f32(base + ".hf_fp32.f32");
+    if (truth.size() != eng.size()) throw std::runtime_error(name + ": hf_fp32 has the wrong size");
+    double er, ec;
+    compare(eng, truth, OUT, er, ec);
+    double floor_rel = 0, floor_cos = 1;
+    std::string floor_name = "transformers BF16";
+    {
+      const std::vector<float> hb = load_bf16(base + ".hf_bf16.bf16");
+      double r, c;
+      compare(hb, truth, OUT, r, c);
+      std::printf("  transformers BF16 against FP32: rel L2 %.3e, worst cosine %.6f\n", r, c);
+      floor_rel = r;
+      floor_cos = c;
+    }
+    if (std::filesystem::exists(base + ".sgl.bf16")) {
+      const std::vector<float> sb = load_bf16(base + ".sgl.bf16");
+      double r, c;
+      compare(sb, truth, OUT, r, c);
+      std::printf("  production (SGLang) against FP32: rel L2 %.3e, worst cosine %.6f\n", r, c);
+      floor_rel = std::max(floor_rel, r);
+      floor_cos = std::min(floor_cos, c);
+      floor_name = "the references";
+    }
+    const bool ok = er <= floor_rel * 1.10 && ec >= floor_cos - 1e-4;
+    failures += !ok;
+    std::printf("  engine against FP32: rel L2 %.3e, worst cosine %.6f (%s: %.3e, %.6f) %s\n", er, ec, floor_name.c_str(),
+                floor_rel, floor_cos, ok ? "ok" : "FAIL");
+    if (bench) {
+      cudaEvent_t a, b;
+      cudaEventCreate(&a);
+      cudaEventCreate(&b);
+      std::vector<float> ms;
+      for (int k = 0; k < 5; ++k) {
+        cudaEventRecord(a);
+        tower->forward(ref_patches.data(), gh, gw, dout, nullptr);
+        cudaEventRecord(b);
+        cudaEventSynchronize(b);
+        float t = 0;
+        cudaEventElapsedTime(&t, a, b);
+        ms.push_back(t);
+      }
+      std::sort(ms.begin(), ms.end());
+      std::printf("  tower: %.1f ms (median of 5), %.0f patches/s\n", ms[2], n / (ms[2] / 1e3));
+      cudaEventDestroy(a);
+      cudaEventDestroy(b);
+    }
+  }
+  cudaFree(dout);
+  std::printf(failures ? "VISION CHECK FAILED (%d)\n" : "vision check passed\n", failures);
+  return failures ? 1 : 0;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
   std::string model, text, chat, ids_arg, prompts_file;
@@ -87,6 +285,8 @@ int main(int argc, char** argv) {
   bool interleave_check = false, batch_check = false, batch_bench = false, draft_bf16 = false;
   std::string draft_head = "sparse", sparse_head_dir;  // the drafter's head (BACKLOG 19)
   int sparse_head_dynamic = 16384;
+  std::string vision_prompts, vision_check;  // images (VISION §20.8)
+  bool vision_bench = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -131,6 +331,9 @@ int main(int argc, char** argv) {
     else if (a == "--batch-bench") batch_check = batch_bench = true;
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else if (a == "--side-prefill") side_prefill = std::stoi(next());
+    else if (a == "--vision-prompts") vision_prompts = next();
+    else if (a == "--vision-check") vision_check = next();
+    else if (a == "--vision-bench") vision_bench = true;
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
@@ -143,6 +346,8 @@ int main(int argc, char** argv) {
   try {
     ling::Tokenizer tok(model + "/tokenizer.json");
     std::vector<std::vector<int>> prompts;
+    ling::serve::ImageRegistry image_registry;
+    std::vector<ling::PromptImage> all_images;  // every image of every prompt (begin_prefill finds each by its id)
     if (!prompts_file.empty()) {  // one JSON string per line, each a raw prompt
       std::ifstream f(prompts_file);
       std::string line;
@@ -154,6 +359,49 @@ int main(int argc, char** argv) {
       std::string part;
       while (std::getline(ss, part, ',')) prompt.push_back(std::stoi(part));
       prompts.push_back(prompt);
+    } else if (!vision_prompts.empty()) {
+      // Each line a chat-completions body; file paths in image parts become data: URLs (the server takes only those).
+      std::ifstream f(vision_prompts);
+      std::string line;
+      while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        nlohmann::json body = nlohmann::json::parse(line);
+        for (auto& m : body["messages"])
+          if (m.contains("content") && m["content"].is_array())
+            for (auto& part : m["content"])
+              if (part.is_object() && part.contains("image_url")) {
+                auto& u = part["image_url"];
+                std::string url = u.is_string() ? u.get<std::string>() : u["url"].get<std::string>();
+                if (url.rfind("data:", 0) != 0) {
+                  std::ifstream img(url, std::ios::binary);
+                  if (!img) throw std::runtime_error("cannot read " + url);
+                  std::string bytes((std::istreambuf_iterator<char>(img)), std::istreambuf_iterator<char>());
+                  static const char* b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                  std::string enc;
+                  size_t i = 0;
+                  for (; i + 2 < bytes.size(); i += 3) {
+                    const uint32_t v = (uint8_t(bytes[i]) << 16) | (uint8_t(bytes[i + 1]) << 8) | uint8_t(bytes[i + 2]);
+                    for (int k = 18; k >= 0; k -= 6) enc += b64[(v >> k) & 63];
+                  }
+                  if (i < bytes.size()) {
+                    uint32_t v = uint8_t(bytes[i]) << 16;
+                    if (i + 1 < bytes.size()) v |= uint8_t(bytes[i + 1]) << 8;
+                    enc += b64[(v >> 18) & 63];
+                    enc += b64[(v >> 12) & 63];
+                    enc += i + 1 < bytes.size() ? b64[(v >> 6) & 63] : '=';
+                    enc += '=';
+                  }
+                  url = "data:image;base64," + enc;
+                }
+                if (u.is_string()) u = url;
+                else u["url"] = url;
+              }
+        ling::serve::Request req = ling::serve::parse_request(body, true, true);
+        std::vector<int> ids = tok.encode(req.prompt_text);
+        ling::serve::attach_images(ids, tok.token_id("<|image_pad|>"), req.image_urls, image_registry,
+                                   ling::serve::ProcessorConfig{}, all_images);
+        prompts.push_back(ids);
+      }
     } else if (!chat.empty()) {
       nlohmann::ordered_json messages = nlohmann::ordered_json::array();
       messages.push_back({{"role", "user"}, {"content", chat}});
@@ -183,7 +431,10 @@ int main(int argc, char** argv) {
     opts.sessions = sessions;
     if (batch_check) opts.tree_nodes = 0;  // the chain alone, as a batch verifies (see --batch-check above)
     opts.side_prefill = side_prefill;
+    opts.vision = !all_images.empty() || !vision_check.empty();
     ling::Engine engine(model, opts);
+    const std::vector<ling::PromptImage>* IMG = all_images.empty() ? nullptr : &all_images;
+    if (!vision_check.empty()) return vision_check_run(engine, vision_check, vision_bench);
     auto t1 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "loaded %.1f GB of weights in %.1f s\n", engine.model().device_bytes() / 1e9,
                  std::chrono::duration<double>(t1 - t0).count());
@@ -197,10 +448,11 @@ int main(int argc, char** argv) {
                         double* decode_s) {
       ling::EngineStats stats;
       engine.reset();
-      std::vector<float> logits = engine.prefill(prompt, &stats);
+      std::vector<float> logits = engine.prefill(prompt, &stats, false, IMG);
       if (!quiet)
-        std::fprintf(stderr, "prefill: %d tokens in %.3f s (%.0f tok/s)\n", stats.prefill_tokens,
-                     stats.prefill_seconds, stats.prefill_tokens / stats.prefill_seconds);
+        std::fprintf(stderr, "prefill: %d tokens in %.3f s (%.0f tok/s); %d image tokens, the tower %.3f s on %d images\n",
+                     stats.prefill_tokens, stats.prefill_seconds, stats.prefill_tokens / stats.prefill_seconds,
+                     stats.image_tokens, stats.vision_seconds, stats.images_encoded);
       ling::StreamDecoder dec(tok);
       std::vector<int> out;
       auto t2 = std::chrono::steady_clock::now();
@@ -274,7 +526,7 @@ int main(int argc, char** argv) {
         for (int k = 0; k < 2; ++k) {
           engine.reset_all();
           engine.activate_session(0, "", true);
-          ling::Engine::PrefillCursor cur = engine.begin_prefill(prompts[i]);
+          ling::Engine::PrefillCursor cur = engine.begin_prefill(prompts[i], false, IMG);
           while (!engine.prefill_chunk(cur, k ? chunk_check : 0)) {
           }
           st[k] = cur.stats;
@@ -316,7 +568,7 @@ int main(int argc, char** argv) {
             for (int k = 0; k < 2; ++k) {
               engine.reset_all();
               engine.activate_session(0, "", true);
-              engine.prefill(k ? B : A);
+              engine.prefill(k ? B : A, nullptr, false, IMG);
               Seq q;
               q.sp = sp;
               q.pending = {engine.sample(engine.logits(), sp, engine.history())};
@@ -331,11 +583,11 @@ int main(int argc, char** argv) {
             b.session = 1;
             a.sp = b.sp = sp;
             engine.activate_session(0, "", true);
-            engine.prefill(A);
+            engine.prefill(A, nullptr, false, IMG);
             a.pending = {engine.sample(engine.logits(), sp, engine.history())};
             for (int k = 0; k < 2 && !a.done; ++k) advance(a, max_tokens);
             engine.activate_session(1, "", true);
-            ling::Engine::PrefillCursor cur = engine.begin_prefill(B);
+            ling::Engine::PrefillCursor cur = engine.begin_prefill(B, false, IMG);
             int chunks_beside = 0;
             while (!a.done || !b.done) {
               if (!cur.done() && engine.side_enabled() && (engine.side_busy() || !a.done)) {
@@ -420,7 +672,7 @@ int main(int argc, char** argv) {
       auto start = [&](Seq& q, int session, const std::vector<int>& prompt) {
         q.session = session;
         engine.activate_session(session, "", true);
-        engine.prefill(prompt);
+        engine.prefill(prompt, nullptr, false, IMG);
         q.pending = {engine.sample(engine.logits(), q.sp, engine.history())};
       };
       for (size_t pi = 0; pi + 1 < prompts.size(); pi += 2) {
@@ -475,7 +727,7 @@ int main(int argc, char** argv) {
               for (int k = 0; k < 2 && !q[f].done; ++k) advance(q[f], max_tokens);
               q[o].session = 1;
               engine.activate_session(1, "", true);
-              ling::Engine::PrefillCursor cur = engine.begin_prefill(*P[o]);
+              ling::Engine::PrefillCursor cur = engine.begin_prefill(*P[o], false, IMG);
               while (!cur.done()) {
                 if (engine.prefill_chunk(cur, q[f].done ? 0 : contended))
                   q[o].pending = {engine.sample(engine.logits(), q[o].sp, engine.history())};
@@ -552,12 +804,12 @@ int main(int argc, char** argv) {
         if (fresh_session) si = engine.free_session(0.0, {});
         engine.activate_session(si, "", fresh_session);
         ling::EngineStats st;
-        const std::vector<float> resumed_logits = engine.prefill(prompts[i], &st);
+        const std::vector<float> resumed_logits = engine.prefill(prompts[i], &st, false, IMG);
         const int resumed = argmax(resumed_logits);
         const uint64_t h_resumed = engine.state_hash();
         const After a_resumed = continue_spec(resumed_logits);
         ling::EngineStats fresh_st;
-        const std::vector<float> fresh_logits = engine.prefill(prompts[i], &fresh_st, /*from_scratch=*/true);
+        const std::vector<float> fresh_logits = engine.prefill(prompts[i], &fresh_st, /*from_scratch=*/true, IMG);
         const int fresh = argmax(fresh_logits);
         const uint64_t h_fresh = engine.state_hash();
         const After a_fresh = continue_spec(fresh_logits);
@@ -631,7 +883,7 @@ int main(int argc, char** argv) {
         const std::vector<int> processed(engine.history().begin() + prompt.size(), engine.history().end());
         // The same tokens through plain decoding, from the same prefill.
         engine.reset();
-        engine.prefill(prompt);
+        engine.prefill(prompt, nullptr, false, IMG);
         for (int t : processed) engine.step(t);
         const uint64_t h_plain = engine.state_hash();
         const ling::SpecStats& st = engine.spec_stats();

@@ -65,9 +65,6 @@ add_library(ling_tokenizer STATIC src/tokenizer/tokenizer.cpp src/tokenizer/chat
 target_include_directories(ling_tokenizer PUBLIC src)
 target_link_libraries(ling_tokenizer PUBLIC PkgConfig::PCRE2 ICU::uc nlohmann_json::nlohmann_json)
 
-# ling-run: token ids or text in, tokens out; the correctness and speed harness.
-add_executable(ling-run tools/ling_run.cpp)
-target_link_libraries(ling-run PRIVATE ling_core ling_tokenizer)
 
 # ling-tokenize: prints token ids for each input line (tested against the reference tokenizer).
 add_executable(ling-tokenize tools/ling_tokenize.cpp)
@@ -78,6 +75,10 @@ target_link_libraries(ling-tokenize PRIVATE ling_tokenizer)
 pkg_check_modules(IMAGE_LIBS REQUIRED IMPORTED_TARGET libpng libwebp libjpeg)
 add_library(ling_api STATIC src/serve/api.cpp src/serve/image_input.cpp)
 target_link_libraries(ling_api PUBLIC ling_core ling_tokenizer PkgConfig::IMAGE_LIBS CUDA::nvjpeg)
+
+# ling-run: token ids or text in, tokens out; the correctness and speed harness.
+add_executable(ling-run tools/ling_run.cpp)
+target_link_libraries(ling-run PRIVATE ling_api)
 
 # ling-template: the chat template, and the Responses-to-prompt conversion, without a model.
 add_executable(ling-template tools/ling_template.cpp)

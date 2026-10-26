@@ -874,44 +874,11 @@ class Handler : public proxygen::RequestHandler {
   // Images (VISION §20.3 (c), §20.6): each URL decoded and preprocessed here, on the HTTP thread; each <|image_pad|>
   // of the tokenized prompt becomes the image's tokens, all its id (§20.7). Throws ImageError or invalid_argument.
   void attach_images(Job& job) {
-    const std::vector<std::string>& urls = job.req.image_urls;
     int pads = 0;
     for (int t : job.prompt) pads += t == ctx_.image_pad;
-    if (urls.empty() && pads == 0) return;
+    if (job.req.image_urls.empty() && pads == 0) return;
     if (!ctx_.vision) throw ImageError("this server has no vision tower (--vision off)", "image_input_not_supported");
-    if (pads != static_cast<int>(urls.size()))
-      throw ImageError("the prompt holds " + std::to_string(pads) + " image placeholders for " + std::to_string(urls.size()) +
-                           " images (is <|image_pad|> in the text?)",
-                       "invalid_image");
-    if (urls.size() > 64) throw ImageError("at most 64 images per request", "too_many_images");
-    std::vector<int> ids;
-    for (const std::string& url : urls) {
-      const DecodedImage img = decode_image(image_bytes_from_url(url));
-      PreparedImage prep = prepare_image(img, ctx_.processor);
-      const int id = ctx_.images->id_for(prep.hash);
-      ids.push_back(id);
-      if (std::none_of(job.images.begin(), job.images.end(), [&](const PromptImage& p) { return p.token == id; })) {
-        PromptImage pi;
-        pi.token = id;
-        pi.grid_h = prep.grid_h;
-        pi.grid_w = prep.grid_w;
-        pi.patches = std::make_shared<const std::vector<uint16_t>>(std::move(prep.patches));
-        job.images.push_back(std::move(pi));
-      }
-    }
-    std::vector<int> out;
-    out.reserve(job.prompt.size());
-    size_t k = 0;
-    for (int t : job.prompt) {
-      if (t != ctx_.image_pad) {
-        out.push_back(t);
-        continue;
-      }
-      const int id = ids[k++];
-      const PromptImage& pi = *std::find_if(job.images.begin(), job.images.end(), [&](const PromptImage& p) { return p.token == id; });
-      out.insert(out.end(), pi.tokens(), id);
-    }
-    job.prompt.swap(out);
+    serve::attach_images(job.prompt, ctx_.image_pad, job.req.image_urls, *ctx_.images, ctx_.processor, job.images);
   }
 
   void generate(bool chat) {

@@ -11,6 +11,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "core/engine.hpp"
+
 namespace ling::serve {
 
 // A request error about an image: the handler answers 400 with this message and code.
@@ -72,7 +74,7 @@ uint64_t hash_pixels(const DecodedImage& img);
 // images on one id (§20.7). Thread-safe.
 class ImageRegistry {
  public:
-  static constexpr int kFirstId = 1000000;
+  static constexpr int kFirstId = kImageTokenBase;
   int id_for(uint64_t hash);
   static bool is_image_id(int token) { return token >= kFirstId; }
 
@@ -81,5 +83,11 @@ class ImageRegistry {
   std::unordered_map<uint64_t, int> ids_;
   int next_ = kFirstId;
 };
+
+// The server's image path for one tokenized prompt (§20.3 (c)): each URL decoded and prepared, each distinct image given
+// its id and appended to `images` (once per id), each `image_pad` token of `prompt` expanded into its image's tokens.
+// The number of image_pad tokens must equal the number of URLs. Throws ImageError.
+void attach_images(std::vector<int>& prompt, int image_pad, const std::vector<std::string>& urls, ImageRegistry& registry,
+                   const ProcessorConfig& cfg, std::vector<PromptImage>& images);
 
 }  // namespace ling::serve
