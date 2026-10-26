@@ -76,13 +76,27 @@ bool test_attention(int n, int heads, std::mt19937& rng) {
     }
   // The error against the output's RMS: P is rounded to BF16 for the PV product and the output to BF16, so an element
   // near zero carries an absolute error of the order of 2^-9 of the large ones (FlashAttention's own numerics).
+  // Both measures, and where the large ones sit: the first run's relative error |e| / (|o| + 0.05), its worst element's
+  // |o|, and its worst among outputs of at least a quarter of the RMS against those below; then |e| / RMS(o), which
+  // decides (P is rounded to BF16 for the PV product and the output to BF16, as in FlashAttention, so an element near
+  // zero carries an absolute error of the order of 2^-9 of the large ones). The tower's comparison with the reference
+  // dumps (ling-run --vision-check) is the test that matters.
   const double rms = std::sqrt(sumsq / ref.size());
-  for (size_t k = 0; k < ref.size(); ++k)
-    worst = std::max(worst, std::abs(double(__bfloat162float(out[k])) - ref[k]) / rms);
+  double rel_worst = 0, rel_at = 0, rel_big = 0, rel_small = 0, abs_worst = 0;
+  for (size_t k = 0; k < ref.size(); ++k) {
+    const double e = std::abs(double(__bfloat162float(out[k])) - ref[k]);
+    const double rel = e / (std::abs(ref[k]) + 0.05);
+    if (rel > rel_worst) rel_worst = rel, rel_at = ref[k];
+    (std::abs(ref[k]) >= 0.25 * rms ? rel_big : rel_small) = std::max(std::abs(ref[k]) >= 0.25 * rms ? rel_big : rel_small, rel);
+    abs_worst = std::max(abs_worst, e);
+    worst = std::max(worst, e / rms);
+  }
+  std::printf("attention n=%-4d relative (|o|+0.05) worst %.3e at |o| = %.4f; among |o| >= RMS/4 %.3e, below %.3e; "
+              "worst |e| %.3e, RMS(o) %.3f\n", n, rel_worst, std::abs(rel_at), rel_big, rel_small, abs_worst, rms);
   cudaFree(dq);
   cudaFree(dout);
   char what[64];
-  std::snprintf(what, sizeof what, "attention n=%d heads=%d", n, heads);
+  std::snprintf(what, sizeof what, "attention n=%d heads=%d (|e| / RMS)", n, heads);
   return report(what, worst, 1e-2);
 }
 
