@@ -15,10 +15,14 @@ M=$(ls -d ~/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4/snapshots
 RTN=$(ls -d ~/.cache/huggingface/hub/models--maurienne-ai--Qwen3.8-27B-DFlash2-NVFP4-RTNcal/snapshots/*)
 INC=$(ls -d ~/.cache/huggingface/hub/models--incoai--Qwen3.8-27B-DFlash2/snapshots/*)
 D=${DUMMIES:-$HOME/bd/dummies}
-ARMS=${ARMS:-"rtn:$RTN: f4-L5:$D/f4-L5-I17408: f4-L8:$D/f4-L8-I17408: f4-L10:$D/f4-L10-I17408: f4-L20:$D/f4-L20-I17408:
- f4-W1.5:$D/f4-L5-I27648: f4-W2:$D/f4-L5-I38912: f4-W4:$D/f4-L5-I79872: f4-L10W2:$D/f4-L10-I38912:
- bf-L5:$INC:--draft-bf16 bf-L8:$D/bf-L8-I17408:--draft-bf16 bf-L10:$D/bf-L10-I17408:--draft-bf16
- bf-L20:$D/bf-L20-I17408:--draft-bf16 bf-W2:$D/bf-L5-I38912:--draft-bf16 bf-W4:$D/bf-L5-I79872:--draft-bf16"}
+# In order of priority (the window may end before the last ones).
+ARMS=${ARMS:-"rtn:$RTN: f4-L5:$D/f4-L5-I17408: f4-L10:$D/f4-L10-I17408: f4-L20:$D/f4-L20-I17408:
+ bf-L5:$INC:--draft-bf16 bf-L10:$D/bf-L10-I17408:--draft-bf16 f4-W2:$D/f4-L5-I38912: f4-W4:$D/f4-L5-I79872:
+ bf-W2:$D/bf-L5-I38912:--draft-bf16 f4-L8:$D/f4-L8-I17408: f4-W1.5:$D/f4-L5-I27648: f4-L10W2:$D/f4-L10-I38912:
+ bf-L20:$D/bf-L20-I17408:--draft-bf16 bf-L8:$D/bf-L8-I17408:--draft-bf16 bf-W4:$D/bf-L5-I79872:--draft-bf16"}
+# END_EPOCH (from the caller): no arm starts with less than 3 minutes left, the training step needs 6.
+END_EPOCH=${END_EPOCH:-$(( $(date -u +%s) + 2400 ))}
+left() { echo $(( END_EPOCH - $(date -u +%s) )); }
 PROMPT=$O/prompt.json
 python3 - "$HERE/../../src/core/speculate.cpp" "$PROMPT" <<'EOF'
 import json, sys
@@ -32,6 +36,7 @@ stats() { curl -s -m 10 localhost:8300/spec_stats; }
 for arm in $ARMS; do
   IFS=: read -r name dir extra <<< "$arm"
   [ -d "$dir" ] || { echo "$name: no drafter at $dir, skipped"; continue; }
+  [ "$(left)" -lt 180 ] && { echo "$name: not started, $(left) s left"; continue; }
   T0=$(date -u +%s)
   setsid "$B"/build/ling-serve --model "$M" --draft "$dir" --port 8300 --served-model-name m --max-context 65536 \
     --draft-block 12 --graphs --pdl ${extra//,/ } > "$O/$name.serve.log" 2>&1 < /dev/null &
@@ -71,9 +76,9 @@ open(f"{o}/results.jsonl", "a").write(json.dumps(rec) + "\n")
 EOF
 done
 # Part 2: the training step (torch from the SGLang image; the harness's directory mounted read-only).
-if [ "${TRAIN:-1}" = 1 ]; then
+if [ "${TRAIN:-1}" = 1 ] && [ "$(left)" -ge 360 ]; then
   echo "train_step $(date -u +%T)"
-  timeout 900 docker run --rm --gpus all --name bd-train --ipc=host -v "$HERE":/w:ro lmsysorg/sglang:v0.5.21 \
+  timeout $(( $(left) - 30 )) docker run --rm --gpus all --name bd-train --ipc=host -v "$HERE":/w:ro lmsysorg/sglang:v0.5.21 \
     python3 /w/train_step.py --layers 5,10 > "$O/train.jsonl" 2> "$O/train.err"
-  echo "train_step rc $? $(date -u +%T)"; cat "$O/train.jsonl"
+  echo "train_step rc $? $(date -u +%T)"; cat "$O/train.jsonl"; docker rm -f bd-train > /dev/null 2>&1
 fi
