@@ -53,7 +53,8 @@ bool test_attention(int n, int heads, std::mt19937& rng) {
   std::vector<__nv_bfloat16> out = download(dout, size_t(n) * H);
   double worst = 0;
   const double scale = 1.0 / std::sqrt(double(D));
-  std::vector<double> p(n);
+  std::vector<double> p(n), ref(size_t(n) * H);
+  double sumsq = 0;
   for (int h = 0; h < heads; ++h)
     for (int i = 0; i < n; ++i) {
       double mx = -1e300;
@@ -69,15 +70,20 @@ bool test_attention(int n, int heads, std::mt19937& rng) {
         double o = 0;
         for (int j = 0; j < n; ++j) o += p[j] * f[size_t(j) * 3 * H + 2 * H + h * D + d];
         o /= sum;
-        const double got = __bfloat162float(out[size_t(i) * H + h * D + d]);
-        worst = std::max(worst, std::abs(got - o) / (std::abs(o) + 0.05));
+        ref[size_t(i) * H + h * D + d] = o;
+        sumsq += o * o;
       }
     }
+  // The error against the output's RMS: P is rounded to BF16 for the PV product and the output to BF16, so an element
+  // near zero carries an absolute error of the order of 2^-9 of the large ones (FlashAttention's own numerics).
+  const double rms = std::sqrt(sumsq / ref.size());
+  for (size_t k = 0; k < ref.size(); ++k)
+    worst = std::max(worst, std::abs(double(__bfloat162float(out[k])) - ref[k]) / rms);
   cudaFree(dq);
   cudaFree(dout);
   char what[64];
   std::snprintf(what, sizeof what, "attention n=%d heads=%d", n, heads);
-  return report(what, worst, 2e-2);  // P in BF16 for the PV product, the output rounded to BF16
+  return report(what, worst, 1e-2);
 }
 
 bool test_layernorm(std::mt19937& rng) {
