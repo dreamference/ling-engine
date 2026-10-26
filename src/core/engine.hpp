@@ -120,6 +120,26 @@ struct EngineOptions {
   int tree_max_depth = 1000;
   int tree_chain = 8;        // the chain's length within the block (the block's later positions hold tree nodes)
   double tree_min_mass = 0;  // a step whose extra nodes' summed path probability is below this verifies the chain alone
+  // BACKLOG 19: the drafter's context-aware sparse head. "full": the target's whole LM head. "sparse" (the default):
+  // per step the drafter scores the fixed list, the session's context vocabulary (the token ids of its prompt and
+  // output) and the `sparse_head_dynamic` rows a rank-256 copy of the head rates best, and takes its top 16 among
+  // them (the target verifies every token, so the output is the full head's; only the proposals change); a session
+  // whose recent tokens are too often outside the fixed list and its context falls back to the full head.
+  // sparse_head_dir: model.safetensors with `us` (BF16 [vocab][256], the head's left factor times its singular
+  // values), `vt` (BF16 [256][hidden]) and `fixed` (I32, the rows always scored), bench/sparse_head/build.py's;
+  // empty: <draft_dir>/sparse-head; without a usable file there the drafter keeps the full head (one line on stderr).
+  // LING_DRAFT_HEAD (full|sparse) and LING_SPARSE_HEAD_DIR override these, and
+  // LING_SH_DYNAMIC, LING_SH_CONTEXT, LING_SH_WINDOW, LING_SH_HI, LING_SH_LO and LING_SH_ACCEPT_FLOOR the rest.
+  std::string draft_head = "sparse";
+  std::string sparse_head_dir;
+  int sparse_head_dynamic = 16384;
+  int sparse_head_context = 32768;  // the most context rows beyond the fixed list a session adds (0: no union)
+  // The fallback: over the last `window` tokens of the session (its prompt's tail first), the share that were outside
+  // the fixed list and the context before them. Above `hi` the session drafts with the full head, below `lo` it
+  // returns to the sparse one. accept_floor > 0: also the full head (for a window of tokens) when the sparse head's
+  // running mean of tokens per step falls below it.
+  int sparse_head_window = 64;
+  double sparse_head_hi = 0.15, sparse_head_lo = 0.08, sparse_head_accept_floor = 0;
 };
 
 struct EngineStats {
@@ -145,6 +165,8 @@ struct SpecStats {
   long batched_steps = 0;
   // BACKLOG 26: tree verifies, those whose accepted path left the chain, and the off-chain tokens they accepted.
   long tree_steps = 0, tree_branch_steps = 0, tree_off_chain = 0;
+  // BACKLOG 19: drafts with the sparse head, and the session's switches to the full head (its fallback).
+  long sparse_steps = 0, sparse_fallbacks = 0;
   // Shadow scoring, per bucket of match length (3, 4-7, 8-15, 16-31, 32+): steps with a proposal, the
   // tokens the proposal would have had accepted (its agreement with what was generated next), and the
   // drafter's accepted tokens on the same steps. `shadow_best` adds up the better of the two per step.
@@ -434,10 +456,18 @@ class Engine {
   void draft_materialize(int rows, kernels::DevPos pos0, int cap_row0);
   void draft_propose(int anchor, int B, bool graph);  // the drafter's block, top-16 candidates and lattice
   void alloc_drafter();
+  void alloc_sparse_head();
+  // The drafter's head over n sequences' E rows each of dh_: dunary_ and dcand_ (the top K16 values and token ids per
+  // row); sequence i's from the sparse head over masks[i] (its session's fixed list and context, BACKLOG 19), or the
+  // full head when masks[i] (or masks) is null, each bit for bit what the sequence gets drafted alone.
+  void draft_head(int n, int E, const uint8_t* const* masks);
+  // Brings session s's context vocabulary up to its history and decides its head for the next draft (BACKLOG 19).
+  // True: the sparse head.
+  bool sparse_head_sync(Session& s);
 
   // The three parts of a speculative step as launch sequences with no host synchronization inside, so
   // each can be captured into a CUDA graph. Their inputs and outputs on the host side are pin_'s buffers.
-  void draft_launch(int B);         // pin_->draft_ids -> pin_->cand, pin_->scores
+  void draft_launch(int B, bool sparse = false);  // pin_->draft_ids -> pin_->cand, pin_->scores
   void verify_launch(int V, int K, bool tree = false);  // pin_->rows -> each row's top K in pin_->topk_vals / topk_ids
   void commit_launch(int row0, int n);  // the anchor and n - 1 accepted drafts into the recurrent state and drafter KV
   // One sequence's part of a speculative step on the host (speculate.cpp): its proposal, the drafted rows and
@@ -453,13 +483,14 @@ class Engine {
   void verify_batch_launch(std::span<StepPlan> plans, int V);
   // The drafter over the blocks of every plan's session at once (M4 stage 4): pin_->draft_ids (B rows per
   // sequence) -> pin_->cand and pin_->scores (E = B - 1 rows per sequence, in order).
-  void draft_batch_launch(std::span<StepPlan> plans, int B);
+  void draft_batch_launch(std::span<StepPlan> plans, int B, unsigned sparse = 0);  // bit i: sequence i's sparse head
   // The batch path's graphs (M4 stage 4), per order of sessions in the batch: they bake the sessions' cache, state
   // and ring pointers and the row split. The draft graph has one shape (B rows per sequence); the verify graphs
   // are keyed by each sequence's top K; each sequence's commit graph is its session's, keyed by its slot in the
   // batch and its accepted count (slot 0 is the one-row step's own commit graph).
   struct BatchGraphs {
     cudaGraphExec_t draft = nullptr;
+    std::map<unsigned, cudaGraphExec_t> draft_sparse;  // with the sparse head, by which sequences take it (BACKLOG 19)
     std::map<std::vector<int>, cudaGraphExec_t> verify;
   };
   std::map<std::vector<int>, BatchGraphs> batch_graphs_;
@@ -583,6 +614,17 @@ class Engine {
   float *dout_ = nullptr, *dcoef_ = nullptr, *dq_ = nullptr, *dg_ = nullptr, *du_ = nullptr, *dattn_ = nullptr;
   float *dlogits_ = nullptr, *dunary_ = nullptr, *dhp_ = nullptr, *dscores_ = nullptr;
   int* dcand_ = nullptr;
+  // The sparse head (BACKLOG 19): its factors, the fixed list (host mask), the step's selection, and the pinned and
+  // device buffers a session's new context ids are marked through.
+  bool sparse_head_ = false;
+  int sh_rank_ = 0, sh_cap_ = 0, sh_nfixed_ = 0;
+  __nv_bfloat16 *sh_us_ = nullptr, *sh_vt_ = nullptr;
+  std::vector<uint8_t> sh_fixed_;
+  float* sh_p_ = nullptr;
+  void* sh_scratch_ = nullptr;
+  int *sh_rows_ = nullptr, *sh_nrows_ = nullptr, *sh_ids_dev_ = nullptr;
+  float* sh_xtmp_ = nullptr;  // a batch's full-head rows copied together (draft_head_rows)
+  static constexpr int kShMarkMax = 4096;  // more new ids at once: the whole mask is uploaded
   float *topk_scratch_ = nullptr, *vals_dev_ = nullptr;
   int* ids_out_dev_ = nullptr;
   // The drafter attends to the last sliding_window positions only, so its context KV is a ring of
@@ -617,6 +659,22 @@ class Engine {
     SpecStats spec;  // this session's speculative steps
     std::mt19937_64 rng;
     cudaGraphExec_t draft_graph = nullptr;
+    cudaGraphExec_t draft_graph_sparse = nullptr;  // the draft with the sparse head (BACKLOG 19)
+    // The sparse head's per-session state (BACKLOG 19): the device mask of the rows always scored (the fixed list
+    // joined with the context vocabulary), its host copy, how much of history it holds, and the fallback's window.
+    uint8_t* sh_mask = nullptr;
+    std::vector<uint8_t> sh_seen;
+    size_t sh_synced = 0;
+    bool sh_dirty = true;  // history was replaced: rebuild the mask from it
+    bool sh_rewin = false;  // history was cut (a new turn): the window starts again from the tokens that follow
+    int sh_ctx = 0;        // context rows beyond the fixed list
+    std::vector<uint8_t> sh_win;  // the last window tokens' novelty, a ring
+    int sh_win_pos = 0, sh_win_n = 0, sh_novel = 0;
+    bool sh_full = true;  // the fallback: the full head
+    size_t sh_cool_until = 0;  // the acceptance floor's fallback lasts until history reaches this length
+    long sh_last_steps = -1, sh_last_acc = 0;
+    bool sh_last_sparse = false;
+    double sh_acc_ema = -1;
     std::map<int, cudaGraphExec_t> verify_graphs;  // by top-K (1 when greedy)
     std::map<int, cudaGraphExec_t> tree_verify_graphs;  // a tree verify's, by top-K
     kernels::GatherBuf* gather = nullptr;  // the buffers a tree's accepted path is gathered in (device)

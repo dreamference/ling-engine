@@ -169,6 +169,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     if (const char* e = std::getenv("LING_DRAFT_NVFP4")) nvfp4 = std::atoi(e) != 0;
     draft_ = std::make_unique<DraftModel>(opts_.draft_dir, nvfp4);
     alloc_drafter();
+    alloc_sparse_head();
     std::fprintf(stderr, "drafter: %.2f GB, block %d, fc and conv projections %s\n", draft_->device_bytes() / 1e9,
                  opts_.draft_block,
                  draft_->nvfp4_copies()
@@ -473,6 +474,7 @@ void Engine::reset_session() {
   reset_state();
   check(cudaStreamSynchronize(stream_), "reset");
   s_->history.clear();
+  s_->sh_dirty = true;  // the sparse head's context vocabulary goes with the history (BACKLOG 19)
   s_->prompt_len = 0;
   s_->turn_start = 0;
   s_->snap_pos = -1;
@@ -576,6 +578,8 @@ SpecStats Engine::spec_stats_total() const {
     t.tree_steps += a.tree_steps;
     t.tree_branch_steps += a.tree_branch_steps;
     t.tree_off_chain += a.tree_off_chain;
+    t.sparse_steps += a.sparse_steps;
+    t.sparse_fallbacks += a.sparse_fallbacks;
     for (int b = 0; b < 5; ++b) {
       t.shadow_steps[b] += a.shadow_steps[b];
       t.shadow_lookup[b] += a.shadow_lookup[b];
@@ -618,6 +622,7 @@ void Engine::adopt_prefix(const Session& from, int n) {
   // The copied ring holds what `from`'s holds: positions [dkv_from(from), from.history.size()); the
   // truncation below keeps the part before n.
   s_->history = from.history;
+  s_->sh_dirty = true;  // the sparse head's context vocabulary is rebuilt from the adopted history (BACKLOG 19)
   s_->dkv_lo = dkv_from(from);
   s_->snap_pos = -1;  // the active session's own end-of-prompt state belongs to the history it replaced
   s_->shadow.clear();
@@ -689,6 +694,10 @@ void Engine::truncate_history(int n) {
   // before the history shrinks (positions [dkv_from, n) stay, the ones after n are rewritten later).
   s_->dkv_lo = std::min(dkv_from(*s_), n);
   if (n < static_cast<int>(s_->history.size())) s_->history.resize(n);
+  // The sparse head's context keeps the forgotten tokens' rows (a superset only costs rows) and reads the tokens
+  // that replace them (BACKLOG 19).
+  if (static_cast<size_t>(std::max(n, 0)) < s_->sh_synced) s_->sh_rewin = true;
+  s_->sh_synced = std::min(s_->sh_synced, static_cast<size_t>(std::max(n, 0)));
   if (s_->snap_pos > n) s_->snap_pos = -1;
   // The checkpoint store keeps its entries: each carries its own token prefix (M4 §1).
 }
@@ -1475,6 +1484,7 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   if (from_kv) {  // the KV of [0, kv_reuse) out of the store, the state from the store or the checkpoint store
     kv_restore(kvm, kv_reuse);
     s_->history.assign(prompt.begin(), prompt.begin() + kv_reuse);
+    s_->sh_dirty = true;    // the sparse head's context vocabulary is rebuilt from the new history (BACKLOG 19)
     s_->dkv_lo = kv_reuse;  // no drafter context before kv_reuse (kv_reuse <= window)
     s_->snap_pos = -1;
     s_->shadow.clear();

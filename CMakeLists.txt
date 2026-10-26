@@ -43,6 +43,7 @@ add_library(ling_core STATIC
   src/core/gemm_bf16.cu
   src/core/prefill_gdn.cu
   src/core/topk.cu
+  src/core/sparse_head.cu
   src/core/draft_kernels.cu
   src/core/drafter.cpp
   src/core/speculate.cpp
