@@ -98,6 +98,8 @@ void bias_act(const float* y, const __nv_bfloat16* b, int M, int N, __nv_bfloat1
 // x[p] = bf16(x[p] + bf16(sum_i bf16(table[idx[i][p]] * wt[i][p]))), the interpolated position embedding.
 void add_pos(__nv_bfloat16* x, const __nv_bfloat16* table, const int* idx, const __nv_bfloat16* wt, int n, int hidden,
              cudaStream_t s);
+// h[r][c] = float(src[r][c]): an image's rows of the language model's input (its embedding replaces the token's).
+void embed_rows(const __nv_bfloat16* src, int rows, int hidden, float* h, cudaStream_t s);
 }  // namespace vision_kernels
 
 // The host side of the position embedding and the rotary positions for a gh x gw patch grid, in merge-window order

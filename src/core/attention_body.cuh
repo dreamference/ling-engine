@@ -32,10 +32,20 @@ __device__ float block_sum(float v, float* red) {
   return warp_sum(t);
 }
 
-// Row m (its position pos) of attn_prepare; the caches are its sequence's.
+// The interleaved M-RoPE sections of Qwen3.8 ([11, 11, 10], mrope_interleaved; VISION §20.1): frequency i of the 32
+// takes the height position when i % 3 == 1 and i < 3 * 11, the width position when i % 3 == 2 and i < 3 * 10, the
+// temporal one otherwise. A text token's three positions are equal, so it is plain RoPE at that position.
+constexpr int kMropeH = 11, kMropeW = 10;
+__device__ __forceinline__ int mrope_pos(int i, int pt, int ph, int pw) {
+  return (i % 3 == 1 && i < 3 * kMropeH) ? ph : (i % 3 == 2 && i < 3 * kMropeW) ? pw : pt;
+}
+
+// Row m (its RoPE positions pos, ph, pw: (temporal, height, width), all equal for text) of attn_prepare; the caches
+// are its sequence's.
 __device__ __forceinline__ void attn_prepare_body(const float* __restrict__ q_gate, const float* __restrict__ k,
                                                   const float* __restrict__ v, const __nv_bfloat16* __restrict__ q_norm,
-                                                  const __nv_bfloat16* __restrict__ k_norm, int m, int pos, int Hq,
+                                                  const __nv_bfloat16* __restrict__ k_norm, int m, int pos, int ph,
+                                                  int pw, int Hq,
                                                   int Hkv, int D, int rot, float theta, float eps, float* __restrict__ q,
                                                   float* __restrict__ gate, __nv_bfloat16* __restrict__ kcache,
                                                   __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps,
@@ -68,7 +78,7 @@ __device__ __forceinline__ void attn_prepare_body(const float* __restrict__ q_ga
     const int half = rot / 2, i = d % half;
     const float inv_freq = powf(theta, -2.f * i / rot);
     float sn, cs;
-    sincosf(static_cast<float>(pos) * inv_freq, &sn, &cs);
+    sincosf(static_cast<float>(mrope_pos(i, pos, ph, pw)) * inv_freq, &sn, &cs);
     o = d < half ? xn[d] * cs - xn[d + half] * sn : xn[d] * cs + xn[d - half] * sn;
   }
   if (is_q) {

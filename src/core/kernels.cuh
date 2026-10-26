@@ -16,16 +16,34 @@ namespace ling::kernels {
 // time, so it passes `dev`: the kernel then reads the position from device memory (*dev + off), where the
 // engine writes it before each replay. `host` is the host's view at launch time; it is never used for
 // launch geometry inside a graph (kernels whose grid would depend on it take a fixed grid instead).
+//
+// The rope delta (images, specs/DREAMFERENCE_LING_ENGINE_VISION.md §20.1): after an image the target's RoPE position is
+// the cache slot plus a negative delta. Only the target's attention prepare reads it (rope_value); the cache slot,
+// the attention's key range and the drafter keep the slot (pos_value). `rdelta_dev` (a graph) or `rdelta` (eager).
 struct DevPos {
   int host = 0;
   int off = 0;               // added to *dev
   const int* dev = nullptr;  // nullptr: the position is `host`
+  int rdelta = 0;
+  const int* rdelta_dev = nullptr;
   DevPos(int p) : host(p) {}  // NOLINT: implicit on purpose, so eager call sites pass a plain int
   DevPos(int p, const int* d, int o) : host(p), off(o), dev(d) {}
-  DevPos plus(int k) const { return DevPos(host + k, dev, off + k); }
+  DevPos plus(int k) const {
+    DevPos q(host + k, dev, off + k);
+    q.rdelta = rdelta;
+    q.rdelta_dev = rdelta_dev;
+    return q;
+  }
+  DevPos with_rope(int delta, const int* delta_dev) const {
+    DevPos q = *this;
+    q.rdelta = delta;
+    q.rdelta_dev = delta_dev;
+    return q;
+  }
 };
 #ifdef __CUDACC__
 __device__ __forceinline__ int pos_value(const DevPos& p) { return p.dev ? *p.dev + p.off : p.host; }
+__device__ __forceinline__ int rope_delta(const DevPos& p) { return p.rdelta_dev ? *p.rdelta_dev : p.rdelta; }
 #endif
 
 // Several sequences' rows in one launch (M4 stage 4, the batched verify and drafter): sequence i owns rows
@@ -37,6 +55,8 @@ struct SeqBatch {
   int row0[kMaxSeqs + 1] = {};
   int pos[kMaxSeqs] = {};          // the host's positions (eager launches; also the launch geometry)
   const int* pos_dev = nullptr;    // a captured graph: sequence i's position is pos_dev[i]
+  int rdelta[kMaxSeqs] = {};       // the sequences' rope deltas (DevPos::rdelta)
+  const int* rdelta_dev = nullptr; // a captured graph: sequence i's rope delta is rdelta_dev[i]
 };
 template <typename T>
 struct SeqPtrs {
@@ -49,6 +69,7 @@ __device__ __forceinline__ int seq_of(const SeqBatch& b, int row) {
   return s;
 }
 __device__ __forceinline__ int seq_pos(const SeqBatch& b, int s) { return b.pos_dev ? b.pos_dev[s] : b.pos[s]; }
+__device__ __forceinline__ int seq_rdelta(const SeqBatch& b, int s) { return b.rdelta_dev ? b.rdelta_dev[s] : b.rdelta[s]; }
 #endif
 
 // Programmatic dependent launch (launch.cuh) for the rows path's kernels (decode, verify, drafter, commit):
@@ -435,7 +456,10 @@ void set_kv_layout(size_t head_stride, size_t pos_stride);
 void attn_prepare(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
                   const __nv_bfloat16* k_norm, DevPos pos0, int M, int Hq, int Hkv, int D, int rot, float theta,
                   float eps, float* q, float* gate, __nv_bfloat16* kcache, __nv_bfloat16* vcache,
-                  cudaStream_t s, const TreeDesc* td = nullptr);
+                  cudaStream_t s, const TreeDesc* td = nullptr, const int* mrope = nullptr);
+// mrope (a prefill chunk of a prompt with images): row m's RoPE positions are mrope[3m .. 3m + 2], (temporal, height,
+// width), each frequency taking its component as the interleaved M-RoPE sections say (attention_body.cuh); null: the
+// row's position is its slot plus pos0's rope delta for all three.
 // Causal attention of M queries (positions pos0..) over the cache, on tensor cores over fixed 4096-key ranges at
 // fixed positions (combined afterwards), so each row's result is independent of M: decode, verify and prefill
 // (in slices of queries). `scratch` needs attention_rows_scratch_floats(M, Hq, D, ctx) floats.

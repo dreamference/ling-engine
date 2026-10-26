@@ -74,8 +74,10 @@ add_executable(ling-tokenize tools/ling_tokenize.cpp)
 target_link_libraries(ling-tokenize PRIVATE ling_tokenizer)
 
 # The API layer without the HTTP library, so it is testable on its own.
-add_library(ling_api STATIC src/serve/api.cpp)
-target_link_libraries(ling_api PUBLIC ling_core ling_tokenizer)
+# Image decoding (VISION §20.3 (c)): libpng, libwebp, libjpeg-turbo from the distribution, nvJPEG from the toolkit.
+pkg_check_modules(IMAGE_LIBS REQUIRED IMPORTED_TARGET libpng libwebp libjpeg)
+add_library(ling_api STATIC src/serve/api.cpp src/serve/image_input.cpp)
+target_link_libraries(ling_api PUBLIC ling_core ling_tokenizer PkgConfig::IMAGE_LIBS CUDA::nvjpeg)
 
 # ling-template: the chat template, and the Responses-to-prompt conversion, without a model.
 add_executable(ling-template tools/ling_template.cpp)

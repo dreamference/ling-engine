@@ -35,8 +35,20 @@
 #include "core/prefix_kv.hpp"
 #include "core/sampling.hpp"
 #include "core/tree.hpp"
+#include "core/vision.hpp"
 
 namespace ling {
+
+// Images (specs/DREAMFERENCE_LING_ENGINE_VISION.md §20.3, §20.7): a prompt holds an image as `tokens()` copies of the
+// image's id, an id at or above kImageTokenBase that the server's registry gives each distinct image, so every prefix
+// match tells two images apart. The engine never looks such an id up in the vocabulary.
+constexpr int kImageTokenBase = 1000000;
+struct PromptImage {
+  int token = 0;              // the image's id in the prompt
+  int grid_h = 0, grid_w = 0; // the patch grid (both even)
+  int tokens() const { return grid_h * grid_w / 4; }
+  std::shared_ptr<const std::vector<uint16_t>> patches;  // BF16 bits [grid_h * grid_w][1536], merge-window order
+};
 
 struct EngineOptions {
   int max_context = 65536;
@@ -140,9 +152,18 @@ struct EngineOptions {
   // running mean of tokens per step falls below it.
   int sparse_head_window = 64;
   double sparse_head_hi = 0.15, sparse_head_lo = 0.08, sparse_head_accept_floor = 0;
+  // Images (VISION §20.3): the checkpoint's vision tower, loaded with scratch for images of up to vision_max_pixels
+  // (the processor's maximum by default), and a cache of encoded images (their embeddings, by image id) of at most
+  // vision_cache_mb, reserved at start. Off: an image id in a prompt is an error.
+  bool vision = false;
+  long vision_max_pixels = 16777216;
+  int vision_cache_mb = 512;
 };
 
 struct EngineStats {
+  int image_tokens = 0;         // image tokens in the prefilled part of the prompt
+  int images_encoded = 0;       // images the tower ran on (the rest came from the embedding cache)
+  double vision_seconds = 0;    // the tower's GPU time
   double prefill_seconds = 0;  // wall time from begin_prefill to the last chunk (other sessions' work included)
   double compute_seconds = 0;  // the prefill's own chunks only
   int prefill_tokens = 0;
@@ -192,7 +213,7 @@ class Engine {
   // reach further) another session's, whose KV for the shared prefix is copied in first (M4 §1).
   // `from_scratch`: reuse nothing (the reference --prefix-check compares a resumed prefill with).
   const std::vector<float>& prefill(const std::vector<int>& prompt, EngineStats* stats = nullptr,
-                                    bool from_scratch = false);
+                                    bool from_scratch = false, const std::vector<PromptImage>* images = nullptr);
   // The same prefill one chunk at a time (M4 §3), so a server can run another session's step between chunks.
   // begin_prefill picks the state to resume from and readies the active session (prefill()'s first half);
   // each prefill_chunk call makes the cursor's session active and runs one pass of at most `max_tokens`
@@ -215,8 +236,24 @@ class Engine {
     std::chrono::steady_clock::time_point t0;
     EngineStats stats;
     bool done() const { return next >= static_cast<int>(prompt.size()); }
+    // Images (VISION §20.3 (b)): the prompt's images, and each run of an image's ids: where it starts, how many
+    // tokens, the image (an index into images), the merged grid (rows, cols) and the RoPE position of its first row.
+    std::vector<PromptImage> images;
+    struct Span {
+      int start = 0, len = 0, image = 0, rows = 0, cols = 0, base = 0;
+    };
+    std::vector<Span> spans;
+    bool has_images() const { return !spans.empty(); }
   };
-  PrefillCursor begin_prefill(const std::vector<int>& prompt, bool from_scratch = false);
+  // `images`: the images whose ids the prompt holds (VISION §20.3); an image id without its image is an error.
+  PrefillCursor begin_prefill(const std::vector<int>& prompt, bool from_scratch = false,
+                              const std::vector<PromptImage>* images = nullptr);
+  bool has_vision() const { return vision_ != nullptr; }
+  VisionTower* vision() { return vision_.get(); }
+  // The RoPE positions (temporal, height, width) of prompt rows [from, to) into out (3 per row), and the delta of the
+  // positions after the prompt (VISION §20.1). Public for the checks.
+  static void rope_rows(const PrefillCursor& cur, int from, int to, std::vector<int>& out);
+  static int rope_delta_after(const PrefillCursor& cur);
   bool prefill_chunk(PrefillCursor& cur, int max_tokens = 0);
   // The same chunk beside other sessions' work (EngineOptions::side_prefill): prefill_chunk_launch queues the
   // chunk's pass on the side stream, with the side scratch, and returns at once; the caller goes on with other
@@ -505,9 +542,11 @@ class Engine {
   // pos_dev_[i]: the position of the batch's i-th sequence (the one-row step uses [0]); dpos() reads slot
   // dpos_slot_ (a batched sequence's commit: its slot in the batch).
   int* pos_dev_ = nullptr;
+  int* rdelta_dev_ = nullptr;  // rdelta_dev_[i]: the rope delta of the batch's i-th sequence, written beside pos_dev_
   int dpos_slot_ = 0;
   kernels::DevPos dpos(int off = 0) const {
-    return use_dev_pos_ ? kernels::DevPos(s_->pos + off, pos_dev_ + dpos_slot_, off) : kernels::DevPos(s_->pos + off);
+    return use_dev_pos_ ? kernels::DevPos(s_->pos + off, pos_dev_ + dpos_slot_, off).with_rope(0, rdelta_dev_ + dpos_slot_)
+                        : kernels::DevPos(s_->pos + off).with_rope(s_->rope_delta, nullptr);
   }
   // The graphs themselves are per session (Session::draft_graph ...): they bake the session's cache and
   // state pointers into their kernels' arguments.
@@ -522,6 +561,8 @@ class Engine {
   struct StepPinned {
     int pos;
     int seq_pos[kernels::kMaxSeqs];  // a batched step's positions, per sequence
+    int rdelta;                       // the one-sequence step's rope delta
+    int seq_rdelta[kernels::kMaxSeqs];  // a batched step's rope deltas
     int draft_ids[kernels::kMaxStreamRows];  // the drafter's block: the anchor, then mask tokens
     int rows[kernels::kMaxStreamRows];       // the verified rows: the anchor, then the drafted tokens
     int cand[kernels::kMaxStreamRows * 16];
@@ -535,6 +576,27 @@ class Engine {
 
   EngineOptions opts_;
   std::unique_ptr<Model> model_;
+  // ---- Images (VISION §20.3). ----
+  std::unique_ptr<VisionTower> vision_;
+  struct EmbEntry {
+    __nv_bfloat16* p = nullptr;
+    size_t bytes = 0;
+    uint64_t used = 0;
+  };
+  std::map<int, EmbEntry> emb_;  // the embedding cache, by image id
+  size_t emb_bytes_ = 0, emb_cap_ = 0;
+  uint64_t emb_clock_ = 0;
+  cudaMemPool_t emb_pool_ = nullptr;
+  // The embedding of `im`, from the cache or the tower (run on stream_); entries of the ids in `keep` are not evicted.
+  const __nv_bfloat16* image_embedding(const PromptImage& im, const std::vector<int>& keep, EngineStats& stats);
+  // The current prefill chunk's images (rows of h_ replaced after the embedding) and RoPE table (null: text only).
+  struct ImgRows {
+    int row, count;
+    const __nv_bfloat16* src;
+  };
+  std::vector<ImgRows> chunk_img_;
+  int* mrope_dev_ = nullptr;  // [prefill_chunk][3]
+  bool chunk_mrope_ = false;
   std::unique_ptr<DraftModel> draft_;
   cudaStream_t stream_ = nullptr;
   std::vector<void*> buffers_;
@@ -655,6 +717,9 @@ class Engine {
     // The ring holds positions [dkv_lo, history.size()), and of those only the last ring_ (dkv_from()).
     int dkv_lo = 0;
     int pos = 0;
+    // The RoPE position of the slot after the last prompt's images, less the slot (VISION §20.1): 0 for text-only
+    // prompts; every pass after the prompt's prefill turns its rows at slot + rope_delta.
+    int rope_delta = 0;
     std::vector<ShadowRecord> shadow;
     SpecStats spec;  // this session's speculative steps
     std::mt19937_64 rng;

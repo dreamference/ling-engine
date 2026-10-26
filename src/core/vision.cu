@@ -308,6 +308,11 @@ __global__ void __launch_bounds__(128) attention_kernel(const __nv_bfloat16* __r
   }
 }
 
+__global__ void embed_rows_kernel(const __nv_bfloat16* __restrict__ src, size_t n, float* __restrict__ h) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
+    h[i] = __bfloat162float(src[i]);
+}
+
 int grid_for(size_t n, int block = 256) { return static_cast<int>(std::min<size_t>((n + block - 1) / block, 65535 * 8)); }
 
 }  // namespace
@@ -345,6 +350,13 @@ void bias_act(const float* y, const __nv_bfloat16* b, int M, int N, __nv_bfloat1
   if (M < 1) return;
   bias_act_kernel<<<grid_for(size_t(M) * ld_out), 256, 0, s>>>(y, b, M, N, out, ld_out, act, residual);
   check(cudaGetLastError(), "bias_act");
+}
+
+void embed_rows(const __nv_bfloat16* src, int rows, int hidden, float* h, cudaStream_t s) {
+  if (rows < 1) return;
+  const size_t n = size_t(rows) * hidden;
+  embed_rows_kernel<<<grid_for(n), 256, 0, s>>>(src, n, h);
+  check(cudaGetLastError(), "embed_rows");
 }
 
 void add_pos(__nv_bfloat16* x, const __nv_bfloat16* table, const int* idx, const __nv_bfloat16* wt, int n, int hidden,

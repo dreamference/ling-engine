@@ -1623,8 +1623,11 @@ __global__ void __launch_bounds__(kWarps * 32, 1) attn_persistent_kernel(MkAttnA
       const int slot = sl < hpg ? j * hpg + sl : sl == hpg ? a.Hq + j : a.Hq + a.Hkv + j;
       for (int m = m0; m < min(a.M, m0 + 4); ++m)
         // a tree's row sits at its depth's position; its key and value still go to slot p0 + m (attn_prepare_kernel)
-        attn_prepare_body(a.qg, a.kk, a.vv, a.q_norm, a.k_norm, m, a.td ? p0 + a.td->depth[m] : p0 + m, a.Hq, a.Hkv, D,
-                          a.rot, a.theta, a.eps, a.q, a.gate, a.kcache, a.vcache, a.hs, a.ps, p0 + m, slot);
+      {
+        const int r = (a.td ? p0 + a.td->depth[m] : p0 + m) + rope_delta(a.pos0);  // the rope delta (VISION §20.3 (b))
+        attn_prepare_body(a.qg, a.kk, a.vv, a.q_norm, a.k_norm, m, r, r, r, a.Hq, a.Hkv, D, a.rot, a.theta, a.eps, a.q,
+                          a.gate, a.kcache, a.vcache, a.hs, a.ps, p0 + m, slot);
+      }
       mk_done_ev(&c[kAtPrep + j], NP, ev ? ev + 1 + kMkMaxKv + j : nullptr);
     } else if (it.kind == 2) {  // attention: row block rb of group j over key range s
       MaybePdl{&waited}();

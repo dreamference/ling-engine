@@ -527,12 +527,22 @@ __global__ void attn_prepare_kernel(const float* __restrict__ q_gate, const floa
                                     int rot, float theta, float eps, float* __restrict__ q,
                                     float* __restrict__ gate, __nv_bfloat16* __restrict__ kcache,
                                     __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps,
-                                    const TreeDesc* __restrict__ td) {
+                                    const TreeDesc* __restrict__ td, const int* __restrict__ mrope) {
   pdl_begin();  // first statement: see launch.cuh
   const int m = blockIdx.x, p0 = pos_value(pos0);
-  // In a tree (BACKLOG 26) the row's position is its depth's; its key and value still go to slot p0 + m.
-  attn_prepare_body(q_gate, k, v, q_norm, k_norm, m, td ? p0 + td->depth[m] : p0 + m, Hq, Hkv, D, rot, theta, eps, q,
-                    gate, kcache, vcache, hs, ps, p0 + m, blockIdx.y);
+  // In a tree (BACKLOG 26) the row's position is its depth's; its key and value still go to slot p0 + m. After an
+  // image the RoPE position is the slot's plus the sequence's rope delta; a prefill chunk with images reads its rows'
+  // (temporal, height, width) from mrope (VISION §20.3 (b)).
+  int pt, ph, pw;
+  if (mrope) {
+    pt = mrope[3 * m];
+    ph = mrope[3 * m + 1];
+    pw = mrope[3 * m + 2];
+  } else {
+    pt = ph = pw = (td ? p0 + td->depth[m] : p0 + m) + rope_delta(pos0);
+  }
+  attn_prepare_body(q_gate, k, v, q_norm, k_norm, m, pt, ph, pw, Hq, Hkv, D, rot, theta, eps, q, gate, kcache, vcache,
+                    hs, ps, p0 + m, blockIdx.y);
 }
 
 // Several sequences' rows in one launch (M4 stage 4): row m belongs to sequence seq_of(m), at that sequence's
@@ -545,9 +555,9 @@ __global__ void attn_prepare_seqs_kernel(const float* __restrict__ q_gate, const
                                          size_t hs, size_t ps) {
   pdl_begin();  // first statement: see launch.cuh
   const int m = blockIdx.x, sq = seq_of(b, m);
-  const int p = seq_pos(b, sq) + m - b.row0[sq];
-  attn_prepare_body(q_gate, k, v, q_norm, k_norm, m, p, Hq, Hkv, D, rot, theta, eps, q, gate, kc.p[sq], vc.p[sq], hs, ps,
-                    p, blockIdx.y);
+  const int p = seq_pos(b, sq) + m - b.row0[sq], r = p + seq_rdelta(b, sq);
+  attn_prepare_body(q_gate, k, v, q_norm, k_norm, m, r, r, r, Hq, Hkv, D, rot, theta, eps, q, gate, kc.p[sq], vc.p[sq], hs,
+                    ps, p, blockIdx.y);
 }
 
 // The rows path's attention (attention_mma_body and its tiles): core/attention_body.cuh.
@@ -797,10 +807,10 @@ void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float
 void attn_prepare(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
                   const __nv_bfloat16* k_norm, DevPos pos0, int M, int Hq, int Hkv, int D, int rot, float theta,
                   float eps, float* q, float* gate, __nv_bfloat16* kcache, __nv_bfloat16* vcache,
-                  cudaStream_t s, const TreeDesc* td) {
+                  cudaStream_t s, const TreeDesc* td, const int* mrope) {
   dim3 grid(M, Hq + 2 * Hkv);
   launch_kernel("attn_prepare", attn_prepare_kernel, grid, dim3(D), D * sizeof(float), s, q_gate, k, v, q_norm, k_norm,
-                pos0, Hq, Hkv, D, rot, theta, eps, q, gate, kcache, vcache, kv_hs(D), kv_ps(Hkv, D), td);
+                pos0, Hq, Hkv, D, rot, theta, eps, q, gate, kcache, vcache, kv_hs(D), kv_ps(Hkv, D), td, mrope);
 }
 
 void attn_prepare_seqs(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
