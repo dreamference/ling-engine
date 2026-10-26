@@ -66,7 +66,8 @@ void png_read_mem(png_structp png, png_bytep out, png_size_t len) {
   s->off += len;
 }
 DecodedImage decode_png(const std::string& bytes) {
-  png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+  // Warnings (an sRGB profile on a grey image, ...) are not errors and not worth a line in the server's log.
+  png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, [](png_structp, png_const_charp) {});
   png_infop info = png ? png_create_info_struct(png) : nullptr;
   if (!png || !info) throw std::runtime_error("libpng: out of memory");
   DecodedImage img;
