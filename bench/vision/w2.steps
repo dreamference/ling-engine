@@ -1,0 +1,9 @@
+# Images window 2: phase (a) again after window 1's fixes, then the end-to-end agreement's engine side.
+SRC=~/ling-engine-vision; B=$SRC/build; R=$V/../ref; P=$V/../prompts.jsonl
+CK=$(ls -d ~/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4/snapshots/*)
+step vision-tests $B/ling-vision-tests
+step vision-check $B/ling-run --model $CK --vision-check $R --vision-bench
+step greedy $B/ling-run --model $CK --vision-prompts $P --greedy-out $V/../engine-greedy.jsonl --max-tokens 48
+python3 $SRC/bench/vision/agree.py cases $V/.. > /dev/null 2>&1
+step force bash -c "$B/ling-run --model $CK --vision-prompts $P --force-file $V/../cases.jsonl > $V/../engine-force.jsonl"
+step agree python3 $SRC/bench/vision/agree.py $V/..
