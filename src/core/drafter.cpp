@@ -129,13 +129,24 @@ DraftModel::DraftModel(const std::string& dir, bool nvfp4_copies) {
     DraftLayer L;
     L.input_norm = bf(p + "input_layernorm.weight");
     L.post_norm = bf(p + "post_attention_layernorm.weight");
-    L.q = fp4(p + "self_attn.q_proj");
-    L.k = fp4(p + "self_attn.k_proj");
-    L.v = fp4(p + "self_attn.v_proj");
-    L.o = fp4(p + "self_attn.o_proj");
-    L.gate = fp4(p + "mlp.gate_proj");
-    L.up = fp4(p + "mlp.up_proj");
-    L.down = fp4(p + "mlp.down_proj");
+    if (ck.get(p + "self_attn.q_proj.weight").dtype == "BF16") {  // the BF16 original: its projections as they are
+      L.bf16 = true;
+      L.bq = bf_w(p + "self_attn.q_proj.weight");
+      L.bk = bf_w(p + "self_attn.k_proj.weight");
+      L.bv = bf_w(p + "self_attn.v_proj.weight");
+      L.bo = bf_w(p + "self_attn.o_proj.weight");
+      L.bgate = bf_w(p + "mlp.gate_proj.weight");
+      L.bup = bf_w(p + "mlp.up_proj.weight");
+      L.bdown = bf_w(p + "mlp.down_proj.weight");
+    } else {
+      L.q = fp4(p + "self_attn.q_proj");
+      L.k = fp4(p + "self_attn.k_proj");
+      L.v = fp4(p + "self_attn.v_proj");
+      L.o = fp4(p + "self_attn.o_proj");
+      L.gate = fp4(p + "mlp.gate_proj");
+      L.up = fp4(p + "mlp.up_proj");
+      L.down = fp4(p + "mlp.down_proj");
+    }
     L.q_norm = bf(p + "self_attn.q_norm.weight");
     L.k_norm = bf(p + "self_attn.k_norm.weight");
     auto kproj = [&](const std::string& name, Bf16Weight& bw, Fp4Weight& w4) {

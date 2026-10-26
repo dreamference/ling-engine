@@ -38,6 +38,10 @@ struct DraftLayer {
   const __nv_bfloat16* input_norm = nullptr;
   const __nv_bfloat16* post_norm = nullptr;
   Fp4Weight q, k, v, o, gate, up, down;
+  // A BF16 drafter (the original's projections unquantized; bench/drafter/big_dummy.py measures its cost): these
+  // replace q .. down on the BF16 rows path.
+  bool bf16 = false;
+  Bf16Weight bq, bk, bv, bo, bgate, bup, bdown;
   const __nv_bfloat16* q_norm = nullptr;
   const __nv_bfloat16* k_norm = nullptr;
   Bf16Weight attn_kproj, mlp_kproj;  // [2 * taps * groups][hidden]; w null when the NVFP4 copies replace them

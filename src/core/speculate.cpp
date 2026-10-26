@@ -157,6 +157,9 @@ void Engine::alloc_drafter() {
       s.dkc.push_back(alloc<__nv_bfloat16>(size_t(ring_) * dkv));
       s.dvc.push_back(alloc<__nv_bfloat16>(size_t(ring_) * dkv));
     }
+  // A drafter wider than the target (bench/drafter/big_dummy.py): the rows path's FP16 copy of x must hold its
+  // down projection's input.
+  if (d.intermediate > c.intermediate) xh_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * d.intermediate);
   dctx_ = alloc<float>(size_t(R) * H);
   if (draft_->nvfp4_copies()) xh_fc_ = alloc<__half>(size_t(B) * draft_->fc4().K);
   dk_ = alloc<float>(size_t(R) * dkv);
@@ -527,7 +530,12 @@ void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
   kernels::rmsnorm(dctx_, draft_->hidden_norm(), dctx_, rows, d.hidden, d.eps, false, stream_);
   for (int l = 0; l < d.layers; ++l) {
     const DraftLayer& L = draft_->layers()[l];
-    linear_fp4_multi({{&L.k, dk_}, {&L.v, dv_}}, dctx_, rows);
+    if (L.bf16) {  // a BF16 drafter (bench/drafter/big_dummy.py): the BF16 rows path, one matrix at a time
+      linear_bf16_drafter(L.bk, dctx_, rows, dk_);
+      linear_bf16_drafter(L.bv, dctx_, rows, dv_);
+    } else {
+      linear_fp4_multi({{&L.k, dk_}, {&L.v, dv_}}, dctx_, rows);
+    }
     kernels::draft_qk_rope(dk_, rows, d.kv_heads, dkv, L.k_norm, pos0, d.rope_theta, d.eps, stream_);
     kernels::draft_store_kv(dk_, dv_, rows, dkv, pos0, s_->dkc[l], s_->dvc[l], ring_, stream_);
   }
@@ -561,21 +569,34 @@ void Engine::draft_launch(int B, bool sparse) {
     // Attention wrapped in the grouped conv: input side 0, output side 1, one kernel projection.
     linear_draft_kproj(L.attn_kproj, L.attn_kproj4, dh_, B, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.attn_base, 0, dh2_, B, H, d.conv_groups, B, stream_);
-    linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, B);
+    if (L.bf16) {
+      linear_bf16_drafter(L.bq, dh2_, B, dq_);
+      linear_bf16_drafter(L.bk, dh2_, B, dk_);
+      linear_bf16_drafter(L.bv, dh2_, B, dv_);
+    } else {
+      linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, B);
+    }
     kernels::draft_qk_rope(dq_, B, d.heads, dq, L.q_norm, dpos(), d.rope_theta, d.eps, stream_);
     kernels::draft_qk_rope(dk_, B, d.kv_heads, dkv, L.k_norm, dpos(), d.rope_theta, d.eps, stream_);
     kernels::draft_attention(dq_, s_->dkc[l], s_->dvc[l], ring_, dk_, dv_, dpos(), B, d.sliding_window - 1, d.heads,
                              d.kv_heads, dattn_, stream_);
-    linear_fp4(L.o, dattn_, B, dh2_);
+    if (L.bf16) linear_bf16_drafter(L.bo, dattn_, B, dh2_);
+    else linear_fp4(L.o, dattn_, B, dh2_);
     kernels::grouped_conv(dh2_, dcoef_, L.attn_base, 1, dout_, B, H, d.conv_groups, B, stream_);
     kernels::add_inplace(dres_, dout_, B * H, stream_);
     kernels::rmsnorm(dres_, L.post_norm, dh_, B, H, d.eps, false, stream_);
     // The MLP, wrapped the same way.
     linear_draft_kproj(L.mlp_kproj, L.mlp_kproj4, dh_, B, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.mlp_base, 0, dh2_, B, H, d.conv_groups, B, stream_);
-    linear_fp4_multi({{&L.gate, dg_}, {&L.up, du_}}, dh2_, B);
+    if (L.bf16) {
+      linear_bf16_drafter(L.bgate, dh2_, B, dg_);
+      linear_bf16_drafter(L.bup, dh2_, B, du_);
+    } else {
+      linear_fp4_multi({{&L.gate, dg_}, {&L.up, du_}}, dh2_, B);
+    }
     kernels::silu_mul(dg_, du_, dg_, B * d.intermediate, stream_);
-    linear_fp4(L.down, dg_, B, dh2_);
+    if (L.bf16) linear_bf16_drafter(L.bdown, dg_, B, dh2_);
+    else linear_fp4(L.down, dg_, B, dh2_);
     kernels::grouped_conv(dh2_, dcoef_, L.mlp_base, 1, dout_, B, H, d.conv_groups, B, stream_);
   }
   kernels::add_inplace(dres_, dout_, B * H, stream_);
@@ -624,20 +645,33 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B, unsigned spars
     kernels::rmsnorm(dres_, L.input_norm, dh_, R, H, d.eps, false, stream_);
     linear_draft_kproj(L.attn_kproj, L.attn_kproj4, dh_, R, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.attn_base, 0, dh2_, R, H, d.conv_groups, B, stream_);
-    linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, R);
+    if (L.bf16) {
+      linear_bf16_drafter(L.bq, dh2_, R, dq_);
+      linear_bf16_drafter(L.bk, dh2_, R, dk_);
+      linear_bf16_drafter(L.bv, dh2_, R, dv_);
+    } else {
+      linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, R);
+    }
     kernels::draft_qk_rope_seqs(dq_, d.heads, dq, L.q_norm, sb, d.rope_theta, d.eps, stream_);
     kernels::draft_qk_rope_seqs(dk_, d.kv_heads, dkv, L.k_norm, sb, d.rope_theta, d.eps, stream_);
     kernels::draft_attention_seqs(dq_, kc, vc, ring_, dk_, dv_, sb, d.sliding_window - 1, d.heads, d.kv_heads, dattn_,
                                   stream_);
-    linear_fp4(L.o, dattn_, R, dh2_);
+    if (L.bf16) linear_bf16_drafter(L.bo, dattn_, R, dh2_);
+    else linear_fp4(L.o, dattn_, R, dh2_);
     kernels::grouped_conv(dh2_, dcoef_, L.attn_base, 1, dout_, R, H, d.conv_groups, B, stream_);
     kernels::add_inplace(dres_, dout_, R * H, stream_);
     kernels::rmsnorm(dres_, L.post_norm, dh_, R, H, d.eps, false, stream_);
     linear_draft_kproj(L.mlp_kproj, L.mlp_kproj4, dh_, R, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.mlp_base, 0, dh2_, R, H, d.conv_groups, B, stream_);
-    linear_fp4_multi({{&L.gate, dg_}, {&L.up, du_}}, dh2_, R);
+    if (L.bf16) {
+      linear_bf16_drafter(L.bgate, dh2_, R, dg_);
+      linear_bf16_drafter(L.bup, dh2_, R, du_);
+    } else {
+      linear_fp4_multi({{&L.gate, dg_}, {&L.up, du_}}, dh2_, R);
+    }
     kernels::silu_mul(dg_, du_, dg_, R * d.intermediate, stream_);
-    linear_fp4(L.down, dg_, R, dh2_);
+    if (L.bf16) linear_bf16_drafter(L.bdown, dg_, R, dh2_);
+    else linear_fp4(L.down, dg_, R, dh2_);
     kernels::grouped_conv(dh2_, dcoef_, L.mlp_base, 1, dout_, R, H, d.conv_groups, B, stream_);
   }
   kernels::add_inplace(dres_, dout_, R * H, stream_);
