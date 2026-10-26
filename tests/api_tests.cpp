@@ -731,6 +731,128 @@ int main() {
     EXPECT(pn && !pn->logprobs);
     EXPECT(!parses(R"({"prompt":"hi","logprobs":21})", false) && !parses(R"({"prompt":"hi","logprobs":-1})", false));
   }
+  {
+    // Nights 12 and 15 (2026-10-21/22): four agent messages that ended a turn as text because the parser kept back a
+    // call it would not send, two of them the task's last answer (an empty patch: django-15554, django-13033). The
+    // model's own outputs, verbatim. The request offered `exec` (Codex's code mode) and nothing else.
+    const json offered = json::parse(R"([{"type":"function","function":{"name":"exec","parameters":{"type":"object",
+      "properties":{"input":{"type":"string"}},"required":["input"]}}}])");
+    // django-15554: a call to a shell command the model took for a tool. SGLang sends it as a call; the client
+    // answers it as unsupported and the turn goes on.
+    {
+      OutputParser p(false, offered);
+      auto d = feed(p, R"LING(<tool_call>
+<function=ling-search>
+<parameter=--read>
+Django FilteredRelation multiple same relation different conditions only one join generated ticket fix
+</parameter>
+</function>
+</tool_call>)LING");
+      EXPECT(d.content.empty() && d.tool_calls.size() == 1);
+      if (d.tool_calls.size() == 1) {
+        EXPECT(d.tool_calls[0].name == "ling-search");
+        EXPECT(json::parse(d.tool_calls[0].arguments)["--read"] ==
+               "Django FilteredRelation multiple same relation different conditions only one join generated ticket fix");
+      }
+    }
+    // sympy-19040: the function named in a `<parameter=` tag, the offered `exec`.
+    {
+      OutputParser p(false, offered);
+      auto d = feed(p, R"LING(<tool_call>
+<parameter=exec>
+<parameter=input>
+const r = await tools.exec_command({cmd: "cd /testbed && grep -n 'def get_ring' sympy/polys/domains/domain.py sympy/polys/domains/*.py 2>/dev/null; grep -rn 'class PolyRing' sympy/polys/domains/"});
+text(r.output);
+
+</parameter>
+</function>
+</tool_call>)LING");
+      EXPECT(d.content.empty() && d.tool_calls.size() == 1);
+      if (d.tool_calls.size() == 1) {
+        EXPECT(d.tool_calls[0].name == "exec");
+        const json a = json::parse(d.tool_calls[0].arguments);
+        EXPECT(a.size() == 1 && a["input"].get<std::string>().find("const r = await tools.exec_command(") == 0);
+      }
+    }
+    // sympy-13757: a call to `exec_command` (not offered) that the answer ended after `</function>`, with no
+    // `</tool_call>`.
+    {
+      OutputParser p(false, offered);
+      auto d = feed(p, R"LING(<tool_call>
+<function=exec_command>
+<parameter=cmd>
+cd /testbed && python - <<'EOF' 2>&1 | grep -v -i "warn\|collections\|MutableSet\|Callable\|plotting\|OrderedSet\|^  from"
+from sympy import Symbol, Poly
+from sympy.polys.polytools import Poly as P
+
+orig = P._mul_ground
+def traced(self, g):
+    print('>> _mul_ground(self=%r, g=%r)' % (self, g))
+    try:
+        r = orig(self, g)
+        print('<< -> %r' % (r,))
+        return r
+    except Exception as e:
+        print('<< raised %r' % (e,))
+        raise
+P._mul_ground = traced
+
+x = Symbol('x')
+print('=== Poly(1,x) * x')
+try:
+    r = P(1, x) * x
+    print('result:', repr(r), type(r))
+except Exception as e:
+    print('raised', repr(e))
+EOF
+</parameter>
+</function>
+)LING");
+      EXPECT(d.content.empty() && d.tool_calls.size() == 1);
+      if (d.tool_calls.size() == 1) {
+        EXPECT(d.tool_calls[0].name == "exec_command");
+        EXPECT(json::parse(d.tool_calls[0].arguments)["cmd"].get<std::string>().find("cd /testbed && python - <<") == 0);
+      }
+    }
+    // django-13033: prose, then `apply_patch` with the patch tool off.
+    {
+      OutputParser p(false, offered);
+      auto d = feed(p, R"LING(Applying the patch now.
+
+<tool_call>
+<function=apply_patch>
+<parameter=files>
+[{"filePath": "django/db/models/sql/query.py", "diff": "@@ -1455,6 +1455,27 @@\n             if name == 'pk':\n                 name = opts.pk.name\n \n+            # If the name is the attname of a foreign key whose column lives\n+            # in the current table (e.g. a self-referential foreign key),\n+            # resolve it as the concrete column instead of joining through\n+            # the relation. The column holds the same value, and this avoids\n+            # an unnecessary join.\n+            if (\n+                hasattr(field, 'attname')\n+                and name == field.attname\n+                and pos + 1 == len(names)\n+                and field.many_to_one\n+                and field.model._meta.concrete_model == opts.model\n+            ):\n+                final_field = field.target_field\n+                targets = (final_field,)\n+                cur_names_with_path[1].append(PathInfo(\n+                    from_model=opts.model, to_model=field.related_model,\n+                    direct=True, transform=None, target_fields=(field.target_field,),\n+                    filter_params=field.get_extra_descriptor_filter(),\n+                    path_fields=(),\n+565440000                    join_field=field,\n+                    related_model=field.related_model,\n+                    is_reverse=True,\n+2147483648                    m2m=field.many_to_many,\n+1073741824                    m2m_field=None,\n+33554432                    m2m_reverse_field=None,\n+329985856                    m2m_target_fields=(),\n+                    filtered_relation=None,\n+                ))\n+                names_with_path.append(cur_names_with_path)\n+                break\n+\n             field = None\n             filtered_relation = None\n"}]
+</parameter>
+</function>
+</tool_call>)LING");
+      EXPECT(d.content == "Applying the patch now.\n\n" && d.tool_calls.size() == 1);
+      if (d.tool_calls.size() == 1) {
+        EXPECT(d.tool_calls[0].name == "apply_patch");
+        EXPECT(json::parse(d.tool_calls[0].arguments).contains("files"));
+      }
+    }
+    // What stays text: the template's placeholder (vllm#58147, above), a misnamed block whose `<parameter=` name is
+    // not offered, a name with spaces, and a call cut off before its `</function>`.
+    {
+      OutputParser p(false, offered);
+      const std::string t = "<tool_call>\n<parameter=shell>\n<parameter=cmd>\nls\n</parameter>\n</function>\n</tool_call>";
+      auto d = feed(p, t);
+      EXPECT(d.tool_calls.empty() && d.content == t);
+    }
+    {
+      OutputParser p(false, offered);
+      const std::string t = "<tool_call>\n<function=run a command>\n</function>\n</tool_call>";
+      auto d = feed(p, t);
+      EXPECT(d.tool_calls.empty() && d.content == t);
+    }
+    {
+      OutputParser p(false, offered);
+      const std::string t = "<tool_call>\n<function=exec>\n<parameter=input>\ntext(1);";
+      auto d = feed(p, t);
+      EXPECT(d.tool_calls.empty() && d.content == t);
+    }
+  }
   if (known_gaps) std::printf("%d known gaps (not failures; see reports/engine-issues-2026-10-09.md)\n", known_gaps);
   std::printf(failures ? "%d API TEST FAILURES\n" : "all api tests passed\n", failures);
   return failures ? 1 : 0;
