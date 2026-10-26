@@ -874,10 +874,12 @@ class Handler : public proxygen::RequestHandler {
   // Images (VISION §20.3 (c), §20.6): each URL decoded and preprocessed here, on the HTTP thread; each <|image_pad|>
   // of the tokenized prompt becomes the image's tokens, all its id (§20.7). Throws ImageError or invalid_argument.
   void attach_images(Job& job) {
+    // Without the tower an image part rendered as `[image]` and no URL was collected: nothing to do (a literal
+    // <|image_pad|> in the text stays a token, as before).
+    if (!ctx_.vision) return;
     int pads = 0;
     for (int t : job.prompt) pads += t == ctx_.image_pad;
     if (job.req.image_urls.empty() && pads == 0) return;
-    if (!ctx_.vision) throw ImageError("this server has no vision tower (--vision off)", "image_input_not_supported");
     serve::attach_images(job.prompt, ctx_.image_pad, job.req.image_urls, *ctx_.images, ctx_.processor, job.images);
   }
 
