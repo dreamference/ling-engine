@@ -285,7 +285,7 @@ int main(int argc, char** argv) {
   bool interleave_check = false, batch_check = false, batch_bench = false, draft_bf16 = false;
   std::string draft_head = "sparse", sparse_head_dir;  // the drafter's head (BACKLOG 19)
   int sparse_head_dynamic = 16384;
-  std::string vision_prompts, vision_check;  // images (VISION §20.8)
+  std::string vision_prompts, vision_check, force_file, greedy_out;  // images (VISION §20.8)
   bool vision_bench = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -334,6 +334,8 @@ int main(int argc, char** argv) {
     else if (a == "--vision-prompts") vision_prompts = next();
     else if (a == "--vision-check") vision_check = next();
     else if (a == "--vision-bench") vision_bench = true;
+    else if (a == "--force-file") force_file = next();
+    else if (a == "--greedy-out") greedy_out = next();
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
@@ -442,6 +444,76 @@ int main(int argc, char** argv) {
     // LING_PROBE_SKIP's runs (src/core/launch.cuh) produce garbage tokens; they decode to --max-tokens regardless.
     const bool no_end = std::getenv("LING_PROBE_SKIP") != nullptr;
     auto is_end = [&](int t) { return !no_end && (t == engine.config().eos_token || t == im_end); };
+    // The agreement study's engine side for these prompts (bench/vision/agree.py), as bench/agreement/ling_force does
+    // for text: plain greedy decoding, and teacher-forced top-20 log-probs over production's continuation.
+    const int pad_id = tok.token_id("<|image_pad|>");
+    auto as_production = [&](std::vector<int> ids) {  // an image's ids as production's prompt_token_ids shows them
+      for (int& t : ids)
+        if (t >= ling::kImageTokenBase) t = pad_id;
+      return ids;
+    };
+    auto topk_json = [&](const std::vector<float>& logits, int K, const std::vector<int>& extra) {
+      const int V = static_cast<int>(logits.size());
+      double mx = -1e30;
+      for (float v : logits) mx = std::max(mx, double(v));
+      double sum = 0;
+      for (float v : logits) sum += std::exp(double(v) - mx);
+      const double lse = mx + std::log(sum);
+      std::vector<int> idx(V);
+      for (int i = 0; i < V; ++i) idx[i] = i;
+      std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
+                        [&](int a, int b) { return logits[a] > logits[b] || (logits[a] == logits[b] && a < b); });
+      nlohmann::json t = nlohmann::json::array();
+      for (int i = 0; i < K; ++i) t.push_back({idx[i], double(logits[idx[i]]) - lse});
+      nlohmann::json e = nlohmann::json::object();
+      for (int id : extra)
+        if (id >= 0 && id < V) e[std::to_string(id)] = double(logits[id]) - lse;
+      return nlohmann::json{{"top", t}, {"lp", e}};
+    };
+    if (!greedy_out.empty()) {
+      std::ofstream out(greedy_out);
+      for (const std::vector<int>& prompt : prompts) {
+        engine.reset();
+        ling::EngineStats st;
+        const std::vector<float>* logits = &engine.prefill(prompt, &st, false, IMG);
+        std::vector<int> ids;
+        for (int i = 0; i < max_tokens; ++i) {
+          const int t = static_cast<int>(std::max_element(logits->begin(), logits->end()) - logits->begin());
+          ids.push_back(t);
+          if (is_end(t)) break;
+          logits = &engine.step(t);
+        }
+        out << nlohmann::json{{"ids", ids}, {"text", tok.decode(ids)}, {"prompt_ids", as_production(prompt)},
+                              {"prefill_s", st.prefill_seconds}, {"vision_s", st.vision_seconds},
+                              {"image_tokens", st.image_tokens}}
+                   .dump()
+            << "\n";
+      }
+      return 0;
+    }
+    if (!force_file.empty()) {
+      std::ifstream in(force_file);
+      std::string line;
+      while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        const nlohmann::json c = nlohmann::json::parse(line);
+        const std::vector<int>& prompt = prompts.at(c["prompt"].get<size_t>());
+        const std::vector<int> cont = c["cont"];
+        const nlohmann::json want = c.value("want", nlohmann::json::array());
+        engine.reset();
+        const std::vector<float>* logits = &engine.prefill(prompt, nullptr, false, IMG);
+        nlohmann::json pos = nlohmann::json::array();
+        for (size_t j = 0; j < cont.size(); ++j) {
+          std::vector<int> extra = {cont[j]};
+          if (j < want.size())
+            for (const auto& w : want[j]) extra.push_back(w.get<int>());
+          pos.push_back(topk_json(*logits, 20, extra));
+          if (j + 1 < cont.size()) logits = &engine.step(cont[j]);
+        }
+        std::cout << nlohmann::json{{"pos", pos}}.dump() << "\n" << std::flush;
+      }
+      return 0;
+    }
 
     // Generates from `prompt` (state reset first): plainly or speculatively. Prints text unless `quiet`.
     auto generate = [&](const std::vector<int>& prompt, const ling::SamplingParams& sp, bool use_spec, bool quiet,
