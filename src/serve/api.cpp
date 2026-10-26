@@ -1,5 +1,7 @@
 #include "serve/api.hpp"
 
+#include <cctype>
+
 #include <algorithm>
 #include <cmath>
 #include <random>
@@ -14,6 +16,7 @@ const std::string kThinkEnd = "</think>";
 const std::string kCallOpen = "<tool_call>";
 const std::string kCallClose = "</tool_call>";
 const std::string kFunctionOpen = "<function=";
+const std::string kParameterOpen = "<parameter=";
 
 // Longest suffix of `s` that is a proper prefix of `tag` (text that might still become the tag).
 size_t partial_tag(const std::string& s, const std::string& tag) {
@@ -335,6 +338,21 @@ void OutputParser::emit_content(Delta& d, const std::string& text) {
   fence_.feed(text);
 }
 
+// Which parsed blocks go out as calls. A call to a function the request offered, and, as SGLang's qwen3_coder
+// parser does, a well-formed call to one it did not (`ling-search`, or `apply_patch` with the tool off: nights 12
+// and 15), so that the client answers it as an unsupported call and the model goes on; handed back as text, it was
+// the turn's final answer and the task ended with an empty patch. What stays text: the chat template's own
+// placeholder names (vllm#58147), a name no client could hold (empty, spaces, markup), and a block that named its
+// function in a `<parameter=` tag, unless that name is offered.
+bool OutputParser::callable(const ToolCall& call) const {
+  if (offered(call.name)) return true;
+  if (call.loose) return false;
+  if (call.name.empty() || call.name == "function_name" || call.name == "example_function_name") return false;
+  for (char c : call.name)
+    if (std::isspace(static_cast<unsigned char>(c)) || c == '<' || c == '>' || c == '"' || c == '\'') return false;
+  return true;
+}
+
 bool OutputParser::offered(const std::string& function) const {
   for (const json& t : tools_) {
     if (!t.is_object()) continue;
@@ -380,11 +398,16 @@ OutputParser::Delta OutputParser::drain(bool final) {
       // buf_ starts with the marker. It opens a call only outside a code fence and when `<function=`
       // follows it (after whitespace); otherwise it is quoted text, released at once rather than held
       // until the end of the answer.
+      // A block the model opened with `<parameter=` where `<function=` belongs (night 12, sympy-19040: the
+      // function's name written as the first parameter's) is read as a call too; parse_call decides.
       const size_t after = buf_.find_first_not_of(" \t\r\n", kCallOpen.size());
-      const std::string next = after == std::string::npos ? std::string() : buf_.substr(after, kFunctionOpen.size());
-      const bool call_follows = next == kFunctionOpen;
-      const bool may_follow = !call_follows && next.size() < kFunctionOpen.size() &&
-                              kFunctionOpen.compare(0, next.size(), next) == 0;
+      const std::string rest = after == std::string::npos ? std::string() : buf_.substr(after, kParameterOpen.size());
+      auto opens = [&](const std::string& tag) { return rest.compare(0, tag.size(), tag) == 0 && rest.size() >= tag.size(); };
+      auto may_open = [&](const std::string& tag) {
+        return rest.size() < tag.size() && tag.compare(0, rest.size(), rest) == 0;
+      };
+      const bool call_follows = opens(kFunctionOpen) || opens(kParameterOpen);
+      const bool may_follow = !call_follows && (may_open(kFunctionOpen) || may_open(kParameterOpen));
       if (fence_.open() || (!call_follows && !(may_follow && !final))) {
         emit_content(d, kCallOpen);
         buf_.erase(0, kCallOpen.size());
@@ -393,8 +416,14 @@ OutputParser::Delta OutputParser::drain(bool final) {
       if (!call_follows) break;  // too little text yet to tell
       const size_t close = buf_.find(kCallClose);
       if (close == std::string::npos) {
-        if (final) {  // an unterminated call: hand it back as text
-          emit_content(d, buf_);
+        if (final) {
+          // The answer ended inside the call. One whose `</function>` came before the end is a call the model
+          // stopped short of closing (night 12, sympy-13757: `</function>` and then the end of the turn), as
+          // SGLang reads it; anything shorter is handed back as text.
+          const std::string block = buf_.substr(kCallOpen.size());
+          auto call = block.find("</function>") != std::string::npos ? parse_call(block) : std::nullopt;
+          if (call && callable(*call)) d.tool_calls.push_back(*call);
+          else emit_content(d, buf_);
           buf_.clear();
         }
         break;
@@ -402,8 +431,8 @@ OutputParser::Delta OutputParser::drain(bool final) {
       const std::string block = buf_.substr(kCallOpen.size(), close - kCallOpen.size());
       buf_.erase(0, close + kCallClose.size());
       auto call = parse_call(block);
-      if (call && offered(call->name)) d.tool_calls.push_back(*call);
-      else emit_content(d, kCallOpen + block + kCallClose);  // not a call to anything the request offered
+      if (call && callable(*call)) d.tool_calls.push_back(*call);
+      else emit_content(d, kCallOpen + block + kCallClose);  // the template's placeholder, or no call at all
       continue;
     }
     d.content += buf_;
@@ -418,12 +447,21 @@ OutputParser::Delta OutputParser::drain(bool final) {
 
 std::optional<ToolCall> OutputParser::parse_call(const std::string& block) const {
   const std::string fopen = "<function=";
+  ToolCall call;
   size_t f = block.find(fopen);
-  if (f == std::string::npos) return std::nullopt;
+  if (f == std::string::npos) {
+    // `<tool_call>\n<parameter=NAME>` with `</function>` later: the function's name in the wrong tag.
+    const size_t first = block.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos || block.compare(first, kParameterOpen.size(), kParameterOpen) != 0 ||
+        block.find("</function>") == std::string::npos)
+      return std::nullopt;
+    f = first;
+    call.loose = true;
+  }
   size_t fend = block.find('>', f);
   if (fend == std::string::npos) return std::nullopt;
-  ToolCall call;
-  call.name = strip(block.substr(f + fopen.size(), fend - f - fopen.size()));
+  const size_t name_at = f + (call.loose ? kParameterOpen.size() : fopen.size());
+  call.name = strip(block.substr(name_at, fend - name_at));
   json args = json::object();
   size_t pos = fend + 1;
   const std::string popen = "<parameter=", pclose = "</parameter>";

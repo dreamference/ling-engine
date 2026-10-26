@@ -75,13 +75,16 @@ Request parse_responses_request(const json& body);
 struct ToolCall {
   std::string name;
   std::string arguments;  // JSON text
+  bool loose = false;     // named by a `<parameter=` tag where `<function=` belongs (OutputParser)
 };
 
 // Splits generated text into reasoning, content and tool calls as it streams in.
 //
-// A `<tool_call>` marker starts a call only when it is followed by `<function=` and the function is one
-// the request offered, and never inside a markdown code fence: an example in a fence, the template's own
-// placeholder name, or a marker quoted in prose stays text (vllm#57541, vllm#58147, vllm#56658).
+// A `<tool_call>` marker starts a call only when it is followed by `<function=` (or, the model's slip, a
+// `<parameter=` naming an offered function), and never inside a markdown code fence: an example in a fence, the
+// template's own placeholder name, or a marker quoted in prose stays text (vllm#57541, vllm#58147, vllm#56658).
+// A well-formed call to a function the request did not offer goes out as a call, as SGLang sends it, so the
+// client can answer it and the turn goes on (callable()).
 class OutputParser {
  public:
   OutputParser(bool reasoning, const json& tools) : in_reasoning_(reasoning), tools_(tools) {}
@@ -119,6 +122,7 @@ class OutputParser {
   std::string convert_value(const std::string& function, const std::string& param, const std::string& raw) const;
   std::optional<ToolCall> parse_call(const std::string& block) const;
   bool offered(const std::string& function) const;
+  bool callable(const ToolCall& call) const;
   void emit_content(Delta& d, const std::string& text);
   Delta drain(bool final);
 
