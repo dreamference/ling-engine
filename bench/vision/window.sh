@@ -16,7 +16,14 @@ step() {
   local left=$(( T0 + 40 * 60 - $(date -u +%s) ))
   if [ $left -le 0 ]; then echo "$(date -u +%T) $name skipped (window over)"; return; fi
   echo "$(date -u +%T) $name"
-  timeout $left "$@" > $V/$name.log 2>&1 8>&-
+  # A subshell, so a step may be a shell function; past the window's end its children and it are stopped.
+  ( "$@" ) > $V/$name.log 2>&1 8>&- &
+  local p=$! w=0
+  while kill -0 $p 2>/dev/null; do
+    sleep 5; w=$((w + 5))
+    if [ $w -ge $left ]; then pkill -TERM -P $p; sleep 2; kill -TERM $p 2>/dev/null; fi
+  done
+  wait $p
   echo "$(date -u +%T) $name exit $?"
 }
 source $STEPS
