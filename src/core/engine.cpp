@@ -126,6 +126,10 @@ void Engine::alloc_scratch() {
 }
 
 Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
+  // BACKLOG 34: the prefill chunk (tokens per pass alone, a multiple of kResumeAlign); every scratch buffer is sized by
+  // it. A prompt's result does not depend on how its prefill is split (--chunk-check), so this changes no output bit.
+  if (const char* e = std::getenv("LING_PREFILL_CHUNK"))
+    opts_.prefill_chunk = std::max(kResumeAlign, std::atoi(e) - std::atoi(e) % kResumeAlign);
   model_ = std::make_unique<Model>(model_dir);
   const ModelConfig& c = model_->config();
   check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream");
@@ -199,6 +203,12 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   prefill_bf16_ = opts_.prefill_bf16;
   if (const char* e = std::getenv("LING_PREFILL_BF16")) prefill_bf16_ = std::atoi(e) != 0;
   if (prefill_bf16_) std::fprintf(stderr, "prefill: BF16 DeltaNet intermediates (not the exact path)\n");
+  branch_checkpoints_ = opts_.branch_checkpoints;
+  if (const char* e = std::getenv("LING_BRANCH_CKPT")) branch_checkpoints_ = std::atoi(e) != 0;
+  inpass_ = opts_.inpass_checkpoints;
+  if (const char* e = std::getenv("LING_CKPT_INPASS")) inpass_ = std::atoi(e) != 0;
+  if (inpass_ && !ckpt_slots_.empty()) soft_slot_ = alloc_slot();
+  else inpass_ = false;
   commit_overlap_ = opts_.commit_overlap && draft_ != nullptr;
   if (const char* e = std::getenv("LING_COMMIT_OVERLAP")) commit_overlap_ = draft_ != nullptr && std::atoi(e) != 0;
   if (commit_overlap_) {
@@ -293,6 +303,46 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     check(cudaEventCreateWithFlags(&side_after_main_, cudaEventDisableTiming), "side event");
     std::fprintf(stderr, "prefill beside a decode: a second stream%s\n",
                  opts_.side_prefill > 0 ? (" on a green context of " + std::to_string(opts_.side_prefill) + " SMs").c_str() : "");
+  }
+  // The prefix KV store (BACKLOG 35) last, from what the engine's own allocations left: one arena allocated now, so the
+  // footprint is fixed at start and never grows while serving. It takes at most prefix_kv_mb and leaves
+  // LING_PREFIX_KV_RESERVE_MB (default 16 GB) of the device's free memory untouched (the host's safety margin and what
+  // the step graphs and the stream pool still take); below 512 MB the store is off.
+  int mb = opts_.prefix_kv_mb;
+  if (const char* e = std::getenv("LING_PREFIX_KV_MB")) mb = std::atoi(e);
+  if (mb > 0 && opts_.prefix_checkpoints > 0) {
+    size_t free_b = 0, total_b = 0;
+    check(cudaMemGetInfo(&free_b, &total_b), "memory info");
+    size_t reserve = size_t(16384) << 20;
+    if (const char* e = std::getenv("LING_PREFIX_KV_RESERVE_MB")) reserve = size_t(std::atoll(e)) << 20;
+    const size_t want = size_t(mb) << 20, avail = free_b > reserve ? free_b - reserve : 0;
+    size_t size = std::min(want, avail);
+    size -= size % (size_t(2) << 20);
+    if (size >= (size_t(512) << 20) && cudaMalloc(&kv_arena_base_, size) == cudaSuccess) {
+      kv_arena_ = std::make_unique<ArenaAlloc>(size, size_t(2) << 20);
+      const size_t per_token = size_t(c.layers - n_linear_) * 2 * c.kv_heads * c.head_dim * sizeof(__nv_bfloat16);
+      const size_t state = size_t(n_linear_) * (size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim +
+                                               size_t(c.lin_conv_channels()) * (c.conv_kernel - 1)) * sizeof(float);
+      PrefixKvTree::Ops ops;
+      ops.alloc = [this](size_t n) -> void* {
+        size_t off = 0;
+        return kv_arena_->alloc(n, &off) ? static_cast<char*>(kv_arena_base_) + off : nullptr;
+      };
+      // Stream-ordered reuse: every copy into or out of a range is queued on stream_ (the main or, swapped, the side
+      // stream, which starts after the main stream's work and is joined before any other prefill), so a range given
+      // out again is written only after the copies that read it.
+      ops.release = [this](void* p) { kv_arena_->release(static_cast<char*>(p) - static_cast<char*>(kv_arena_base_)); };
+      ops.store = [this](void* buf, int buf_start, int buf_len, int from, int to) {
+        kv_copy(buf, buf_start, buf_len, from, to, true);
+      };
+      kv_tree_ = std::make_unique<PrefixKvTree>(size, per_token, state, std::move(ops));
+      std::fprintf(stderr, "prefix KV store: %zu MB of %d asked (%zu MB free after the engine's own memory, %zu kept free; %zu KB a token, %zu MB a state)\n",
+                   size >> 20, mb, free_b >> 20, reserve >> 20, per_token >> 10, state >> 20);
+    } else {
+      cudaGetLastError();
+      std::fprintf(stderr, "prefix KV store: off (%zu MB free after the engine's own memory, %zu kept free, %d asked)\n",
+                   free_b >> 20, reserve >> 20, mb);
+    }
   }
 }
 
@@ -389,6 +439,9 @@ Engine::~Engine() {
     mk_times_report();
   }
   if (commit_stream_) cudaStreamSynchronize(commit_stream_);
+  if (stream_) cudaStreamSynchronize(stream_);
+  kv_tree_.reset();
+  if (kv_arena_base_) cudaFree(kv_arena_base_);
   if (side_.stream_) {
     cudaStreamSynchronize(side_.stream_);
     if (side_.logits_host_) cudaFreeHost(side_.logits_host_);
@@ -413,6 +466,7 @@ Engine::~Engine() {
 void Engine::reset() {
   reset_session();
   ckpts_.clear();
+  if (kv_tree_) kv_tree_->clear();
 }
 
 void Engine::reset_session() {
@@ -496,6 +550,7 @@ void Engine::reset_all() {
   }
   s_ = &sessions_[0];
   ckpts_.clear();
+  if (kv_tree_) kv_tree_->clear();
 }
 
 const SpecStats& Engine::session_spec_stats(int i) {
@@ -659,7 +714,65 @@ bool Engine::ckpt_match(const Checkpoint& k, const std::vector<int>& prompt,
   return std::equal(k.tokens.begin(), k.tokens.end(), prompt.begin());
 }
 
-void Engine::save_checkpoint(int pos, uint64_t epoch) {
+// The prefix KV store's device side (BACKLOG 35). A state buffer is every linear layer's recurrent state then its conv
+// window, back to back; a KV buffer of n positions is [layer][K, V][kv head][n][head_dim] in BF16.
+Engine::StateSlot Engine::state_view(const void* p) const {
+  const ModelConfig& c = model_->config();
+  const size_t gdn = size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim, conv = size_t(c.lin_conv_channels()) * (c.conv_kernel - 1);
+  StateSlot v;
+  float* f = static_cast<float*>(const_cast<void*>(p));
+  for (int i = 0; i < n_linear_; ++i) {
+    v.gdn.push_back(f);
+    f += gdn;
+    v.conv.push_back(f);
+    f += conv;
+  }
+  return v;
+}
+
+void Engine::kv_copy(void* buf, int buf_start, int buf_len, int from, int to, bool to_buf) {
+  const ModelConfig& c = model_->config();
+  const size_t D = c.head_dim, row = D * sizeof(__nv_bfloat16), cache_pitch = size_t(opts_.max_context) * row;
+  const size_t buf_pitch = size_t(buf_len) * row, width = size_t(to - from) * row;
+  auto* b = static_cast<__nv_bfloat16*>(buf);
+  for (size_t l = 0; l < s_->kcache.size(); ++l)
+    for (int kv = 0; kv < 2; ++kv) {
+      __nv_bfloat16* cache = (kv == 0 ? s_->kcache : s_->vcache)[l] + size_t(from) * D;
+      __nv_bfloat16* run = b + (l * 2 + kv) * size_t(c.kv_heads) * buf_len * D + size_t(from - buf_start) * D;
+      check(to_buf ? cudaMemcpy2DAsync(run, buf_pitch, cache, cache_pitch, width, c.kv_heads, cudaMemcpyDeviceToDevice, stream_)
+                   : cudaMemcpy2DAsync(cache, cache_pitch, run, buf_pitch, width, c.kv_heads, cudaMemcpyDeviceToDevice, stream_),
+            "prefix KV copy");
+    }
+}
+
+void Engine::kv_restore(const PrefixKvTree::Match& m, int n) {
+  join_commit();
+  for (const PrefixKvTree::Segment& g : kv_tree_->segments(m, n))
+    kv_copy(const_cast<void*>(g.buf), g.buf_start, g.buf_len, g.from, g.to, false);
+}
+
+void Engine::kv_insert(const PrefillCursor& cur) {
+  const std::vector<std::pair<int, int>> want = kv_tree_->insert(cur.prompt, cur.kv_q, cur.kv_cuts, cur.kv_epoch);
+  // Each cut's state from the checkpoint store (this prefill saved them; one the store had no room for is left out).
+  for (const auto& [node, pos] : want)
+    for (const Checkpoint& k : ckpts_)
+      if (k.pos == pos && std::equal(k.tokens.begin(), k.tokens.end(), cur.prompt.begin())) {
+        if (void* st = kv_tree_->add_state(node, cur.kv_epoch)) copy_slot(state_view(st), ckpt_slots_[k.slot]);
+        break;
+      }
+}
+
+void Engine::copy_slot(const StateSlot& dst, const StateSlot& src) {
+  const ModelConfig& c = model_->config();
+  const size_t gdn_bytes = size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim * sizeof(float);
+  const size_t conv_bytes = size_t(c.lin_conv_channels()) * (c.conv_kernel - 1) * sizeof(float);
+  for (size_t i = 0; i < src.gdn.size(); ++i) {
+    check(cudaMemcpyAsync(dst.gdn[i], src.gdn[i], gdn_bytes, cudaMemcpyDeviceToDevice, stream_), "slot copy");
+    check(cudaMemcpyAsync(dst.conv[i], src.conv[i], conv_bytes, cudaMemcpyDeviceToDevice, stream_), "slot copy");
+  }
+}
+
+void Engine::save_checkpoint(int pos, uint64_t epoch, const StateSlot* from, bool soft) {
   const uint64_t hash = fnv_tokens(s_->history.data(), pos);
   for (Checkpoint& k : ckpts_)
     if (k.pos == pos && k.hash == hash && std::equal(k.tokens.begin(), k.tokens.end(), s_->history.begin())) {
@@ -679,13 +792,19 @@ void Engine::save_checkpoint(int pos, uint64_t epoch) {
     int victim = -1;
     for (size_t i = 0; i < ckpts_.size(); ++i)
       if (ckpts_[i].used < epoch && (victim < 0 || ckpts_[i].used < ckpts_[victim].used)) victim = static_cast<int>(i);
+    // A message end or a branch point (BACKLOG 35) is what other conversations resume from: when every entry is this
+    // prompt's own, it replaces the furthest chunk multiple among them instead of being dropped.
+    if (victim < 0 && soft)
+      for (size_t i = 0; i < ckpts_.size(); ++i)
+        if (!ckpts_[i].soft && (victim < 0 || ckpts_[i].pos > ckpts_[victim].pos)) victim = static_cast<int>(i);
     if (victim < 0) return;
     slot = ckpts_[victim].slot;
     ckpts_.erase(ckpts_.begin() + victim);
   }
   // Stream-ordered: the copy completes before any later restore reads the slot (one stream, M4 §1).
-  copy_state(ckpt_slots_[slot], true);
-  ckpts_.push_back({pos, slot, hash, std::vector<int>(s_->history.begin(), s_->history.begin() + pos), ++ckpt_clock_});
+  if (from) copy_slot(ckpt_slots_[slot], *from);
+  else copy_state(ckpt_slots_[slot], true);
+  ckpts_.push_back({pos, slot, hash, std::vector<int>(s_->history.begin(), s_->history.begin() + pos), ++ckpt_clock_, soft});
   std::sort(ckpts_.begin(), ckpts_.end(), [](const Checkpoint& a, const Checkpoint& b) { return a.pos < b.pos; });
 }
 
@@ -996,11 +1115,11 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       mark("gdn_proj");
       const bool keep = keep_at > 0 && keep_at < M;
       kernels::gdn_conv_prefill_bf16(t2_bf16_, mixed_bf16_, s_->conv[slot], L.conv, M, C, stream_,
-                                     keep ? s_->snap.conv[slot] : nullptr, keep_at);
+                                     keep ? keep_target().conv[slot] : nullptr, keep_at);
       kernels::gdn_gating(a_, b_, L.A_log, L.dt_bias, g_, beta_, M, c.lin_v_heads, stream_);
       mark("gdn_conv");
       kernels::gdn_recurrent_prefill_bf16(mixed_bf16_, g_, beta_, s_->gdn[slot], core_bf16_, M, c.lin_k_heads,
-                                          c.lin_v_heads, s_->pos, stream_, keep ? s_->snap.gdn[slot] : nullptr, keep_at);
+                                          c.lin_v_heads, s_->pos, stream_, keep ? keep_target().gdn[slot] : nullptr, keep_at);
       mark("gdn_recurrent");
       kernels::gated_rmsnorm_fp8_bf16(core_bf16_, z_bf16_, L.lin_norm, M * c.lin_v_heads, c.lin_v_dim, c.eps,
                                       L.out.in_scale, xq_, stream_);
@@ -1143,7 +1262,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         }
       } else if (quantized_) {
         kernels::gdn_conv_prefill(t2_, mixed, s_->conv[slot], L.conv, M, C, stream_,
-                                  keep ? s_->snap.conv[slot] : nullptr, keep_at);
+                                  keep ? keep_target().conv[slot] : nullptr, keep_at);
       } else {
         kernels::gdn_conv(mixed, s_->conv[slot], L.conv, M, C, stream_);
       }
@@ -1151,7 +1270,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       mark("gdn_conv");
       if (quantized_)
         kernels::gdn_recurrent_prefill(mixed, g, beta, s_->gdn[slot], core_, M, c.lin_k_heads, c.lin_v_heads, s_->pos,
-                                       stream_, keep ? s_->snap.gdn[slot] : nullptr, keep_at);
+                                       stream_, keep ? keep_target().gdn[slot] : nullptr, keep_at);
       else if (verify && tree_)  // a tree (BACKLOG 26), from the state, left unwritten
         kernels::gdn_recurrent_tree(mixed, g, beta, s_->gdn[slot], core_, c.lin_k_heads, c.lin_v_heads, tree_,
                                     tree_grid_, stream_);
@@ -1302,16 +1421,71 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
       }
     }
   }
+  // The prefix KV store (BACKLOG 35): a donor beside the sessions. Its KV runs cover the prompt's first kvm.len tokens,
+  // and a state there (its own at a node's end, or the checkpoint store's) lets the prompt resume, up to the drafter's
+  // window (the store holds no drafter context) and short of the prompt's last token.
+  PrefixKvTree::Match kvm;
+  int kv_reuse = 0;
+  const void* kv_state = nullptr;
+  const StateSlot* kv_ckpt = nullptr;
+  cur.kv_epoch = ++kv_epoch_;
+  if (kv_tree_ && !from_scratch) {
+    kvm = kv_tree_->match(prompt);
+    const int lim = std::min({kvm.len, draft_ ? window : L, L - 1});
+    kv_reuse = kv_tree_->best_state(kvm, lim, &kv_state);
+    for (const Checkpoint& k : ckpts_)
+      if (k.pos > kv_reuse && k.pos <= lim && ckpt_match(k, prompt, prefix_hash)) {
+        kv_reuse = k.pos;
+        kv_state = nullptr;
+        kv_ckpt = &ckpt_slots_[k.slot];
+      }
+    kv_tree_->touch(kvm, cur.kv_epoch);
+  }
+  const bool from_kv = kv_reuse > src.reuse;
+  // The branch point (BACKLOG 34; the hybrid models' radix rule): where this prompt leaves the longest prefix it
+  // shares with another conversation, a resident session's history or a stored entry, taken before this prefill
+  // truncates or replaces the active session's history. A checkpoint there lets the next prompt of either branch
+  // resume at it instead of at the last chunk multiple before it (agents' system prompts share ~5-11K tokens and
+  // differ after). The active session's own history counts only when the prompt does not extend it (its snap
+  // covers that).
+  int branch_at = 0;
+  if (branch_checkpoints_ && !ckpt_slots_.empty()) {
+    auto lcp_of = [&](const std::vector<int>& h) {
+      const size_t n = std::min(h.size(), prompt.size());
+      size_t i = 0;
+      while (i < n && h[i] == prompt[i]) ++i;
+      return static_cast<int>(i);
+    };
+    for (const Session& s : sessions_) {
+      if (s.history.empty()) continue;
+      const int l = lcp_of(s.history);
+      if (&s == s_ && s.prompt_len > 0 && l >= s.turn_start) continue;
+      branch_at = std::max(branch_at, l);
+    }
+    for (const Checkpoint& k : ckpts_) branch_at = std::max(branch_at, lcp_of(k.tokens));
+    branch_at = std::max(branch_at, kvm.len);
+    branch_at -= branch_at % kResumeAlign;
+  }
   // The store's clock (its LRU order): every entry on this prompt's prefix is used by this prefill, and the
   // entries it saves come after; save_checkpoint never evicts one of them for another.
   cur.ckpt_epoch = ++ckpt_clock_;
   if (!prefix_hash.empty())
     for (Checkpoint& k : ckpts_)
       if (ckpt_match(k, prompt, prefix_hash)) k.used = cur.ckpt_epoch;
-  if (donor) adopt_prefix(*donor, src.reuse);
-  if (src.from) copy_state(*src.from, false);
-  else reset_state();
-  const int reuse = src.reuse;
+  if (from_kv) {  // the KV of [0, kv_reuse) out of the store, the state from the store or the checkpoint store
+    kv_restore(kvm, kv_reuse);
+    s_->history.assign(prompt.begin(), prompt.begin() + kv_reuse);
+    s_->dkv_lo = kv_reuse;  // no drafter context before kv_reuse (kv_reuse <= window)
+    s_->snap_pos = -1;
+    s_->shadow.clear();
+    copy_state(kv_state ? state_view(kv_state) : *kv_ckpt, false);
+    cur.stats.store_tokens = kv_reuse;
+  } else {
+    if (donor) adopt_prefix(*donor, src.reuse);
+    if (src.from) copy_state(*src.from, false);
+    else reset_state();
+  }
+  const int reuse = from_kv ? kv_reuse : src.reuse;
   s_->pos = reuse;
   truncate_history(reuse);
   if (draft_ && window > reuse) s_->dkv_lo = window;
@@ -1322,15 +1496,56 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   // absolute positions, so a prompt resumed there computes exactly what a prefill from scratch does.
   auto align = [](int p) { return p - p % kResumeAlign; };
   if (!ckpt_slots_.empty()) {
+    // With inpass_ (BACKLOG 35) the message ends and the branch point are soft: their state is captured inside the
+    // pass that crosses them (as the end-of-prompt snap is), so they do not cut a chunk short.
+    std::vector<int>& at = inpass_ ? cur.soft : cur.bounds;
     int messages = 0;
     for (int i = 0; i < L && i < opts_.checkpoint_limit && messages < 2; ++i)
       if (prompt[i] == opts_.boundary_token) {
-        if (align(i + 1) > 0) cur.bounds.push_back(align(i + 1));
+        if (align(i + 1) > 0) at.push_back(align(i + 1));
         ++messages;
       }
     for (int b = opts_.prefill_chunk; b < std::min(L, opts_.checkpoint_limit + 1); b += opts_.prefill_chunk)
       cur.bounds.push_back(b);
+    if (branch_at > reuse && branch_at < L && branch_at <= opts_.checkpoint_limit) at.push_back(branch_at);
+    // LING_CKPT_TRIM=1 (BACKLOG 34, measured before any default): no chunk-multiple checkpoint past both the branch
+    // point and the message ends. Those positions serve only this conversation, whose own snap covers its next turn,
+    // and each one cuts a chunk short off the 2,048-token grid that the other bounds shift (one more pass).
+    static const bool trim = [] {
+      const char* e = std::getenv("LING_CKPT_TRIM");
+      return e && std::atoi(e) != 0;
+    }();
+    if (trim) {
+      int keep_to = branch_at;
+      for (int i = 0, messages = 0; i < L && i < opts_.checkpoint_limit && messages < 2; ++i)
+        if (prompt[i] == opts_.boundary_token) {
+          keep_to = std::max(keep_to, align(i + 1));
+          ++messages;
+        }
+      std::erase_if(cur.bounds, [&](int b) { return b > keep_to && b % opts_.prefill_chunk == 0; });
+    }
     std::sort(cur.bounds.begin(), cur.bounds.end());
+    cur.bounds.erase(std::unique(cur.bounds.begin(), cur.bounds.end()), cur.bounds.end());
+    // A soft point that is also a chunk end needs no capture; the others stay sorted and unique.
+    std::erase_if(cur.soft, [&](int b) { return b <= reuse || b >= L || std::binary_search(cur.bounds.begin(), cur.bounds.end(), b); });
+    std::sort(cur.soft.begin(), cur.soft.end());
+    cur.soft.erase(std::unique(cur.soft.begin(), cur.soft.end()), cur.soft.end());
+  }
+  // What this prompt adds to the prefix KV store at its end: its first tokens up to the furthest of its first two
+  // message ends and its branch point (the part another conversation can share), with states at those positions.
+  if (kv_tree_) {
+    std::vector<int> cuts;
+    for (int i = 0, messages = 0; i < L && messages < 2; ++i)
+      if (prompt[i] == opts_.boundary_token) {
+        if (align(i + 1) > 0) cuts.push_back(align(i + 1));
+        ++messages;
+      }
+    if (branch_at > 0) cuts.push_back(branch_at);
+    std::erase_if(cuts, [&](int c) { return c >= L || c > opts_.checkpoint_limit; });
+    std::sort(cuts.begin(), cuts.end());
+    cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+    cur.kv_q = cuts.empty() ? 0 : cuts.back();
+    cur.kv_cuts = cuts;
   }
   cur.snap_at = align(L);  // the end-of-prompt state is kept here (the tokens after it are re-prefilled)
   cur.window = window;
@@ -1365,15 +1580,42 @@ Engine::ChunkRun Engine::chunk_begin(PrefillCursor& cur, int max_tokens) {
       end = b;
       break;
     }
+  // The soft points inside the chunk (BACKLOG 35): the pass captures one state; the snap takes precedence (the first
+  // soft point then ends the chunk), and a second soft point ends it too.
+  std::vector<int> caught;
+  for (int b : cur.soft)
+    if (b > i && b < end) caught.push_back(b);
+  if (snap_at > i && snap_at < end && !caught.empty()) {
+    end = caught[0];
+    caught.clear();
+  }
+  if (caught.size() > 1) {
+    end = caught[1];
+    caught.resize(1);
+  }
   // The end-of-prompt state at snap_at < end is captured inside the pass (no separate pass for the tail).
-  const int keep_at = snap_at > i && snap_at < end ? snap_at - i : -1;
+  int keep_at = snap_at > i && snap_at < end ? snap_at - i : -1;
   if (keep_at > 0) s_->snap_pos = -1;  // the snap is rewritten by the pass
+  r.soft_at = -1;
+  if (keep_at < 0 && !caught.empty()) {  // a soft point's state, into the soft slot
+    if ((caught[0] - i) % kResumeAlign != 0 || end - i <= kRowsMax)
+      throw std::runtime_error("prefill: a soft checkpoint off the resume grid or on the rows path");
+    keep_at = caught[0] - i;
+    r.soft_at = caught[0];
+    keep_slot_ = &soft_slot_;
+  }
   r.i = i;
   r.end = end;
   r.keep_at = keep_at;
   r.n = end - i;
   r.pos0 = s_->pos;
-  forward(prompt.data() + i, r.n, Pass::Prefill, keep_at);
+  try {
+    forward(prompt.data() + i, r.n, Pass::Prefill, keep_at);
+  } catch (...) {
+    keep_slot_ = nullptr;
+    throw;
+  }
+  keep_slot_ = nullptr;
   return r;
 }
 
@@ -1391,7 +1633,7 @@ bool Engine::chunk_end(PrefillCursor& cur, const ChunkRun& run) {
     s_->pos = i;
     throw NonFiniteLogits();
   }
-  if (keep_at > 0) s_->snap_pos = snap_at;
+  if (keep_at > 0 && run.soft_at < 0) s_->snap_pos = snap_at;
   if (draft_) {
     const int first = std::max(pos0, window);
     if (first < pos0 + n) draft_materialize(pos0 + n - first, first, first - pos0);  // still quantized_
@@ -1402,13 +1644,17 @@ bool Engine::chunk_end(PrefillCursor& cur, const ChunkRun& run) {
     copy_state(s_->snap, true);
     s_->snap_pos = snap_at;
   }
-  if (end < L && std::binary_search(cur.bounds.begin(), cur.bounds.end(), end)) save_checkpoint(end, cur.ckpt_epoch);
+  if (run.soft_at > 0) save_checkpoint(run.soft_at, cur.ckpt_epoch, &soft_slot_, true);  // captured inside the pass
+  const bool soft_end = std::binary_search(cur.soft.begin(), cur.soft.end(), end);
+  if (end < L && (soft_end || std::binary_search(cur.bounds.begin(), cur.bounds.end(), end)))
+    save_checkpoint(end, cur.ckpt_epoch, nullptr, soft_end);
   cur.stats.chunks += 1;
   if (end < L) {
     cur.stats.compute_seconds +=
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t_chunk).count();
     return false;
   }
+  if (kv_tree_ && cur.kv_q > 0) kv_insert(cur);
   check(cudaStreamSynchronize(stream_), "prefill");
   s_->prompt_len = L;
   s_->turn_start = L;  // a raw prompt without message boundaries is bound only when extended whole

@@ -52,6 +52,7 @@ add_library(ling_core STATIC
   src/core/sampling.cpp
   src/core/model.cu
   src/core/engine.cpp
+  src/core/prefix_kv.cpp
 )
 target_include_directories(ling_core PUBLIC src)
 target_link_libraries(ling_core PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::nvtx3 nlohmann_json::nlohmann_json)
@@ -117,6 +118,9 @@ add_test(NAME spec COMMAND ling-spec-tests)
 add_executable(ling-sampling-tests tests/sampling_tests.cpp)
 target_link_libraries(ling-sampling-tests PRIVATE ling_core)
 add_test(NAME sampling COMMAND ling-sampling-tests)
+add_executable(ling-prefix-kv-tests tests/prefix_kv_tests.cpp)
+target_link_libraries(ling-prefix-kv-tests PRIVATE ling_core)
+
 add_executable(ling-api-tests tests/api_tests.cpp)
 target_link_libraries(ling-api-tests PRIVATE ling_api)
 add_test(NAME api COMMAND ling-api-tests)

@@ -558,9 +558,10 @@ int main(int argc, char** argv) {
         const bool spec_same = a_resumed.tokens == a_fresh.tokens && a_resumed.hash == a_fresh.hash &&
                                a_resumed.steps == a_fresh.steps && a_resumed.accepted == a_fresh.accepted;
         failures += !same + !spec_same;
-        std::printf("prompt %zu: %zu tokens, session %d%s, resumed at %d (%.2f s) against %.2f s from scratch: state %s, "
+        std::printf("prompt %zu: %zu tokens, session %d%s, resumed at %d%s (%.2f s) against %.2f s from scratch: state %s, "
                     "next token %s",
-                    i, prompts[i].size(), si, fresh_session ? " (new)" : "", st.reused_tokens, st.prefill_seconds,
+                    i, prompts[i].size(), si, fresh_session ? " (new)" : "", st.reused_tokens,
+                    st.store_tokens > 0 ? " from the prefix KV store" : "", st.prefill_seconds,
                     fresh_st.prefill_seconds, h_resumed == h_fresh ? "identical" : "DIFFERS",
                     resumed == fresh ? "identical" : "DIFFERS");
         if (engine.has_drafter())
