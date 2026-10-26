@@ -2,9 +2,10 @@
 // (NVFP4: E2M1 codes [N][K/2] low nibble first + E4M3 scales [N][K/16]; FP8: E4M3 [N][K]), are decoded
 // to FP16 in registers and multiplied on WMMA 16x16x16 against M <= 16*MT activation rows staged in LDS.
 // One wave owns one 16-column tile of N and walks all of K. Header-free (no HIP headers on the box).
-// The fastest configuration on 2026-10-26 (specs/DREAMFERENCE_LING_ENGINE_AMD.md §6.5): -DKMAJOR -DNT -DKC=256,
-// with -DBWAVES=32 -DXROWS=16 and 1024-thread blocks for FP8. The fp4_/fp8_ kernels are the first, row-major
-// attempt; the fp4w_/fp8w_ ones give each wave two tiles; NODEC, NOWMMA, NOX and NOBAR strip parts for attribution.
+// The fastest configuration on 2026-10-26 (specs/DREAMFERENCE_LING_ENGINE_AMD.md §6.5, §6.6): -DKMAJOR -DNT -DKC=256
+// -DLUT -DXDB; for FP8 also -DBWAVES=32 -DXROWS=16 with 1024-thread blocks. The fp4_/fp8_ kernels are the first,
+// row-major attempt; fp4w_/fp8w_ give each wave two tiles; NODEC, NOWMMA, NOX, NOBAR and XFAKE strip or fake parts
+// for attribution.
 #define G extern "C" __attribute__((global))
 #define D static __attribute__((device)) inline
 typedef unsigned int u32;
@@ -39,7 +40,11 @@ typedef u32 v2u __attribute__((ext_vector_type(2)));
 #define XPAD 16
 #endif
 #define XST (KC + XPAD)
+#ifdef XDB
+__attribute__((shared)) h XS[2 * XROWS * XST];
+#else
 __attribute__((shared)) h XS[XROWS * XST];
+#endif
 D void bar() { __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup"); __builtin_amdgcn_s_barrier(); __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup"); }
 
 D u32 as_u(v2h x) { return __builtin_bit_cast(u32, x); }
@@ -54,6 +59,22 @@ D void dec_fp4(u32 c, v2h sc, v2h* o) {
     u32 d = __builtin_amdgcn_perm(hi, lo, 0x0C040C00u + j * 0x00010001u);  // [lo_j, 0, hi_j, 0]
     u32 r = ((d & 0x00070007u) << 9) | ((d & 0x00080008u) << 12);
     o[j] = as_h(r) * k14 * sc;
+  }
+}
+
+// Day 2: E2M1 through a byte table. The FP16 forms of the eight E2M1 magnitudes have a zero low byte, so one
+// v_perm_b32 over a two-register table gives four high bytes at once; the sign is bit 3 of the nibble moved to
+// bit 7, and one more v_perm per output dword interleaves the bytes into FP16 pairs. Then one packed multiply
+// by the block scale per pair. sc is the scale times 2^7 (as dec_fp4 takes it); the 2^-7 is applied here.
+D void dec_fp4_lut(u32 c, v2h sc, v2h* o) {
+  const u32 T0 = 0x3E3C3800u, T1 = 0x46444240u;  // 0, .5, 1, 1.5 | 2, 3, 4, 6
+  u32 lo = c & 0x07070707u, hi = (c >> 4) & 0x07070707u;
+  u32 hl = __builtin_amdgcn_perm(T1, T0, lo) | ((c & 0x08080808u) << 4);
+  u32 hh = __builtin_amdgcn_perm(T1, T0, hi) | (c & 0x80808080u);
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    u32 d = __builtin_amdgcn_perm(hh, hl, ((4u + j) << 24) | 0x000C0000u | ((u32)j << 8) | 0x0Cu);
+    o[j] = as_h(d) * sc;
   }
 }
 // 4 E4M3 bytes -> 4 halves.
@@ -176,6 +197,34 @@ D void tbody(const unsigned char* __restrict w, const unsigned char* __restrict 
   for (int j = 0; j < NTW; j++)
 #pragma unroll
   for (int t = 0; t < MT; t++) acc[j][t] = (v8f){};
+#ifdef XDB
+  // Double-buffered staging: the next chunk's activations are loaded into registers while this chunk computes,
+  // written to the other buffer after it, and one barrier per chunk separates the two.
+  constexpr u32 NV = MT * 16 * KC / 8;
+  constexpr u32 PER = (NV + BWAVES * 32 - 1) / (BWAVES * 32);
+  v4u pre[PER];
+  auto xload = [&](u32 kb) {
+#pragma unroll
+    for (u32 p = 0; p < PER; p++) {
+      u32 i = TX + p * BWAVES * 32; u32 r = i / (KC / 8), c = (i % (KC / 8)) * 8;
+      v4u v = {0, 0, 0, 0};
+      if (i < NV && r < M) v = *(const v4u*)(x + (u64)r * K + kb + c);
+      pre[p] = v;
+    }
+  };
+  auto xstore = [&](h* buf) {
+#pragma unroll
+    for (u32 p = 0; p < PER; p++) {
+      u32 i = TX + p * BWAVES * 32; u32 r = i / (KC / 8), c = (i % (KC / 8)) * 8;
+      if (i < NV) *(v4u*)(buf + r * XST + c) = pre[p];
+    }
+  };
+  xload(0); xstore(XS); bar();
+  for (u32 k0 = 0; k0 < K; k0 += KC) {
+    xs = XS + ((k0 / KC) & 1) * (XROWS * XST);
+    bool more = k0 + KC < K;
+    if (more) xload(k0 + KC);
+#else
   for (u32 k0 = 0; k0 < K; k0 += KC) {
 #ifndef NOBAR
     bar();
@@ -183,13 +232,18 @@ D void tbody(const unsigned char* __restrict w, const unsigned char* __restrict 
 #ifndef NOX
     for (u32 i = TX; i < MT * 16 * KC / 8; i += BWAVES * 32) {
       u32 r = i / (KC / 8), c = (i % (KC / 8)) * 8;
+#ifdef XFAKE
+      v4u v = {0x3C003C00u, 0xBC003800u, 0x3C00B800u, 0x38003C00u};  // +-1, +-0.5 in rows the request does not fill
+#else
       v4u v = {0, 0, 0, 0};
+#endif
       if (r < M) v = *(const v4u*)(x + (u64)r * K + k0 + c);
       *(v4u*)(xs + r * XST + c) = v;
     }
 #endif
 #ifndef NOBAR
     bar();
+#endif
 #endif
 #pragma unroll UNR
     for (u32 kk = 0; kk < KC; kk += 64) {
@@ -211,10 +265,17 @@ D void tbody(const unsigned char* __restrict w, const unsigned char* __restrict 
         own0 = (v8u){c.x, c.y, c.z, c.w, c.x ^ s2, c.y, c.z, c.w}; own1 = (v8u){c.w, c.z, c.y, c.x, c.w, c.z, c.y, c.x ^ s2};
         (void)sa; (void)sb; (void)o;
 #else
-        dec_fp4(c.x, sa, o); dec_fp4(c.y, sa, o + 4);
+#ifdef LUT
+        const v2h k7 = {(h)(1.0f / 128.0f), (h)(1.0f / 128.0f)};
+        sa = sa * k7; sb = sb * k7;
+#define DEC4 dec_fp4_lut
+#else
+#define DEC4 dec_fp4
+#endif
+        DEC4(c.x, sa, o); DEC4(c.y, sa, o + 4);
 #pragma unroll
         for (int e = 0; e < 8; e++) own0[e] = as_u(o[e]);
-        dec_fp4(c.z, sb, o); dec_fp4(c.w, sb, o + 4);
+        DEC4(c.z, sb, o); DEC4(c.w, sb, o + 4);
 #pragma unroll
         for (int e = 0; e < 8; e++) own1[e] = as_u(o[e]);
 #endif
@@ -253,8 +314,16 @@ D void tbody(const unsigned char* __restrict w, const unsigned char* __restrict 
           }
         }
     }
+#ifdef XDB
+    if (more) xstore(XS + (((k0 / KC) + 1) & 1) * (XROWS * XST));
+    bar();
+#endif
   }
+#ifdef LUT
+  float post = gscale;
+#else
   float post = FP4 ? gscale * (1.0f / 128.0f) : gscale;
+#endif
 #pragma unroll
   for (int j = 0; j < NTW; j++)
 #pragma unroll

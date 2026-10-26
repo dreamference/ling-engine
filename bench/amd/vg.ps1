@@ -1,5 +1,6 @@
 # Host for vg.hip, the first milestone's verify-GEMM probe: correctness against an FP32 reference, then us and GB/s per matrix
-# for M = 1, 16, 32 rows, and the plain read stream over the same bytes (specs/DREAMFERENCE_LING_ENGINE_AMD.md §6.5).
+# for M = 1, 16, 32 rows (events and wall clock), and the plain read stream over the same bytes. -Quick 1..7 select
+# the reduced runs of specs/DREAMFERENCE_LING_ENGINE_AMD.md §6.6 (7: 90 s continuous, wall clock per window).
 param([int]$TB = 256, [int]$L = 8, [int]$Iters = 10, [string]$Co = "C:\llm\amd-port\vg.co", [int]$Quick = 0)
 $ErrorActionPreference = "Stop"
 $src = @"
@@ -50,6 +51,8 @@ public static class V {
     foreach (var t in new object[][] { new object[] { "fp4_m16", 16u, true }, new object[] { "fp8_m16", 16u, false }, new object[] { "fp4t_m16", 16u, true }, new object[] { "fp4t_m32", 32u, true }, new object[] { "fp8t_m16", 16u, false }, new object[] { "fp8t_m32", 32u, false }, new object[] { "fp4w_m16", 16u, true }, new object[] { "fp4w_m32", 32u, true }, new object[] { "fp8w_m16", 16u, false }, new object[] { "fp8w_m32", 32u, false } }) {
       string kn = (string)t[0]; uint M = (uint)t[1]; bool f4 = (bool)t[2]; uint N = f4 ? N4 : N8;
       if (quick == 1 && !(kn == "fp4t_m16" || kn == "fp8t_m16")) continue;
+      if ((quick == 3 || quick == 4 || quick == 6 || quick == 7) && kn != "fp4t_m16") continue;
+      if (quick == 5 && kn != "fp8t_m16") continue;
       IntPtr w = f4 ? codes : w8;
       C(hipModuleLaunchKernel(Fn(kn), kn.Contains("t_") ? N / (TB / 2) : (kn.Contains("w_") ? N / 256 : N / 128), 1, 1, kn.Contains("t_") ? TB : 256u, 1, 1, 0, IntPtr.Zero, new IntPtr[] { P(w.ToInt64()), P(scales.ToInt64()), P(x.ToInt64()), P(y.ToInt64()), U(K), U(N), U(M), F(0.5f) }, IntPtr.Zero), "launch " + kn);
       Go("ref", (uint)((M * N + 255) / 256), new IntPtr[] { P(w.ToInt64()), P(scales.ToInt64()), P(x.ToInt64()), P(yr.ToInt64()), U(K), U(N), U(M), U(f4 ? 1u : 0u), F(0.5f), U((kn.Contains("t_") || kn.Contains("w_")) ? 1u : 0u) });
@@ -62,7 +65,9 @@ public static class V {
                                        new object[] { "fp4w_m16", 1u, true }, new object[] { "fp4w_m16", 16u, true }, new object[] { "fp4w_m32", 32u, true },
                                        new object[] { "fp8w_m16", 1u, false }, new object[] { "fp8w_m16", 16u, false }, new object[] { "fp8w_m32", 32u, false } }) {
       string kn = (string)t[0]; uint M = (uint)t[1]; bool f4 = (bool)t[2]; uint N = f4 ? N4 : N8;
-      if (quick == 1 && !(kn == "fp4t_m16" || kn == "fp8t_m16")) continue;
+      if (quick >= 1 && !(kn == "fp4t_m16" || kn == "fp8t_m16")) continue;
+      if (quick == 5 && kn != "fp8t_m16") continue;
+      if ((quick == 6 || quick == 7) && !(kn == "fp4t_m16" && M == 16)) continue;
       long bytes = f4 ? cb + sbz : fb;
       IntPtr f = Fn(kn);
       IntPtr[][] args = new IntPtr[L][];
@@ -70,16 +75,33 @@ public static class V {
         long wo = (f4 ? codes.ToInt64() + c * cb : w8.ToInt64() + c * fb), so = scales.ToInt64() + c * sbz;
         args[c] = new IntPtr[] { P(wo), P(so), P(x.ToInt64()), P(y.ToInt64()), U(K), U(N), U(M), F(0.5f) };
       }
+      int warm = (quick >= 4) ? 2500 : 1;  // quick 4: about ten seconds of the same kernel first (sustained load)
+      for (int wi = 0; wi < warm; wi++)
       for (int c = 0; c < L; c++) C(hipModuleLaunchKernel(f, kn.Contains("t_") ? N / (TB / 2) : (kn.Contains("w_") ? N / 256 : N / 128), 1, 1, kn.Contains("t_") ? TB : 256u, 1, 1, 0, IntPtr.Zero, args[c], IntPtr.Zero), "warm");
       C(hipDeviceSynchronize(), "sync");
+      if (quick == 7) {  // continuous load for about 90 s, GB/s per window of ~2 s
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.Elapsed.TotalSeconds < 90) {
+          double w0 = sw.Elapsed.TotalSeconds;
+          C(hipEventRecord(e0, IntPtr.Zero), "rec");
+          for (int i = 0; i < 500; i++) for (int c = 0; c < L; c++) C(hipModuleLaunchKernel(f, kn.Contains("t_") ? N / (TB / 2) : (kn.Contains("w_") ? N / 256 : N / 128), 1, 1, kn.Contains("t_") ? TB : 256u, 1, 1, 0, IntPtr.Zero, args[c], IntPtr.Zero), "launch");
+          C(hipEventRecord(e1, IntPtr.Zero), "rec"); C(hipEventSynchronize(e1), "evsync");
+          float wms; C(hipEventElapsedTime(out wms, e0, e1), "el");
+          double w1 = sw.Elapsed.TotalSeconds;
+          sb.AppendLine(String.Format("t={0,5:F1}s {1} M={2,2}: events {3,6:F1} GB/s, wall clock {4,6:F1} GB/s", w1, kn, M, bytes * 500.0 * L / (wms / 1000) / 1e9, bytes * 500.0 * L / (w1 - w0) / 1e9));
+        }
+        continue;
+      }
+      var swt = System.Diagnostics.Stopwatch.StartNew();
       C(hipEventRecord(e0, IntPtr.Zero), "rec");
       for (int i = 0; i < iters; i++) for (int c = 0; c < L; c++) C(hipModuleLaunchKernel(f, kn.Contains("t_") ? N / (TB / 2) : (kn.Contains("w_") ? N / 256 : N / 128), 1, 1, kn.Contains("t_") ? TB : 256u, 1, 1, 0, IntPtr.Zero, args[c], IntPtr.Zero), "launch");
       C(hipEventRecord(e1, IntPtr.Zero), "rec"); C(hipEventSynchronize(e1), "evsync");
       float ms; C(hipEventElapsedTime(out ms, e0, e1), "el");
+      double wallms = swt.Elapsed.TotalMilliseconds;
       double per = ms / (iters * L);
-      sb.AppendLine(String.Format("{0} {1,-8} M={2,2}: {3,7:F1} us per matrix ({4:F1} MB), {5,6:F1} GB/s", f4 ? "NVFP4 5120x34816" : "FP8   5120x16384", kn, M, per * 1000, bytes / 1e6, bytes / (per / 1000) / 1e9));
+      sb.AppendLine(String.Format("{0} {1,-8} M={2,2}: {3,7:F1} us per matrix ({4:F1} MB), {5,6:F1} GB/s (wall clock {6,6:F1} GB/s)", f4 ? "NVFP4 5120x34816" : "FP8   5120x16384", kn, M, per * 1000, bytes / 1e6, bytes / (per / 1000) / 1e9, bytes * (double)iters * L / (wallms / 1000) / 1e9));
     }
-    if (quick == 1) return sb.ToString();
+    if (quick >= 1) return sb.ToString();
     // The same bytes read by the plain read stream.
     foreach (var t in new object[][] { new object[] { codes, cb * L, "NVFP4 codes" }, new object[] { scales, sbz * L, "NVFP4 scales" }, new object[] { w8, fb * L, "FP8 weights" } }) {
       IntPtr p = (IntPtr)t[0]; long n = (long)t[1]; IntPtr f = Fn("rd");
