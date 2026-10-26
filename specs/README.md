@@ -25,6 +25,7 @@ This directory holds the specification, split into focused documents. This page 
 | [DREAMFERENCE_LING_ENGINE_MILESTONES.md](./DREAMFERENCE_LING_ENGINE_MILESTONES.md) | §14 the milestones with the standing status, the agreement gate and the exactness policy; §15 risks and open questions |
 | [DREAMFERENCE_LING_ENGINE_RESEARCH.md](./DREAMFERENCE_LING_ENGINE_RESEARCH.md) | §16 the low-level speed-ups from the literature, measured or estimated; §17 sources |
 | [DREAMFERENCE_LING_ENGINE_BACKLOG.md](./DREAMFERENCE_LING_ENGINE_BACKLOG.md) | §19 what users of SGLang and vLLM asked for and what the four clients send, ranked, plus the maintainer's requests |
+| [DREAMFERENCE_LING_ENGINE_AMD.md](./DREAMFERENCE_LING_ENGINE_AMD.md) | *Written on 2026-10-26 from measurements on the AMD box and from the code:* porting the engine to AMD Strix Halo (Radeon 8060S, gfx1151) on Windows or Linux: the hardware ceiling measured, what is CUDA- or Blackwell-specific, four options with effort and exactness, how Mightling would use it, a staged plan |
 
 ## Section map
 
@@ -50,4 +51,4 @@ This directory holds the specification, split into focused documents. This page 
 | §18 | [DREAMFERENCE_LING_ENGINE_VALIDATION.md](./DREAMFERENCE_LING_ENGINE_VALIDATION.md) |
 | §19 | [DREAMFERENCE_LING_ENGINE_BACKLOG.md](./DREAMFERENCE_LING_ENGINE_BACKLOG.md) |
 
-The two documents without a section number, `DREAMFERENCE_LING_ENGINE_CLI.md` and `DREAMFERENCE_LING_ENGINE_API.md`, were written on 2026-10-09 from the code and have no counterpart in the original file.
+The documents without a section number have no counterpart in the original file: `DREAMFERENCE_LING_ENGINE_CLI.md` and `DREAMFERENCE_LING_ENGINE_API.md` were written on 2026-10-09 from the code, and `DREAMFERENCE_LING_ENGINE_AMD.md` on 2026-10-26 from the AMD box and the code.
