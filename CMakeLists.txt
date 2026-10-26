@@ -131,4 +131,7 @@ target_link_libraries(ling-prefix-kv-tests PRIVATE ling_core)
 
 add_executable(ling-api-tests tests/api_tests.cpp)
 target_link_libraries(ling-api-tests PRIVATE ling_api)
+add_executable(ling-vision-input-tests tests/vision_input_tests.cpp)
+target_link_libraries(ling-vision-input-tests PRIVATE ling_api)
+add_test(NAME vision_input COMMAND ling-vision-input-tests)
 add_test(NAME api COMMAND ling-api-tests)
