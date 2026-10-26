@@ -399,7 +399,7 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 
 ## 5. Recommendation and staged plan
 
-**Not "port to Windows" first.** The most uncertain part of every ling-engine-grade option (a, b-with-gufo, d) is the same: **can a 16-row verify on gfx1151 cost about what a one-row decode costs?** llama.cpp's verify does not (2.1×, *measured*); gufo's costs 1.29× (*third-party*). The engine's 50–60 tokens/s estimate stands or falls on it. It can be measured in a week on the box as it is, with the harness of §6 and no installs.
+**Not "port to Windows" first.** The most uncertain part of every ling-engine-grade option (a, b-with-gufo, d) is the same: **can a 16-row verify on gfx1151 cost about what a one-row decode costs?** llama.cpp's verify does not (2.1× on short prompts, 2.6× at 28–32K, *measured*); gufo's costs 1.29× (*third-party*). The engine's 50–60 tokens/s estimate stands or falls on it. It can be measured in a week on the box as it is, with the harness of §6 and no installs.
 
 | Stage | What | Where | Effort | Gate to the next |
 |---|---|---|---|---|
@@ -415,7 +415,7 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 
 ---
 
-## 6. What was run on the box (2026-10-26, 22:15 UTC to 00:30 UTC on the 27th)
+## 6. What was run on the box (2026-10-26, 22:15–23:35 UTC)
 
 Scratch files are in `C:\llm\amd-port` on the box; the probes are also in this repository under `bench/amd/`. Nothing was installed, no driver or setting was changed, and the downloads came to 1.14 GB (the drafter).
 
@@ -493,7 +493,7 @@ A ling-engine build for Windows therefore needs TheRock only to compile. The rel
 
 ### 6.5 The first milestone, day 1: the verify kernel probe
 
-The owner approved starting §5's first milestone once this study was written. This is its first day (2026-10-26, 23:30–00:30 UTC), with `bench/amd/vg.hip` and `vg.ps1`. Everything is *measured*.
+The owner approved starting §5's first milestone once this study was written. This is its first day (2026-10-26, from 23:24 UTC), with `bench/amd/vg.hip` and `vg.ps1`. Everything is *measured*.
 
 **The setup.**
 
