@@ -2,6 +2,7 @@
 #include "serve/image_input.hpp"
 
 #include <cuda_runtime.h>
+#include <dlfcn.h>
 #include <jpeglib.h>
 #include <nvjpeg.h>
 #include <png.h>
@@ -11,6 +12,7 @@
 #include <atomic>
 #include <cmath>
 #include <csetjmp>
+#include <cstdio>
 #include <cstring>
 #include <thread>
 
@@ -122,14 +124,31 @@ struct JpegErr {
 void jpeg_fail(j_common_ptr c) { longjmp(reinterpret_cast<JpegErr*>(c->err)->jb, 1); }
 
 // ---- JPEG on the GPU (nvJPEG, as torchvision.io.decode_jpeg(device="cuda") in production). ----
+// nvJPEG is opened at run time (libnvjpeg.so.13), so a deployment without it (the CUDA base image has none) decodes
+// JPEGs on the CPU instead of failing to start; the first failure to open it says so once.
 struct Nvjpeg {
   nvjpegHandle_t h = nullptr;
   nvjpegJpegState_t st = nullptr;
   cudaStream_t stream = nullptr;
   bool ok = false;
+  decltype(&nvjpegCreateSimple) create = nullptr;
+  decltype(&nvjpegJpegStateCreate) state_create = nullptr;
+  decltype(&nvjpegGetImageInfo) info = nullptr;
+  decltype(&nvjpegDecode) decode = nullptr;
   Nvjpeg() {
-    if (nvjpegCreateSimple(&h) != NVJPEG_STATUS_SUCCESS) return;
-    if (nvjpegJpegStateCreate(h, &st) != NVJPEG_STATUS_SUCCESS) return;
+    void* lib = dlopen("libnvjpeg.so.13", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) lib = dlopen("libnvjpeg.so", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) {
+      std::fprintf(stderr, "images: nvJPEG not found, JPEGs are decoded on the CPU (libjpeg-turbo)\n");
+      return;
+    }
+    create = reinterpret_cast<decltype(create)>(dlsym(lib, "nvjpegCreateSimple"));
+    state_create = reinterpret_cast<decltype(state_create)>(dlsym(lib, "nvjpegJpegStateCreate"));
+    info = reinterpret_cast<decltype(info)>(dlsym(lib, "nvjpegGetImageInfo"));
+    decode = reinterpret_cast<decltype(decode)>(dlsym(lib, "nvjpegDecode"));
+    if (!create || !state_create || !info || !decode) return;
+    if (create(&h) != NVJPEG_STATUS_SUCCESS) return;
+    if (state_create(h, &st) != NVJPEG_STATUS_SUCCESS) return;
     if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) return;
     ok = true;
   }
@@ -144,7 +163,7 @@ bool decode_jpeg_gpu(const std::string& bytes, DecodedImage& img) {
   int nc = 0;
   nvjpegChromaSubsampling_t sub;
   int w[NVJPEG_MAX_COMPONENT], h[NVJPEG_MAX_COMPONENT];
-  if (nvjpegGetImageInfo(nv.h, p, bytes.size(), &nc, &sub, w, h) != NVJPEG_STATUS_SUCCESS) return false;
+  if (nv.info(nv.h, p, bytes.size(), &nc, &sub, w, h) != NVJPEG_STATUS_SUCCESS) return false;
   if (w[0] <= 0 || h[0] <= 0 || size_t(w[0]) * h[0] > (size_t(1) << 28)) return false;
   img.width = w[0];
   img.height = h[0];
@@ -156,7 +175,7 @@ bool decode_jpeg_gpu(const std::string& bytes, DecodedImage& img) {
     out.channel[c] = d + plane * c;
     out.pitch[c] = static_cast<unsigned>(w[0]);
   }
-  bool good = nvjpegDecode(nv.h, nv.st, p, bytes.size(), NVJPEG_OUTPUT_RGB, &out, nv.stream) == NVJPEG_STATUS_SUCCESS;
+  bool good = nv.decode(nv.h, nv.st, p, bytes.size(), NVJPEG_OUTPUT_RGB, &out, nv.stream) == NVJPEG_STATUS_SUCCESS;
   std::vector<uint8_t> planar;
   if (good) {
     planar.resize(plane * 3);
