@@ -274,7 +274,7 @@ The Windows penalty is third-party: gufo's Windows fork measured decode 7.6–9.
 
 **Exactness.**
 
-- llama.cpp: **no**, *measured*. Greedy output changes with the speculation setting on two of the three prompts (§6.2), because the batched verify and the one-row decode run different kernels. Making it exact means batch-invariant kernels, which upstream would take only behind a flag.
+- llama.cpp: **not guaranteed**, *measured*. Greedy output changes with the speculation setting on two of the three short prompts (§6.2), and is equal on the four agentlong turns (§6.3). The batched verify and the one-row decode run different kernels, so near-ties can round differently. Making it exact means batch-invariant kernels, which upstream would take only behind a flag.
 - gufo: **yes**, by its own policy.
 
 **Effort** (*estimate*):
@@ -344,7 +344,7 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 | Decode, agent output (*estimate*) | 50–60 Linux; 5–10% less on Windows | gufo: toward 50–60; llama.cpp: 35–45 | as (a) | 50–60 |
 | Prefill at 32K | 420–520 | 413–469 (gufo), 226 (llama.cpp, *measured*) | 10–25% below (a) | 420–520 |
 | Effort, engineer-weeks | 10–14 Linux; 15–21 with Windows | 6–9 (gufo); 8–12 (llama.cpp) | 20–30 | 12–17 with the node |
-| Exact (greedy = own non-speculative) | yes | gufo yes; llama.cpp **no** (*measured*) | yes | yes |
+| Exact (greedy = own non-speculative) | yes | gufo yes; llama.cpp **not guaranteed** (*measured*: differs on two of three short prompts, equal on four agentlong turns) | yes | yes |
 | Same checkpoint as the GB10 | **yes** (NVFP4 decoded in software) | no (GGUF) | yes | **yes** |
 | Main risk | the WMMA stream kernel; Windows host and toolchain | others' roadmaps; not our engine | effort | the dual boot and the carve-out switch |
 
@@ -427,7 +427,7 @@ Scratch files are in `C:\llm\amd-port` on the box; the probes are also in this r
 | `wmma.hip`, `wmma.ps1` | FP16, BF16, IU8 and IU4 WMMA loops; §1.1's matrix table |
 | `spec.ps1`, `prompts.json` | `llama-server` (b11907, the zips of AMD_NODES §13.4) on three prompts: prose (350 words of explanation), code (a Python function and five tests), edit (return a 70-line file with a rename, type hints and a sorted summary). Temperature 0, thinking off, one warm-up request; the server's own timings and draft counters; SHA-256 of each answer |
 | `rt.ps1` | the driver's HIP runtime with TheRock off `PATH` (§6.4) |
-| `vg.hip`, `vg.ps1`, `vg-tune.ps1` | the first milestone's verify-GEMM probe (§6.5) |
+| `vg.hip`, `vg.ps1`, `vg-tune.ps1`, `vg-attrib.ps1` | the first milestone's verify-GEMM probe (§6.5) |
 | `ag.ps1`, `cmp.ps1` (with `ag-t0[0-3].json` and `qwen38-patched.jinja`, kept on the box only) | the first four agentlong turns (25–33K tokens of context, `bench/agentlong/manifest.json`), sent to `llama-server`'s `/v1/responses` with temperature 0 and Mightling's patched chat template |
 
 The drafter is z-lab's `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` (1,143,006,816 bytes, SHA-256 `1a25c568…31ebd`, equal to the LFS object). It runs with `--spec-type draft-dflash -ngld 99`. llama.cpp logs `block_size=8, n_extract=5`.
@@ -522,8 +522,15 @@ ling-engine's loader already retiles every matrix for its kernels on the GB10 (A
 
 - **FP8 passes.** 96% of the read stream, and 16 rows cost the same as one.
 - **NVFP4 does not yet.** It reaches 71% of the stream at 16 rows and 83% at one row.
-- **What the NVFP4 gap is not.** The M = 1 and M = 16 runs execute the same instructions (WMMA always computes 16 rows), and stripping the activation staging or the barriers does not close the gap.
-- **What it might be.** The cost is in the decode and the WMMA under load, and possibly in a clock that falls with non-zero operands; the firmware's power mode is unknown (AMD_NODES §13.2).
+- **Where the NVFP4 gap is**, from the K-major kernel with one part switched off at a time (176 GB/s at 16 rows with everything on):
+
+  | Switched off | M = 1 | M = 16 |
+  |---|---|---|
+  | the in-register decode | 212 GB/s | **208 GB/s** |
+  | the WMMA | 202 GB/s | 198 GB/s |
+  | the activation staging | 191 GB/s | 189 GB/s |
+
+  The decode is the largest single cost: without it the 16-row kernel passes the gate. The 16 staged rows account for the difference between M = 1 and M = 16. The firmware's power mode, which a person at the box has to read (AMD_NODES §13.2), may also matter.
 - **32 rows do not fit for NVFP4** (112 GB/s), as §1.3 predicted. FP8 at 32 rows loses 35%.
 
 **What it means for §1.2's estimate.**
@@ -534,7 +541,7 @@ ling-engine's loader already retiles every matrix for its kernels on the GB10 (A
 
 **Left for the rest of the milestone:**
 
-- The NVFP4 decode: a byte-table decode with `v_perm_b32`, since E2M1's FP16 low bytes are all zero, and the scale folded into the epilogue.
+- The NVFP4 decode, the measured bottleneck: a byte-table decode with `v_perm_b32`, since E2M1's FP16 low bytes are all zero, and the scale folded into the epilogue.
 - The person-at-the-box check of the firmware power mode.
 - The `hipGraph` gap per node for a ~330-kernel step.
 
