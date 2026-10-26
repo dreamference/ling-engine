@@ -3,6 +3,9 @@
 // independent reference, the patch order and normalisation, the registry, the expansion of the placeholders, the
 // template's placeholders and URL order on both routes, and the M-RoPE table against get_rope_index's rule. No GPU and
 // no model; the comparisons with production's own pixels need its image (ling-run --vision-check).
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <jpeglib.h>
 #include <png.h>
 #include <webp/encode.h>
