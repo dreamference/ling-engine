@@ -25,6 +25,7 @@ This directory holds the specification, split into focused documents. This page 
 | [DREAMFERENCE_LING_ENGINE_MILESTONES.md](./DREAMFERENCE_LING_ENGINE_MILESTONES.md) | §14 the milestones with the standing status, the agreement gate and the exactness policy; §15 risks and open questions |
 | [DREAMFERENCE_LING_ENGINE_RESEARCH.md](./DREAMFERENCE_LING_ENGINE_RESEARCH.md) | §16 the low-level speed-ups from the literature, measured or estimated; §17 sources |
 | [DREAMFERENCE_LING_ENGINE_BACKLOG.md](./DREAMFERENCE_LING_ENGINE_BACKLOG.md) | §19 what users of SGLang and vLLM asked for and what the four clients send, ranked, plus the maintainer's requests |
+| [DREAMFERENCE_LING_ENGINE_VISION.md](./DREAMFERENCE_LING_ENGINE_VISION.md) | §20 images: the checkpoint's vision tower, what production does with an image, the engine's four phases, memory and time on GB10, exactness, the API as Mightling's clients send images, images and the prefix caches, the test plan (new on 2026-10-26) |
 
 ## Section map
 
@@ -49,5 +50,6 @@ This directory holds the specification, split into focused documents. This page 
 | §17 | [DREAMFERENCE_LING_ENGINE_RESEARCH.md](./DREAMFERENCE_LING_ENGINE_RESEARCH.md) |
 | §18 | [DREAMFERENCE_LING_ENGINE_VALIDATION.md](./DREAMFERENCE_LING_ENGINE_VALIDATION.md) |
 | §19 | [DREAMFERENCE_LING_ENGINE_BACKLOG.md](./DREAMFERENCE_LING_ENGINE_BACKLOG.md) |
+| §20 (new, 2026-10-26) | [DREAMFERENCE_LING_ENGINE_VISION.md](./DREAMFERENCE_LING_ENGINE_VISION.md) |
 
-The two documents without a section number, `DREAMFERENCE_LING_ENGINE_CLI.md` and `DREAMFERENCE_LING_ENGINE_API.md`, were written on 2026-10-09 from the code and have no counterpart in the original file.
+§20 is the first section written after the split; it has no counterpart in the former file. The two documents without a section number, `DREAMFERENCE_LING_ENGINE_CLI.md` and `DREAMFERENCE_LING_ENGINE_API.md`, were written on 2026-10-09 from the code and have no counterpart in the original file.
