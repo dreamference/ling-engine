@@ -1,17 +1,18 @@
 # ling-engine on AMD Strix Halo: a port to the AMD box, researched
 
-Part of the ling-engine specification; the index is [README.md](./README.md). Written on 2026-10-26 in answer to the owner's question of the same day, "can we port ling-engine to Windows so we can run it on the AMD box?". It has no section number in the former `SPEC.md`. **Status: research.** Nothing is ported. The measurements in §1 and §6 were taken on the box that evening over SSH with throwaway probes; nothing was installed on it.
+Part of the ling-engine specification; the index is [README.md](./README.md). Written on 2026-10-26 in answer to the owner's question of the same day, "can we port ling-engine to Windows so we can run it on the AMD box?". It has no section number in the former `SPEC.md`. **Status: research.** Nothing is ported. The measurements in §1 and §6 were taken on the box that evening over SSH with small probes, kept in `bench/amd/`; nothing was installed on it. §6.5 is the first day of the first milestone, which the owner approved once the study was written.
 
 Every figure is tagged: *measured* (on `amd-box`, 2026-10-26, the settings named), *third-party* (source named in §7), or *estimate* (the arithmetic is shown). Mightling's side of the AMD box (the client test box, the node pieces, the Windows memory model) is in Mightling's `specs/DREAMFERENCE_MIGHTLING_AMD_NODES.md` (cited as AMD_NODES), which this document builds on and does not repeat.
 
 ## Short answer
 
-1. **Yes, it can be ported, but Windows is the expensive half, and the port is a rewrite of the kernels, not a recompile.** About 4,500 of ling-engine's 7,050 lines of device code use Blackwell or NVIDIA-only instructions (`mma.sync` fragments, `cp.async`, TMA, `ldmatrix`, block-scaled FP4 MMA) and are rewritten for RDNA 3.5's WMMA. The host side ports mechanically, except the HTTP layer (proxygen/folly) and the loader on Windows. *Estimate:* **10–14 engineer-weeks on Linux, 15–21 for Windows**, which includes the Linux work.
+1. **Yes, it can be ported, but Windows is the expensive half, and the port is a rewrite of the kernels, not a recompile.** About 4,600 of ling-engine's 7,050 lines of device code use Blackwell or NVIDIA-only instructions (`mma.sync` fragments, `cp.async`, TMA, `ldmatrix`, block-scaled FP4 MMA) and are rewritten for RDNA 3.5's WMMA. The host side ports mechanically, except the HTTP layer (proxygen/folly) and the loader on Windows. *Estimate:* **10–14 engineer-weeks on Linux, 15–21 for Windows**, which includes the Linux work.
 2. **The box's memory bus is not the problem.** *Measured:* a HIP read stream reaches **240 GB/s**, 94% of the 256 GB/s theoretical. That is as fast as the GB10's in-order read on `cudaMalloc` (234 GB/s, BACKLOG 19 item 28). So decode, which is bandwidth-bound, can come close to the GB10's.
 3. **Two things are worse than on the GB10: the verify's compute, and prefill.** *Measured:* WMMA sustains **40–43 TFLOPS in FP16, BF16 and INT8, and 70–83 TOPS in INT4**. There is no FP4 or FP8 matrix unit. That is 167 FLOP per byte of bus, against about 900 on the GB10. A 16-row verify still fits under the weight stream (§1.3), but prefill is compute-bound. *Estimate:* its ceiling is about **650–820 tokens/s**, against ling-engine's 2,100–2,600 on the GB10.
-4. **What the engine's design is worth here** (*estimate*, §1.2): a ling-engine-grade port with 16-row tree verification reaches about **50–60 tokens/s** on agent output. One agent turn at 32K would take about **8–9 s**, against about 4 s on the GB10, ~15 s for gufo (*third-party*) and ~19–24 s for llama.cpp (*measured*, §6). The engine's *speculation* is not the missing piece: DFlash2 already runs in upstream llama.cpp on this box. What is missing is a **verify that costs no more than a plain decode step**. *Measured:* llama.cpp's DFlash2 step with an 8-token block costs **2.1× its plain decode step**, so widening the draft barely pays.
+4. **What the engine's design is worth here** (*estimate*, §1.2): a ling-engine-grade port with 16-row tree verification reaches about **50–60 tokens/s** on agent output. One agent turn at 32K would take about **8–9 s**, against about 4 s on the GB10, ~15 s for gufo (*third-party*) and ~18 s for llama.cpp (*measured*, §6.3). The engine's *speculation* is not the missing piece: DFlash2 already runs in upstream llama.cpp on this box. What is missing is a **verify that costs no more than a plain decode step**. *Measured* on four agentlong turns: llama.cpp's DFlash2 chain accepts **5.33 tokens per step**, close to ling-engine's 6.02–6.74 on the GB10. But its 8-row step costs **2.6× its plain decode step**, so it decodes at 22 tokens/s instead of about 50.
 5. **Recommendation (§5).**
    - **First milestone:** the verify kernel. Prove on the box, in about a week and with no installs, that a 16-row NVFP4/FP8 WMMA streaming GEMM over the 27B's real matrix shapes runs at ≥ 200 GB/s and costs ≤ 1.15× a one-row pass.
+   - **Day 1 of that milestone (§6.5):** FP8 passes, at 232 GB/s with 16 rows costing what one costs. NVFP4 reaches 172 GB/s, so its decode is the remaining work.
    - **If it passes:** port on **Linux first** (the dual boot), as a registry engine of the Linux node, and do the Windows host layer after that, only if the owner wants ling-engine on a Windows node.
    - **Until then:** the Windows node serves the 27B with llama.cpp + DFlash2, as AMD_NODES §6.4 plans.
 
@@ -90,6 +91,7 @@ A port that keeps the served checkpoint (§3.1 argues it should) reads the same 
 | 6.74 | ling-engine on GB10, agentlong greedy, tree 7 + chain 8 = 16 rows, ScaleSearch drafter (BACKLOG 19 item 26) | 76 | **61–67** |
 | 6.02 | the same, chain only (main before the tree merge) | 68 | 55–60 |
 | 5.96 | the served RTN drafter with the tree, seed 1013 | 67 | 54–59 |
+| 5.33 | llama.cpp's DFlash2 chain of 7 on four agentlong turns, on this box (*measured*, §6.3) | 60 | 48–53 (llama.cpp measures 22) |
 | ~2.7 | gufo's DFlash2 chain on mixed text, Q4, depth 0 (*third-party*) | 31 | 25–27 (gufo measures 26.9) |
 
 The right-hand column applies the GB10's ratio of step-average to read-stream bandwidth:
@@ -104,7 +106,7 @@ The acceptance itself should carry over:
 - It is a property of the drafter and the target's greedy path, not of the GPU.
 - The target's outputs differ slightly between quantizations, and the box would run the same NVFP4 checkpoint under option (a).
 
-§6's agentlong replay measures what llama.cpp's DFlash2 chain accepts on the same turns on this box.
+*Measured* (§6.3): on four agentlong turns on this box, llama.cpp's DFlash2 chain of 7, with the Q4 drafter on the Q4_K target, accepts τ = 5.33.
 
 ### 1.3 The verify's compute: why 16 rows fit and 32 do not, comfortably
 
@@ -155,7 +157,7 @@ The method of AMD_NODES §4: a 2,000-token tail at 32K of cached context, then a
 | ling-engine, GB10 | ~2,100+ (README) | ~65 (BACKLOG 19) | **~4 s** |
 | ling-engine port, box (*estimate*) | 420–520 | 50–60 | **~8–9 s** |
 | gufo, box (*third-party*, Linux) | 413 | 19.8 mixed | ~15 s |
-| llama.cpp + DFlash2, box (*measured*, Windows, ROCm) | 226 | see §6.3 | ~19–24 s |
+| llama.cpp + DFlash2, box (*measured*, Windows, ROCm) | 226 | 22 (four agentlong turns, §6.3) | **~18 s** |
 
 On this box the port halves the turn against the best open engine. It still leaves the box at about half the GB10's speed, because prefill sets the floor.
 
@@ -401,8 +403,8 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 
 | Stage | What | Where | Effort | Gate to the next |
 |---|---|---|---|---|
-| **0 (done, 2026-10-26)** | The bus, WMMA, and llama.cpp's DFlash2 on the box: acceptance, step cost and exactness on three prompts and four agentlong turns (§6) | Windows, release zips | — | — |
-| **1, the first milestone** | **The verify kernel probe.** A header-free HIP kernel that streams one of the 27B's real matrices in its served format, the FFN gate\|up (5120 × 34,816, NVFP4) and the DeltaNet in-projection (5120 × 16,384, FP8), decoded to FP16 and multiplied on WMMA for M = 1, 4, 8, 16, 32 rows. Measured: GB/s and µs per M. Also: a `hipGraph` of ~330 small kernels (the per-node gap that PDL hides on the GB10) | Windows as it is (§6's harness) | **~1 week** | M = 16 at **≥ 200 GB/s** and **≤ 1.15×** the M = 1 time; graph gap ≤ 10 µs per node |
+| **0 (done, 2026-10-26)** | The bus, WMMA, and llama.cpp's DFlash2 on the box: acceptance, step cost and exactness on three prompts and four agentlong turns (§6.2, §6.3); the driver's HIP runtime (§6.4) | Windows, release zips | — | — |
+| **1, the first milestone** | **The verify kernel probe.** A header-free HIP kernel that streams one of the 27B's real matrices in its served format, the FFN gate\|up (5120 × 34,816, NVFP4) and the DeltaNet in-projection (5120 × 16,384, FP8), decoded to FP16 and multiplied on WMMA for M = 1, 4, 8, 16, 32 rows. Measured: GB/s and µs per M. Also: a `hipGraph` of ~330 small kernels (the per-node gap that PDL hides on the GB10) | Windows as it is (§6's harness); **started 2026-10-26, day 1 in §6.5**: FP8 passes, NVFP4 at 172 GB/s | **~1 week** | M = 16 at **≥ 200 GB/s** and **≤ 1.15×** the M = 1 time; graph gap ≤ 10 µs per node |
 | 2 | Decode-only port on Linux (dual boot): streaming GEMM, attention, DeltaNet, drafter, tree, graphs; `ling-run --spec-check` and agentlong greedy 16/16 identical to its own non-speculative output | Linux | 7–9 weeks | ≥ 45 tokens/s on agentlong greedy, exact |
 | 3 | Prefill on WMMA, `ling-serve` on the Linux node (AMD_NODES §7's minimum node, `engine: "ling"`) | Linux | 4–6 weeks (+2–3 for the node) | a Work session from a client against the box; prefill ≥ 400 tokens/s at 32K |
 | 4 (owner's decision) | The Windows host layer of §3.1: build, HTTP, loader, WDDM, packaging; the launcher's supervisor | Windows | 5–7 weeks | the same agentlong numbers within 10% of Linux |
@@ -413,9 +415,9 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 
 ---
 
-## 6. What was run on the box (2026-10-26, 22:15–24:00 UTC)
+## 6. What was run on the box (2026-10-26, 22:15 UTC to 00:30 UTC on the 27th)
 
-Scratch files are in `C:\llm\amd-port` on the box. Nothing was installed, no driver or setting was changed, and the downloads came to 1.14 GB (the drafter).
+Scratch files are in `C:\llm\amd-port` on the box; the probes are also in this repository under `bench/amd/`. Nothing was installed, no driver or setting was changed, and the downloads came to 1.14 GB (the drafter).
 
 ### 6.1 The probes
 
@@ -425,7 +427,8 @@ Scratch files are in `C:\llm\amd-port` on the box. Nothing was installed, no dri
 | `wmma.hip`, `wmma.ps1` | FP16, BF16, IU8 and IU4 WMMA loops; §1.1's matrix table |
 | `spec.ps1`, `prompts.json` | `llama-server` (b11907, the zips of AMD_NODES §13.4) on three prompts: prose (350 words of explanation), code (a Python function and five tests), edit (return a 70-line file with a rename, type hints and a sorted summary). Temperature 0, thinking off, one warm-up request; the server's own timings and draft counters; SHA-256 of each answer |
 | `rt.ps1` | the driver's HIP runtime with TheRock off `PATH` (§6.4) |
-| `ag.ps1`, `ag-t0[0-3].json`, `qwen38-patched.jinja` | the first four agentlong turns (25–33K tokens of context, `bench/agentlong/manifest.json`), sent to `llama-server`'s `/v1/responses` with temperature 0 and Mightling's patched chat template |
+| `vg.hip`, `vg.ps1`, `vg-tune.ps1` | the first milestone's verify-GEMM probe (§6.5) |
+| `ag.ps1`, `cmp.ps1` (with `ag-t0[0-3].json` and `qwen38-patched.jinja`, kept on the box only) | the first four agentlong turns (25–33K tokens of context, `bench/agentlong/manifest.json`), sent to `llama-server`'s `/v1/responses` with temperature 0 and Mightling's patched chat template |
 
 The drafter is z-lab's `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` (1,143,006,816 bytes, SHA-256 `1a25c568…31ebd`, equal to the LFS object). It runs with `--spec-type draft-dflash -ngld 99`. llama.cpp logs `block_size=8, n_extract=5`.
 
@@ -461,9 +464,23 @@ The drafter is z-lab's `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` (1,143,006,816 bytes, S
   - On ROCm the plain answers (`D737…`, `DD46…`) differ again from both its speculative ones and Vulkan's.
   - The answers part where two logits are near-tied and the batched verify and the one-row decode round differently. ling-engine and gufo avoid this by running every row through one kernel.
 
-### 6.3 Unspeculated reruns and four agentlong turns
+### 6.3 Four agentlong turns
 
-*Pending at the time of writing; filled in by the follow-up commit.*
+*Measured*, ROCm (TheRock 10.0), `-c 40960`, no prompt cache between configurations. The turns are t00–t03 of `bench/agentlong/manifest.json`: 28,307–32,458 tokens of context, the same request bodies `bench/agentlong/run.py` sends to `ling-serve`, at temperature 0, through `/v1/responses` with Mightling's patched chat template. Every answer is a message plus a tool call, 111–522 tokens long.
+
+| Drafting | Decode, pooled over the 4 turns | τ (tokens per step) | Step | Prefill at 28–32K |
+|---|---|---|---|---|
+| none | **10.7 tokens/s** (1,083 tokens in 101.1 s) | 1 | 93 ms | 228–243 tokens/s |
+| DFlash2, 7 drafts | **22.0 tokens/s** (49.3 s) | **5.33** (880 of 1,083 tokens from accepted drafts) | 243 ms | 217–256 |
+| DFlash2 7 + `ngram-mod` | 20.7 tokens/s (52.4 s) | 5.28 | 255 ms | 220–238 |
+
+**Reading.**
+
+- **The drafter accepts well on agent output on this box.** Its chain of 7 gives τ = 5.33. ling-engine's chain gives 6.02 on the GB10 and its 16-row tree 6.74 (BACKLOG 19 item 26), on all sixteen turns rather than these four. So the acceptance of §1.2's table carries over to the box's quantization, give or take the workload.
+- **llama.cpp's step is the loss.** At 28–32K of context its 8-row step costs **2.6× its one-row step**. That is more than on the short prompts (2.1×), because its verify attention also grows with the rows.
+- **The arithmetic:** with τ = 5.33 and a step of 1.15× the plain one (§5's gate, about 107 ms here), the same drafter would give about **50 tokens/s**, against 22 today.
+- **Exactness held on these turns.** The four answers' content (message text, tool names and arguments) is byte-identical across the three configurations (`cmp.ps1`), unlike two of the three short prompts of §6.2. So llama.cpp's speculative greedy is often equal to plain greedy, but not guaranteed.
+- **One agent turn at 32K** by AMD_NODES §4's method: 2,000 ÷ 226 + 200 ÷ 22 ≈ **18 s** with llama.cpp + DFlash2 on Windows.
 
 ### 6.4 The driver's own HIP runtime
 
@@ -473,6 +490,53 @@ The drafter is z-lab's `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` (1,143,006,816 bytes, S
 - Windows searches `System32` before `PATH`, so the measurements of §1.1 ran on this same driver runtime.
 
 A ling-engine build for Windows therefore needs TheRock only to compile. The release zip ships the program and its code objects, and the driver supplies the runtime (§4.1).
+
+### 6.5 The first milestone, day 1: the verify kernel probe
+
+The owner approved starting §5's first milestone once this study was written. This is its first day (2026-10-26, 23:30–00:30 UTC), with `bench/amd/vg.hip` and `vg.ps1`. Everything is *measured*.
+
+**The setup.**
+
+- **Matrices:** the FFN gate|up (K 5,120 × N 34,816, NVFP4: E2M1 codes, one E4M3 scale per 16, 100.3 MB) and the DeltaNet in-projection (K 5,120 × N 16,384, FP8 E4M3, 83.9 MB).
+- **Data:** hashed codes and scales, eight copies of each matrix so the 32 MB MALL cannot hold them.
+- **The kernel:** decodes in registers to FP16 and multiplies on WMMA 16×16×16 against M activation rows staged in LDS. M = 1 and 16 use one 16-row tile; M = 32 uses two.
+- **Correctness:** checked against an FP32 reference, with a relative error of 1.4–1.6 × 10⁻⁵ for every kernel and M.
+
+**What made the difference**, in order:
+
+1. **Retiling.** In row-major order a wave reads 16 rows 32 bytes at a time: 36 GB/s. With 16 × 64 tiles that one wave loads contiguously (512 bytes for NVFP4), each half-wave decodes only its own K and the halves swap decoded fragments (`v_permlanex16`): 93–108 GB/s.
+2. **LDS padding.** Padding the LDS activation rows by 16 halves removes a 16-way bank conflict: 173 GB/s.
+3. **K-major tile order.** Ordering the tiles K-major lets neighbouring waves read neighbouring memory at the same moment. The bare loads alone, with decode, WMMA and staging switched off, then reach 227 GB/s, against 198 in N-major order.
+4. **Larger blocks for FP8.** 1,024-thread blocks share the staged activations.
+
+ling-engine's loader already retiles every matrix for its kernels on the GB10 (ARCHITECTURE §8, stage 4), so none of this changes the checkpoint.
+
+**Best results:**
+
+| Matrix | M = 1 | M = 16 | M = 32 | Read stream over the same bytes | M = 16 ÷ M = 1 time |
+|---|---|---|---|---|---|
+| FP8 in-projection, 1,024-thread blocks | 234 GB/s | **232 GB/s** (362 µs) | 151 GB/s (earlier layout) | 242 GB/s | **1.01** |
+| NVFP4 gate\|up, 256-thread blocks | 200 GB/s | **172 GB/s** (585 µs) | 112 GB/s (earlier layout) | 241 GB/s | 1.17 |
+
+**Against the gate** (M = 16 at ≥ 200 GB/s and ≤ 1.15× the M = 1 time):
+
+- **FP8 passes.** 96% of the read stream, and 16 rows cost the same as one.
+- **NVFP4 does not yet.** It reaches 71% of the stream at 16 rows and 83% at one row.
+- **What the NVFP4 gap is not.** The M = 1 and M = 16 runs execute the same instructions (WMMA always computes 16 rows), and stripping the activation staging or the barriers does not close the gap.
+- **What it might be.** The cost is in the decode and the WMMA under load, and possibly in a clock that falls with non-zero operands; the firmware's power mode is unknown (AMD_NODES §13.2).
+- **32 rows do not fit for NVFP4** (112 GB/s), as §1.3 predicted. FP8 at 32 rows loses 35%.
+
+**What it means for §1.2's estimate.**
+
+- The target's weights would stream in about **92 ms**: 10.35 GB of NVFP4 (FFN and head) at ~172 GB/s and 7.2 GB of FP8 at ~232 GB/s. At 240 GB/s they would take 73 ms.
+- With the drafter, KV and state (~3.6 GB at ~200 GB/s), the step is about 110 ms.
+- At τ = 6.74 that is about 61 tokens/s; at llama.cpp's measured τ = 5.33, about 48. That sits within §1.2's 50–60.
+
+**Left for the rest of the milestone:**
+
+- The NVFP4 decode: a byte-table decode with `v_perm_b32`, since E2M1's FP16 low bytes are all zero, and the scale folded into the epilogue.
+- The person-at-the-box check of the firmware power mode.
+- The `hipGraph` gap per node for a ~330-kernel step.
 
 ---
 
