@@ -232,6 +232,14 @@ int vision_check_run(ling::Engine& engine, const std::string& dir, bool bench) {
       floor_rel = r;
       floor_cos = c;
     }
+    if (std::filesystem::exists(base + ".hfprodpos.bf16")) {
+      const std::vector<float> pb = load_bf16(base + ".hfprodpos.bf16");
+      double r, c;
+      compare(pb, truth, OUT, r, c);
+      std::printf("  transformers BF16 with production's position embedding against FP32: rel L2 %.3e, worst cosine %.6f\n", r, c);
+      floor_rel = std::max(floor_rel, r);
+      floor_cos = std::min(floor_cos, c);
+    }
     if (std::filesystem::exists(base + ".sgl.bf16")) {
       const std::vector<float> sb = load_bf16(base + ".sgl.bf16");
       double r, c;
@@ -375,6 +383,9 @@ int main(int argc, char** argv) {
                 auto& u = part["image_url"];
                 std::string url = u.is_string() ? u.get<std::string>() : u["url"].get<std::string>();
                 if (url.rfind("data:", 0) != 0) {
+                  // A path relative to the prompts file's directory.
+                  if (!url.empty() && url[0] != '/')
+                    url = std::filesystem::absolute(vision_prompts).parent_path().string() + "/" + url;
                   std::ifstream img(url, std::ios::binary);
                   if (!img) throw std::runtime_error("cannot read " + url);
                   std::string bytes((std::istreambuf_iterator<char>(img)), std::istreambuf_iterator<char>());
