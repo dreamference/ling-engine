@@ -1,22 +1,33 @@
 #!/bin/bash
-# Waits for the GPU's earlier claims before an images window (the brief of 2026-10-26: after night 17 and the tree
-# check's window F), then runs it. Status in ~/vision/queue.status.
-#   queue.sh WINDOW_SCRIPT ARGS...
+# Waits for the GPU's earlier claims before the images windows (the coordinator's order, 2026-10-26 evening: no night
+# container; after the tree agent's window F; after verify-profile only if it already holds the lock), then runs each
+# window in turn (each takes and releases the lock itself). Status in ~/vision/queue.status.
+#   queue.sh SCRIPT [ARGS...] [-- SCRIPT [ARGS...]]...
 H=~/.ling-gpu-holds.log
 st() { echo "$(date -u +%FT%TZ) $*" > ~/vision/queue.status; }
 while true; do
-  now=$(date -u +%s); not_before=$(date -u -d "2026-10-27 07:30" +%s)
   night=$(docker ps --format '{{.Names}}' | grep -c '^ab-n17')
-  serve8300=$(ss -ltn 2>/dev/null | grep -c ':8300 ')
-  fline=$(grep -n 'window F' $H | head -1 | cut -d: -f1)
+  fline=$(grep -n '^[^ ]* tree-rows-agent .*window F' $H | head -1 | cut -d: -f1)
   fdone=0
   if [ -n "$fline" ]; then
-    tail -n +$((fline + 1)) $H | grep -qE 'tree-rows-agent lock released|tree-rows-agent.*released|UTC (agentlong|tree)' && fdone=1
+    tail -n +$((fline + 1)) $H | grep -qE 'tree-rows-agent lock released|UTC (agentlong|tree)' && fdone=1
   fi
-  if [ $now -ge $not_before ] && [ $night -eq 0 ] && [ $serve8300 -eq 0 ] && [ $fdone -eq 1 ]; then break; fi
-  st "waiting: night containers $night, 8300 listening $serve8300, window F line ${fline:-none} done $fdone"
+  # verify-profile first only when it already holds the lock: its last line is "lock taken" without a release after it.
+  vp_holds=0
+  vt=$(grep -n 'verify-profile-agent lock taken' $H | tail -1 | cut -d: -f1)
+  if [ -n "$vt" ] && ! tail -n +$((vt + 1)) $H | grep -qE 'verify-profile-agent .*released|UTC .*verify'; then vp_holds=1; fi
+  if [ $night -eq 0 ] && [ $fdone -eq 1 ] && [ $vp_holds -eq 0 ]; then break; fi
+  st "waiting: night containers $night, window F line ${fline:-none} done $fdone, verify-profile holding $vp_holds"
   sleep 60
 done
-st "running $1"
-"$@"
-st "done $1 (exit $?)"
+while [ $# -gt 0 ]; do
+  cmd=()
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do cmd+=("$1"); shift; done
+  [ "${1:-}" = -- ] && shift
+  st "running ${cmd[*]}"
+  "${cmd[@]}"
+  rc=$?
+  st "ran ${cmd[*]} (exit $rc)"
+  [ -e ~/vision/stop ] && { st "stopped before the next window (~/vision/stop)"; exit 0; }
+done
+st "done all windows"
