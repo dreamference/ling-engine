@@ -354,7 +354,8 @@ int main(int argc, char** argv) {
     return 2;
   }
   try {
-    ling::Tokenizer tok(model + "/tokenizer.json");
+    // Image prompts are tokenized as ling-serve tokenizes (production's pre-tokenizer), so their ids are production's.
+    ling::Tokenizer tok(model + "/tokenizer.json", vision_prompts.empty() ? "" : ling::kProductionPretokenizer);
     std::vector<std::vector<int>> prompts;
     ling::serve::ImageRegistry image_registry;
     std::vector<ling::PromptImage> all_images;  // every image of every prompt (begin_prefill finds each by its id)
