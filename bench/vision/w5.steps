@@ -4,6 +4,7 @@
 SRC=~/ling-engine-vision; B=$SRC/build; P=$V/../prompts.jsonl
 M=$(ls -d ~/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4/snapshots/*)
 D=$HOME/.cache/dreamference/drafters/dflash2-nvfp4-scalesearch
+step vision-tests $B/ling-vision-tests
 HUB=$HOME/.cache/huggingface
 IMG=lmsysorg/sglang@sha256:b1259f3ea3275f66237c498ea388919729018bc9f01c3d638391e06e2cf3f469
 step ref-sgl docker run --rm --gpus all --network none --name vision-refs -v $HUB:$HUB:ro -v $V/..:$V/.. -v $SRC:$SRC:ro \
