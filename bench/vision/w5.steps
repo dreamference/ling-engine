@@ -5,7 +5,7 @@
 SRC=~/ling-engine-vision; B=$SRC/build; P=$V/../prompts.jsonl; T=$V/../prompts-tails.jsonl
 M=$(ls -d ~/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4/snapshots/*)
 D=$HOME/.cache/dreamference/drafters/dflash2-nvfp4-scalesearch
-step tails-make bash -c "python3 $SRC/bench/vision/tails.py $SRC/specs/DREAMFERENCE_LING_ENGINE_VISION.md > $T"
+step tails-make bash -c "python3 $SRC/bench/chunk_tails.py $SRC/specs/DREAMFERENCE_LING_ENGINE_VISION.md > $T"
 step chunk-tails-nofix $V/../ling-run-nofix --model $M --draft $D --prompts-file $T --chunk-check 256 --max-tokens 32
 step chunk-tails-main $HOME/tree2/mainb/build/ling-run --model $M --draft $D --prompts-file $T --chunk-check 256 --max-tokens 32
 step chunk-tails $B/ling-run --model $M --draft $D --prompts-file $T --chunk-check 256 --max-tokens 32
