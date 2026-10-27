@@ -579,9 +579,20 @@ class Scheduler {
     for (const auto& o : running_)
       if (o->prefilling && !o->side_flight && eng.can_attach(o->cur)) c.push_back(o.get());
     std::stable_sort(c.begin(), c.end(), [](const Running* a, const Running* b) { return prefill_left(*a) < prefill_left(*b); });
+    // One whose yield has lasted kMaxYield goes first; otherwise the shortest (which has nothing shorter to yield to).
+    // Every other candidate's yield clock starts or runs on (yield_prefill), as its own turn would run it.
+    const auto now = std::chrono::steady_clock::now();
+    Running* chosen = nullptr;
     for (Running* p : c)
-      if (!yield_prefill(*p)) return p;
-    return nullptr;
+      if (!chosen && p->yielding && now - p->yield_t0 >= kMaxYield) chosen = p;
+    for (Running* p : c) {
+      if (p == chosen) {
+        p->yielding = false;
+        continue;
+      }
+      if (!yield_prefill(*p) && !chosen) chosen = p;
+    }
+    return chosen;
   }
   // One speculative step of `batch` (one request, or a pair) carrying the next chunk of `p` (Engine::speculate_fused),
   // then p's prompt, if that was its last chunk, starts decoding (first token emitted), and the batch's tokens are
