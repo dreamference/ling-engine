@@ -71,6 +71,10 @@ target_link_libraries(ling-run PRIVATE ling_core ling_tokenizer)
 # ling-tokenize: prints token ids for each input line (tested against the reference tokenizer).
 add_executable(ling-tokenize tools/ling_tokenize.cpp)
 target_link_libraries(ling-tokenize PRIVATE ling_tokenizer)
+# ling-tokenizer-threads-tests TOKENIZER_JSON TEXT: one tokenizer shared by 16 threads, as ling-serve's HTTP workers share it.
+find_package(Threads REQUIRED)
+add_executable(ling-tokenizer-threads-tests tests/tokenizer_threads_tests.cpp)
+target_link_libraries(ling-tokenizer-threads-tests PRIVATE ling_tokenizer Threads::Threads)
 
 # The API layer without the HTTP library, so it is testable on its own.
 add_library(ling_api STATIC src/serve/api.cpp)
