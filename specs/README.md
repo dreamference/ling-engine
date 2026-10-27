@@ -25,7 +25,7 @@ This directory holds the specification, split into focused documents. This page 
 | [DREAMFERENCE_LING_ENGINE_MILESTONES.md](./DREAMFERENCE_LING_ENGINE_MILESTONES.md) | §14 the milestones with the standing status, the agreement gate and the exactness policy; §15 risks and open questions |
 | [DREAMFERENCE_LING_ENGINE_RESEARCH.md](./DREAMFERENCE_LING_ENGINE_RESEARCH.md) | §16 the low-level speed-ups from the literature, measured or estimated; §17 sources |
 | [DREAMFERENCE_LING_ENGINE_BACKLOG.md](./DREAMFERENCE_LING_ENGINE_BACKLOG.md) | §19 what users of SGLang and vLLM asked for and what the four clients send, ranked, plus the maintainer's requests |
-| [DREAMFERENCE_LING_ENGINE_AMD.md](./DREAMFERENCE_LING_ENGINE_AMD.md) | *Written on 2026-10-26 from measurements on the AMD box and from the code:* porting the engine to AMD Strix Halo (Radeon 8060S, gfx1151) on Windows or Linux: the hardware ceiling measured, what is CUDA- or Blackwell-specific, four options with effort and exactness, how Mightling would use it, a staged plan |
+| [DREAMFERENCE_LING_ENGINE_AMD.md](./DREAMFERENCE_LING_ENGINE_AMD.md) | *Written on 2026-10-26 from measurements on the AMD box and from the code:* porting the engine to AMD Strix Halo (Radeon 8060S, gfx1151): the hardware ceiling measured, what is CUDA- or Blackwell-specific, four options with effort and exactness, how Mightling would use it, the first milestone (passed 2026-10-27) and the owner's Windows-only plan |
 
 ## Section map
 

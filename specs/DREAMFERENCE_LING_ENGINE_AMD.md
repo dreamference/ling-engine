@@ -1,23 +1,29 @@
 # ling-engine on AMD Strix Halo: a port to the AMD box, researched
 
-Part of the ling-engine specification; the index is [README.md](./README.md). Written on 2026-10-26 in answer to the owner's question of the same day, "can we port ling-engine to Windows so we can run it on the AMD box?". It has no section number in the former `SPEC.md`. **Status: research.** Nothing is ported. The measurements in §1 and §6 were taken on the box that evening over SSH with small probes, kept in `bench/amd/`; nothing was installed on it. §6.5 records the first milestone, which the owner approved once the study was written. **The owner's decision (2026-10-26):** if the first milestone passes, ling-engine is ported to the AMD chip on **Linux and Windows**, Linux first, each phase exact against a reference (§5). There is no interim llama.cpp engine in Mightling.
+Part of the ling-engine specification; the index is [README.md](./README.md). Written on 2026-10-26 in answer to the owner's question of the same day, "can we port ling-engine to Windows so we can run it on the AMD box?". It has no section number in the former `SPEC.md`. **Status:** research done, and the first milestone passed on 2026-10-27. The Windows-only port is planned (§5); no engine code is ported yet. The measurements in §1 and §6 were taken on the box that evening over SSH with small probes, kept in `bench/amd/`; nothing was installed on it. §6.5 records the first milestone, which the owner approved once the study was written. **The owner's decisions:**
+
+- **2026-10-26:** there is no interim llama.cpp engine in Mightling.
+- **2026-10-27, superseding the Linux-first plan of 2026-10-26:** the port is **Windows only**. There is no Linux phase ("later, if ever") and the box's Linux dual boot is off.
+- **2026-10-27:** **the first milestone passed** at the box's 140 W setting (§6.7), so the Windows port proceeds as §5 plans it.
 
 Every figure is tagged: *measured* (on `amd-box`, 2026-10-26, the settings named), *third-party* (source named in §7), or *estimate* (the arithmetic is shown). Mightling's side of the AMD box (the client test box, the node pieces, the Windows memory model) is in Mightling's `specs/DREAMFERENCE_MIGHTLING_AMD_NODES.md` (cited as AMD_NODES), which this document builds on and does not repeat.
 
 ## Short answer
 
-1. **Yes, it can be ported, but Windows is the expensive half, and the port is a rewrite of the kernels, not a recompile.** About 4,600 of ling-engine's 7,050 lines of device code use Blackwell or NVIDIA-only instructions (`mma.sync` fragments, `cp.async`, TMA, `ldmatrix`, block-scaled FP4 MMA) and are rewritten for RDNA 3.5's WMMA. The host side ports mechanically, except the HTTP layer (proxygen/folly) and the loader on Windows. *Estimate:* **10–14 engineer-weeks on Linux, 15–21 for Windows**, which includes the Linux work.
+1. **Yes, it can be ported, but Windows is the expensive half, and the port is a rewrite of the kernels, not a recompile.** About 4,600 of ling-engine's 7,050 lines of device code use Blackwell or NVIDIA-only instructions (`mma.sync` fragments, `cp.async`, TMA, `ldmatrix`, block-scaled FP4 MMA) and are rewritten for RDNA 3.5's WMMA. The host side ports mechanically, except the HTTP layer (proxygen/folly) and the loader on Windows. *Estimate* for the Windows-only port the owner chose: **15–21 engineer-weeks** (§5). The kernel work stays the same size; it now happens on Windows, where the tools are thinner.
 2. **The box's memory bus is not the problem.** *Measured:* a HIP read stream reaches **240 GB/s**, 94% of the 256 GB/s theoretical. That is as fast as the GB10's in-order read on `cudaMalloc` (234 GB/s, BACKLOG 19 item 28). So decode, which is bandwidth-bound, can come close to the GB10's.
-3. **Two things are worse than on the GB10: the verify's compute, and prefill.** *Measured:* WMMA sustains **40–43 TFLOPS in FP16, BF16 and INT8, and 70–83 TOPS in INT4**. There is no FP4 or FP8 matrix unit. That is 167 FLOP per byte of bus, against about 900 on the GB10. A 16-row verify still fits under the weight stream (§1.3), but prefill is compute-bound. *Estimate:* its ceiling is about **650–820 tokens/s**, against ling-engine's 2,100–2,600 on the GB10.
-4. **What the engine's design is worth here** (*estimate*, §1.2): a ling-engine-grade port with 16-row tree verification reaches about **50–60 tokens/s** on agent output. One agent turn at 32K would take about **8–9 s**, against about 4 s on the GB10, ~15 s for gufo (*third-party*) and ~18 s for llama.cpp (*measured*, §6.3). The engine's *speculation* is not the missing piece: DFlash2 already runs in upstream llama.cpp on this box. What is missing is a **verify that costs no more than a plain decode step**. *Measured* on four agentlong turns: llama.cpp's DFlash2 chain accepts **5.33 tokens per step**, close to ling-engine's 6.02–6.74 on the GB10. But its 8-row step costs **2.6× its plain decode step**, so it decodes at 22 tokens/s instead of about 50.
-5. **Plan (§5, the owner's decision of 2026-10-26).**
-   - **First milestone:** the verify kernel. Show on the box that a 16-row NVFP4/FP8 WMMA streaming GEMM over the 27B's real matrix shapes runs at ≥ 200 GB/s and costs ≤ 1.15× a one-row pass, and that a captured step graph costs ≤ 10 µs per node.
-   - **Its result (§6.5), two days in:**
-     - FP8 and the graph gate pass: FP8 runs at 212–234 GB/s with 16 rows costing what one costs, and a graph node costs 1.1 µs.
-     - NVFP4 at 16 rows **misses by about 5% under sustained load**: 190 GB/s steady over 90 s. It reaches 185–215 GB/s depending on what ran before.
-     - The step estimate is unchanged by the miss: about 107 ms, so 50–63 tokens/s.
-     - Next: re-measured once the owner sets the box's front power knob to 140 W.
-   - **If it passes, the port runs in phases:** Linux first (decode, then prefill and the node), then the Windows host layer on the same kernels. Each phase is exact against a named reference.
+3. **Two things are worse than on the GB10: the verify's compute, and prefill.** *Measured:* WMMA sustains **51–53 TFLOPS in FP16, BF16 and INT8, and 105 TOPS in INT4** at the box's 140 W setting (40–43 and 70–83 at the delivered setting). There is no FP4 or FP8 matrix unit. That is about 220 FLOP per byte of bus, against about 900 on the GB10. A 16-row verify fits under the weight stream (§1.3, measured in §6.7), but prefill is compute-bound. *Estimate:* its ceiling is about **550–850 tokens/s**, against ling-engine's 2,100–2,600 on the GB10.
+4. **What the engine's design is worth here** (*estimate*, §1.2): a ling-engine-grade port with 16-row tree verification reaches about **55–65 tokens/s** on agent output (raised from 50–60 by §6.7's kernel figures). One agent turn at 32K would take about **6–7 s**, against about 4 s on the GB10, ~15 s for gufo (*third-party*) and ~18 s for llama.cpp (*measured*, §6.3). The engine's *speculation* is not the missing piece: DFlash2 already runs in upstream llama.cpp on this box. What is missing is a **verify that costs no more than a plain decode step**. *Measured* on four agentlong turns: llama.cpp's DFlash2 chain accepts **5.33 tokens per step**, close to ling-engine's 6.02–6.74 on the GB10. But its 8-row step costs **2.6× its plain decode step**, so it decodes at 22 tokens/s instead of about 55.
+5. **Plan (§5, the owner's decisions of 2026-10-26 and 2026-10-27).**
+   - **The first milestone has passed** (§6.5–§6.7). It asked whether a 16-row NVFP4/FP8 WMMA streaming GEMM over the 27B's real matrix shapes runs at ≥ 200 GB/s and costs ≤ 1.15× a one-row pass, and whether a captured step graph costs ≤ 10 µs per node. At the box's 140 W setting:
+     - NVFP4 at 16 rows runs at **227–230 GB/s steady over 90 s**, against 190–192 at the delivered setting. It is 223–230 GB/s in every condition, 92–95% of the read stream.
+     - 16 rows cost 0.98–1.03× one row.
+     - FP8 runs at 221–222 GB/s, and a graph node costs 1.1 µs.
+   - **The port is Windows only** (the owner, 2026-10-27), in three phases (§5):
+     - W0, the Windows toolchain and bring-up;
+     - W1, decode;
+     - W2, prefill and serving with the Windows host layer.
+   - Each phase is exact against a named reference, under a determinism rule from the first kernel. Linux is "later, if ever".
 
 ---
 
@@ -57,7 +63,9 @@ Against the GB10:
 | INT4 → INT32 | 70.0–83.1 TOPS | 118.8 |
 | FP8, FP4 | **none** on gfx11 (FP8 WMMA is gfx12 and gfx1170 only, LLVM `BuiltinsAMDGPU.td`) | — |
 
-- The measured figures are about 70% of peak, the same fraction as a third-party hipBLASLt BF16 GEMM (36.9 TFLOPS, llm-tracker). The likely cause is the clock under sustained load; the clock cannot be read from Windows over SSH.
+- These figures are at the box's delivered power setting, and they are about 70% of peak, the same fraction as a third-party hipBLASLt BF16 GEMM (36.9 TFLOPS, llm-tracker). The cause was the power limit.
+- **At the 140 W setting** (the front knob, 2026-10-27, §6.7), the same probe measures **52.5 TFLOPS FP16, 51.5 BF16, 53.4 TOPS INT8 and 105.1 TOPS INT4**, 88% of peak.
+- The read stream is unchanged at 240 GB/s.
 - INT8 runs at the FP16 rate, so W8A8 buys bandwidth, not compute.
 - The NVIDIA side, for comparison: the GB10 has about 250 TFLOPS of dense FP8 and 500 TFLOPS of dense FP4 (OVERVIEW §4).
 
@@ -102,7 +110,7 @@ The right-hand column applies the GB10's ratio of step-average to read-stream ba
 - On the GB10, 21.2 GB in 102.6 ms is 207 GB/s, which is 79–88% of its read figures.
 - At 79–88% of 240 GB/s, a step on the box takes 100–112 ms.
 
-**Risk.** The GB10 hides its verify compute for free and the box does not (§1.3). If none of the verify's compute overlaps the stream, the step grows by about 20–40 ms. At τ = 6.74 that is **48 tokens/s**, the low end. The stated range is therefore **about 50–60 tokens/s** on agentlong greedy, for a port as well made as the GB10 engine.
+**Risk.** The GB10 hides its verify compute for free and the box does not (§1.3). If none of the verify's compute overlaps the stream, the step grows by about 20–40 ms. At τ = 6.74 that is **48 tokens/s**, the low end. The range stated on 2026-10-26 was therefore **about 50–60 tokens/s** on agentlong greedy, for a port as well made as the GB10 engine. The first milestone then measured the verify's compute hiding under the stream (16 rows cost what one costs, at 223–230 GB/s at 140 W, §6.7), which moves the range to **55–65 tokens/s**.
 
 The acceptance itself should carry over:
 
@@ -136,8 +144,8 @@ The acceptance itself should carry over:
 
 | Depth | At the measured 40 TFLOPS | At a realistic 65–80% of it |
 |---|---|---|
-| 0 | 820 tokens/s | 530–650 |
-| 32K | 650 tokens/s | 420–520 |
+| 0 | 820 tokens/s (1,070 at 140 W's 52 TFLOPS) | 530–650 (700–850 at 140 W) |
+| 32K | 650 tokens/s (840 at 140 W) | 420–520 (550–670 at 140 W) |
 
 **Third-party, for comparison:**
 
@@ -158,7 +166,7 @@ The method of AMD_NODES §4: a 2,000-token tail at 32K of cached context, then a
 | Engine | Prefill at 32K | Decode on agent output | One turn |
 |---|---|---|---|
 | ling-engine, GB10 | ~2,100+ (README) | ~65 (BACKLOG 19) | **~4 s** |
-| ling-engine port, box (*estimate*) | 420–520 | 50–60 | **~8–9 s** |
+| ling-engine port, box (*estimate*, 140 W) | 550–670 | 55–65 | **~6–7 s** |
 | gufo, box (*third-party*, Linux) | 413 | 19.8 mixed | ~15 s |
 | llama.cpp + DFlash2, box (*measured*, Windows, ROCm) | 226 | 22 (four agentlong turns, §6.3) | **~18 s** |
 
@@ -221,7 +229,7 @@ Read from `main` at `c5ec4ec`. Line counts are from `wc -l`.
 
 | | Linux | Windows |
 |---|---|---|
-| Decode on agentlong greedy | 50–60 tokens/s | 5–10% less |
+| Decode on agentlong greedy | 55–65 tokens/s at 140 W (§6.7) | the Windows figure is the measured one: the probe ran on Windows |
 | Prefill at 32K | 420–520 tokens/s | 420–520 tokens/s |
 
 The Windows penalty is third-party: gufo's Windows fork measured decode 7.6–9.5% slower without its Windows-only switches, `hipStreamSynchronize` returning about 0.4 ms late, and copy-engine hand-offs of about 150 µs.
@@ -242,6 +250,8 @@ The Windows penalty is third-party: gufo's Windows fork measured decode 7.6–9.
 | WDDM specifics: the DXGI budget, TDR, the carve-out, process kill, the sync latency | 1.5–2 |
 | Packaging, signing, Smart App Control (AMD_NODES §13.2) | 0.5 |
 | **Windows total, Linux included** | **15–21** |
+
+The owner chose a Windows-only port (2026-10-27). §5 re-estimates the work for that: still **15–21 weeks**, since the kernel rows stay and move to Windows.
 
 **Risks.**
 
@@ -322,6 +332,8 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 
 ### 3.4 (d) The box's Linux side only
 
+**Not chosen.** The owner decided on 2026-10-27 that the port is Windows only, and the box's Linux dual boot is off. This option is kept as the record of what Linux would have saved and cost; it is "later, if ever".
+
 **What it is.** (a) on Ubuntu 26.04 with ROCm, plus AMD_NODES §7's minimum Linux node (platform detection, a registry entry, the `/dev/kfd` launch prefix, the GTT pre-flight, the advertisement).
 
 **What it saves.**
@@ -344,7 +356,7 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 
 | | (a) HIP port | (b) into gufo / llama.cpp | (c) Vulkan | (d) Linux only |
 |---|---|---|---|---|
-| Decode, agent output (*estimate*) | 50–60 Linux; 5–10% less on Windows | gufo: toward 50–60; llama.cpp: 35–45 | as (a) | 50–60 |
+| Decode, agent output (*estimate*) | 55–65 on Windows at 140 W (§6.7) | gufo: toward 50–60; llama.cpp: 35–45 | as (a) | 50–60 |
 | Prefill at 32K | 420–520 | 413–469 (gufo), 226 (llama.cpp, *measured*) | 10–25% below (a) | 420–520 |
 | Effort, engineer-weeks | 10–14 Linux; 15–21 with Windows | 6–9 (gufo); 8–12 (llama.cpp) | 20–30 | 12–17 with the node |
 | Exact (greedy = own non-speculative) | yes | gufo yes; llama.cpp **not guaranteed** (*measured*: differs on two of three short prompts, equal on four agentlong turns) | yes | yes |
@@ -354,9 +366,9 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 **Best on Windows:**
 
 - **Of the engines that exist today:** llama.cpp (release zips, *measured* here) and gufo (native Windows build, upstream). The owner decided against an interim llama.cpp engine in Mightling (2026-10-26), so neither is planned as a Mightling engine.
-- **For ling-engine itself:** (a), after (d). This is the owner's choice: the Linux port first, then the Windows host layer on the same kernels (§5).
+- **For ling-engine itself:** (a), on Windows only. This is the owner's choice of 2026-10-27 (§5).
 
-**Best on Linux:** (d), which is (a) built where ROCm is first-class.
+**Best on Linux:** (d), which is (a) built where ROCm is first-class. Not pursued: the port is Windows only (§5).
 
 ---
 
@@ -364,14 +376,14 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 
 ### 4.1 The node role
 
-**On Linux (option d).**
+**On Linux (option d; not pursued, the port is Windows only).**
 
 - AMD_NODES §7 unchanged.
 - The registry entry names `engine: "ling"` with a platform `gfx1151`, the same checkpoint (`RadixArk/Qwen3.8-27B-NVFP4`) and the same DFlash2 drafter. The launch builder gets the AMD device prefix (`--device /dev/kfd --device /dev/dri …`).
 - The image is a ROCm base with `ling-serve`, pinned by digest.
 - Mightling's tools ask the server which model runs (`/v1/models`), so a client cannot tell the AMD node from a GB10 except by speed.
 
-**On Windows.** There is no Docker. The launcher's engine supervisor (Mightling's WINDOWS_ARM §8.3, designed, not built) runs `ling-serve.exe` as a child in a Job Object.
+**On Windows (the chosen target).** There is no Docker. The launcher's engine supervisor (Mightling's WINDOWS_ARM §8.3, designed, not built) runs `ling-serve.exe` as a child in a Job Object.
 
 - **The registry recipe** reaches Rust as a JSON export in the release (AMD_NODES §6.3).
 - **The binary** is a release asset, `ling-engine-<version>-windows-gfx1151.zip`: `ling-serve.exe`, its code objects and the vcpkg DLLs, pinned by SHA-256 like llama.cpp's zips in AMD_NODES §13.4.
@@ -380,7 +392,7 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 
 ### 4.2 Host safety
 
-**Linux:** as the GB10. That covers `check_host_safety()`, the PSI watchdog and earlyoom, plus AMD_NODES §7's GTT pre-flight, because a killed GPU process can leave tens of GiB of GTT held until a reboot (*third-party*, halogen).
+**Linux (not pursued):** as the GB10. That covers `check_host_safety()`, the PSI watchdog and earlyoom, plus AMD_NODES §7's GTT pre-flight, because a killed GPU process can leave tens of GiB of GTT held until a reboot (*third-party*, halogen).
 
 **Windows** (WINDOWS_ARM §9's design):
 
@@ -396,53 +408,68 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 - **The engine's budget.** INTEGRATION §12 budgets about 57 GB: weights and drafter ~19, embedding ~3.5, sessions 30, prefix store 2–4, scratch 2. That fits inside the 96 GB carve-out with room for a larger session pool, since the box runs nothing else that needs GPU memory.
 - **What Windows keeps:** 31.6 GB (AMD_NODES §13.2). That is enough for the launcher, the client and the desktop app.
 - **The 27B alone needs far less.** llama.cpp peaked at 19–20 GB (AMD_NODES §13.4), so 64 GB would do. The 96 GB setting is Flash-Next's.
-- **On Linux the setting is wrong:** VGM goes to its minimum and the pool comes from GTT (AMD_NODES §7).
+- **On Linux the setting would be wrong** (VGM at its minimum, the pool from GTT, AMD_NODES §7). The port is Windows only, so the 96 GB carve-out stays.
 
 ---
 
-## 5. The plan: the owner's decision of 2026-10-26
+## 5. The plan: a Windows-only port (the owner's decisions of 2026-10-26 and 2026-10-27)
 
-**The owner's decision:**
+**The decisions:**
 
-- If the first milestone passes, ling-engine is ported to the AMD chip on **Linux and Windows**.
-- The port comes in phases, the Linux port first and then the Windows host layer, and **each phase is exact against a reference**.
-- There is **no interim llama.cpp engine** in Mightling.
-- The firmware power mode goes on the owner's list: the front knob goes to 140 W.
+| Date | Decision |
+|---|---|
+| 2026-10-26 | No interim llama.cpp engine in Mightling |
+| 2026-10-26 | If the first milestone passes, port on Linux and Windows, Linux first, each phase exact against a reference. *Superseded the next day* |
+| **2026-10-27** | **The port is Windows only.** No Linux phase: Linux is "later, if ever". The box's Linux dual boot is off |
+| 2026-10-27 | The box's front power knob set to 140 W. The first milestone was re-measured at it and **passed** (§6.7) |
 
-**Why the first milestone comes first.** The most uncertain part of the port is whether a 16-row verify on gfx1151 can cost about what a one-row decode costs.
+**Why Windows-only costs about what Linux-then-Windows did.**
 
-- llama.cpp's verify does not: 2.1× on short prompts and 2.6× at 28–32K (*measured*).
-- gufo's costs 1.29× (*third-party*).
-- The engine's 50–60 tokens/s estimate stands or falls on it.
+- All of the kernel rewrite stays: the streaming GEMM, attention, prefill, DeltaNet and graphs.
+- That work now happens on Windows, where TheRock is pinned to 10.0.0 (gufo reports that later SDKs stall on gfx1151), the profilers and debuggers are thinner, and there is no rocprofv3.
+- What goes away is the Linux node (2–3 weeks) and the dual boot.
+- What comes forward is the Windows host layer, which every phase now needs: the build, the HTTP server in place of proxygen/folly, the loader and WDDM.
+- The first milestone's probe (`bench/amd/vg.hip`) has already settled the layout and decode of the streaming GEMM, which saves about a week.
+
+**The determinism rule, from the first kernel.** No kernel's result may depend on scheduling:
+
+- fixed-order reductions;
+- no split-K or reductions by atomics;
+- no data-dependent kernel choice between runs.
+
+The rule makes the references below checkable. It also keeps a later Linux build, if one ever comes, byte-comparable with the Windows one on the same box. The probe's kernels already follow it.
 
 **The references.** "Exact" means greedy output identical, byte for byte, to a named reference.
 
 | Phase | Reference | What has to hold |
 |---|---|---|
-| L1 (Linux decode) | the same Linux build's non-speculative greedy, same weights, same box | speculative greedy identical on all sixteen agentlong turns and in `ling-run --spec-check`; kernel tests against the FP32 host references of `tests/` |
-| L2 (Linux prefill and serving) | the same build's `ling-run` on the same request | `ling-serve`'s answers byte-identical to `ling-run`'s; identical with and without shared-prefix checkpoints and across prefill chunk sizes (`ling-run --prefix-check`); speculative still equal to non-speculative |
-| W1 (Windows) | **the Linux build on the same box** | the same gfx1151 code objects, so every agentlong turn byte-identical between the two operating systems |
+| W0 | the FP32 host references of `tests/` (as on the GB10) and the probe's FP32 reference kernel | every kernel within its tolerance; **two runs of every kernel bit-identical** |
+| W1 | the same Windows build's non-speculative greedy, same weights, same box | speculative greedy identical on all sixteen agentlong turns and in `ling-run --spec-check`; **two complete agentlong runs byte-identical** |
+| W2 | the same build's `ling-run` on the same request | `ling-serve`'s answers byte-identical to `ling-run`'s; identical with and without shared-prefix checkpoints and across prefill chunk sizes (`ling-run --prefix-check`); speculative still equal to non-speculative |
 
-What the references rely on:
+**Quality against the GB10.** The GB10's output is not an exactness reference, because its arithmetic differs. Against it the port is measured for quality: top-1 agreement teacher-forced over the agentlong turns (`bench/validate_v0.py`'s method), with a bar set in W1.
 
-- **W1's reference is possible because both builds run the same kernels on the same GPU.** It holds only if no kernel's result depends on scheduling. So there is one design rule from L1 on: **deterministic kernels**. That means fixed-order reductions and no split-K by atomics; the probe's kernels already follow it.
-- **The GB10's output is not a reference.** Its arithmetic differs. Against it the port is measured for quality, as top-1 agreement teacher-forced over the agentlong turns (`bench/validate_v0.py`'s method), not for identity.
+**The phases** (*estimate*, one engineer who knows the engine):
 
-**The phases:**
+| Phase | What | Effort | Gate to the next |
+|---|---|---|---|
+| **M1 (passed, 2026-10-27)** | The verify-kernel probe (§6.5–§6.7) | 3 days | NVFP4 and FP8 at 16 rows ≥ 200 GB/s and ≤ 1.15× one row; graph ≤ 10 µs per node. **Measured at 140 W:** 223–230 and 221–222 GB/s, 0.98–1.03×, 1.1 µs |
+| **W0** | The Windows toolchain and bring-up: a build machine with Visual Studio Build Tools + the Windows SDK + TheRock 10.0.0 + vcpkg (ICU, PCRE2, nlohmann_json); CMake with clang-cl; hipify of the host code; the portable kernels (norms, conv, DeltaNet recurrence, sampling, top-k, drafter non-GEMM parts); the loader on `MapViewOfFile`; kernel tests green on the box | 3–4 weeks | W0's reference; the test binaries run on the box against the driver's HIP runtime (§6.4) |
+| **W1** | Decode: the streaming GEMM from the probe (NVFP4 and FP8, 1–16 rows, the head and the drafter's shapes), decode and verify attention over BF16 KV, split across the KV length with a fixed-order combine, DeltaNet with the tree replay, the drafter, the tree and lookup, `hipGraph` capture of the step, `ling-run` on Windows | 6–8 weeks | W1's reference; **≥ 50 tokens/s on agentlong greedy**; the GB10 quality bar |
+| **W2** | Prefill on WMMA (W4A16/W8A16 FP16, or W8A8 INT8), prefill DeltaNet; `ling-serve` with a Windows HTTP layer (a small server for the routes of [API](./DREAMFERENCE_LING_ENGINE_API.md), or proxygen if it builds); WDDM host safety (the DXGI budget, TDR-bounded kernels, the 96 GB carve-out, kill and restart); packaging as a zip against the driver's HIP runtime; signing | 6–9 weeks | W2's reference; prefill ≥ 500 tokens/s at 32K; a Work session from a client against the box |
+| **Total** | | **15–21 engineer-weeks** | |
 
-| Phase | What | Where | Effort (*estimate*) | Gate to the next |
-|---|---|---|---|---|
-| **0 (done, 2026-10-26)** | The bus, WMMA, and llama.cpp's DFlash2 on the box: acceptance, step cost and exactness on three prompts and four agentlong turns (§6.2, §6.3); the driver's HIP runtime (§6.4) | Windows, release zips | — | — |
-| **M1, the first milestone** | The verify-kernel probe: the FFN gate\|up (5120 × 34,816, NVFP4) and the DeltaNet in-projection (5120 × 16,384, FP8) decoded to FP16 and multiplied on WMMA for M = 1, 16, 32; a captured graph of 330 kernels | Windows as it is (§6's harness) | ~1 week; **two days spent, §6.5** | M = 16 at **≥ 200 GB/s** and **≤ 1.15×** the M = 1 time; graph gap ≤ 10 µs per node. **Status:** FP8 and the graph pass; NVFP4 misses by ~5% under sustained load (190 GB/s), to re-measure at 140 W |
-| **L1** | The decode port on Linux (dual boot): streaming GEMM, attention, DeltaNet, drafter, tree, graphs | Linux | 7–9 weeks | exact against L1's reference; ≥ 45 tokens/s on agentlong greedy |
-| **L2** | Prefill on WMMA; `ling-serve` on the Linux node (AMD_NODES §7's minimum node, `engine: "ling"`) | Linux | 4–6 weeks, plus 2–3 for the node | exact against L2's reference; a Work session from a client against the box; prefill ≥ 400 tokens/s at 32K |
-| **W1** | The Windows host layer of §3.1: the build (clang-cl + MSVC + Windows SDK, TheRock 10.0.0 pinned), an HTTP layer in place of proxygen, the loader, WDDM (the DXGI budget, TDR, the carve-out), packaging against the driver's HIP runtime (§6.4); the launcher's engine supervisor | Windows | 5–7 weeks | exact against the Linux build on the same box; agentlong decode within 10% of Linux |
+**Outside the engine, and separate:** Mightling's side of a Windows node (AMD_NODES §6.4, about 4–5 weeks). That covers the launcher's engine supervisor, the registry export, the watchdog, the advertisement and the egress audit of the engine's process. It can run beside W1–W2.
 
-**If M1 fails for good** (still under its gate at 140 W after the NVFP4 decode work), the decision returns to the owner. The ling-engine port would then be worth little more than gufo already is.
+**Needs from the owner:**
+
+- **A Windows build machine.** The box has no Visual Studio or Windows SDK. Installing the Build Tools there is an install on a shared box, so it is the owner's call; the alternative is a separate Windows machine or CI runner, with the binaries copied to the box.
+- **Signing** for the shipped zip (WINDOWS_ARM §16.3).
+- The reboot the owner still owes for Smart App Control does not affect the measurements.
 
 ---
 
-## 6. What was run on the box (2026-10-26, 22:15–23:56 UTC, box clock)
+## 6. What was run on the box (2026-10-26 22:15 UTC to 2026-10-27 09:10 UTC, box clock)
 
 Scratch files are in `C:\llm\amd-port` on the box; the probes are also in this repository under `bench/amd/`. Nothing was installed, no driver or setting was changed, and the downloads came to 1.14 GB (the drafter).
 
@@ -618,8 +645,56 @@ Two findings came out of these runs:
 
 **What is left:**
 
-- The re-measurement once the owner sets the front power knob to 140 W. The BIOS name ends in `120W`, and the firmware mode cannot be read from Windows.
+- The re-measurement once the owner sets the front power knob to 140 W (done: §6.7, passed). The BIOS name ends in `120W`, and the firmware mode cannot be read from Windows.
 - If NVFP4 is still under the gate at 140 W, one more decode idea: scaling per 16-row chunk on the accumulator instead of per pair. It counts as many operations but frees the packed-multiply port.
+
+### 6.7 The first milestone at 140 W: passed
+
+The owner set the box's front power knob to 140 W on 2026-10-27. *Measured* the same morning (box clock, 08:58–09:10 UTC) with the same code object as §6.6 (`-DKMAJOR -DNT -DKC=256 -DLUT -DXDB`), with no code changed. A `ling exec` test of the Windows fix agent was running at the time; it uses the GB10 node, not the GPU.
+
+**The NVFP4 16-row kernel**, the gate's open item:
+
+| Condition | M = 1 | M = 16 | M = 16 ÷ M = 1 time | At 120 W (§6.6) |
+|---|---|---|---|---|
+| **continuous for 90 s** (wall clock per window) | — | **229.4–230.1 GB/s, steady** | — | 190–192 |
+| fresh process (`-Quick 1`, two runs) | 219–230 GB/s | **223–229 GB/s** | 0.98–1.03 | 185–193 |
+| after the ten checks (two full runs) | 222–230 GB/s | **227–230 GB/s** | 1.00 | 211–215 |
+
+**Everything else:**
+
+| Kernel or measurement | At 140 W |
+|---|---|
+| FP8 at 16 rows | 220–222 GB/s, 1.01× one row |
+| FP8 at 32 rows, two tiles per wave | 208–210 GB/s |
+| NVFP4 at 32 rows, two tiles per wave | 198–199 GB/s |
+| Read stream | 240–243 GB/s (unchanged) |
+| WMMA, FP16 / BF16 / INT8 / INT4 | 52.5 / 51.5 / 53.4 / 105.1 (TFLOPS or TOPS) |
+| Graph node (§6.6) | 1.1 µs |
+
+All kernels stay within 1.4–1.6 × 10⁻⁵ of the FP32 reference.
+
+**Verdict: the first milestone passes.**
+
+- NVFP4 at 16 rows runs at 223–230 GB/s in every condition. That is above the 200 GB/s gate and 92–95% of the read stream.
+- 16 rows cost what one costs, within 3%.
+- FP8 and the graph gate passed already.
+- The 120 W shortfall was the power limit, not the kernel: the read stream does not change between the settings, and the matrix rate rises by 30%.
+- **The extra decode change is not needed.**
+- At 140 W even 32 rows nearly fit (198–210 GB/s), so batches of two sequences at 16 rows each come within reach. On the GB10 that is M4's batch path; here it remains to be measured inside a whole step.
+
+**The estimate it gives** (*estimate*):
+
+- 10.35 GB of NVFP4 at ~228 GB/s and 7.2 GB of FP8 at ~221 GB/s is 78 ms of weights.
+- With ~3.6 GB of drafter, KV and state at ~220 GB/s, and ~5–10 ms the probe does not contain (attention compute, the DeltaNet recurrence, sampling, accept, graph gaps), the step is about **100–110 ms**.
+- At τ = 6.74 that is **61–67 tokens/s**; at the 5.33 llama.cpp's chain reaches on the box, 48–53.
+- Hence §1.2's range moves to **55–65 tokens/s**, about the GB10's 65.
+- Prefill at 140 W: §1.4's ceiling rises to 550–670 tokens/s at 32K. One agent turn at 32K is then about 2,000 ÷ 600 + 200 ÷ 60 ≈ **6–7 s**.
+
+**Still to measure inside the port** (W1), not here:
+
+- the whole step's overhead;
+- the attention kernel at 25–32K with 16 rows;
+- sustained behaviour over an agent session rather than 90 s.
 
 ---
 
