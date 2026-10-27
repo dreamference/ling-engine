@@ -1,47 +1,22 @@
-# Images window 5: the agreement study again (ling-run now keeps the tools' key order), then ling-serve with images:
-# its cold time to first token on the prompt set (as window 1 measured production's) and the HTTP tests, which run
-# from the main machine against port 18101 while the server waits for ~/vision/serve.done (at most 15 minutes).
-SRC=~/ling-engine-vision; B=$SRC/build; P=$V/../prompts.jsonl
+# Images window 5: the chunk-check item of window 3 (image prompt 4's continuation took 12 steps and 58 drafts against
+# 11 and 59), then the kernel tests, resumes inside images and SGLang's own tower as a second floor.
+# The chunk item: text prompts whose last chunk of 256 is at most 32 rows, on the build before the fix (the drafter
+# context compared bit for bit), on main (c5ec4ec, its own check) and on the fixed build; then the image prompts.
+SRC=~/ling-engine-vision; B=$SRC/build; P=$V/../prompts.jsonl; T=$V/../prompts-tails.jsonl
 M=$(ls -d ~/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4/snapshots/*)
 D=$HOME/.cache/dreamference/drafters/dflash2-nvfp4-scalesearch
+step tails-make bash -c "python3 $SRC/bench/vision/tails.py $SRC/specs/DREAMFERENCE_LING_ENGINE_VISION.md > $T"
+step chunk-tails-nofix $V/../ling-run-nofix --model $M --draft $D --prompts-file $T --chunk-check 256 --max-tokens 32
+step chunk-tails-main $HOME/tree2/mainb/build/ling-run --model $M --draft $D --prompts-file $T --chunk-check 256 --max-tokens 32
+step chunk-tails $B/ling-run --model $M --draft $D --prompts-file $T --chunk-check 256 --max-tokens 32
+step chunk-check $B/ling-run --model $M --draft $D --vision-prompts $P --chunk-check 256 --max-tokens 32
 step vision-tests $B/ling-vision-tests
 HUB=$HOME/.cache/huggingface
 IMG=lmsysorg/sglang@sha256:b1259f3ea3275f66237c498ea388919729018bc9f01c3d638391e06e2cf3f469
 step ref-sgl docker run --rm --gpus all --network none --name vision-refs -v $HUB:$HUB:ro -v $V/..:$V/.. -v $SRC:$SRC:ro \
   -e HF_HUB_OFFLINE=1 -e ONLY_SGL=1 --entrypoint python3 $IMG $SRC/bench/vision/reference.py $M $V/../ref
 step vision-check-sgl bash -c "[ -e $V/../ref/icon.sgl.bf16 ] && $B/ling-run --model $M --vision-check $V/../ref || echo no SGLang dumps"
-step greedy $B/ling-run --model $M --vision-prompts $P --greedy-out $V/../engine-greedy.jsonl --max-tokens 48
-step cases python3 $SRC/bench/vision/agree.py cases $V/..
-step force bash -c "$B/ling-run --model $M --vision-prompts $P --force-file $V/../cases.jsonl > $V/../engine-force.jsonl"
-step agree python3 $SRC/bench/vision/agree.py $V/..
 # Resumes inside an image: the same 8K-token image under two questions (a kept state inside it), two images whose
 # second differs (a resume between them), and the exactness of each against a prefill from scratch.
 step prefix-check-resume $B/ling-run --model $M --draft $D --vision-prompts $V/../prompts-resume.jsonl --prefix-check --sessions 1 --max-tokens 32
-serve() {
-  rm -f ~/vision/serve.done ~/vision/serve.ready
-  setsid $B/ling-serve --model $M --draft $D --port 18101 --served-model-name RadixArk/Qwen3.8-27B-NVFP4 \
-    --max-context 65536 --draft-block 12 --graphs --pdl > $V/serve.log 2>&1 8>&- < /dev/null &
-  local srv=$!
-  for i in $(seq 1 120); do curl -sf -m 2 localhost:18101/health > /dev/null && break; sleep 3; done
-  python3 - $P <<'PY'
-import base64, json, os, sys, time, urllib.request
-base = os.path.dirname(sys.argv[1])
-for line in open(sys.argv[1]):
-    body = json.loads(line)
-    for m in body["messages"]:
-        if isinstance(m.get("content"), list):
-            for p in m["content"]:
-                if "image_url" in p:
-                    u = p["image_url"]["url"]
-                    p["image_url"]["url"] = "data:image;base64," + base64.b64encode(open(os.path.join(base, u), "rb").read()).decode()
-    body.update(model="RadixArk/Qwen3.8-27B-NVFP4", max_tokens=1, temperature=0)
-    t = time.time()
-    r = json.loads(urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:18101/v1/chat/completions",
-        data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}), timeout=600).read())
-    print(f"{time.time() - t:.3f} s, prompt {r['usage']['prompt_tokens']} tokens", flush=True)
-PY
-  touch ~/vision/serve.ready
-  for i in $(seq 1 180); do [ -e ~/vision/serve.done ] && break; sleep 5; done
-  kill $srv; wait $srv 2>/dev/null
-}
-step serve serve
+step chunk-check-nofix $V/../ling-run-nofix --model $M --draft $D --vision-prompts $P --chunk-check 256 --max-tokens 32

@@ -1,0 +1,38 @@
+# Images window 6: the agreement study again (ling-run now keeps the tools' key order), then ling-serve with images:
+# its cold time to first token on the prompt set (as window 1 measured production's) and the HTTP tests, which run
+# from the main machine against port 18101 while the server waits for ~/vision/serve.done (at most 15 minutes).
+SRC=~/ling-engine-vision; B=$SRC/build; P=$V/../prompts.jsonl
+M=$(ls -d ~/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4/snapshots/*)
+D=$HOME/.cache/dreamference/drafters/dflash2-nvfp4-scalesearch
+step greedy $B/ling-run --model $M --vision-prompts $P --greedy-out $V/../engine-greedy.jsonl --max-tokens 48
+step cases python3 $SRC/bench/vision/agree.py cases $V/..
+step force bash -c "$B/ling-run --model $M --vision-prompts $P --force-file $V/../cases.jsonl > $V/../engine-force.jsonl"
+step agree python3 $SRC/bench/vision/agree.py $V/..
+serve() {
+  rm -f ~/vision/serve.done ~/vision/serve.ready
+  setsid $B/ling-serve --model $M --draft $D --port 18101 --served-model-name RadixArk/Qwen3.8-27B-NVFP4 \
+    --max-context 65536 --draft-block 12 --graphs --pdl > $V/serve.log 2>&1 8>&- < /dev/null &
+  local srv=$!
+  for i in $(seq 1 120); do curl -sf -m 2 localhost:18101/health > /dev/null && break; sleep 3; done
+  python3 - $P <<'PY'
+import base64, json, os, sys, time, urllib.request
+base = os.path.dirname(sys.argv[1])
+for line in open(sys.argv[1]):
+    body = json.loads(line)
+    for m in body["messages"]:
+        if isinstance(m.get("content"), list):
+            for p in m["content"]:
+                if "image_url" in p:
+                    u = p["image_url"]["url"]
+                    p["image_url"]["url"] = "data:image;base64," + base64.b64encode(open(os.path.join(base, u), "rb").read()).decode()
+    body.update(model="RadixArk/Qwen3.8-27B-NVFP4", max_tokens=1, temperature=0)
+    t = time.time()
+    r = json.loads(urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:18101/v1/chat/completions",
+        data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}), timeout=600).read())
+    print(f"{time.time() - t:.3f} s, prompt {r['usage']['prompt_tokens']} tokens", flush=True)
+PY
+  touch ~/vision/serve.ready
+  for i in $(seq 1 180); do [ -e ~/vision/serve.done ] && break; sleep 5; done
+  kill $srv; wait $srv 2>/dev/null
+}
+step serve serve
