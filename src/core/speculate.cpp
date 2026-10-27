@@ -960,7 +960,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   // 2. Verify, with each row's top K (the argmax when greedy) on the GPU.
   std::copy(sp.rows.begin(), sp.rows.end(), pin_->rows);
   join_commit();  // the previous step's DeltaNet replay, beside this step's draft until here
-  if (graph) {
+  if (graph && !rider_) {  // a verify carrying a chunk (C2, forward_fused) runs eagerly
     cudaGraphExec_t& g = (sp.tree ? s_->tree_verify_graphs : s_->verify_graphs)[K];
     run_graph(g, "verify", [&] { verify_launch(V, K, sp.tree); });
   } else {
@@ -1146,7 +1146,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   // sequence: the verify wrote no state of it, its commit is skipped and its session reset.
   for (const StepPlan& sp : plans) std::copy(sp.rows.begin(), sp.rows.end(), pin_->rows + sp.row0);
   join_commit();  // the previous step's DeltaNet replays, beside this step's draft until here
-  if (graph) {
+  if (graph && !rider_) {  // a verify carrying a chunk (C2, forward_fused) runs eagerly
     std::vector<int> ks(n);
     for (int i = 0; i < n; ++i) ks[i] = plans[i].K;
     run_graph(bg->verify[ks], "verify", [&] { verify_batch_launch(plans, V); });

@@ -121,6 +121,12 @@ struct EngineOptions {
   // kernels stay off the other SMs and the decode keeps them; -1: a plain second stream (no partition); 0: off.
   // The same kernels on the same inputs, so the same bits (--interleave-check with --side-prefill).
   int side_prefill = 0;
+  // The fused pass (BATCHING §5.5, C2; drafts/C2-integration-2026-10-28.md): a prefill chunk of at most fused_chunk
+  // tokens attached to a speculative step's verify (speculate_fused), one weight read per projection for both row
+  // groups, each with its own path's arithmetic. Needs side_prefill != 0 (the chunk's rows use the side set). Off by
+  // default until measured.
+  bool fused_pass = false;
+  int fused_chunk = 256;
   // Tree verification (BACKLOG 26): this many drafter candidates beyond the chain verified in the same pass, as a
   // tree (core/tree.hpp), on one-stream steps; 0: the chain alone. On by default since 2026-10-19 (the owner's
   // decision) at the measured shape: the chain's first 8 drafts plus 7 nodes at temperature 1.5, 16 rows.
@@ -310,6 +316,22 @@ class Engine {
   // draft block (a shorter block or a plain step runs alone, M4 §2).
   bool can_batch(int session, const SamplingParams& p) const;
   void speculate_batch(std::span<SeqStep> seqs);
+  // The fused pass (C2, EngineOptions::fused_pass): one speculative step of `seqs`, as speculate_batch takes it (one
+  // entry: speculate's one-row step, tree and all), with the next chunk of `cur` (at most max_tokens, 0: fused_chunk)
+  // attached to its verify. The verify runs forward_fused: per projection one launch reads each weight tile once for
+  // the verify's rows and the chunk's rows, each with its own path's arithmetic, so every sequence's tokens, state and
+  // accepted drafts are bit for bit what speculate_batch gives it and the chunk's state what prefill_chunk gives it
+  // (ling-run --fused-check). The draft and commit replay their graphs; the fused verify runs eagerly. Needs
+  // can_attach(cur), every entry can_batch and none of them the chunk's session. Returns what prefill_chunk returns,
+  // the chunk's session active and logits() its logits (as prefill_chunk_finish leaves them); a sequence whose rows
+  // are not finite gets its error in its entry, as in speculate_batch. On any other error the chunk's session is reset.
+  bool can_attach(const PrefillCursor& cur) const;
+  // chunk_error, when given, takes an error of the chunk's finish (a non-finite pass) instead of a throw, since the
+  // sequences' results stand.
+  bool speculate_fused(std::span<SeqStep> seqs, PrefillCursor& cur, int max_tokens = 0,
+                       std::exception_ptr* chunk_error = nullptr);
+  bool fused_enabled() const { return opts_.fused_pass; }
+  int fused_chunk() const { return opts_.fused_chunk; }
   // The active session's speculation counters (each session counts its own steps, M4 §3), its lookup
   // shadow records scored as far as known.
   const SpecStats& spec_stats() {
@@ -783,8 +805,22 @@ class Engine {
     int soft_at = -1;  // the soft point whose state the pass captured into soft_slot_ (-1: none, or the snap)
     std::chrono::steady_clock::time_point t;
   };
-  ChunkRun chunk_begin(PrefillCursor& cur, int max_tokens);  // prefill_chunk's pass, launched
+  // The chunk attached to a fused verify (C2): its session, its ids, its rows, and the state slot its keep_at
+  // writes into (the snap or the soft slot), planned by chunk_begin and run by forward_fused.
+  struct Rider {
+    Session* s = nullptr;
+    const int* ids = nullptr;
+    int M = 0, keep_at = -1;
+    StateSlot keep;
+    bool ran = false;
+  };
+  ChunkRun chunk_begin(PrefillCursor& cur, int max_tokens, Rider* rider = nullptr);  // prefill_chunk's pass, launched
+                                                                                    // (rider: planned only, for C2)
   bool chunk_end(PrefillCursor& cur, const ChunkRun& run);   // and everything after it
+  Rider* rider_ = nullptr;  // set during speculate_fused: the verify forward takes forward_fused
+  bool fused_ok_ = false;   // the model's shapes allow the fused pass (gate and up share an input scale, ...)
+  cudaEvent_t fz_main_ = nullptr, fz_side_ = nullptr;  // the fused pass's handoffs between the main and side streams
+  void forward_fused(const int* ids, int M, std::span<const Seg> segs, Rider& rd);
   void alloc_scratch();
 #define LING_SIDE_SET(X)                                                                                     \
   X(h_) X(xn_) X(t1_) X(t2_) X(mixed_) X(z_) X(a_) X(b_) X(g_) X(beta_) X(core_) X(normed_) X(q_gate_) X(k_)     \

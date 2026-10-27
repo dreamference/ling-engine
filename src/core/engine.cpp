@@ -329,6 +329,24 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     std::fprintf(stderr, "prefill beside a decode: a second stream%s\n",
                  opts_.side_prefill > 0 ? (" on a green context of " + std::to_string(opts_.side_prefill) + " SMs").c_str() : "");
   }
+  if (const char* e = std::getenv("LING_FUSED_PASS")) opts_.fused_pass = std::atoi(e) != 0;
+  if (opts_.fused_pass) {
+    // C2: the chunk's rows take the side set; its projections the fused kernels, which need every matrix's N and K in
+    // multiples of 128 and the FFN's gate and up quantized alike (the prefill's one SwiGLU GEMM).
+    if (opts_.side_prefill == 0) throw std::runtime_error("the fused pass needs the side set (side_prefill != 0)");
+    if (opts_.fused_chunk < kResumeAlign || opts_.fused_chunk % kResumeAlign != 0 || opts_.fused_chunk > opts_.prefill_chunk)
+      throw std::runtime_error("fused_chunk must be a multiple of 32 in [32, prefill_chunk]");
+    fused_ok_ = !opts_.prefill_bf16 && model_->lm_head().N % 128 == 0 && model_->lm_head().K % 128 == 0;
+    for (const LayerWeights& L : model_->layers()) {
+      fused_ok_ = fused_ok_ && L.gate.in_scale == L.up.in_scale && L.gate.N % 128 == 0 && L.down.N % 128 == 0;
+      if (L.full) fused_ok_ = fused_ok_ && L.q.N % 128 == 0 && L.k.N % 128 == 0 && L.v.N % 128 == 0 && L.o.N % 128 == 0;
+      else fused_ok_ = fused_ok_ && L.in_qkv.N % 128 == 0 && L.in_z.N % 128 == 0 && L.out.N % 128 == 0;
+    }
+    for (cudaEvent_t* ev : {&fz_main_, &fz_side_})
+      check(cudaEventCreateWithFlags(ev, cudaEventDisableTiming), "fused event");
+    std::fprintf(stderr, "fused pass: %s, chunks of up to %d tokens attached to a decode's verify\n",
+                 fused_ok_ ? "on" : "OFF (the model's shapes do not allow it)", opts_.fused_chunk);
+  }
   // The prefix KV store (BACKLOG 35) last, from what the engine's own allocations left: one arena allocated now, so the
   // footprint is fixed at start and never grows while serving. It takes at most prefix_kv_mb and leaves
   // LING_PREFIX_KV_RESERVE_MB (default 16 GB) of the device's free memory untouched (the host's safety margin and what
@@ -982,6 +1000,11 @@ void Engine::forward(const int* ids, int M, Pass pass, int keep_at) {
 }
 
 void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::span<const Seg> segs) {
+  if (pass == Pass::Verify && rider_ && !rider_->ran && !side_active_) {  // C2: the verify carries a chunk
+    rider_->ran = true;
+    forward_fused(ids, M, segs, *rider_);
+    return;
+  }
   join_commit();  // a no-op inside a verify's capture: speculate joins before the verify
   const ModelConfig& c = model_->config();
   const bool rows = M <= kernels::kMaxStreamRows, verify = pass == Pass::Verify;
@@ -1432,6 +1455,252 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   s_->pos += M;
 }
 
+// The fused pass (BATCHING §5.5, C2; drafts/C2-integration-2026-10-28.md). A verify's M rows (segs, as forward_rows
+// takes them, in the main set) and a prefill chunk's rd.M rows (rd.s, in the side set) go through the model together:
+// each projection is one fused launch on the main stream that reads its weights once and computes the verify's rows
+// with the stream GEMM's arithmetic and the chunk's with the prefill GEMM's (fused_gemm.cu). Everything else is the
+// two row groups' own kernels, called as forward_rows calls them: the verify's on the main stream (the rows path's
+// branches; the megakernels hold their own stream GEMMs, so a fused verify does not take them), the chunk's on the
+// side stream (the prefill path's branches, which run the chunk's attention, KV writes, conv and recurrence in its own
+// session). Around each projection the main stream waits for the side stream's input and the side stream for the
+// projection's output; between projections the two groups' state kernels run side by side. The chunk's tail (its
+// last row's logits into the side's pinned buffer, side_done_) is the side pass's, so prefill_chunk_finish takes over.
+void Engine::forward_fused(const int* ids, int M, std::span<const Seg> segs, Rider& rd) {
+  join_commit();
+  const ModelConfig& c = model_->config();
+  if (use_dev_pos_) throw std::runtime_error("the fused pass inside a step graph's capture");
+  if (!fused_ok_) throw std::runtime_error("the fused pass is off for this model");
+  if (M < 1 || M > kernels::kMaxStreamRows) throw std::runtime_error("fused pass: the verify takes 1 to 32 rows");
+  if (segs.empty() || segs.size() > static_cast<size_t>(kernels::kMaxSeqs)) throw std::runtime_error("fused pass: segments");
+  int seg_rows = 0;
+  for (const Seg& g : segs) {
+    if (g.row0 != seg_rows || g.rows < 1) throw std::runtime_error("forward: segments must tile the rows in order");
+    if (g.s->pos + g.rows > opts_.max_context) throw std::runtime_error("context is longer than max_context");
+    if (g.s == rd.s) throw std::runtime_error("fused pass: the chunk's session is also verified");
+    seg_rows += g.rows;
+  }
+  if (seg_rows != M) throw std::runtime_error("forward: segments must tile the rows");
+  Session& cs = *rd.s;
+  const int Mp = rd.M, keep_at = rd.keep_at;
+  if (Mp < 1 || Mp > opts_.prefill_chunk) throw std::runtime_error("fused pass: the chunk's rows");
+  if (cs.pos + Mp > opts_.max_context) throw std::runtime_error("context is longer than max_context");
+  const bool multi = segs.size() > 1;
+  kernels::SeqBatch sb;
+  sb.n = static_cast<int>(segs.size());
+  for (int i = 0; i < sb.n; ++i) {
+    sb.row0[i + 1] = segs[i].row0 + segs[i].rows;
+    sb.pos[i] = segs[i].s->pos;
+    sb.rdelta[i] = segs[i].s->rope_delta;
+  }
+  quantized_ = false;  // the main set's rows: the rows path
+  NvtxRange range("fused");
+  const int H = c.hidden, I = c.intermediate, C = c.lin_conv_channels(), Vs = c.lin_value_size();
+  const int qsize = c.heads * c.head_dim, kvsize = c.kv_heads * c.head_dim, VH = c.lin_v_heads;
+  SideSet& P = side_;  // the chunk's set (its scratch, its stream)
+  cudaStream_t ms = stream_, ss = P.stream_;
+  // As a prefill pass leaves its set: chunk_end's drafter context takes the prefill path (quantized_), and P.xq_ is
+  // overwritten here, so nothing in it is reusable afterwards.
+  P.quantized_ = true;
+  P.xq_scale_ = 0.f;
+  auto seg_pos = [](const Seg& g, int off) { return kernels::DevPos(g.s->pos + off).with_rope(g.s->rope_delta, nullptr); };
+  auto chunk_pos = [&](int off) { return kernels::DevPos(cs.pos + off).with_rope(cs.rope_delta, nullptr); };
+  // The handoffs: the main stream after the side stream's work so far (a projection's chunk input), and back.
+  auto to_main = [&] {
+    check(cudaEventRecord(fz_side_, ss), "fused handoff");
+    check(cudaStreamWaitEvent(ms, fz_side_, 0), "fused handoff");
+  };
+  auto to_side = [&] {
+    check(cudaEventRecord(fz_main_, ms), "fused handoff");
+    check(cudaStreamWaitEvent(ss, fz_main_, 0), "fused handoff");
+  };
+  // What the chunk's quantized input holds (Engine::set_xq / xq_is for the side set).
+  float cq_scale = 0.f;
+  bool cq_nvfp4 = false;
+  auto cq_set = [&](float s, bool nvfp4) {
+    cq_scale = s;
+    cq_nvfp4 = nvfp4;
+  };
+  auto cq_is = [&](float s, bool nvfp4) { return s != 0.f && cq_scale == s && cq_nvfp4 == nvfp4; };
+  // linear_fp8_multi's prefill branch for one matrix: the chunk's FP8 input, quantized again only when the matrix's
+  // input scale differs from what P.xq_ holds.
+  auto chunk_quant_fp8 = [&](const Fp8Weight& w, const float* x, bool x_ready) {
+    if (!(x_ready && cq_is(w.in_scale, false))) kernels::quant_act_fp8(x, Mp, w.K, w.in_scale, P.xq_, ss);
+    cq_set(w.in_scale, false);
+  };
+  // One FP8 projection: the verify's rows from xh_/xinv_ into yd, the chunk's from P.xq_ into yp (ldy, or += ).
+  auto fused_fp8 = [&](const Fp8Weight& w, float* yd, float* yp, int ldy, bool accumulate) {
+    to_main();
+    kernels::fused_gemm_fp8(xh_, xinv_, M, yd, w.scale, P.xq_, Mp, w.w, w.in_scale * w.scale, yp, ldy, w.N, w.K,
+                            accumulate, ms);
+    to_side();
+  };
+
+  // The ids and embeddings; the chunk's side stream already waits for the main stream's work before this pass
+  // (speculate_fused), so its session's KV and state are as begin_prefill and earlier chunks left them.
+  check(cudaMemcpyAsync(ids_dev_, ids, M * sizeof(int), cudaMemcpyHostToDevice, ms), "ids");
+  kernels::embed(model_->embed(), ids_dev_, M, H, h_, ms);
+  check(cudaMemcpyAsync(P.ids_dev_, rd.ids, Mp * sizeof(int), cudaMemcpyHostToDevice, ss), "chunk ids");
+  kernels::embed(model_->embed(), P.ids_dev_, Mp, H, P.h_, ss);
+  const bool keep = keep_at > 0 && keep_at < Mp;
+
+  for (int li = 0; li < c.layers; ++li) {
+    const LayerWeights& L = model_->layers()[li];
+    const int slot = layer_slot_[li];
+    if (L.full) {
+      NvtxRange r("attention");
+      kernels::rmsnorm_half(h_, L.input_norm, xn_, xh_, xinv_, M, H, c.eps, true, ms);
+      const bool f32 = L.k.in_scale != L.q.in_scale || L.v.in_scale != L.q.in_scale;
+      kernels::rmsnorm_quant(P.h_, L.input_norm, f32 ? P.xn_ : nullptr, Mp, H, c.eps, false, L.q.in_scale, P.xq_, P.xsf_,
+                             ss);
+      cq_set(L.q.in_scale, false);
+      chunk_quant_fp8(L.q, P.xn_, true);
+      fused_fp8(L.q, q_gate_, P.q_gate_, L.q.N, false);
+      chunk_quant_fp8(L.k, P.xn_, true);
+      fused_fp8(L.k, k_, P.k_, L.k.N, false);
+      chunk_quant_fp8(L.v, P.xn_, true);
+      fused_fp8(L.v, v_, P.v_, L.v.N, false);
+      // The verify's rows: per sequence (M4 §2), into each session's cache, over its context (forward_rows' branch).
+      if (multi) {
+        kernels::SeqPtrs<__nv_bfloat16> kc, vc;
+        kernels::SeqPtrs<const __nv_bfloat16> kcr, vcr;
+        for (int i = 0; i < sb.n; ++i) {
+          kcr.p[i] = kc.p[i] = segs[i].s->kcache[slot];
+          vcr.p[i] = vc.p[i] = segs[i].s->vcache[slot];
+        }
+        kernels::attn_prepare_seqs(q_gate_, k_, v_, L.q_norm, L.k_norm, sb, c.heads, c.kv_heads, c.head_dim, c.rotary_dim,
+                                   c.rope_theta, c.eps, q_, gate_, kc, vc, ms);
+        kernels::attention_rows_seqs(q_, kcr, vcr, sb, c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_, ms, 0);
+      } else {
+        const Seg& g = segs[0];
+        kernels::attn_prepare(q_gate_, k_, v_, L.q_norm, L.k_norm, seg_pos(g, 0), g.rows, c.heads, c.kv_heads, c.head_dim,
+                              c.rotary_dim, c.rope_theta, c.eps, q_, gate_, g.s->kcache[slot], g.s->vcache[slot], ms, tree_,
+                              nullptr);
+        for (int q0 = 0; q0 < g.rows; q0 += kAttnSlice) {
+          const int n = std::min(kAttnSlice, g.rows - q0);
+          kernels::attention_rows(q_ + size_t(q0) * qsize, g.s->kcache[slot], g.s->vcache[slot], seg_pos(g, q0), n,
+                                  c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_ + size_t(q0) * qsize, ms, 0, tree_);
+        }
+      }
+      kernels::sigmoid_mul(attn_, gate_, M * qsize, ms);
+      kernels::to_half_rows(attn_, M, L.o.K, xh_, xinv_, ms);
+      // The chunk's rows: into its session's cache, over its context, in slices of kAttnSlice queries.
+      kernels::attn_prepare(P.q_gate_, P.k_, P.v_, L.q_norm, L.k_norm, chunk_pos(0), Mp, c.heads, c.kv_heads, c.head_dim,
+                            c.rotary_dim, c.rope_theta, c.eps, P.q_, P.gate_, cs.kcache[slot], cs.vcache[slot], ss, nullptr,
+                            nullptr);
+      for (int q0 = 0; q0 < Mp; q0 += kAttnSlice) {
+        const int n = std::min(kAttnSlice, Mp - q0);
+        kernels::attention_rows(P.q_ + size_t(q0) * qsize, cs.kcache[slot], cs.vcache[slot], chunk_pos(q0), n, c.heads,
+                                c.kv_heads, c.head_dim, P.attn_scratch_, P.attn_ + size_t(q0) * qsize, ss, 0, nullptr);
+      }
+      kernels::sigmoid_mul_fp8(P.attn_, P.gate_, size_t(Mp) * qsize, L.o.in_scale, P.xq_, ss);
+      cq_set(L.o.in_scale, false);
+      fused_fp8(L.o, t1_, P.h_, H, true);  // the chunk's rows add into its residual stream
+      kernels::add_inplace(h_, t1_, M * H, ms);
+    } else {
+      NvtxRange r("deltanet");
+      kernels::rmsnorm_half(h_, L.input_norm, xn_, xh_, xinv_, M, H, c.eps, true, ms);
+      kernels::rmsnorm_quant(P.h_, L.input_norm, P.xn_, Mp, H, c.eps, false, L.in_qkv.in_scale, P.xq_, P.xsf_, ss);
+      cq_set(L.in_qkv.in_scale, false);
+      chunk_quant_fp8(L.in_qkv, P.xn_, true);
+      fused_fp8(L.in_qkv, v_pre_[slot], P.t2_, L.in_qkv.N, false);  // the prefill convolves out of place, from t2_
+      chunk_quant_fp8(L.in_z, P.xn_, true);
+      fused_fp8(L.in_z, z_, P.z_, L.in_z.N, false);
+      // The verify's rows: the DeltaNet chain from each session's conv window and state, both left unwritten, with
+      // the layer's inputs kept for commit() (forward_rows' verify branch).
+      float* mixed = v_post_[slot];
+      float* g = v_g_[slot];
+      float* beta = v_beta_[slot];
+      if (L.in_a.N == L.in_b.N) {
+        kernels::bf16_rows(xn_, M, L.in_a.w, a_, L.in_a.N, L.in_a.K, ms, L.in_b.w, b_);
+      } else {
+        linear_bf16(L.in_a, xn_, M, a_);
+        linear_bf16(L.in_b, xn_, M, b_);
+      }
+      if (tree_) {
+        kernels::gdn_conv_tree(v_pre_[slot], mixed, segs[0].s->conv[slot], L.conv, M, C, tree_, ms);
+      } else {
+        check(cudaMemcpyAsync(mixed, v_pre_[slot], size_t(M) * C * sizeof(float), cudaMemcpyDeviceToDevice, ms),
+              "verify inputs");
+        if (multi) {
+          kernels::SeqPtrs<const float> st;
+          for (int i = 0; i < sb.n; ++i) st.p[i] = segs[i].s->conv[slot];
+          kernels::gdn_conv_seqs(mixed, st, L.conv, sb, C, ms);
+        } else {
+          const Seg& sg = segs[0];
+          check(cudaMemcpyAsync(conv_tmp_, sg.s->conv[slot], size_t(C) * (c.conv_kernel - 1) * sizeof(float),
+                                cudaMemcpyDeviceToDevice, ms),
+                "verify conv");
+          kernels::gdn_conv(mixed, conv_tmp_, L.conv, sg.rows, C, ms);
+        }
+      }
+      kernels::gdn_gating(a_, b_, L.A_log, L.dt_bias, g, beta, M, VH, ms);
+      if (tree_) {
+        kernels::gdn_recurrent_tree(mixed, g, beta, segs[0].s->gdn[slot], core_, c.lin_k_heads, VH, tree_, tree_grid_, ms);
+      } else if (multi) {
+        kernels::SeqPtrs<const float> st;
+        for (int i = 0; i < sb.n; ++i) st.p[i] = segs[i].s->gdn[slot];
+        kernels::gdn_recurrent_seqs(mixed, g, beta, st, core_, sb, c.lin_k_heads, VH, ms);
+      } else {
+        const Seg& sg = segs[0];
+        kernels::gdn_recurrent(mixed, g, beta, sg.s->gdn[slot], nullptr, core_, sg.rows, c.lin_k_heads, VH, ms);
+      }
+      kernels::gated_rmsnorm(core_, z_, L.lin_norm, normed_, M * VH, c.lin_v_dim, c.eps, ms);
+      kernels::to_half_rows(normed_, M, L.out.K, xh_, xinv_, ms);
+      // The chunk's rows: conv and recurrence into its session's state, the snap or soft state captured at keep_at.
+      kernels::narrow_bf16(P.xn_, Mp, L.in_a.w, L.in_b.w, P.a_, P.b_, L.in_a.N, L.in_a.K, ss);
+      kernels::gdn_conv_prefill(P.t2_, P.mixed_, cs.conv[slot], L.conv, Mp, C, ss, keep ? rd.keep.conv[slot] : nullptr,
+                                keep_at);
+      kernels::gdn_gating(P.a_, P.b_, L.A_log, L.dt_bias, P.g_, P.beta_, Mp, VH, ss);
+      kernels::gdn_recurrent_prefill(P.mixed_, P.g_, P.beta_, cs.gdn[slot], P.core_, Mp, c.lin_k_heads, VH, cs.pos, ss,
+                                     keep ? rd.keep.gdn[slot] : nullptr, keep_at);
+      kernels::gated_rmsnorm_fp8(P.core_, P.z_, L.lin_norm, Mp * VH, c.lin_v_dim, c.eps, L.out.in_scale, P.xq_, ss);
+      cq_set(L.out.in_scale, false);
+      fused_fp8(L.out, t1_, P.h_, H, true);
+      kernels::add_inplace(h_, t1_, M * H, ms);
+    }
+    {
+      NvtxRange r("mlp");
+      kernels::rmsnorm_half(h_, L.post_norm, xn_, xh_, xinv_, M, H, c.eps, true, ms);
+      kernels::rmsnorm_quant(P.h_, L.post_norm, nullptr, Mp, H, c.eps, true, L.gate.in_scale, P.xq_, P.xsf_, ss);
+      cq_set(L.gate.in_scale, true);
+      // gate|up: the verify's rows into t1_ (gate) and t2_ (up) as stream_gemm_multi gives them; the chunk's straight
+      // into the down projection's NVFP4 input, as prefill_swiglu_nvfp4 writes it.
+      to_main();
+      kernels::fused_swiglu_nvfp4(xh_, xinv_, M, t1_, t2_, L.gate.scale2, L.up.scale2, P.xq_, P.xsf_, Mp, L.gate.w,
+                                  L.gate.in_scale * L.gate.scale2, L.up.w, L.up.in_scale * L.up.scale2, I, H,
+                                  L.down.in_scale, P.xq2_, P.xsf2_, ms, L.gate.scales, L.up.scales);
+      kernels::silu_mul(t1_, t2_, t1_, M * I, ms);
+      kernels::to_half_rows(t1_, M, L.down.K, xh_, xinv_, ms);
+      kernels::fused_gemm_nvfp4(xh_, xinv_, M, t2_, L.down.scale2, P.xq2_, P.xsf2_, Mp, L.down.w,
+                                L.down.in_scale * L.down.scale2, P.h_, H, L.down.N, L.down.K, true, ms, L.down.scales);
+      to_side();
+      kernels::add_inplace(h_, t2_, M * H, ms);
+    }
+    if (draft_ && feature_layer_[li] >= 0) {  // the drafter's features of both row groups, each into its own set
+      kernels::copy_rows_bf16(h_, M, H, cap_ + size_t(feature_layer_[li]) * H, cap_stride_, ms);
+      kernels::copy_rows_bf16(P.h_, Mp, H, P.cap_ + size_t(feature_layer_[li]) * H, cap_stride_, ss);
+    }
+  }
+  {
+    // Every verify row's logits stay on the GPU for the accept step; the chunk's last row's go to the side's pinned
+    // buffer. One read of the head for both.
+    NvtxRange r("lm_head");
+    const Fp4Weight& lm = model_->lm_head();
+    kernels::rmsnorm(h_, model_->final_norm(), xn_, M, H, c.eps, true, ms);
+    kernels::to_half_rows(xn_, M, lm.K, xh_, xinv_, ms);
+    kernels::rmsnorm(P.h_ + size_t(Mp - 1) * H, model_->final_norm(), P.xn_, 1, H, c.eps, true, ss);
+    kernels::quant_act_nvfp4(P.xn_, 1, lm.K, lm.in_scale, P.xq_, P.xsf_, ss);
+    to_main();
+    kernels::fused_gemm_nvfp4(xh_, xinv_, M, logits_dev_, lm.scale2, P.xq_, P.xsf_, 1, lm.w, lm.in_scale * lm.scale2,
+                              P.logits_dev_, lm.N, lm.N, lm.K, false, ms, lm.scales);
+    to_side();
+  }
+  check(cudaMemcpyAsync(P.logits_host_, P.logits_dev_, size_t(c.vocab) * sizeof(float), cudaMemcpyDeviceToHost, ss),
+        "chunk logits");
+  check(cudaEventRecord(side_done_, ss), "fused chunk");
+  cs.pos += Mp;
+}
+
 Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool from_scratch,
                                             const std::vector<PromptImage>* images) {
   if (prompt.empty()) throw std::runtime_error("empty prompt");
@@ -1751,7 +2020,7 @@ bool Engine::prefill_chunk(PrefillCursor& cur, int max_tokens) {
   return chunk_end(cur, run);
 }
 
-Engine::ChunkRun Engine::chunk_begin(PrefillCursor& cur, int max_tokens) {
+Engine::ChunkRun Engine::chunk_begin(PrefillCursor& cur, int max_tokens, Rider* rider) {
   ChunkRun r;
   r.t = std::chrono::steady_clock::now();
   const std::vector<int>& prompt = cur.prompt;
@@ -1794,6 +2063,16 @@ Engine::ChunkRun Engine::chunk_begin(PrefillCursor& cur, int max_tokens) {
   r.keep_at = keep_at;
   r.n = end - i;
   r.pos0 = s_->pos;
+  if (rider) {  // C2: planned here, run by the fused verify (forward_fused), which takes no images
+    if (cur.has_images()) throw std::runtime_error("a fused chunk with images");
+    rider->s = s_;
+    rider->ids = prompt.data() + i;
+    rider->M = r.n;
+    rider->keep_at = keep_at;
+    if (keep_at > 0) rider->keep = keep_target();
+    keep_slot_ = nullptr;
+    return r;
+  }
   // Images (VISION §20.3 (b)): the chunk's rows of each image take the image's embedding (the tower runs here when
   // the cache does not hold it), the ids are replaced by 0 for the embedding lookup, and every row of a prompt with
   // images reads its RoPE positions from the table.
@@ -1944,6 +2223,67 @@ void Engine::side_abandon() {
   if (!side_cur_) return;
   check(cudaEventSynchronize(side_done_), "side chunk");
   side_cur_ = nullptr;
+}
+
+bool Engine::can_attach(const PrefillCursor& cur) const {
+  return opts_.fused_pass && fused_ok_ && !prefill_bf16_ && side_.stream_ && !side_cur_ && !side_active_ && !rider_ &&
+         !cur.done() && !cur.has_images() && cur.session >= 0 && cur.session < sessions();
+}
+
+bool Engine::speculate_fused(std::span<SeqStep> seqs, PrefillCursor& cur, int max_tokens, std::exception_ptr* chunk_error) {
+  if (!can_attach(cur)) throw std::runtime_error("speculate_fused: the chunk cannot attach");
+  if (seqs.empty()) throw std::runtime_error("speculate_fused: no sequence to carry the chunk");
+  for (const SeqStep& q : seqs) {
+    if (q.session == cur.session) throw std::runtime_error("speculate_fused: the chunk's session also decodes");
+    if (q.session < 0 || q.session >= sessions() || !q.params || !can_batch(q.session, *q.params))
+      throw std::runtime_error("speculate_fused: a sequence cannot take a full speculative step");
+  }
+  // The chunk's plan, as prefill_chunk_launch makes it: in the side set, the chunk's session active there, its stream
+  // ordered after everything queued on the main stream so far (begin_prefill's reset, state copy and donor KV).
+  Session* main_s = s_;
+  Rider rd;
+  check(cudaEventRecord(side_after_main_, stream_), "fused order");
+  swap_side();
+  try {
+    check(cudaStreamWaitEvent(stream_, side_after_main_, 0), "fused order");
+    select_session(cur.session);
+    side_run_ = chunk_begin(cur, max_tokens > 0 ? std::min(max_tokens, opts_.fused_chunk) : opts_.fused_chunk, &rd);
+  } catch (...) {
+    swap_side();
+    s_ = main_s;
+    throw;
+  }
+  swap_side();
+  s_ = main_s;
+  side_cur_ = &cur;  // nothing else launches a side chunk meanwhile; prefill_chunk_finish finishes this one
+  rider_ = &rd;
+  auto drop_chunk = [&] {  // the chunk's pass may have run in part: wait for the side stream, forget the chunk and
+    rider_ = nullptr;      // reset its session, whose KV and state no longer match its history
+    cudaStreamSynchronize(side_.stream_);
+    side_cur_ = nullptr;
+    Session* keep_s = s_;
+    select_session(cur.session);
+    reset_session();
+    s_ = keep_s;
+  };
+  try {
+    speculate_batch(seqs);
+  } catch (...) {
+    drop_chunk();
+    throw;
+  }
+  rider_ = nullptr;
+  if (!rd.ran) {
+    drop_chunk();
+    throw std::runtime_error("speculate_fused: the step ran no verify to carry the chunk");
+  }
+  if (!chunk_error) return prefill_chunk_finish();
+  try {
+    return prefill_chunk_finish();
+  } catch (...) {  // the decode's results stand; the chunk's request fails (a non-finite pass keeps nothing)
+    *chunk_error = std::current_exception();
+    return false;
+  }
 }
 
 const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, EngineStats* stats, bool from_scratch,

@@ -264,6 +264,79 @@ bool test_fp8(std::mt19937& rng) {
   return ok;
 }
 
+// The shapes ling-serve's fused pass adds (drafts/C2-integration-2026-10-28.md): FP8 projections with FP32 output,
+// written (not added), as the attention's q, k, v and the DeltaNet's in_qkv and in_z take them (N 12,288 / 1,024 /
+// 10,240, K 5,120); and the NVFP4 lm head's shape with one chunk row (the prefill's last row), FP32 written.
+bool test_pass_shapes(std::mt19937& rng) {
+  bool ok = true;
+  for (int N : {12288, 1024, 10240}) {
+    const int K = kH;
+    uint8_t* w = make_fp8_weights(rng, N, K);
+    Buffers b = make_buffers(rng, K, N);
+    for (int Md : {0, 1, 12, 16, 24, 25, 32}) {
+      for (int Mp : {0, 1, 32, 200, 256}) {
+        if (Md == 0 && Mp == 0) continue;
+        for (int i = 0; i < 2; ++i) {
+          cudaMemset(b.yg[i], 0xff, size_t(32) * N * sizeof(float));
+          cudaMemset(b.yp[i], 0xff, size_t(512) * N * sizeof(float));
+        }
+        if (Md > 0) {
+          k::to_half_rows(b.xd, Md, K, b.xh, b.xinv, nullptr);
+          k::stream_gemm_fp8(b.xh, b.xinv, Md, w, kWs8, b.yg[0], N, K, nullptr);
+        }
+        if (Mp > 0) {
+          k::quant_act_fp8(b.xp, Mp, K, kIn8, b.xq, nullptr);
+          k::prefill_gemm_fp8(b.xq, Mp, w, kIn8 * kWs8, b.yp[0], N, N, K, false, nullptr);
+        }
+        k::fused_gemm_fp8(b.xh, b.xinv, Md, b.yg[1], kWs8, b.xq, Mp, w, kIn8 * kWs8, b.yp[1], N, N, K, false, nullptr);
+        const cudaError_t e = cudaDeviceSynchronize();
+        if (e != cudaSuccess) {
+          std::printf("CUDA error: %s\n", cudaGetErrorString(e));
+          return false;
+        }
+        const bool dec = same_bytes(b.yg[0], b.yg[1], size_t(Md) * N);
+        const bool pre = same_bytes(b.yp[0], b.yp[1], size_t(512) * N);
+        ok &= dec && pre;
+        std::printf("fused fp8 = N %5d decode %2d rows vs stream_gemm_fp8: %-9s chunk %3d rows vs prefill_gemm_fp8: %s\n",
+                    N, Md, dec ? "identical" : "DIFFER", Mp, pre ? "identical" : "DIFFER");
+      }
+    }
+  }
+  {  // the lm head's shape (N a multiple of 128, K the hidden size): every verify row and the chunk's last row
+    const int N = 16384, K = kH;
+    const Weights W = make_weights(rng, N, K);
+    Buffers b = make_buffers(rng, K, N);
+    for (bool coded : {false, true}) {
+      if (coded && !W.coded) continue;
+      const uint8_t* w = coded ? W.coded : W.tiled;
+      const uint8_t* sf = coded ? W.raw : nullptr;
+      for (int Md : {1, 12, 16, 24, 25, 32}) {
+        for (int i = 0; i < 2; ++i) {
+          cudaMemset(b.yg[i], 0xff, size_t(32) * N * sizeof(float));
+          cudaMemset(b.yp[i], 0xff, size_t(512) * N * sizeof(float));
+        }
+        k::to_half_rows(b.xd, Md, K, b.xh, b.xinv, nullptr);
+        k::stream_gemm_nvfp4(b.xh, b.xinv, Md, w, coded ? W.table : nullptr, kDown2, b.yg[0], N, K, nullptr);
+        k::quant_act_nvfp4(b.xp, 1, K, kInDown, b.xq, b.xsf, nullptr);
+        k::prefill_gemm_nvfp4(b.xq, b.xsf, 1, w, kInDown * kDown2, b.yp[0], N, N, K, false, nullptr, sf);
+        k::fused_gemm_nvfp4(b.xh, b.xinv, Md, b.yg[1], kDown2, b.xq, b.xsf, 1, w, kInDown * kDown2, b.yp[1], N, N, K,
+                            false, nullptr, sf);
+        const cudaError_t e = cudaDeviceSynchronize();
+        if (e != cudaSuccess) {
+          std::printf("CUDA error: %s\n", cudaGetErrorString(e));
+          return false;
+        }
+        const bool dec = same_bytes(b.yg[0], b.yg[1], size_t(Md) * N);
+        const bool pre = same_bytes(b.yp[0], b.yp[1], size_t(N));
+        ok &= dec && pre;
+        std::printf("fused head    %-5s decode %2d rows vs stream_gemm_nvfp4: %-9s chunk   1 row  vs prefill_gemm: %s\n",
+                    coded ? "coded" : "raw", Md, dec ? "identical" : "DIFFER", pre ? "identical" : "DIFFER");
+      }
+    }
+  }
+  return ok;
+}
+
 // ---- --bench ----
 
 struct Timer {
@@ -411,6 +484,7 @@ int main(int argc, char** argv) {
   bool ok = test_swiglu(rng);
   ok &= test_down(rng);
   ok &= test_fp8(rng);
+  ok &= test_pass_shapes(rng);
   const cudaError_t e = cudaDeviceSynchronize();
   if (e != cudaSuccess) {
     std::printf("CUDA error: %s\n", cudaGetErrorString(e));

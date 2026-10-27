@@ -6,7 +6,7 @@
 //            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N]]
 //            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16] [--graph-check] [--seed N]
 //            [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N]]
-//            [--batch-check] [--side-prefill N] [--draft-bf16]
+//            [--batch-check] [--side-prefill N] [--draft-bf16] [--fused-check [--fused-chunk N]]
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -52,6 +52,17 @@
 // a green context of N SMs, or a plain second stream for -1), each a full chunk launched while A goes on taking steps
 // on the main stream, finished when its pass is done; the same comparison with the runs alone.
 //
+// --fused-check (BATCHING C2, drafts/C2-integration-2026-10-28.md; needs --draft, --side-prefill N and --sessions 2
+// or 3): with two sessions the prompts in pairs (A, B), both orders; with three in triples, A and C decoding as a batch
+// of two (the chain: tree verification off, as --batch-check) and each prompt of the triple taking B's part once.
+// Each prompt is first prefilled alone from a cold engine (full chunks) and decoded speculatively, --max-tokens. Then
+// the decoders are prefilled and take two steps; B's prompt starts and every decode step carries B's next chunk of
+// --fused-chunk tokens (default 256; Engine::speculate_fused) while one can; a chunk no step can carry runs alone. Once
+// B's prompt is done all take steps in turn. Compared bit for bit with the runs alone: B's state, drafter context and
+// logits after its prefill, and every sequence's tokens, state, drafter context, steps and accepted drafts. Greedy and
+// sampled (--temperature, default 1, seeded by --seed or 1). The numbers of chunks carried and run alone are printed
+// (a run with none carried fails), with the carrying steps' mean wall time against the decoders' steps alone.
+//
 // --vision-prompts F (images, VISION §20.8): one chat-completions request body (JSON) per line, image parts as data:
 // URLs or file paths, rendered and prepared as ling-serve does; the prompts take part in every check above with their
 // images (the vision tower on). --vision-check DIR compares the tower with reference dumps (bench/vision/reference.py):
@@ -75,6 +86,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iterator>
+#include <map>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -317,7 +329,8 @@ int main(int argc, char** argv) {
   int attn_prefetch = 2;
   std::string draft;
   int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256, side_prefill = 0;
-  bool interleave_check = false, batch_check = false, batch_bench = false, draft_bf16 = false;
+  bool interleave_check = false, batch_check = false, batch_bench = false, draft_bf16 = false, fused_check = false;
+  int fused_chunk = 256;
   std::string draft_head = "sparse", sparse_head_dir;  // the drafter's head (BACKLOG 19)
   int sparse_head_dynamic = 16384;
   std::string vision_prompts, vision_check, force_file, greedy_out;  // images (VISION §20.8)
@@ -366,6 +379,8 @@ int main(int argc, char** argv) {
     else if (a == "--batch-bench") batch_check = batch_bench = true;
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else if (a == "--side-prefill") side_prefill = std::stoi(next());
+    else if (a == "--fused-check") fused_check = true;
+    else if (a == "--fused-chunk") fused_chunk = std::stoi(next());
     else if (a == "--vision-prompts") vision_prompts = next();
     else if (a == "--vision-check") vision_check = next();
     else if (a == "--vision-bench") vision_bench = true;
@@ -473,7 +488,10 @@ int main(int argc, char** argv) {
     opts.sparse_head_dynamic = sparse_head_dynamic;
     opts.sessions = sessions;
     if (batch_check) opts.tree_nodes = 0;  // the chain alone, as a batch verifies (see --batch-check above)
+    if (fused_check && sessions >= 3) opts.tree_nodes = 0;  // a pair of decoders verifies the chain (--fused-check)
     opts.side_prefill = side_prefill;
+    opts.fused_pass = fused_check;
+    opts.fused_chunk = fused_chunk;
     opts.vision = !all_images.empty() || !vision_check.empty();
     ling::Engine engine(model, opts);
     const std::vector<ling::PromptImage>* IMG = all_images.empty() ? nullptr : &all_images;
@@ -748,6 +766,175 @@ int main(int argc, char** argv) {
         }
       }
       std::printf(failures ? "INTERLEAVE CHECK FAILED\n" : "interleave check passed\n");
+      return failures ? 1 : 0;
+    }
+    if (fused_check) {
+      const int nseq = engine.sessions() >= 3 ? 3 : 2;
+      if (!engine.has_drafter() || engine.sessions() < 2 || static_cast<int>(prompts.size()) < nseq || !engine.side_enabled())
+        throw std::runtime_error("--fused-check needs --draft, --side-prefill N, --sessions 2 or 3 and that many prompts");
+      auto bytes_hash = [](const void* p, size_t n) {
+        uint64_t h = 1469598103934665603ull;
+        for (size_t i = 0; i < n; ++i) h = (h ^ static_cast<const unsigned char*>(p)[i]) * 1099511628211ull;
+        return h;
+      };
+      struct AfterPrefill {
+        uint64_t state = 0, draft = 0, logits = 0;
+        bool operator==(const AfterPrefill& o) const { return state == o.state && draft == o.draft && logits == o.logits; }
+      };
+      auto after_prefill = [&]() {  // the active session's, right after its prefill
+        AfterPrefill a;
+        a.state = engine.state_hash();
+        a.draft = engine.draft_hash();
+        a.logits = bytes_hash(engine.logits().data(), engine.logits().size() * sizeof(float));
+        return a;
+      };
+      auto emit = [&](Seq& q, int limit) {
+        for (int t : q.pending) {
+          q.out.push_back(t);
+          if (is_end(t) || static_cast<int>(q.out.size()) >= limit) return q.done = true;
+        }
+        return false;
+      };
+      auto seconds = [](auto t0) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
+      long carried_total = 0;
+      for (size_t pi = 0; pi + nseq <= prompts.size(); pi += nseq) {
+        for (int rot = 0; rot < nseq; ++rot) {  // the rider: prompts[pi + (rot + 1) % nseq] (B's part)
+          const int ib = static_cast<int>(pi) + (rot + 1) % nseq;
+          std::vector<int> idec;  // the decoders' prompts, in row order
+          for (int k = 0; k < nseq; ++k)
+            if (static_cast<int>(pi) + (rot + k) % nseq != ib) idec.push_back(static_cast<int>(pi) + (rot + k) % nseq);
+          for (int sampled = 0; sampled < 2; ++sampled) {
+            ling::SamplingParams sp;
+            sp.temperature = sampled ? (temperature > 0.f ? temperature : 1.f) : 0.f;
+            sp.seed = seed ? seed : 1;
+            // Alone, from a cold engine in session 0: the rider's state after its prefill, and every sequence's run.
+            std::map<int, Result> alone;
+            AfterPrefill b_alone;
+            double alone_step_s = 0;
+            long alone_steps = 0;
+            std::vector<int> all = idec;
+            all.push_back(ib);
+            for (int k : all) {
+              engine.reset_all();
+              engine.activate_session(0, "", true);
+              engine.prefill(prompts[k], nullptr, false, IMG);
+              if (k == ib) b_alone = after_prefill();
+              Seq q;
+              q.sp = sp;
+              q.pending = {engine.sample(engine.logits(), sp, engine.history())};
+              while (!q.done) advance(q, max_tokens);
+              alone[k] = result_of(q);
+              if (k != ib) {
+                const ling::SpecStats& st = engine.session_spec_stats(0);
+                alone_step_s += st.draft_seconds + st.verify_seconds + st.commit_seconds;
+                alone_steps += st.steps;
+              }
+            }
+            // Fused: the decoders in sessions 0 (and 2), two steps each; then the rider in session 1, its chunks
+            // carried by their steps.
+            engine.reset_all();
+            std::vector<Seq> dq(idec.size());
+            for (size_t d = 0; d < idec.size(); ++d) {
+              dq[d].session = d == 0 ? 0 : 2;
+              dq[d].sp = sp;
+              engine.activate_session(dq[d].session, "", true);
+              engine.prefill(prompts[idec[d]], nullptr, false, IMG);
+              dq[d].pending = {engine.sample(engine.logits(), sp, engine.history())};
+            }
+            for (int k = 0; k < 2; ++k)
+              for (Seq& q : dq)
+                if (!q.done) advance(q, max_tokens);
+            Seq b;
+            b.session = 1;
+            b.sp = sp;
+            engine.activate_session(1, "", true);
+            ling::Engine::PrefillCursor cur = engine.begin_prefill(prompts[ib], false, IMG);
+            AfterPrefill b_fused;
+            int carried = 0, alone_chunks = 0;
+            double fused_s = 0;
+            while (!cur.done()) {
+              std::vector<ling::Engine::SeqStep> steps;
+              std::vector<Seq*> in;
+              for (Seq& q : dq) {
+                if (q.done || emit(q, max_tokens)) continue;
+                if (!engine.can_batch(q.session, q.sp)) {  // no room for a full block: its own step
+                  engine.select_session(q.session);
+                  q.pending = engine.speculate(q.pending.back(), q.sp);
+                  continue;
+                }
+                ling::Engine::SeqStep st;
+                st.session = q.session;
+                st.anchor = q.pending.back();
+                st.params = &q.sp;
+                steps.push_back(std::move(st));
+                in.push_back(&q);
+              }
+              bool last = false;
+              if (!steps.empty() && engine.can_attach(cur)) {
+                const auto t0 = std::chrono::steady_clock::now();
+                last = engine.speculate_fused(steps, cur, fused_chunk);
+                fused_s += seconds(t0);
+                ++carried;
+                for (size_t i = 0; i < steps.size(); ++i) {
+                  if (steps[i].error) std::rethrow_exception(steps[i].error);
+                  in[i]->pending = steps[i].out;
+                }
+              } else {
+                if (!steps.empty()) engine.speculate_batch(steps);
+                for (size_t i = 0; i < steps.size(); ++i) {
+                  if (steps[i].error) std::rethrow_exception(steps[i].error);
+                  in[i]->pending = steps[i].out;
+                }
+                last = engine.prefill_chunk(cur, 0);
+                ++alone_chunks;
+              }
+              if (last) {
+                b_fused = after_prefill();  // the chunk's session is active after its last chunk
+                b.pending = {engine.sample(engine.logits(), sp, engine.history())};
+              }
+            }
+            // Then every sequence takes steps in turn until all are done.
+            for (bool more = true; more;) {
+              more = false;
+              for (Seq& q : dq)
+                if (!q.done) advance(q, max_tokens), more = true;
+              if (!b.done) advance(b, max_tokens), more = true;
+            }
+            carried_total += carried;
+            bool same = b_fused == b_alone;
+            std::string detail;
+            for (size_t d = 0; d < dq.size(); ++d) {
+              const Result r = result_of(dq[d]);
+              const bool ok = r == alone[idec[d]];
+              same = same && ok;
+              char buf[256];
+              std::snprintf(buf, sizeof buf, " | decoder %zu: %zu out, %ld steps %ld accepted: %s%s", d, r.tokens.size(),
+                            r.steps, r.accepted, ok ? "identical" : "DIFFERS",
+                            ok ? "" : (r.hash == alone[idec[d]].hash ? " (state identical)" : " (state differs)"));
+              detail += buf;
+            }
+            const Result rb = result_of(b);
+            const bool ok_b = rb == alone[ib];
+            same = same && ok_b;
+            failures += !same;
+            std::printf("group %zu rider %d, %s: rider %zu prompt tokens, %d chunks carried, %d alone; after its prefill "
+                        "state %s, drafter context %s, logits %s; %zu out, %ld steps %ld accepted: %s%s; carrying step "
+                        "%.1f ms mean (rows %zu x %d), decoders' steps alone %.1f ms: %s\n",
+                        pi / nseq, ib, sampled ? "sampled" : "greedy", prompts[ib].size(), carried, alone_chunks,
+                        b_fused.state == b_alone.state ? "identical" : "DIFFERS",
+                        b_fused.draft == b_alone.draft ? "identical" : "DIFFERS",
+                        b_fused.logits == b_alone.logits ? "identical" : "DIFFERS", rb.tokens.size(), rb.steps,
+                        rb.accepted, ok_b ? "identical" : "DIFFERS", detail.c_str(), carried ? 1e3 * fused_s / carried : 0.,
+                        dq.size(), fused_chunk, alone_steps ? 1e3 * alone_step_s / alone_steps : 0.,
+                        same ? "identical" : "DIFFERS");
+          }
+        }
+      }
+      if (carried_total == 0) {
+        std::printf("no chunk was carried by a decode step\n");
+        ++failures;
+      }
+      std::printf(failures ? "FUSED CHECK FAILED\n" : "fused check passed\n");
       return failures ? 1 : 0;
     }
     if (batch_check) {

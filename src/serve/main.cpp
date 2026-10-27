@@ -6,7 +6,7 @@
 //              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
-//              [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off]
+//              [--side-prefill N] [--side-share N] [--fused-pass] [--fused-chunk N] [--fused-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off]
 //              [--repetition-report incomplete|completed]
 //
 // --sessions N (default 2; M4 §1) keeps N resident sessions, each with its own KV cache and state, so N
@@ -32,6 +32,13 @@
 // decoding conversations take some steps at their speed alone instead of every step beside a chunk. At four warm
 // agent conversations (node-b, 2026-10-27) 16 raised the pooled decode from 25.7 to 35.6 tok/s with the rounds'
 // time unchanged (139.3 / 140.9 s). Only the order of units changes, as with the shortest prefill first.
+// --fused-pass (BATCHING §5.5, C2; drafts/C2-integration-2026-10-28.md; off by default until measured): a waiting
+// prefill's next chunk of at most --fused-chunk N tokens (default 256) rides a speculative decode step's verify
+// (Engine::speculate_fused: one weight read per projection for both row groups, each with its own path's arithmetic),
+// instead of running on the side stream beside it. The chunk is chosen as C1 chooses (fewest tokens left, a 5 s yield
+// cap); a chunk that cannot attach (images) and a prefill with no speculative decode to carry it take the side stream
+// as before. --fused-share N (default 0): while two or more requests decode, N decode passes run without a chunk after
+// each carried one. The same bits as each request alone (ling-run --fused-check).
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -118,6 +125,7 @@ struct Metrics {
   // the batched steps so far (one per batch, whatever its size).
   int batch_rows = 0;
   double batched_steps = 0;
+  double fused_passes = 0;
   // The session pool (M4 §1): slots, slots holding a session, evictions so far, the protection window.
   int sessions = 0, sessions_resident = 0;
   double session_evictions = 0, protect_seconds = 0;
@@ -170,6 +178,8 @@ struct Metrics {
             "Prefill chunks run between another request's decode steps.");
     counter("ling:batched_steps_total", batched_steps,
             "Decode steps that verified two or more requests' rows in one pass.");
+    counter("ling:fused_passes_total", fused_passes,
+            "Decode steps whose verify carried another request's prefill chunk (--fused-pass).");
     auto gauge = [&](const char* name, double v, const char* help) {
       out += std::string("# HELP ") + name + " " + help + "\n# TYPE " + name + " gauge\n";
       char buf[64];
@@ -303,12 +313,13 @@ struct Running {
 // one-row step on its turn; a prefill chunk still alternates with the decode steps.
 class Scheduler {
  public:
-  Scheduler(ServerContext& ctx, double protect_seconds, int batch, int contended, int side_share = 0)
+  Scheduler(ServerContext& ctx, double protect_seconds, int batch, int contended, int side_share = 0, int fused_share = 0)
       : ctx_(ctx),
         protect_seconds_(protect_seconds),
         batch_(batch),
         contended_(contended),
         side_share_(side_share),
+        fused_share_(fused_share),
         thread_([this] { run(); }) {}
   ~Scheduler() {
     {
@@ -449,7 +460,10 @@ class Scheduler {
       Running& r = *running_[k];
       std::vector<Running*> ended;
       std::vector<Running*> batch = batch_with(r);
-      if (batch.size() >= 2) {
+      Running* rider = batch.empty() ? nullptr : pick_rider();
+      if (rider) {
+        fused_step(batch, *rider, ended);
+      } else if (batch.size() >= 2) {
         batch_step(batch, ended);
       } else {
         bool done = false;
@@ -540,6 +554,105 @@ class Scheduler {
     }
   }
 
+  // C2 (--fused-pass): whether a decode step can carry r's next chunk now. Then r's own turn leaves its prefill to
+  // that step: some other request decodes speculatively with room for a full block, and the chunk can attach.
+  bool carried(const Running& r) const {
+    Engine& eng = *ctx_.engine;
+    if (!eng.fused_enabled() || r.side_flight || !eng.can_attach(r.cur)) return false;
+    for (const auto& o : running_)
+      if (o.get() != &r && batchable(*o)) return true;
+    return false;
+  }
+  // --fused-share N: while two or more requests decode, N decode passes run without a chunk after each carried one.
+  bool fused_hold() const {
+    if (fused_share_ <= 0 || fused_mark_ < 0) return false;
+    int decoding = 0;
+    for (const auto& o : running_) decoding += !o->prefilling;
+    return decoding >= 2 && decode_passes_ - fused_mark_ < fused_share_;
+  }
+  // The request whose next chunk the coming decode step carries, by C1's rule: of the prefilling requests whose chunk
+  // can attach, the fewest tokens left first, unless a longer one has yielded for kMaxYield. Null: none (or held).
+  Running* pick_rider() {
+    Engine& eng = *ctx_.engine;
+    if (!eng.fused_enabled() || fused_hold()) return nullptr;
+    std::vector<Running*> c;
+    for (const auto& o : running_)
+      if (o->prefilling && !o->side_flight && eng.can_attach(o->cur)) c.push_back(o.get());
+    std::stable_sort(c.begin(), c.end(), [](const Running* a, const Running* b) { return prefill_left(*a) < prefill_left(*b); });
+    for (Running* p : c)
+      if (!yield_prefill(*p)) return p;
+    return nullptr;
+  }
+  // One speculative step of `batch` (one request, or a pair) carrying the next chunk of `p` (Engine::speculate_fused),
+  // then p's prompt, if that was its last chunk, starts decoding (first token emitted), and the batch's tokens are
+  // emitted as batch_step emits them. A failed chunk fails p only; a failed step fails all of them.
+  void fused_step(const std::vector<Running*>& batch, Running& p, std::vector<Running*>& ended) {
+    Engine& eng = *ctx_.engine;
+    std::vector<Engine::SeqStep> steps(batch.size());
+    const auto now = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < batch.size(); ++i) {
+      Running& r = *batch[i];
+      r.beside.add(std::chrono::duration<double>(now - r.last_step).count());
+      r.last_step = now;
+      ++r.passes;
+      if (batch.size() >= 2) ++r.batched;
+      steps[i].session = r.job.session;
+      steps[i].anchor = r.pending.back();
+      steps[i].params = &r.job.req.sampling;
+      steps[i].row_logits = r.job.req.logprobs ? &r.rows : nullptr;
+    }
+    ++decode_passes_;
+    fused_mark_ = decode_passes_;
+    count_interleaved(p);
+    std::exception_ptr chunk_error;
+    bool last = false;
+    try {
+      last = eng.speculate_fused(steps, p.cur, 0, &chunk_error);
+    } catch (const std::exception& e) {  // the step itself failed (and the chunk's session was reset)
+      for (Running* r : batch) {
+        fail(*r, e);
+        ended.push_back(r);
+      }
+      fail(p, e);
+      ended.push_back(&p);
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+      ctx_.metrics.fused_passes += 1;
+      if (batch.size() >= 2) ctx_.metrics.batched_steps += 1;
+      ctx_.metrics.batch_rows = static_cast<int>(batch.size()) * eng.draft_block();
+    }
+    // The chunk first: after its last chunk the engine's active session and logits are p's prompt's (begin_decode).
+    bool pdone = false;
+    try {
+      if (chunk_error) std::rethrow_exception(chunk_error);
+      if (last) {
+        p.prefilling = false;
+        begin_decode(p);
+        pdone = emit(p) && end(p);
+      }
+    } catch (const std::exception& e) {
+      fail(p, e);
+      pdone = true;
+    }
+    if (pdone) ended.push_back(&p);
+    for (size_t i = 0; i < batch.size(); ++i) {
+      Running& r = *batch[i];
+      bool done = false;
+      try {
+        if (steps[i].error) std::rethrow_exception(steps[i].error);
+        r.pending = std::move(steps[i].out);
+        if (r.job.req.logprobs) require_finite(r.rows);
+        done = emit(r) && end(r);
+      } catch (const std::exception& e) {
+        fail(r, e);
+        done = true;
+      }
+      if (done) ended.push_back(&r);
+    }
+  }
+
   bool other_decoding(const Running& self) const {
     for (const auto& r : running_)
       if (r.get() != &self && !r->prefilling) return true;
@@ -594,6 +707,7 @@ class Scheduler {
   bool unit(Running& r) {
     Engine& eng = *ctx_.engine;
     if (r.prefilling) {
+      if (carried(r)) return false;  // a decode step carries its next chunk (C2)
       const bool contended = other_decoding(r);
       if (eng.side_enabled() && (r.side_flight || (contended && !eng.side_busy()))) {
         // A full chunk on the side stream; the decoding request's turns go on while it runs.
@@ -796,9 +910,10 @@ class Scheduler {
 
   ServerContext& ctx_;
   double protect_seconds_;
-  int batch_, contended_, side_share_;
+  int batch_, contended_, side_share_, fused_share_;
   long decode_passes_ = 0;  // decode passes run (a batched step counts once), for --side-share
   long side_mark_ = -1;     // decode_passes_ when the last side chunk finished (--side-share)
+  long fused_mark_ = -1;    // decode_passes_ after the last decode pass that carried a chunk (--fused-share)
   std::mutex mu_;
   std::condition_variable cv_;
   std::deque<Job> queue_;
@@ -1443,6 +1558,8 @@ int main(int argc, char** argv) {
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40, side_share = 16;
+  bool fused_pass = false;
+  int fused_chunk = 256, fused_share = 0;
   long host_reserve_mb = 16384, admit_reserve_mb = 8192;
   double protect_seconds = 30;
   bool draft_bf16 = false;
@@ -1494,6 +1611,9 @@ int main(int argc, char** argv) {
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else if (a == "--side-prefill") side_prefill = std::stoi(next());
     else if (a == "--side-share") side_share = std::stoi(next());
+    else if (a == "--fused-pass") fused_pass = true;
+    else if (a == "--fused-chunk") fused_chunk = std::stoi(next());
+    else if (a == "--fused-share") fused_share = std::stoi(next());
     else if (a == "--host-reserve-mb") host_reserve_mb = std::stol(next());
     else if (a == "--admit-reserve-mb") admit_reserve_mb = std::stol(next());
     else if (a == "--repetition-detection") repetition_arg = next();
@@ -1504,7 +1624,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fused-pass] [--fused-chunk N] [--fused-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
     return 2;
   }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
@@ -1571,6 +1691,8 @@ int main(int argc, char** argv) {
   opts.sparse_head_dynamic = sparse_head_dynamic;
   opts.sessions = sessions;
   opts.side_prefill = side_prefill;
+  opts.fused_pass = fused_pass;
+  opts.fused_chunk = fused_chunk;
   if (vision != "on" && vision != "off") {
     std::cerr << "--vision is on or off\n";
     return 2;
@@ -1657,7 +1779,7 @@ int main(int argc, char** argv) {
     name = name.substr(name.find_last_of('/') + 1);
   }
   ctx.model_name = name;
-  ling::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended, side_share);
+  ling::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended, side_share, fused_share);
 
   proxygen::HTTPServerOptions options;
   options.threads = 2;
