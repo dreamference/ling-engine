@@ -103,10 +103,12 @@ float bf16f(uint16_t b) {
   return f;
 }
 
-// relative L2 error of a against the truth t, and the worst row's cosine (rows of `width`)
-void compare(const std::vector<float>& a, const std::vector<float>& t, int width, double& rel, double& worst_cos) {
+// relative L2 error of a against the truth t, the worst row's cosine (rows of `width`), and the rows' cosines in *cos
+void compare(const std::vector<float>& a, const std::vector<float>& t, int width, double& rel, double& worst_cos,
+             std::vector<double>* cos = nullptr) {
   double num = 0, den = 0;
   worst_cos = 1;
+  if (cos) cos->clear();
   for (size_t r = 0; r * width < t.size(); ++r) {
     double ab = 0, aa = 0, tt = 0;
     for (int c = 0; c < width; ++c) {
@@ -117,13 +119,26 @@ void compare(const std::vector<float>& a, const std::vector<float>& t, int width
       aa += x * x;
       tt += y * y;
     }
-    worst_cos = std::min(worst_cos, ab / std::sqrt(aa * tt + 1e-30));
+    const double c = ab / std::sqrt(aa * tt + 1e-30);
+    worst_cos = std::min(worst_cos, c);
+    if (cos) cos->push_back(c);
   }
   rel = std::sqrt(num / (den + 1e-30));
 }
 
+// The rows' cosines summarised: the 1st percentile, the median, and the share below 0.99.
+std::string cos_summary(std::vector<double> c) {
+  if (c.empty()) return "";
+  std::sort(c.begin(), c.end());
+  const double p1 = c[c.size() / 100], med = c[c.size() / 2];
+  const double below = double(std::lower_bound(c.begin(), c.end(), 0.99) - c.begin()) / c.size();
+  char b[128];
+  std::snprintf(b, sizeof b, "cosine p1 %.5f, median %.6f, %.2f%% of tokens below 0.99", p1, med, 100 * below);
+  return b;
+}
+
 // --vision-check DIR (VISION §20.5 items 2 and 3).
-int vision_check_run(ling::Engine& engine, const std::string& dir, bool bench) {
+int vision_check_run(ling::Engine& engine, const std::string& dir, bool bench, bool dump) {
   ling::VisionTower* tower = engine.vision();
   if (!tower) throw std::runtime_error("no vision tower");
   const int OUT = tower->config().out, PD = tower->config().patch_dim();
@@ -220,39 +235,48 @@ int vision_check_run(ling::Engine& engine, const std::string& dir, bool bench) {
     };
     const std::vector<float> truth = load_f32(base + ".hf_fp32.f32");
     if (truth.size() != eng.size()) throw std::runtime_error(name + ": hf_fp32 has the wrong size");
+    if (dump) {
+      std::ofstream f(base + ".engine.bf16", std::ios::binary);
+      f.write(reinterpret_cast<const char*>(ob.data()), ob.size() * 2);
+    }
     double er, ec;
-    compare(eng, truth, OUT, er, ec);
+    std::vector<double> ecos;
+    compare(eng, truth, OUT, er, ec, &ecos);
     double floor_rel = 0, floor_cos = 1;
     std::string floor_name = "transformers BF16";
     {
       const std::vector<float> hb = load_bf16(base + ".hf_bf16.bf16");
       double r, c;
-      compare(hb, truth, OUT, r, c);
-      std::printf("  transformers BF16 against FP32: rel L2 %.3e, worst cosine %.6f\n", r, c);
+      std::vector<double> cs;
+      compare(hb, truth, OUT, r, c, &cs);
+      std::printf("  transformers BF16 against FP32: rel L2 %.3e, worst cosine %.6f; %s\n", r, c, cos_summary(cs).c_str());
       floor_rel = r;
       floor_cos = c;
     }
     if (std::filesystem::exists(base + ".hfprodpos.bf16")) {
       const std::vector<float> pb = load_bf16(base + ".hfprodpos.bf16");
       double r, c;
-      compare(pb, truth, OUT, r, c);
-      std::printf("  transformers BF16 with production's position embedding against FP32: rel L2 %.3e, worst cosine %.6f\n", r, c);
+      std::vector<double> cs;
+      compare(pb, truth, OUT, r, c, &cs);
+      std::printf("  transformers BF16 with production's position embedding against FP32: rel L2 %.3e, worst cosine %.6f; %s\n",
+                  r, c, cos_summary(cs).c_str());
       floor_rel = std::max(floor_rel, r);
       floor_cos = std::min(floor_cos, c);
     }
     if (std::filesystem::exists(base + ".sgl.bf16")) {
       const std::vector<float> sb = load_bf16(base + ".sgl.bf16");
       double r, c;
-      compare(sb, truth, OUT, r, c);
-      std::printf("  production (SGLang) against FP32: rel L2 %.3e, worst cosine %.6f\n", r, c);
+      std::vector<double> cs;
+      compare(sb, truth, OUT, r, c, &cs);
+      std::printf("  production (SGLang) against FP32: rel L2 %.3e, worst cosine %.6f; %s\n", r, c, cos_summary(cs).c_str());
       floor_rel = std::max(floor_rel, r);
       floor_cos = std::min(floor_cos, c);
       floor_name = "the references";
     }
     const bool ok = er <= floor_rel * 1.10 && ec >= floor_cos - 1e-4;
     failures += !ok;
-    std::printf("  engine against FP32: rel L2 %.3e, worst cosine %.6f (%s: %.3e, %.6f) %s\n", er, ec, floor_name.c_str(),
-                floor_rel, floor_cos, ok ? "ok" : "FAIL");
+    std::printf("  engine against FP32: rel L2 %.3e, worst cosine %.6f; %s (%s: %.3e, %.6f) %s\n", er, ec,
+                cos_summary(ecos).c_str(), floor_name.c_str(), floor_rel, floor_cos, ok ? "ok" : "FAIL");
     if (bench) {
       cudaEvent_t a, b;
       cudaEventCreate(&a);
@@ -294,7 +318,7 @@ int main(int argc, char** argv) {
   std::string draft_head = "sparse", sparse_head_dir;  // the drafter's head (BACKLOG 19)
   int sparse_head_dynamic = 16384;
   std::string vision_prompts, vision_check, force_file, greedy_out;  // images (VISION §20.8)
-  bool vision_bench = false;
+  bool vision_bench = false, vision_dump = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -342,6 +366,7 @@ int main(int argc, char** argv) {
     else if (a == "--vision-prompts") vision_prompts = next();
     else if (a == "--vision-check") vision_check = next();
     else if (a == "--vision-bench") vision_bench = true;
+    else if (a == "--vision-dump") vision_dump = true;
     else if (a == "--force-file") force_file = next();
     else if (a == "--greedy-out") greedy_out = next();
     else {
@@ -448,7 +473,7 @@ int main(int argc, char** argv) {
     opts.vision = !all_images.empty() || !vision_check.empty();
     ling::Engine engine(model, opts);
     const std::vector<ling::PromptImage>* IMG = all_images.empty() ? nullptr : &all_images;
-    if (!vision_check.empty()) return vision_check_run(engine, vision_check, vision_bench);
+    if (!vision_check.empty()) return vision_check_run(engine, vision_check, vision_bench, vision_dump);
     auto t1 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "loaded %.1f GB of weights in %.1f s\n", engine.model().device_bytes() / 1e9,
                  std::chrono::duration<double>(t1 - t0).count());

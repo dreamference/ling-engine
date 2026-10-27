@@ -117,7 +117,7 @@ def sgl_tower(model_dir):
     if not dist.is_initialized():
         ps.init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="tcp://127.0.0.1:29571",
                                         backend="nccl")
-        ps.initialize_model_parallel(1, 1)
+        ps.initialize_model_parallel(backend="nccl")
     from transformers import AutoConfig
     from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 
@@ -131,8 +131,23 @@ def sgl_tower(model_dir):
     return m.eval()
 
 
+def only_sgl(model_dir, out):
+    """SGLang's tower on the pixel values already dumped in OUT (a second pass, when the first could not build it)."""
+    sgl = sgl_tower(model_dir)
+    for name in sorted(f[:-5] for f in os.listdir(out) if f.endswith(".json")):
+        meta = json.load(open(f"{out}/{name}.json"))
+        pv = torch.from_numpy(np.fromfile(f"{out}/{name}.pixel_values.bf16", dtype=np.int16)).view(torch.bfloat16)
+        pv = pv.reshape(-1, 1536).cuda()
+        grid = torch.tensor([meta["grid"]], device="cuda")
+        with torch.no_grad():
+            dump(f"{out}/{name}.sgl.bf16", sgl(pv, grid))
+        print(name, "sgl", flush=True)
+
+
 def main():
     model_dir, out = sys.argv[1], sys.argv[2]
+    if os.environ.get("ONLY_SGL"):
+        return only_sgl(model_dir, out)
     os.makedirs(out, exist_ok=True)
     from transformers import AutoImageProcessor
     from sglang.srt.utils.common import load_image
