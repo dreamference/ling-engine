@@ -35,8 +35,8 @@
 //
 // --chunk-check N (M4 §3) prefills each prompt from a cold engine twice, in full chunks and in chunks of N
 // tokens (what ling-serve runs while another request decodes), and checks that the state and the next token
-// are the same both ways; with --draft also the 64-token speculative continuation's tokens, state, steps and
-// accepted drafts (the drafter's context ring, which the prefill's chunks fill).
+// are the same both ways; with --draft also the drafter's context ring after the prefill (bit for bit) and the
+// 64-token speculative continuation's tokens, state, steps and accepted drafts.
 //
 // --interleave-check (M4 §3, stage 2; needs --draft and --sessions 2) takes the prompts in pairs (A, B). Each
 // is first decoded alone (cold engine, full chunks, --max-tokens speculatively); then A is prefilled and
@@ -632,6 +632,7 @@ int main(int argc, char** argv) {
       for (size_t i = 0; i < prompts.size(); ++i) {
         Result r[2];
         int next[2];
+        uint64_t ctx[2];  // the drafter's context after the prefill
         ling::EngineStats st[2];
         for (int k = 0; k < 2; ++k) {
           engine.reset_all();
@@ -642,6 +643,7 @@ int main(int argc, char** argv) {
           st[k] = cur.stats;
           const std::vector<float> logits = engine.logits();
           next[k] = argmax(logits);
+          ctx[k] = engine.draft_hash();
           Seq q;
           q.sp.temperature = 0.f;
           if (engine.has_drafter()) {
@@ -650,14 +652,16 @@ int main(int argc, char** argv) {
           }
           r[k] = result_of(q);
         }
-        const bool same = r[0] == r[1] && next[0] == next[1];
+        const bool same = r[0] == r[1] && next[0] == next[1] && ctx[0] == ctx[1];
         failures += !same;
         std::printf("prompt %zu: %zu tokens, %d chunks (%.2f s) against %d chunks of %d (%.2f s): state %s, next token %s, "
-                    "continuation %zu tokens %ld steps %ld accepted against %ld steps %ld accepted: %s\n",
+                    "drafter context %s, continuation %zu tokens (%s) %ld steps %ld accepted against %ld steps %ld "
+                    "accepted: %s\n",
                     i, prompts[i].size(), st[0].chunks, st[0].compute_seconds, st[1].chunks, chunk_check,
                     st[1].compute_seconds, r[0].hash == r[1].hash ? "identical" : "DIFFERS",
-                    next[0] == next[1] ? "identical" : "DIFFERS", r[1].tokens.size(), r[0].steps, r[0].accepted,
-                    r[1].steps, r[1].accepted, same ? "identical" : "DIFFERS");
+                    next[0] == next[1] ? "identical" : "DIFFERS", ctx[0] == ctx[1] ? "identical" : "DIFFERS",
+                    r[1].tokens.size(), r[0].tokens == r[1].tokens ? "identical" : "DIFFER", r[0].steps,
+                    r[0].accepted, r[1].steps, r[1].accepted, same ? "identical" : "DIFFERS");
       }
       std::printf(failures ? "CHUNK CHECK FAILED\n" : "chunk check passed\n");
       return failures ? 1 : 0;

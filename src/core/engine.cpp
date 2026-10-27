@@ -687,6 +687,26 @@ uint64_t Engine::state_hash() {
   return h;
 }
 
+uint64_t Engine::draft_hash() {
+  if (!draft_) return 0;
+  const DraftConfig& d = draft_->config();
+  const size_t dkv = size_t(d.kv_heads) * d.head_dim;
+  join_commit();
+  check(cudaStreamSynchronize(stream_), "draft_hash");
+  std::vector<__nv_bfloat16> host(size_t(ring_) * dkv);
+  uint64_t h = 1469598103934665603ull;
+  const int hi = static_cast<int>(s_->history.size());
+  for (int l = 0; l < d.layers; ++l)
+    for (const __nv_bfloat16* ring : {s_->dkc[l], s_->dvc[l]}) {
+      check(cudaMemcpy(host.data(), ring, host.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost), "draft_hash");
+      for (int p = dkv_from(*s_); p < hi; ++p) {
+        const unsigned char* b = reinterpret_cast<const unsigned char*>(host.data() + size_t(p % ring_) * dkv);
+        for (size_t i = 0; i < dkv * sizeof(__nv_bfloat16); ++i) h = (h ^ b[i]) * 1099511628211ull;
+      }
+    }
+  return h;
+}
+
 void Engine::set_draft_block(int b) {
   if (b < 2 || b > kernels::kMaxStreamRows) throw std::runtime_error("draft block must be in [2, 32]");
   if (b != opts_.draft_block) clear_graphs();  // they were captured for the old block
