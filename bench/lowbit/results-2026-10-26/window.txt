@@ -1,0 +1,2 @@
+name, memory.used [MiB], utilization.gpu [%], clocks.current.sm [MHz]
+NVIDIA GB10, [N/A], 11 %, 474 MHz

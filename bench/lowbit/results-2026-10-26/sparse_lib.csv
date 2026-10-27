@@ -1,0 +1,27 @@
+# NVIDIA GB10 sm_121, torch 2.14.1+cu130, CUDA 13.0
+# cuSPARSELt 801
+shape,N,K,rows,arm,bytes,ms,gbps,note
+ffn_gate_up,34816,5120,16,dense_fp16,356515840,1.7669,201.8,
+ffn_gate_up,34816,5120,16,dense_fp8,178257920,0.8951,199.1,
+ffn_gate_up,34816,5120,16,sparse_fp16,200540160,4.1598,48.2,
+ffn_gate_up,34816,5120,16,sparse_fp8,111411200,,,failed: CUDA error: operation not supported when calling `cusparseLtMatmulDescriptorInit( &handle, &matmul, CUSPARSE_OPERATION_NON_TRANSPOSE, (dense_B.is_contiguous()) 
+ffn_gate_up,34816,5120,32,dense_fp16,356515840,1.6937,210.5,
+ffn_gate_up,34816,5120,32,dense_fp8,178257920,0.8601,207.2,
+ffn_gate_up,34816,5120,32,sparse_fp16,200540160,4.3414,46.2,
+ffn_gate_up,34816,5120,32,sparse_fp8,111411200,,,failed: CUDA error: operation not supported when calling `cusparseLtMatmulDescriptorInit( &handle, &matmul, CUSPARSE_OPERATION_NON_TRANSPOSE, (dense_B.is_contiguous()) 
+ffn_down,5120,17408,16,dense_fp16,178257920,0.8429,211.5,
+ffn_down,5120,17408,16,dense_fp8,89128960,0.4111,216.8,
+ffn_down,5120,17408,16,sparse_fp16,100270080,3.8516,26.0,
+ffn_down,5120,17408,16,sparse_fp8,55705600,,,failed: CUDA error: operation not supported when calling `cusparseLtMatmulDescriptorInit( &handle, &matmul, CUSPARSE_OPERATION_NON_TRANSPOSE, (dense_B.is_contiguous()) 
+ffn_down,5120,17408,32,dense_fp16,178257920,0.8777,203.1,
+ffn_down,5120,17408,32,dense_fp8,89128960,0.4975,179.1,
+ffn_down,5120,17408,32,sparse_fp16,100270080,3.8837,25.8,
+ffn_down,5120,17408,32,sparse_fp8,55705600,,,failed: CUDA error: operation not supported when calling `cusparseLtMatmulDescriptorInit( &handle, &matmul, CUSPARSE_OPERATION_NON_TRANSPOSE, (dense_B.is_contiguous()) 
+gdn_in,16384,5120,16,dense_fp16,167772160,0.8881,188.9,
+gdn_in,16384,5120,16,dense_fp8,83886080,0.3844,218.2,
+gdn_in,16384,5120,16,sparse_fp16,94371840,3.9597,23.8,
+gdn_in,16384,5120,16,sparse_fp8,52428800,,,failed: CUDA error: operation not supported when calling `cusparseLtMatmulDescriptorInit( &handle, &matmul, CUSPARSE_OPERATION_NON_TRANSPOSE, (dense_B.is_contiguous()) 
+gdn_in,16384,5120,32,dense_fp16,167772160,0.7964,210.7,
+gdn_in,16384,5120,32,dense_fp8,83886080,0.3717,225.7,
+gdn_in,16384,5120,32,sparse_fp16,94371840,3.7967,24.9,
+gdn_in,16384,5120,32,sparse_fp8,52428800,,,failed: CUDA error: operation not supported when calling `cusparseLtMatmulDescriptorInit( &handle, &matmul, CUSPARSE_OPERATION_NON_TRANSPOSE, (dense_B.is_contiguous()) 

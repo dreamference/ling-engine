@@ -25,6 +25,7 @@ This directory holds the specification, split into focused documents. This page 
 | [DREAMFERENCE_LING_ENGINE_MILESTONES.md](./DREAMFERENCE_LING_ENGINE_MILESTONES.md) | §14 the milestones with the standing status, the agreement gate and the exactness policy; §15 risks and open questions |
 | [DREAMFERENCE_LING_ENGINE_RESEARCH.md](./DREAMFERENCE_LING_ENGINE_RESEARCH.md) | §16 the low-level speed-ups from the literature, measured or estimated; §17 sources |
 | [DREAMFERENCE_LING_ENGINE_BACKLOG.md](./DREAMFERENCE_LING_ENGINE_BACKLOG.md) | §19 what users of SGLang and vLLM asked for and what the four clients send, ranked, plus the maintainer's requests |
+| [DREAMFERENCE_LING_ENGINE_LOWBIT.md](./DREAMFERENCE_LING_ENGINE_LOWBIT.md) | *A study of 2026-10-27, no change to the shipped model:* a faster, non-exact target with fewer bits per weight (3-bit, MXFP4, FP6, all-NVFP4 projections), 2:4 sparsity or an FP8 KV cache; bytes and projected step per candidate, the literature on quality, the drafter, the quality protocol, the GB10 microbenchmarks, and the recommendation |
 
 ## Section map
 
@@ -50,4 +51,4 @@ This directory holds the specification, split into focused documents. This page 
 | §18 | [DREAMFERENCE_LING_ENGINE_VALIDATION.md](./DREAMFERENCE_LING_ENGINE_VALIDATION.md) |
 | §19 | [DREAMFERENCE_LING_ENGINE_BACKLOG.md](./DREAMFERENCE_LING_ENGINE_BACKLOG.md) |
 
-The two documents without a section number, `DREAMFERENCE_LING_ENGINE_CLI.md` and `DREAMFERENCE_LING_ENGINE_API.md`, were written on 2026-10-09 from the code and have no counterpart in the original file.
+The documents without a section number have no counterpart in the original file: `DREAMFERENCE_LING_ENGINE_CLI.md` and `DREAMFERENCE_LING_ENGINE_API.md`, written on 2026-10-09 from the code, and `DREAMFERENCE_LING_ENGINE_LOWBIT.md`, a study of 2026-10-27.
