@@ -55,7 +55,8 @@
 // --fused-check (BATCHING C2, drafts/C2-integration-2026-10-28.md; needs --draft, --side-prefill N and --sessions 2
 // or 3): with two sessions the prompts in pairs (A, B), both orders; with three in triples, A and C decoding as a batch
 // of two (the chain: tree verification off, as --batch-check) and each prompt of the triple taking B's part once.
-// Each prompt is first prefilled alone from a cold engine (full chunks) and decoded speculatively, --max-tokens. Then
+// Each prompt is first prefilled alone from a cold engine (the rider in chunks of --fused-chunk with prefill_chunk, the
+// decoders in full chunks) and decoded speculatively, --max-tokens. Then
 // the decoders are prefilled and take two steps; B's prompt starts and every decode step carries B's next chunk of
 // --fused-chunk tokens (default 256; Engine::speculate_fused) while one can; a chunk no step can carry runs alone. Once
 // B's prompt is done all take steps in turn. Compared bit for bit with the runs alone: B's state, drafter context and
@@ -817,8 +818,14 @@ int main(int argc, char** argv) {
             for (int k : all) {
               engine.reset_all();
               engine.activate_session(0, "", true);
-              engine.prefill(prompts[k], nullptr, false, IMG);
-              if (k == ib) b_alone = after_prefill();
+              if (k == ib) {  // the rider alone in chunks of --fused-chunk, as prefill_chunk runs them
+                ling::Engine::PrefillCursor c1 = engine.begin_prefill(prompts[k], false, IMG);
+                while (!engine.prefill_chunk(c1, fused_chunk)) {
+                }
+                b_alone = after_prefill();
+              } else {
+                engine.prefill(prompts[k], nullptr, false, IMG);
+              }
               Seq q;
               q.sp = sp;
               q.pending = {engine.sample(engine.logits(), sp, engine.history())};

@@ -29,7 +29,7 @@ namespace ling::serve {
 inline constexpr size_t kDraftRingBytes = size_t(5) * 2 * 8224 * 1024 * 2;
 // What the engine allocates besides weights and sessions (activations for a 2,048-row chunk and their second set for
 // the side prefill, logits, the checkpoint store, graphs), measured on node-b on 2026-10-27: 2.5-3.4 GB at one to
-// four sessions; 4 GB with margin.
+// four sessions; 4 GB with margin. The fused pass (C2, --fused-pass) adds nothing: its chunk rows take the side set.
 inline constexpr size_t kScratchBytes = size_t(4) << 30;
 
 // One session's flat slot at `max_context` tokens: the full-attention layers' BF16 KV, the DeltaNet and conv state
