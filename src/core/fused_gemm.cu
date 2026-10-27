@@ -110,6 +110,10 @@ __global__ void __launch_bounds__(kThreads)
     pl.M = 1;
   }
   const Loader<FP4, BN, STAGES, SWIGLU> loader(pl, m0, n0);
+  if constexpr (!FP4) {  // the weight tiles kL2LeadFp8 chunks ahead into L2, as prefill_gemm does (prefill_tile.cuh)
+#pragma unroll
+    for (int c = 0; c < kL2LeadFp8; ++c) l2_prefetch_fp8<BN>(p, n0, c);
+  }
 #pragma unroll
   for (int s = 0; s < STAGES - 1; ++s) {
     if (s < KT) loader.load(smem, s, s);
@@ -128,6 +132,9 @@ __global__ void __launch_bounds__(kThreads)
         const int nk = kt + STAGES - 1;
         if (nk < KT) loader.load(smem, nk % STAGES, nk);
         cp_commit();
+        if constexpr (!FP4) {
+          if (u % SPC == 0) l2_prefetch_fp8<BN>(p, n0, c + kL2LeadFp8);
+        }
         const uint8_t* st = smem + (kt % STAGES) * S::kStageBytes;
         const uint8_t* sb = st + S::kStageA;
         // xpf: the next chunk's activations (each lane's 64 bytes per row) into L1 ahead of stream_chunk's loads,

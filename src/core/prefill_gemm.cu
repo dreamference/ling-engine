@@ -18,6 +18,8 @@
 // stage, mbarriers between it and 8 consumer warps) ran FP8 ~8% faster and NVFP4 3-4x slower: one warp
 // cannot issue a stage's ~1,800 copies in the time the MMAs take. TMA would issue them in a few
 // instructions, but the FP8 tiled layout (decode's) has no 64-byte row runs for a swizzled box.
+// FP8 blocks also prefetch their weight tiles into L2 two chunks ahead of the MMAs (l2_prefetch_fp8, a
+// hint): with the stage copies alone the FP8 weights streamed at ~100 GB/s at 128-512 rows, with it ~150-175.
 #include "core/kernels.cuh"
 
 #include <cuda_fp8.h>
@@ -52,6 +54,10 @@ __global__ void __launch_bounds__(kThreads) prefill_gemm_kernel(GemmArgs p) {
     for (int j = 0; j < NF; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
 
   const Loader<FP4, BN, STAGES, SWIGLU> loader(p, m0, n0);
+  if constexpr (!FP4) {  // the weight tiles kL2LeadFp8 chunks ahead of the MMAs, into L2 (prefill_tile.cuh)
+#pragma unroll
+    for (int c = 0; c < kL2LeadFp8; ++c) l2_prefetch_fp8<BN>(p, n0, c);
+  }
 #pragma unroll
   for (int s = 0; s < STAGES - 1; ++s) {
     if (s < KT) loader.load(smem, s, s);
@@ -63,6 +69,9 @@ __global__ void __launch_bounds__(kThreads) prefill_gemm_kernel(GemmArgs p) {
     const int nk = kt + STAGES - 1;
     if (nk < KT) loader.load(smem, nk % STAGES, nk);
     cp_commit();
+    if constexpr (!FP4) {
+      if ((kt & 1) == 0) l2_prefetch_fp8<BN>(p, n0, (kt >> 1) + kL2LeadFp8);
+    }
     compute_stage<FP4, BN, STAGES>(smem + (kt % STAGES) * S::kStageBytes, acc, lane, wm, wn);
   }
   cp_wait<0>();

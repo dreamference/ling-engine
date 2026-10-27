@@ -16,6 +16,11 @@ constexpr int kBM = 128, kThreads = 256;
 constexpr int kRowBytes = 64;  // per row per stage
 constexpr int kTileBytesFp4 = 16 * 64 + 16 * 8, kTileBytesFp8 = 16 * 128;
 constexpr int kValueBytesFp4 = 16 * 64;  // B26: a coded blob's value blocks (its codes follow them all, stream_gemm.cu)
+// FP8: how many 128-value chunks ahead of the MMAs a block prefetches its weight tiles into L2 (l2_prefetch_fp8).
+// The stage copies alone run 1.5 chunks ahead and stream the FP8 weights at ~100 GB/s at 128-512 rows; with each
+// tile's tiled block requested whole two chunks ahead, at ~150-175 GB/s. One chunk ahead changes nothing (the copies
+// have asked for it already); four and eight are slower (specs/drafts/C2-fused-gemm-2026-10-27.md).
+constexpr int kL2LeadFp8 = 2;
 
 // A block computes kBM tokens x BN weight rows; 8 warps, 2 along M x 4 along N, each 64 x BN / 4.
 template <int BN, int STAGES>
@@ -108,6 +113,18 @@ __device__ __forceinline__ const uint8_t* weight_row(const GemmArgs& p, int n0, 
     const int wn = r / WN, within = r % WN;
     row = n0 / 2 + wn * HALF + within % HALF;
     return within < HALF ? p.w : p.w2;
+  }
+}
+
+// FP8: chunk c of the block's weight tiles (block n0 = blockIdx.y * BN, rows n0 .. n0 + BN - 1) into L2, one bulk
+// prefetch of the tile's 2,048-byte tiled block by each of threads 0 .. BN / 16 - 1. A hint: the stage copies read the
+// same bytes with it or without it, so every result is the same.
+template <int BN>
+__device__ __forceinline__ void l2_prefetch_fp8(const GemmArgs& p, int n0, int c) {
+  const int chunks = p.K / 128;
+  if (threadIdx.x < BN / 16 && c < chunks) {
+    const uint8_t* tile = p.w + (static_cast<size_t>(n0 / 16 + threadIdx.x) * chunks + c) * kTileBytesFp8;
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(tile), "r"(kTileBytesFp8) : "memory");
   }
 }
 
