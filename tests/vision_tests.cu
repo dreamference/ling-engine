@@ -107,9 +107,12 @@ bool test_attention(int n, int heads, std::mt19937& rng) {
             for (int d = 0; d < D; ++d) o[d] += pb * f[size_t(j) * 3 * H + 2 * H + h * D + d];
           }
         }
+        // In BF16 units of the value (2^(exponent - 7)): rounding gives at most half a unit; the FP32 sums' order and
+        // a P value rounded the other way add a little.
         for (int d = 0; d < D; ++d) {
-          const double want = bfr(float(o[d] / l));
-          emu_worst = std::max(emu_worst, std::abs(double(__bfloat162float(out[size_t(i) * H + h * D + d])) - want));
+          const double want = o[d] / l;
+          const double ulp = std::ldexp(1.0, std::ilogb(std::max(std::abs(want), 1e-30)) - 7);
+          emu_worst = std::max(emu_worst, std::abs(double(__bfloat162float(out[size_t(i) * H + h * D + d])) - want) / ulp);
         }
       }
   }
@@ -135,8 +138,8 @@ bool test_attention(int n, int heads, std::mt19937& rng) {
   char what[64];
   std::snprintf(what, sizeof what, "attention n=%d heads=%d (|e| / RMS, exact softmax)", n, heads);
   report(what, worst, 3e-2);  // reported; BF16 P and output put the exact-softmax error at 1-2% of the RMS
-  std::snprintf(what, sizeof what, "attention n=%d heads=%d (|e| / RMS, the kernel's algorithm)", n, heads);
-  return report(what, emu_worst / rms, 4e-3);
+  std::snprintf(what, sizeof what, "attention n=%d heads=%d (BF16 units, the kernel's algorithm)", n, heads);
+  return report(what, emu_worst, 1.0);
 }
 
 bool test_layernorm(std::mt19937& rng) {
