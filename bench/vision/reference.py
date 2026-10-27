@@ -136,7 +136,22 @@ def sgl_tower(model_dir):
         m = Qwen3VLMoeVisionModel(cfg, norm_eps=1e-6, prefix="visual")
     torch.set_default_dtype(torch.float32)
     sd = load_visual(model_dir)
-    m.load_weights(list(sd.items()))
+    # As SGLang's model loader does for the tower (Qwen3VLForConditionalGeneration.load_weights, v0.5.21): the fused
+    # qkv goes to VisionAttention's qkv_proj, every other weight by its own name; a missing name is an error here.
+    from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+    params = dict(m.named_parameters(remove_duplicate=False))
+    loaded = set()
+    for name, w in sd.items():
+        n = name.replace("attn.qkv.", "attn.qkv_proj.")
+        if n not in params:
+            raise KeyError(f"SGLang's tower has no parameter {n} (from {name})")
+        p = params[n]
+        getattr(p, "weight_loader", default_weight_loader)(p, w)
+        loaded.add(n)
+    missing = sorted(set(params) - loaded)
+    if missing:
+        raise KeyError(f"SGLang's tower parameters not loaded: {missing[:8]} ({len(missing)})")
     return m.eval()
 
 
