@@ -14,6 +14,9 @@ step greedy $B/ling-run --model $M --vision-prompts $P --greedy-out $V/../engine
 step cases python3 $SRC/bench/vision/agree.py cases $V/..
 step force bash -c "$B/ling-run --model $M --vision-prompts $P --force-file $V/../cases.jsonl > $V/../engine-force.jsonl"
 step agree python3 $SRC/bench/vision/agree.py $V/..
+# Resumes inside an image: the same 8K-token image under two questions (a kept state inside it), two images whose
+# second differs (a resume between them), and the exactness of each against a prefill from scratch.
+step prefix-check-resume $B/ling-run --model $M --draft $D --vision-prompts $V/../prompts-resume.jsonl --prefix-check --sessions 1 --max-tokens 32
 serve() {
   rm -f ~/vision/serve.done ~/vision/serve.ready
   setsid $B/ling-serve --model $M --draft $D --port 18101 --served-model-name RadixArk/Qwen3.8-27B-NVFP4 \
