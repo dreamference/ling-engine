@@ -3,7 +3,7 @@
 Every residue of the token count modulo 256 is hit at a step of 8, so about four of the 32 prompts end in a chunk of at
 most 32 rows (the rows path's size) when prefilled in chunks of 256, and in one long chunk when prefilled whole.
 
-    python3 tails.py SOURCE.md > prompts-tails.jsonl
+    python3 bench/chunk_tails.py SOURCE.md > prompts-tails.jsonl
 """
 
 import json
