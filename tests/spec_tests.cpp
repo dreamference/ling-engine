@@ -4,6 +4,7 @@
 //     times, with random draft distributions and with deterministic (lookup) proposals, and the joint
 //     distribution of the first tokens is compared with the target's by a chi-square test;
 //   - the context lookup's proposals.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -222,6 +223,60 @@ bool check_tree(int E, int extra, uint64_t seed) {
   return ok;
 }
 
+// BACKLOG 26, follow-up 3: the sampled tree's rule at a node is the multi-draft rule (recursive rejection sampling, as in
+// SpecInfer) for its proposals. The chain's token x is drawn from q and the siblings y_1 .. y_S are fixed tokens (point
+// masses). Recursive rejection sampling accepts x with min(1, p(x) / q(x)), else goes on with the residual
+// R = max(0, p - q) / Z; then accepts each y_i with probability p_i(y_i), p_i being R with y_1 .. y_{i-1} removed and
+// renormalised, and at the end draws from what is left. accept_tree_sampled() instead draws once from R and continues into
+// the sibling holding the draw. The two give every outcome (x, each y_i, each other token) the same probability; this
+// checks it exactly, from the probabilities, on random p, q and sibling sets (the chi-square of check_tree checks the
+// emitted distribution).
+bool check_sibling_rule(uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  double worst = 0;
+  for (int trial = 0; trial < 2000; ++trial) {
+    const ling::Dist p = random_dist(rng, true), q = random_dist(rng, false);
+    for (int x = 0; x < kVocab; ++x) {
+      const double qx = prob(q, x);
+      if (qx == 0) continue;
+      const double a = std::min(1.0, prob(p, x) / qx);
+      std::vector<double> R(kVocab);
+      double Z = 0;
+      for (int t = 0; t < kVocab; ++t) Z += R[t] = std::max(0.0, prob(p, t) - prob(q, t));
+      if (Z <= 0) continue;
+      for (double& r : R) r /= Z;
+      std::vector<int> sib;
+      for (int t = 0; t < kVocab; ++t)
+        if (t != x && std::uniform_real_distribution<double>(0, 1)(rng) < 0.5) sib.push_back(t);
+      std::shuffle(sib.begin(), sib.end(), rng);
+      // Recursive rejection sampling over the siblings, outcome by outcome.
+      std::vector<double> rrs(kVocab, 0.0), draw(kVocab, 0.0);
+      std::vector<double> cur = R;
+      double reach = 1 - a;  // probability of reaching the siblings
+      for (int y : sib) {
+        double tot = 0;
+        for (double c : cur) tot += c;
+        if (tot <= 0) break;
+        const double py = cur[y] / tot;
+        rrs[y] += reach * py;
+        reach *= 1 - py;
+        cur[y] = 0;
+      }
+      double tot = 0;
+      for (double c : cur) tot += c;
+      for (int t = 0; t < kVocab; ++t)
+        if (tot > 0) rrs[t] += reach * cur[t] / tot;
+      // The engine's rule: one draw from R, continuing into the sibling that holds it, else emitting it.
+      for (int t = 0; t < kVocab; ++t) draw[t] = (1 - a) * R[t];
+      for (int t = 0; t < kVocab; ++t) worst = std::max(worst, std::fabs(rrs[t] - draw[t]));
+    }
+  }
+  const bool ok = worst < 1e-12;
+  std::printf("sibling rule: recursive rejection sampling over point-mass siblings against one residual draw, largest "
+              "difference %.2g %s\n", worst, ok ? "ok" : "FAIL");
+  return ok;
+}
+
 // build_tree and describe_tree on random drafter outputs: the chain is rows 0 .. E, parents precede children, every
 // row's variant path holds it at its depth, and each gdn path advances parent to child with leaves after their parent,
 // writing every row exactly once.
@@ -308,6 +363,7 @@ int main() {
   ok &= check_accept(true, 2, 3);
   ok &= check_accept(true, 4, 4);
   ok &= check_tree_desc(11);
+  ok &= check_sibling_rule(13);
   ok &= check_tree(1, 3, 5);
   ok &= check_tree(3, 6, 6);
   ok &= check_tree(4, 12, 7);
