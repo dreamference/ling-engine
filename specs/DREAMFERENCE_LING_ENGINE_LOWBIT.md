@@ -18,7 +18,7 @@ Part of the ling-engine specification; the index is [README.md](./README.md). A 
   | 3-bit everywhere + FP8 KV | ×1.47–1.50 |
 
   1.6× would need the step at 66 ms, about 40 ms off, which no weight format above 2 bits gives at one stream. Every one of these candidates can only lower acceptance, the other factor in tokens/s.
-- **Measured on GB10 (2026-10-26, third-puffin, dummy data, section 6):**
+- **Measured on GB10 (2026-10-26, node-c, dummy data, section 6):**
   - At the verify's 16 rows, a 3-bit format and a 2:4 sparse NVFP4 format both stream at the same 205–220 GB/s as dense NVFP4. A matrix's time therefore falls with its bytes: decoding in registers is free here, unlike item 30's entropy code.
   - sm_121 accepts and runs 2:4 sparse MMAs (`mma.sp`) for FP16, FP8, FP4 and block-scaled NVFP4 and MXFP8.
   - The library path is no use at these shapes. cuSPARSELt 0.8.1 runs 2:4 FP16 2.4–4.6× *slower* than dense cuBLAS at 16 rows and refuses 2:4 FP8.
@@ -168,9 +168,9 @@ What is known:
 | (a2) 3-bit FFN | A quantizer to an 8-entry per-tensor codebook with E4M3 per-16 scales (section 6's `b3`), GPTQ-style error feedback. GPTQModel 7.7.0 supports `qwen3_5` hybrids but quantizes to uniform INT grids. QTIP/AQLM show no sign of supporting the DeltaNet hybrid. Healing (low-rank residual, distillation) needs cloud GPUs | A `b3` path in `stream_gemm` (the microbenchmark's decode: masks, one `prmt` per four values, `cvt` from E4M3) and in the megakernel's FFN; a prefill path that dequantizes to FP8/BF16 tiles; a new tile layout in the loader | 1–2 weeks after a passing quality filter |
 | (b) 2:4 | SparseGPT in llm-compressor 0.14.0.1 or ModelOpt's `sparsegpt`, then recovery distillation (~13B tokens) | `mma.sp` works (section 6), and the kernel is the dense one with metadata. Not the obstacle | Weeks of cloud training: not pursued |
 
-## 6. Measurements: 2026-10-26 on third-puffin (dummy data, no model)
+## 6. Measurements: 2026-10-26 on node-c (dummy data, no model)
 
-**Windows.** Two GPU windows on third-puffin under the lock convention (`flock ~/.ling-gpu.lock`, logged in `~/.ling-gpu-holds.log` as `lowbit-study-agent`): 23:51–23:52 and 23:54–23:56 UTC. No production model server was running there, so none was stopped. No model was converted or loaded. The scripts are in `bench/lowbit/`: `window.sh`, `sparse_isa_probe.{cu,sh}`, `lowbit_gemm.cu`, `sparse_lib.py`, `summarize.py`. Raw results are in `bench/lowbit/results-2026-10-26/`.
+**Windows.** Two GPU windows on node-c under the lock convention (`flock ~/.ling-gpu.lock`, logged in `~/.ling-gpu-holds.log` as `lowbit-study-agent`): 23:51–23:52 and 23:54–23:56 UTC. No production model server was running there, so none was stopped. No model was converted or loaded. The scripts are in `bench/lowbit/`: `window.sh`, `sparse_isa_probe.{cu,sh}`, `lowbit_gemm.cu`, `sparse_lib.py`, `summarize.py`. Raw results are in `bench/lowbit/results-2026-10-26/`.
 
 **(1) What sm_121 runs: `sparse_isa_probe`.** Each MMA multiplies an all-ones compressed A by an all-ones B and checks every output against K/2. The build target is `-gencode arch=compute_121a,code=sm_121a`.
 
@@ -297,7 +297,7 @@ Not tried: (b) 2:4, (a3) MXFP4, (d) layer skipping.
 
 ## Sources
 
-- Measured here: `bench/lowbit/` and `bench/lowbit/results-2026-10-26/` (third-puffin, 2026-10-26).
+- Measured here: `bench/lowbit/` and `bench/lowbit/results-2026-10-26/` (node-c, 2026-10-26).
 - This repository: BACKLOG §19 items 19, 20, 22, 26, 27, 29, 30, 33, 34 and 35; [MODEL §5](./DREAMFERENCE_LING_ENGINE_MODEL.md); [RESEARCH §16.2, §16.10, §16.13](./DREAMFERENCE_LING_ENGINE_RESEARCH.md); [MILESTONES §14](./DREAMFERENCE_LING_ENGINE_MILESTONES.md); [VALIDATION §13](./DREAMFERENCE_LING_ENGINE_VALIDATION.md); `src/core/stream_gemm.cu`, `src/core/model.cu`; `bench/agreement/`, `bench/quant/`, `bench/agentlong/manifest.json`.
 - Mightling: `specs/DREAMFERENCE_MODELS.md` §2.2 (the Minima candidate, night 2); SWE-bench nights 12 and 13 (`~/.local/share/dreamference/swe-bench/night12/`, `night13/`).
 - Minima, "Why Gated DeltaNet Survives 4-Bit Quantization": [arXiv 2609.04098](https://arxiv.org/abs/2609.04098).
