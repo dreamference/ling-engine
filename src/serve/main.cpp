@@ -6,7 +6,7 @@
 //              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
-//              [--side-prefill N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off]
+//              [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off]
 //              [--repetition-report incomplete|completed]
 //
 // --sessions N (default 2; M4 §1) keeps N resident sessions, each with its own KV cache and state, so N
@@ -27,6 +27,10 @@
 // request decodes, a prefill runs in full chunks on the engine's second stream, on a green context of N SMs (-1: a
 // plain second stream), at the same time as the other request's steps on the main stream, instead of alternating
 // contended chunks with them. The same kernels on the same inputs (ling-run --interleave-check --side-prefill N).
+// --side-share N (BATCHING §5.5, C1; default 0, off): while two or more other requests decode, a prefill on the side
+// stream waits after each chunk until N decode passes have run on the main stream alone, so the decoding
+// conversations take some steps at their speed alone instead of every step beside a chunk. Only the order of units
+// changes, as with the shortest prefill first.
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -281,6 +285,7 @@ struct Running {
   int chunks_beside = 0;  // prefill chunks run while another request was decoding (contended size, or on the side)
   bool side_flight = false;  // one of its chunks is in flight on the engine's side stream
   bool yielding = false;     // its prefill is letting a shorter one go first, since yield_t0 (C1)
+  long side_mark = -1;       // the scheduler's decode passes when its last side chunk finished (--side-share)
   std::chrono::steady_clock::time_point yield_t0;
   int batched = 0;       // its decode steps taken in a batch with another request (M4 stage 3)
   Periods alone, beside;  // step periods without and with another request's prefill in between
@@ -298,8 +303,13 @@ struct Running {
 // one-row step on its turn; a prefill chunk still alternates with the decode steps.
 class Scheduler {
  public:
-  Scheduler(ServerContext& ctx, double protect_seconds, int batch, int contended)
-      : ctx_(ctx), protect_seconds_(protect_seconds), batch_(batch), contended_(contended), thread_([this] { run(); }) {}
+  Scheduler(ServerContext& ctx, double protect_seconds, int batch, int contended, int side_share = 0)
+      : ctx_(ctx),
+        protect_seconds_(protect_seconds),
+        batch_(batch),
+        contended_(contended),
+        side_share_(side_share),
+        thread_([this] { run(); }) {}
   ~Scheduler() {
     {
       std::lock_guard<std::mutex> l(mu_);
@@ -499,6 +509,7 @@ class Scheduler {
       steps[i].params = &r.job.req.sampling;
       steps[i].row_logits = r.job.req.logprobs ? &r.rows : nullptr;
     }
+    ++decode_passes_;
     try {
       eng.speculate_batch(steps);
     } catch (const std::exception& e) {  // not one sequence's rows: the step itself failed
@@ -533,6 +544,18 @@ class Scheduler {
     for (const auto& r : running_)
       if (r.get() != &self && !r->prefilling) return true;
     return false;
+  }
+  int others_decoding(const Running& self) const {
+    int n = 0;
+    for (const auto& r : running_)
+      if (r.get() != &self && !r->prefilling) ++n;
+    return n;
+  }
+  // Whether r's next side chunk waits (--side-share N): while two or more other requests decode, N decode passes
+  // run on the main stream alone after each of r's chunks before its next chunk starts.
+  bool hold_side(const Running& r) const {
+    if (side_share_ <= 0 || r.side_mark < 0 || others_decoding(r) < 2) return false;
+    return decode_passes_ - r.side_mark < side_share_;
   }
   bool other_prefilling(const Running& self) const {
     for (const auto& r : running_)
@@ -575,7 +598,7 @@ class Scheduler {
       if (eng.side_enabled() && (r.side_flight || (contended && !eng.side_busy()))) {
         // A full chunk on the side stream; the decoding request's turns go on while it runs.
         if (!r.side_flight) {
-          if (yield_prefill(r)) return false;
+          if (hold_side(r) || yield_prefill(r)) return false;
           eng.prefill_chunk_launch(r.cur, 0);
           r.side_flight = true;
           count_interleaved(r);
@@ -584,7 +607,8 @@ class Scheduler {
         if (contended && !eng.side_ready()) return false;
         r.side_flight = false;
         if (!eng.prefill_chunk_finish()) {
-          if (other_decoding(r) && !yield_prefill(r)) {  // the next chunk at once, unless a short prefill waits
+          r.side_mark = decode_passes_;
+          if (other_decoding(r) && !hold_side(r) && !yield_prefill(r)) {  // the next chunk at once, unless a short prefill waits
             eng.prefill_chunk_launch(r.cur, 0);
             r.side_flight = true;
             count_interleaved(r);
@@ -609,6 +633,7 @@ class Scheduler {
     r.last_step = now;
     eng.select_session(r.job.session);
     ++r.passes;
+    ++decode_passes_;
     {
       std::lock_guard<std::mutex> m(ctx_.metrics.mu);
       ctx_.metrics.batch_rows = r.spec ? std::min(eng.draft_block(), eng.max_context() - static_cast<int>(eng.history().size())) : 1;
@@ -770,7 +795,8 @@ class Scheduler {
 
   ServerContext& ctx_;
   double protect_seconds_;
-  int batch_, contended_;
+  int batch_, contended_, side_share_;
+  long decode_passes_ = 0;  // decode passes run (a batched step counts once), for --side-share
   std::mutex mu_;
   std::condition_variable cv_;
   std::deque<Job> queue_;
@@ -1414,7 +1440,7 @@ int main(int argc, char** argv) {
   int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 7, prefix_kv_mb = -1;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
-  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40;
+  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40, side_share = 0;
   long host_reserve_mb = 16384, admit_reserve_mb = 8192;
   double protect_seconds = 30;
   bool draft_bf16 = false;
@@ -1465,6 +1491,7 @@ int main(int argc, char** argv) {
     else if (a == "--batch") batch = std::stoi(next());
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else if (a == "--side-prefill") side_prefill = std::stoi(next());
+    else if (a == "--side-share") side_share = std::stoi(next());
     else if (a == "--host-reserve-mb") host_reserve_mb = std::stol(next());
     else if (a == "--admit-reserve-mb") admit_reserve_mb = std::stol(next());
     else if (a == "--repetition-detection") repetition_arg = next();
@@ -1475,7 +1502,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
     return 2;
   }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
@@ -1628,7 +1655,7 @@ int main(int argc, char** argv) {
     name = name.substr(name.find_last_of('/') + 1);
   }
   ctx.model_name = name;
-  ling::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended);
+  ling::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended, side_share);
 
   proxygen::HTTPServerOptions options;
   options.threads = 2;
