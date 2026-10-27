@@ -144,10 +144,28 @@ def only_sgl(model_dir, out):
         print(name, "sgl", flush=True)
 
 
+def only_fp32(model_dir, out):
+    """The FP32 tower again on the pixel values already dumped (a second pass without TF32)."""
+    m32 = hf_tower(model_dir, torch.float32)
+    for name in sorted(f[:-5] for f in os.listdir(out) if f.endswith(".json")):
+        meta = json.load(open(f"{out}/{name}.json"))
+        pv = torch.from_numpy(np.fromfile(f"{out}/{name}.pixel_values.bf16", dtype=np.int16)).view(torch.bfloat16)
+        pv = pv.reshape(-1, 1536).cuda()
+        grid = torch.tensor([meta["grid"]], device="cuda")
+        with torch.no_grad():
+            dump(f"{out}/{name}.hf_fp32.f32", m32(pv.float(), grid).pooler_output)
+        print(name, "fp32", flush=True)
+
+
 def main():
+    # The FP32 tower is the truth: no TF32 anywhere (cuDNN's convolutions default to it).
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
     model_dir, out = sys.argv[1], sys.argv[2]
     if os.environ.get("ONLY_SGL"):
         return only_sgl(model_dir, out)
+    if os.environ.get("ONLY_FP32"):
+        return only_fp32(model_dir, out)
     os.makedirs(out, exist_ok=True)
     from transformers import AutoImageProcessor
     from sglang.srt.utils.common import load_image
