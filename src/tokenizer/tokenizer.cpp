@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <climits>
 #include <fstream>
+#include <mutex>
 #include <stdexcept>
 
 #include <nlohmann/json.hpp>
@@ -188,9 +189,12 @@ void Tokenizer::encode_segment(std::string_view raw, std::vector<int>& out) cons
 }
 
 void Tokenizer::bpe(const std::string& piece, std::vector<int>& out) const {
-  if (auto it = cache_.find(piece); it != cache_.end()) {
-    out.insert(out.end(), it->second.begin(), it->second.end());
-    return;
+  {
+    std::shared_lock<std::shared_mutex> l(cache_mu_);
+    if (auto it = cache_.find(piece); it != cache_.end()) {
+      out.insert(out.end(), it->second.begin(), it->second.end());
+      return;
+    }
   }
   std::vector<int> ids;
   if (auto it = vocab_.find(piece); it != vocab_.end()) {
@@ -217,7 +221,10 @@ void Tokenizer::bpe(const std::string& piece, std::vector<int>& out) const {
       ids.push_back(it->second);
     }
   }
-  if (cache_.size() < 200000) cache_.emplace(piece, ids);
+  {
+    std::unique_lock<std::shared_mutex> l(cache_mu_);
+    if (cache_.size() < 200000) cache_.emplace(piece, ids);
+  }
   out.insert(out.end(), ids.begin(), ids.end());
 }
 
