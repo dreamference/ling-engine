@@ -27,10 +27,11 @@
 // request decodes, a prefill runs in full chunks on the engine's second stream, on a green context of N SMs (-1: a
 // plain second stream), at the same time as the other request's steps on the main stream, instead of alternating
 // contended chunks with them. The same kernels on the same inputs (ling-run --interleave-check --side-prefill N).
-// --side-share N (BATCHING §5.5, C1; default 0, off): while two or more other requests decode, a prefill on the side
-// stream waits after each chunk until N decode passes have run on the main stream alone, so the decoding
-// conversations take some steps at their speed alone instead of every step beside a chunk. Only the order of units
-// changes, as with the shortest prefill first.
+// --side-share N (BATCHING §5.5, C1; default 16, 0 off): while two or more other requests decode, the side stream
+// waits after each prefill chunk (any request's) until N decode passes have run on the main stream alone, so the
+// decoding conversations take some steps at their speed alone instead of every step beside a chunk. At four warm
+// agent conversations (node-b, 2026-10-27) 16 raised the pooled decode from 25.7 to 35.6 tok/s with the rounds'
+// time unchanged (139.3 / 140.9 s). Only the order of units changes, as with the shortest prefill first.
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -1441,7 +1442,7 @@ int main(int argc, char** argv) {
   int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 7, prefix_kv_mb = -1;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
-  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40, side_share = 0;
+  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40, side_share = 16;
   long host_reserve_mb = 16384, admit_reserve_mb = 8192;
   double protect_seconds = 30;
   bool draft_bf16 = false;
