@@ -526,11 +526,14 @@ void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
   const int dkv = d.kv_heads * d.head_dim;
   // fc over the concatenated target features (already BF16), then the hidden norm. The context goes
   // straight to each layer's K and V: no input norm, no convolution (SGLang's prepare_context_hidden_for_kv).
+  // A prefill's rows (quantized_) always take the BF16 GEMM, as the target's projections take the prefill path
+  // whatever the chunk's size: a prompt's last few rows (a chunk of <= 32) must give the drafter the context a larger
+  // chunk gives them, or the speculative continuation depends on the chunking (--chunk-check).
   const Fp4Weight& fc4 = draft_->fc4();
-  if (rows <= kernels::kMaxStreamRows && fc4.w) {  // BACKLOG 33: the NVFP4 copy on the rows path
+  if (!quantized(rows) && fc4.w) {  // BACKLOG 33: the NVFP4 copy on the rows path
     kernels::bf16_to_half_rows(cap_ + size_t(cap_row0) * cap_stride_, rows, fc4.K, xh_fc_, xinv_, stream_);
     kernels::stream_gemm_nvfp4(xh_fc_, xinv_, rows, fc4.w, fc4.table, fc4.scale2, dctx_, fc4.N, fc4.K, stream_);
-  } else if (rows <= kernels::kMaxStreamRows)
+  } else if (!quantized(rows))
     kernels::bf16_rows_bf16in(cap_ + size_t(cap_row0) * cap_stride_, rows, draft_->fc().w, dctx_, d.hidden, cap_stride_,
                               stream_);
   else

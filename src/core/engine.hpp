@@ -335,6 +335,9 @@ class Engine {
   long session_evictions() const { return evictions_; }
   // FNV-1a over every DeltaNet and conv state, bit for bit (the exactness tests compare runs with it).
   uint64_t state_hash();
+  // FNV-1a over the drafter's context KV of the active session's positions [dkv_from, history), bit for bit; 0
+  // without a drafter.
+  uint64_t draft_hash();
 
  private:
   struct Session;
