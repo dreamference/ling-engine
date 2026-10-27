@@ -55,8 +55,13 @@ for item in "$@"; do
       for _ in $(seq 1 120); do curl -sf -m 2 localhost:8300/health > /dev/null && break; sleep 3; done
       echo "engine $label up $(date -u +%T), MemAvailable $(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo) MB"
       warm=; [ "${mode#warm-}" != "$mode" ] && { warm=--warm; mode=${mode#warm-}; }
+      if [ "$mode" = probe ]; then  # probe.py: A decoding, B's cold prime, C's warm question (n = repeats)
+        python3 "$HERE/probe.py" --url http://127.0.0.1:8300 --label "$label" --repeat "$n" \
+          --serve-log "$O/$label.serve.log" --out "$O/$label.jsonl" > "$O/$label.log" 2>&1 8>&-
+      else
       python3 "$HERE/n_streams.py" --url http://127.0.0.1:8300 --streams "$n" --mode "$mode" --label "$label" $warm --cache-key \
         --out "$O/$label.jsonl" > "$O/$label.log" 2>&1 8>&-
+      fi
       curl -s -m 10 localhost:8300/spec_stats > "$O/$label.spec.json" 2>/dev/null
       curl -s -m 10 localhost:8300/metrics > "$O/$label.metrics.txt" 2>/dev/null
       kill $SRV; wait $SRV 2>/dev/null

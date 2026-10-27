@@ -48,5 +48,14 @@ window w8-sglang-cold-greedy "batching W8: SGLang v0.5.21 phase merge, agentlong
   "sglang-up:sg" "$S:s1g:1:greedy" "$S:s2g:2:greedy" "$S:s4g:4:greedy" "$S:s8g:8:greedy" "sglang-down"
 window w10-sglang-warm-sampled "batching W10: SGLang v0.5.21 phase merge, agentlong warm follow-ups sampled seed 1013 (1, 2, 4, 8), request log; <= 45 min, m0 stopped" \
   "sglang-up:sg" "$S:w1s:1:warm-seed1013" "$S:w2s:2:warm-seed1013" "$S:w4s:4:warm-seed1013" "$S:w8s:8:warm-seed1013" "sglang-down"
+elif [ "${ROUND}" = 2b ]; then
+# Round 2, reordered at 10:55 UTC after W11 and W7 (the GPU queue is long): SGLang cold greedy (W2 failed: the
+# baseline that matters) before the engine's sampled warm runs; W10 (SGLang warm sampled, unseeded) dropped.
+while pgrep -f "streams_window.sh $O/w7-" > /dev/null; do st "waiting for w7 to end"; sleep 60; done
+sleep 120
+window w8-sglang-cold-greedy "batching W8: SGLang v0.5.21 phase merge, agentlong cold turns, N streams greedy (1, 2, 4, 8); <= 45 min, m0 stopped" \
+  "sglang-up:sg" "$S:s1g:1:greedy" "$S:s2g:2:greedy" "$S:s4g:4:greedy" "$S:s8g:8:greedy" "sglang-down"
+window w9-engine-warm-sampled-key "batching W9: ling-serve main, agentlong warm follow-ups with prompt_cache_key, sampled seed 1013 (1, 2, 4) and the cold one-stream rerun; <= 45 min, m0 stopped" \
+  "$E:k1s:1:warm-seed1013" "$E:k2s:2:warm-seed1013" "$E:k4s:4:warm-seed1013:--sessions,4,--batch,4" "$E:e1s:1:seed1013"
 fi
 st "all done"
