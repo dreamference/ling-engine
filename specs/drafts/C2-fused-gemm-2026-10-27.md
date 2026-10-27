@@ -124,7 +124,7 @@ on the answer.
 The fix (`l2_prefetch_fp8`, `kL2LeadFp8` = 2): every FP8 block, in `prefill_gemm` and in the fused kernel, has
 threads 0 .. BN / 16 - 1 issue `cp.async.bulk.prefetch.L2` for chunk c + 2 of their weight tile at chunk c (and
 chunks 0 and 1 at the start). It is a hint: the stage copies, the MMAs and their order are untouched, so every output
-bit is unchanged. The NVFP4 kernels compile to the same SASS as before (`cuobjdump -sass`, all eight prefill and both
+bit is unchanged. The NVFP4 kernels compile to the same SASS as before (`cuobjdump -sass`: the four NVFP4 prefill and the two
 NVFP4 fused instantiations); the prefetch did not help NVFP4 (0.553 against 0.551 ms).
 
 Exactness: `prefill_gemm_fp8` and `prefill_gemm_fp8_bf16out` against the previous build, 336 cases byte for byte
@@ -140,7 +140,17 @@ run at 1 stream with ling-serve is 16 of 16 turns identical to the reference (`r
 | out, before | 0.329 (95) | 0.350 (90) | 0.438 (72) |
 | out, after | 0.205 (154) | 0.231 (136) | 0.360 (87) |
 
+At 1,024 and 2,048 rows the FP8 GEMMs are compute-bound and the prefetch changes nothing: in_qkv|z 1.246 / 2.380 ms
+before, 1.238 / 2.394 after; out 0.635 / 1.101 before, 0.613 / 1.041 after (17:37 UTC, the two builds back to back).
+
 Single-stream prefill (cold agentlong greedy, 1 stream, 520,529 new prompt tokens in chunks of ~2,048 rows, where the
 FP8 GEMMs are compute-bound): 1,812 tok/s before (287.2 s of prefill), 1,831 after (284.3 s), +1%; decode
 64.1 tok/s both; both runs 16 of 16 turns identical to the reference and to each other (same window pair, 17:04 and
 16:56 UTC).
+
+The fused kernel's launch policy (the decode rows on the prefill's blocks, or on blocks of their own when the chunk has
+two or more M tiles and the launch is under two waves) was tuned before the fix and still picks the better placement
+for FP8 at every point measured. Beside 12 decode rows at 128 / 256 / 512 rows, decode on blocks of its own
+(`LING_FUSED_SEP=1`) against on the prefill's (`=0`): in_qkv|z 0.58 / 0.71 / 0.97 ms against 0.58 / 0.55 / 0.79 (the
+policy: the prefill's blocks throughout); out 0.27 / 0.31 / 0.42 against 0.25 / 0.32 / 0.38 (the policy: its own
+blocks at 256 rows only).

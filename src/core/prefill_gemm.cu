@@ -19,7 +19,7 @@
 // cannot issue a stage's ~1,800 copies in the time the MMAs take. TMA would issue them in a few
 // instructions, but the FP8 tiled layout (decode's) has no 64-byte row runs for a swizzled box.
 // FP8 blocks also prefetch their weight tiles into L2 two chunks ahead of the MMAs (l2_prefetch_fp8, a
-// hint): with the stage copies alone the FP8 weights streamed at ~100 GB/s at 128-512 rows, with it ~150-175.
+// hint): with the stage copies alone the FP8 weights streamed at 70-100 GB/s at 128-512 rows, with it 120-180.
 #include "core/kernels.cuh"
 
 #include <cuda_fp8.h>

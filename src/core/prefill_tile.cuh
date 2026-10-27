@@ -17,9 +17,10 @@ constexpr int kRowBytes = 64;  // per row per stage
 constexpr int kTileBytesFp4 = 16 * 64 + 16 * 8, kTileBytesFp8 = 16 * 128;
 constexpr int kValueBytesFp4 = 16 * 64;  // B26: a coded blob's value blocks (its codes follow them all, stream_gemm.cu)
 // FP8: how many 128-value chunks ahead of the MMAs a block prefetches its weight tiles into L2 (l2_prefetch_fp8).
-// The stage copies alone run 1.5 chunks ahead and stream the FP8 weights at ~100 GB/s at 128-512 rows; with each
-// tile's tiled block requested whole two chunks ahead, at ~150-175 GB/s. One chunk ahead changes nothing (the copies
-// have asked for it already); four and eight are slower (specs/drafts/C2-fused-gemm-2026-10-27.md).
+// With the stage copies alone the FP8 weights stream at 70-100 GB/s at 128-512 rows; with each tile's tiled block
+// requested whole two chunks ahead, at 120-180 (in_qkv|z: 182 / 160 / 120 GB/s at 128 / 256 / 512 rows). One chunk
+// ahead changes nothing (the copies have asked for it already); four and eight are slower
+// (specs/drafts/C2-fused-gemm-2026-10-27.md §6).
 constexpr int kL2LeadFp8 = 2;
 
 // A block computes kBM tokens x BN weight rows; 8 warps, 2 along M x 4 along N, each 64 x BN / 4.
