@@ -54,6 +54,7 @@ add_library(ling_core STATIC
   src/core/model.cu
   src/core/engine.cpp
   src/core/prefix_kv.cpp
+  src/core/kv_pool.cpp
   src/core/vision.cu
 )
 target_include_directories(ling_core PUBLIC src)
@@ -133,6 +134,9 @@ add_test(NAME sampling COMMAND ling-sampling-tests)
 add_executable(ling-vision-tests tests/vision_tests.cu)
 target_link_libraries(ling-vision-tests PRIVATE ling_core)
 add_test(NAME vision COMMAND ling-vision-tests)
+add_executable(ling-kv-pool-tests tests/kv_pool_tests.cpp)
+target_link_libraries(ling-kv-pool-tests PRIVATE ling_core)
+add_test(NAME kv_pool COMMAND ling-kv-pool-tests)
 add_executable(ling-prefix-kv-tests tests/prefix_kv_tests.cpp)
 target_link_libraries(ling-prefix-kv-tests PRIVATE ling_core)
 
