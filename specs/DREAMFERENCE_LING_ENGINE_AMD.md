@@ -473,7 +473,10 @@ The rule makes the references below checkable. It also keeps a later Linux build
 
 ## 6. What was run on the box (2026-10-26 22:15 UTC to 2026-10-27 09:03 UTC, box clock)
 
-Scratch files are in `C:\llm\amd-port` on the box; the probes are also in this repository under `bench/amd/`. Nothing was installed, no driver or setting was changed, and the downloads came to 1.14 GB (the drafter).
+The probes are in this repository under `bench/amd/`. `C:\llm\amd-port` on the box keeps them and their results, cleaned on 2026-10-27 to 0.5 MB:
+
+- **Kept:** the sources, the scripts, the code objects (`vgf.co` is the build that passed in §6.7), the run logs and the result files.
+- **Dropped:** the drafter GGUF (re-downloadable; its SHA-256 is below), the copied agentlong request bodies and their answers, the template and the tuning variants. Nothing was installed, no driver or setting was changed, and the downloads came to 1.14 GB (the drafter).
 
 ### 6.1 The probes
 
@@ -485,7 +488,7 @@ Scratch files are in `C:\llm\amd-port` on the box; the probes are also in this r
 | `rt.ps1` | the driver's HIP runtime with TheRock off `PATH` (§6.4) |
 | `vg.hip`, `vg.ps1`, `vg-tune.ps1`, `vg-attrib.ps1` | the first milestone's verify-GEMM probe (§6.5, §6.6) |
 | `graph.ps1` | the per-node cost of a captured `hipGraph` (§6.6) |
-| `ag.ps1`, `cmp.ps1` (with `ag-t0[0-3].json` and `qwen38-patched.jinja`, kept on the box only) | the first four agentlong turns (25–33K tokens of context, `bench/agentlong/manifest.json`), sent to `llama-server`'s `/v1/responses` with temperature 0 and Mightling's patched chat template |
+| `ag.ps1`, `cmp.ps1` (the request bodies came from `bench-sets` and the template from Mightling's `ChatTemplatePatcher`; neither is kept) | the first four agentlong turns (25–33K tokens of context, `bench/agentlong/manifest.json`), sent to `llama-server`'s `/v1/responses` with temperature 0 and Mightling's patched chat template |
 
 The drafter is z-lab's `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` (1,143,006,816 bytes, SHA-256 `1a25c568…31ebd`, equal to the LFS object). It runs with `--spec-type draft-dflash -ngld 99`. llama.cpp logs `block_size=8, n_extract=5`.
 
