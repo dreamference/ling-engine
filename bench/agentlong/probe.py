@@ -2,13 +2,16 @@
 
 Three conversations against one server:
   A  decodes a long answer (a short prompt asking for ~1,500 tokens of text, greedy), started first;
-  B  sends a cold agent prompt (the largest agentlong turn, ~57K tokens) once A is decoding;
+  B  sends a cold agent prompt (one of the largest agentlong turns, 50-62K tokens, a different one each repeat)
+     once A is decoding;
   C  is a warm follow-up: its conversation (another agentlong turn's previous request) is primed before the probe,
-     and one second after B arrives it sends that conversation plus a short user question answered in text.
+     and five seconds after B arrives (B's prefill under way) it sends that conversation plus a short user question
+     answered in text.
 Reported: C's time to first token (the client's first streamed delta: C answers in text, so it streams), B's
 time to first token and prefill, and from ling-serve's request log A's step period alone and beside a prefill and
 its decode tokens/s over the probe. Each conversation has its own prompt_cache_key, so it keeps its session.
-Run --repeat R times (the conversations re-primed each time); every record and a summary go to --out.
+Run --repeat R times (new conversations each time); every record and a summary go to --out. Start ling-serve with
+--session-protect-seconds 0, or the repeats' new sessions wait for the last ones' protection to expire.
 
 Usage: probe.py --url http://127.0.0.1:8300 --out PROBE.jsonl [--label L] [--serve-log LOG] [--repeat R]
 """
@@ -39,12 +42,13 @@ def main():
     ap.add_argument("--label", default="probe")
     ap.add_argument("--serve-log", default="", help="ling-serve's log, for A's step periods (engine only)")
     ap.add_argument("--repeat", type=int, default=3)
+    ap.add_argument("--decoders", type=int, default=1,
+                    help="conversations decoding while B prefills: A, plus A2..AN with the same request in a variant")
     ap.add_argument("--bodies", default=os.path.expanduser("~/bench-sets/agentlong/bodies.jsonl"))
     a = ap.parse_args()
     bodies = [json.loads(ln) for ln in open(a.bodies)]
     size = lambda b: len(json.dumps(b["body"]["input"]))  # noqa: E731
     by_size = sorted(bodies, key=size)
-    b_body, c_body = by_size[-1], by_size[len(by_size) // 2]
     model = bodies[0]["body"]["model"]
     recs = []
 
@@ -53,12 +57,12 @@ def main():
                 "reasoning": {"effort": "none"}, "temperature": 0.0, "prompt_cache_key": f"{a.label}-A{rep}"}
 
     def body_b(rep):
-        body = dict(b_body["body"])
+        body = dict(by_size[-1 - rep % 4]["body"])
         body.update(temperature=0.0, prompt_cache_key=f"{a.label}-B{rep}")
         return body
 
     def body_c(rep, full):
-        body = dict(c_body["body"])
+        body = dict(by_size[len(by_size) // 2 + rep % 4]["body"])
         body.update(temperature=0.0, prompt_cache_key=f"{a.label}-C{rep}")
         prev = body["input"][:-2]  # the conversation as its previous request saw it
         if full:
@@ -87,13 +91,20 @@ def main():
 
         ta = threading.Thread(target=go, args=("A", body_a(rep)))
         ta.start()
+        extra = []
+        for i in range(2, a.decoders + 1):  # more decoders, each its own conversation (a different first line)
+            bi = body_a(rep)
+            bi["prompt_cache_key"] = f"{a.label}-A{i}-{rep}"
+            bi["input"] = text_input(f"Variant {i}.\n" + A_TEXT)
+            extra.append(threading.Thread(target=go, args=(f"A{i}", bi)))
+            extra[-1].start()
         time.sleep(2.0)  # A is decoding
         tb = threading.Thread(target=go, args=("B", body_b(rep)))
         tb.start()
-        time.sleep(1.0)
+        time.sleep(5.0)
         tc = threading.Thread(target=go, args=("C", body_c(rep, True)))
         tc.start()
-        for t in (ta, tb, tc):
+        for t in (ta, tb, tc, *extra):
             t.join()
         rec = {"kind": "probe", "rep": rep, **{k: v for k, v in out.items()}}
         recs.append(rec)
@@ -117,6 +128,8 @@ def main():
     s = {"summary": True, "label": a.label, "repeat": a.repeat,
          "c_ttft_s": med([r["C"]["ttft"] or 0 for r in recs]), "b_ttft_s": med([r["B"]["ttft"] or 0 for r in recs]),
          "a_decode_tps": med([(r["A"]["out"] - 1) / max(1e-9, r["A"]["t_total"] - (r["A"]["ttft"] or 0)) for r in recs]),
+         "others_decode_tps": med([(r[k]["out"] - 1) / max(1e-9, r[k]["t_total"] - (r[k]["ttft"] or 0))
+                                   for r in recs for k in r if k.startswith("A") and k != "A"]),
          "a_period_alone_ms": med([p["alone_ms"] for p in periods if p["alone_n"]]),
          "a_period_beside_ms": med([p["beside_ms"] for p in periods if p["beside_n"]]),
          "a_steps_beside_share": med([p["beside_n"] / max(1, p["alone_n"] + p["beside_n"]) for p in periods])}
