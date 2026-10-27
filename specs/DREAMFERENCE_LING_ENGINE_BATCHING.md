@@ -1,0 +1,160 @@
+# ling-engine: Batching several requests
+
+Part of the ling-engine specification; the index is [README.md](./README.md). Like the CLI and API documents it has no number from the single-file `SPEC.md`; it extends [§11](./DREAMFERENCE_LING_ENGINE_SESSIONS.md) ("Batches") and [BACKLOG §19](./DREAMFERENCE_LING_ENGINE_BACKLOG.md) item 31 (batches of three and four), and it builds on M4's sessions and batched verify ([drafts/M4](./drafts/M4-sessions-and-batches-2026-10-10.md)) and the prefill beside decode ([drafts/M4-prefill-beside-decode](./drafts/M4-prefill-beside-decode-2026-10-17.md)).
+
+Written 2026-10-27 from the owner's question of 2026-10-26, "batching several requests well: how are we doing on that?", and his decision of 2026-10-27 that the engine becomes Mightling's default (1.8.0) only once it serves four or more concurrent conversations well. First where `ling-serve` main (`c5ec4ec`) stands against SGLang at one to eight concurrent agent streams, measured on node-b; then where a step's time and a session's memory go; then the target, the design and the phases, each phase exact. Phase 0 (admission control on host memory) is merged; P1 is built on a branch and parked (§6); the rest of §5 is design. After the measurements the owner set the order (2026-10-27): concurrency first, each conversation moving while the others prefill (C1, C2), then the wider batch.
+
+## 1. The question and the scope
+
+Mightling runs several conversations at once: SWE-bench at two to four instances, Night Shift's best-of-3, refine's study and fix, Ask and Work side by side, subagents. Every one of them is an *agent* stream: a long prompt (28-62K tokens on the agentlong set), then turns of tool output (a few hundred new tokens each) and short answers, many of them tool calls. So "batching well" is not only the decode step at N sequences; it is what each conversation sees when the others are prefilling, decoding and waiting, and whether the machine survives N of them.
+
+In scope: `ling-serve` with N = 1-8 concurrent agent streams, cold (every turn a new session) and warm (follow-ups on a resident session, `prompt_cache_key`), greedy and seeded sampling; the batched step's cost; memory per session; prefill/decode interference; safety. Out of scope: two-node tensor parallel ([drafts/two-node-tp](./drafts/two-node-tp-2026-10-12.md)), FP8 KV as a default (non-exact, §6 P5), more than one model.
+
+## 2. Measured
+
+All on node-b (GB10, 121 GB), `ling-serve` `c5ec4ec` with the ScaleSearch drafter, `--draft-block 12 --graphs --pdl`, 65,536-token context, m0-prod8000 stopped, every server beside `mem_guard.sh` from 2026-10-27 09:00. SGLang is v0.5.21 (production's phase-merge image) at `--mem-fraction-static 0.5`, 12 draft tokens. The tools are in `bench/agentlong/`: `n_streams.py` (N concurrent agentlong streams, `--compare A B` = greedy identity turn for turn), `streams_server.py RUN.jsonl SERVERLOG` (server-side timing: decode intervals, steps batched, steps beside a prefill, TTFT), `streams_window.sh` (a GPU window: the lock, m0 stopped and restarted, the guard, at most four sessions), `batch_profile.sh` (the step in place and under nsys).
+
+The client's own first-delta timing is not usable: a tool-call answer streams nothing until its end, so it reads as a long TTFT and a short, fast decode (that artefact also gave the "two streams at 28.6 tokens/s" that started this question). Every number below is server-side.
+
+### 2.1 Cold agent turns (16 turns, 520-555K tokens of new prefill, 5,275 output tokens greedy)
+
+| Run | Wall s | End-to-end tok/s | Per-stream decode tok/s | Aggregate decode tok/s (any decoding) | ms/pass | Steps batched | Steps beside a prefill | TTFT median/max s |
+|---|---|---|---|---|---|---|---|---|
+| engine, 1 stream | 378.1 | 13.95 | 64.0 | 64.0 | 105.3 | 0 | 0 | 16.7 / 31.6 |
+| engine, 2 streams | 379.6 | 13.90 | 30.4 | 32.1 | 217 | 18% | 70% (253 ms) | 31.9 / 55.6 |
+| engine, 3 streams, 3 sessions | 377.2 | 13.98 | 26.5 | 35.0 | 241 | 48% | 69% (271 ms) | 46.5 / 75.5 |
+| engine, 4 streams, 2 sessions (queued) | 375.2 | 14.06 | 30.7 | 33.9 | 212 | 31% | 63% | 35.1 / 54.7 |
+| engine, 4 streams, 4 sessions | 380.5 | 13.86 | 24.5 | 30.5 | 261 | 31% | 73% (288 ms) | 62.5 / 122.7 |
+| SGLang, 1 stream | 442.0 | 11.57 | 51.4 | 51.4 | 110.4 | | | 20.4 / 36.6 |
+| SGLang, 2 streams | 432.8 | 11.92 | 20.4, 11.9 | 16.5 | 401 | | | 23.2 / 74.7 |
+| SGLang, 4 streams | 420.8 | 9.60 | 4.1-27.4 | 13.2 | 600 | | | 26.8 / 61.2 |
+| SGLang, 8 streams | 416.1 | 11.76 | 0.9-52.1 | 12.5 | 1,527 | | | 27.4 / 138.0 |
+
+(SGLang W8, the same bodies byte for byte; its output was 5,113 / 5,159 / 4,039 / 4,895 tokens, since its greedy output changes with the concurrency, §2.3.) On cold turns the engine takes 375-381 s where SGLang takes 416-442, and a stream decoding beside another's prefill keeps 24-31 tokens/s on the engine against 4-27 on SGLang, whose decode steps wait behind its prefill chunks (401-1,527 ms a step).
+
+Cold agent turns are prefill-bound: about 290 s of the 378 s is prefill at 1.8-2.2K tokens/s, so more streams add no throughput and only spread the waiting. What they cost each stream is decode speed: 63-73% of the decode steps at two to four streams run beside another request's prefill on the side stream (a green context of 40 of 48 SMs) and take 250-290 ms instead of ~105. That is the real-world loss, not the batched step (§3.1).
+
+Seeded sampling (seed 1013), end to end: engine 2/3/4 streams 8.35 / 9.0 / 8.88 tokens/s (4 streams on 2 sessions 8.23; the one-stream run was invalid, started while another server was still releasing memory, and its rerun was dropped for the concurrency work); SGLang 1/2/4/8 streams 8.56 / 11.72 / 12.02 / 6.46 at walls of 429 / 423 / 399 / 403 s. Sampled lengths differ between runs (SGLang's output was 3,676 / 4,953 / 4,792 / 2,605 tokens), so these compare walls, not decode.
+
+### 2.2 Warm follow-ups
+
+`n_streams.py --warm` with `prompt_cache_key` (W11, 2026-10-27): in rounds, every stream first sends its turn's prompt without the last tool call and its output (max 1 output token, not counted), all wait, then all send their full turns at once. The same 16 turns and 5,275 output tokens; the measure is the rounds' wall (the warm-up requests excluded). The appended part is not small on this set: 112-125K new tokens over 16 turns, ~7K a turn (up to ~30K), so even warm turns carry real prefill.
+
+| Run | Rounds s | Output tok/s over the rounds | Per-stream decode tok/s | Aggregate while all N decode (s of it) | Aggregate while any decodes | ms/pass | Tokens/pass | Steps batched | Steps beside a prefill (ms) | Prefill s (sum) | TTFT median/max s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| engine, 1 stream | 147.7 | 35.7 | 66.1 | 66.1 | 66.1 | 101.8 | 6.73 | 0 | 0 | 67.1 | 0.42 / 18.2 |
+| engine, 2 streams | 150.4 | 35.1 | 40.5, 51.1 | 106.5 (5.3 s) | 46.3 | 149.8 | 6.63 | 11% | 28% (256) | 96.2 | 0.77 / 29.3 |
+| engine, 3 streams | 146.7 | 36.0 | 40.9, 26.7, 53.9 | 117.3 (5.0 s) | 51.1 | 159.1 | 6.48 | 38% | 29% (230) | 122.7 | 1.0 / 27.9 |
+| engine, 4 streams | 141.0 | 37.4 | 23.4, 30.9, 20.3, 43.0 | 66.8 (2.3 s) | 41.2 | 234.4 | 6.22 | 62% | 52% (313) | 196.0 | 3.85 / 55.5 |
+| SGLang, 1 stream | 441.8 | 12.0 | 54.3 | 54.3 | 54.3 | 110.5 | 6.01 | | | | 20.5 / 36.7 |
+| SGLang, 2 streams | 422.8 | 12.7 | 45.1, 16.6 | 78.3 (31.0 s) | 29.2 | 235 | 5.86 | | | | 28.4 / 69.6 |
+| SGLang, 4 streams | 394.2 | 11.7 | 23.3, 11.2, 6.5, 26.0 | 138.9 (6.8 s) | 24.1 | 430 | 5.95 | | | | 31.3 / 130.5 |
+| SGLang, 8 streams | 387.9 | 12.9 | 4.1-53.4 | (never all eight) | 18.5 | 720 | 5.93 | | | | 43.1 / 197.9 |
+
+(W7, the same bodies; SGLang's request log gives no prefill/decode overlap, so the beside-a-prefill columns are empty.) SGLang does not keep the conversations warm: it prefilled 531-545K new tokens in every run, as many as the cold turns (its cache served 108-142K tokens in all), so its "warm" rounds are cold rounds and take 388-442 s against the engine's 141-150 s. On the workload Mightling actually sends, the engine's resident sessions are worth about 3x in wall time at every concurrency, before any batching. While all four of SGLang's streams decode it reaches 139 tokens/s (M0's ~135 again), but for 6.8 s of 394.
+
+So concurrency buys the engine nothing on warm agent turns either: the rounds take the same ~145 s at one to four streams. While two or three sequences decode together the batch does what it should (106-117 tokens/s, 1.6-1.8x one stream), but that is 5 s of a 150 s run; the rest is decode beside a prefill (256-313 ms a step, 2.5-3x) and prefill slowed by the decodes beside it (the summed prefill time 67 s at one stream, 196 s at four). At four even a step with no prefill beside it takes 144 ms, because only two sequences fit a pass and four take turns in pairs.
+
+### 2.3 Exactness
+
+Engine greedy: 16/16 turns identical to one stream at 2, 3 and 4 streams cold and at 2 and 4 warm and, with `prompt_cache_key`, at 2, 3 and 4 warm (W11; its one-stream run is also 16/16 identical to the cold one-stream run). Seeded sampling: 12-15/16 identical. That is expected and exact: a batched step verifies the 12-row chain while a one-row step verifies the 16-row tree, so the accepted lengths and with them the random draws differ; each draw is still from the exact distribution (SPECULATION §10). SGLang sampled 0-1/16 (its speculative draws are unseeded: not a correctness signal); SGLang greedy is not batch-invariant: cold, 3/16, 2/16 and 2/16 turns identical to its one-stream run at 2, 4 and 8 streams, warm 2/16, 5/16 and 5/16 (and 0/16 identical to the engine's: different kernels, a different model of exactness).
+
+### 2.4 The batched step in place
+
+`ling-run` on a raw-text pair of ~24K and ~31K tokens, 1,000 tokens greedy (W5):
+
+| Step | ms | Tokens per step |
+|---|---|---|
+| one stream, chain (12 rows) | 99.1-99.5 | 3.53 |
+| one stream, tree (16 rows) | 100.4-100.6 | 4.31 |
+| batch of two, chain (2 x 12 rows) | 121.7-121.8 per batched step | 3.53 each |
+
+The second sequence costs +22.5 ms at ~27K: the pair's aggregate is 1.63x one stream's chain and 1.35x its tree. Under nsys (150 batched and 100 single steps, `runs/w5-profile/prof/*.breakdown.txt`), the batched step minus the single one: attention +9.8 ms (10.8 -> 20.6); the DeltaNet path +8.6 (a batched verify leaves the gdn megakernel: its FP8 GEMMs 32.5 ms and recurrence and conv 13.0 against the megakernel's 36.9); the FFN at 24 rows +4.6 (`ffn_persistent<4>` 46.1 against `<2>` 41.5); the drafter and the NVFP4 head +2. The long in-place runs (124K) produced no output and are not used.
+
+### 2.5 Memory
+
+MemAvailable before and after the start (prefix store off): one session at 64K 31.5 GB, two 35.7, four 44.9; two at 128K 44.7, two at 256K 61.3; two at 64K with a 4 GB prefix store 40.0. So a session is ~4.2-4.6 GB at 64K, ~8.9 at 128K, ~17.3 at 256K: a fixed ~0.48 GB (the DeltaNet state 151 MB, conv, the end-of-prompt snapshot, the drafter's ring 168 MB) plus 64 KB per token of BF16 KV, allocated flat at `--max-context` whether used or not. SGLang at 0.5: an FP8 KV pool of 253,201 tokens (7.7 GB, 32 KB a token), a mamba cache of 96 slots (BF16 SSM state 6.8 GB plus intermediates 7.6 GB), the drafter's BF16 KV 4.8 GB, `max_running_requests` 8. Host memory drifts ~1 GB during an engine run, ~3 GB during SGLang's.
+
+After the start the engine grows little: sampled every second during W11 (`~/batching/memtrace`), MemAvailable fell 0.7 GB below its value at "serving" at one session, 4.0 GB at two and 3.7 GB at four (warm agent turns, 64K) (the host as a whole, so the client and page cache are in it too). It does not grow with the number of sessions up to four. Every large device buffer (KV, state, checkpoints, the snapshot slots, the drafter's rings, activations) is allocated at start; only the stream GEMMs' split buffer (at most ~0.25 GB) and the CUDA graphs come later.
+
+### 2.6 The freeze of 2026-10-27
+
+A W6 item, `ling-serve --sessions 8 --batch 8` at 65,536 tokens with a 4 GB prefix store, reported itself serving at 08:41:33 with 41.7 GB of MemAvailable left; eight cold primes (28-62K tokens) arrived together; no prime completed, the journal stops at 08:42:11 with no OOM line, and the host rebooted at about 08:44. The start was within budget: eight 64K sessions plus weights and scratch plan to ~61 GB against ~95 GB free, and admission control's start check (§5.6) passes it. So whatever took the last ~40 GB in under 40 seconds was allocated after the start: memory the start-time plan does not see. The data from that run cannot say what; what was measured since (§2.5) does not explain it: up to four sessions nothing grows by more than 4 GB after the start, and the only allocations made after it are graphs and the split buffer. The suspects left are the graphs of 56 ordered session pairs at eight sessions (captured on first use; untested above two orders' worth) and a fault in the eight-session path itself (`kMaxSeqs` is 4; `--batch 8` is capped to pairs by the row budget, but nothing at eight sessions had run before). A reproduction needs eight sessions under `mem_guard.sh` and the per-second trace, after admission control is merged and with the owner's say. The consequences are already in force: `mem_guard.sh` beside every bench server (Mightling's PSI rule plus a MemAvailable floor), at most four sessions in any run until admission control is merged and the owner raises the cap, and §5.2's rule that every allocation a batch needs is made, and counted, at the start.
+
+## 3. Analysis
+
+### 3.1 Where a batched step's time goes
+
+A step model that fits W5 and the nsys breakdown: step(N, L) ~= 99 + (N - 1) x c(L) ms, where c(L) ~= 0.37 ms per 1K tokens of the sequence's context (attention) + ~9 (the DeltaNet path outside the megakernel) + 3-5 (more rows through the stream GEMMs and the FFN); c(27K) ~= 22.5 measured. At N = 4 and 32K that is ~170 ms; at the chain's agentlong ~6.2 tokens per step that is ~145 tokens/s aggregate greedy, against SGLang's ~135 while four decode (M0, 148 ms step) and OVERVIEW §7's target of >= 175. Two changes take it there: the DeltaNet path of a batch in one persistent launch (the single stream's megakernel generalised to N, about -6 ms per added sequence) and the tree inside the batch (+8-9% tokens per step on agentlong, BACKLOG 26; the W5 raw-text pair shows +22%, an upper end), ~185 tokens/s.
+
+### 3.2 Why a batch loses the tree
+
+`fit = kMaxStreamRows / draft_block` = 32 / 12 = 2, so a batch of two verifies two 12-row chains and a one-row step verifies the tree (16 rows at `c5ec4ec`, 17-24 on main since tree/rows). Three or four sequences do not fit one pass at all today; they take turns in pairs. The stream GEMMs hold 230-240 GB/s only up to about 32 rows (item 31), so going wider needs a 33-64-row tier that is row-invariant (each row's result independent of the others in the tile) to keep the outputs bit for bit.
+
+### 3.3 Prefill interference dominates the real workload
+
+Cold, 63-73% of decode steps run beside a prefill at 2.5-2.9x their alone time; warm with keys 28-52% at 2.3-3x (§2.2), and the batch proper (all N decoding, no prefill) is 2-5 s of a 150 s run. Batching more sequences into a decode step helps only the steps that are not beside a prefill. The arithmetic of a warm round says where the time is: at one stream it is ~53 s of prefill (112K new tokens at ~2.1K tokens/s, compute-bound) and ~80 s of decode (5,275 tokens at 66 tokens/s, bound by the weight read) in series, ~145 s. The two use different resources, so a round could approach the larger of the two, not their sum; today, at two to four streams, running them together on two streams costs each about what it saves the other, and the round stays at ~145 s. The prefill-beside-decode work of 2026-10-17 ([drafts](./drafts/M4-prefill-beside-decode-2026-10-17.md) §4) already swept the knobs of that arrangement (contended chunks of 256-2,048 tokens, a side stream on 24-48 SMs): each trades the other stream's step (137-997 ms) against the prefill's time (18-42 s for 35K) along one curve. Moving along the curve is not the lever; reading each weight tile once for both (§5.5) is.
+
+### 3.4 Memory
+
+Flat slots at `--max-context` make resident sessions expensive: Mightling 1.7.2's recipe (no `--sessions`, so the default two, at 262,144 tokens) holds 2 x 17.3 GB of KV whether the conversations are 30K or 250K long, ~61 GB with the weights. Eight resident sessions at 64K fit (~61 GB); eight at the model's full context do not (~160 GB). Paged KV (§5.3) makes a session cost what it holds.
+
+## 4. The target: four or more conversations, well
+
+The engine is the 1.8.0 default when, on node-b, with the agentlong set:
+
+1. **Every conversation moves (the owner's bar of 2026-10-27).** Warm agentlong (`n_streams.py --warm --cache-key`) at one, two and four streams: the round's aggregate output tokens/s rises with the streams (today 35.7 / 35.1 / 37.4: flat), and every conversation's decode stays at or above production's two-stream 34.6 tokens/s (item 31's floor; today 20-43 at four). Reported at every phase as rounds s, aggregate tokens/s and per-stream decode tokens/s, against W11 and SGLang's W7 (whose rounds take 388-442 s on the same set).
+2. **Time to first token while another stream prefills.** A probe: stream A decodes while B sends a cold 30-60K prime and C a warm append of 0.3-2K tokens; reported as A's decode tokens/s during B's prefill, B's TTFT and C's TTFT (target: C's within 2x its value alone, A's decode >= 34.6).
+3. **Throughput when all decode.** Aggregate decode while four decode >= SGLang's at four (139 tokens/s, W7) and, as the longer-term target, >= 175 (OVERVIEW §7).
+4. **Exactness.** Greedy output per sequence identical to that sequence alone, turn for turn, at 2, 3, 4 (and 8 once P4 lands) streams; seeded sampling exact in distribution, identical whenever the batch shape is equal.
+5. **Safety.** Eight resident sessions start and run with no host-memory growth after the start beyond the plan's margin; a request the host cannot hold is refused (503), never allowed to take the host down.
+
+## 5. Design
+
+### 5.1 The row budget
+
+`kMaxStreamRows` 32 -> 64, with the per-row arrays it sizes (the tree's `depth`/`var`/`path`, `gdn_step`, `kMkFfnWords`, `kMkGdnWords`) and a `stream_gemm` tier for 33-64 rows that is row-invariant; `kMaxSeqs` stays 4 (8 only with P4). The scheduler's `fit` becomes a per-sequence row share by batch size: two sequences x up to 24 tree rows (48), three or four x 16 rows (48-64: the tree at its 16-row shape, or the chain at 12 when a sequence's acceptance says the tree does not pay). The share is a fixed function of the batch size, not of the other sequences' acceptance, so a seeded sequence's draws are identical whenever the batch shape is.
+
+### 5.2 N sequences in one pass
+
+The batch path today (M4 stage 4) runs the drafter over every block at once and the state kernels in one launch each (`kernels::SeqBatch`), and captures its graphs per *ordered tuple of sessions* (`batch_graphs_`): eight sessions are 56 ordered pairs, each with draft, verify and per-count commit graphs, captured lazily on first use. That becomes graphs per *batch size*, reading each slot's session (its KV and state pointers, positions, row offsets) from a device descriptor table written before the replay, so the set of graphs is bounded (sizes 1-4) and **captured at start, inside the memory plan**: no allocation after the start depends on which sessions meet. The DeltaNet path of a batch moves into the persistent gdn kernel generalised to N sequences (each sequence's rows its own recurrence), recovering most of §2.4's +8.6 ms per sequence.
+
+### 5.3 Paged KV
+
+64-token pages from one pool, a page table per session; attention reads by logical position, with the same tiling and reduction order as today, so the bits are unchanged (checked by memcmp, §5.7). Shared prefix pages: a session that starts on a stored prefix maps the prefix's pages copy-on-write instead of copying them, merged with the prefix KV store's radix arena (BACKLOG 35). The DeltaNet state and conv window stay one slot per session (fixed size). A session then costs ~0.48 GB plus what it holds, and `--sessions 8` at 262,144 is a pool size, not 8 x 17.3 GB.
+
+### 5.4 Steps with different acceptance
+
+Sequences in a batch accept different numbers of tokens; there is no lockstep and no padding: each commits its own count (as M4 already does). Cross-sequence allocation of rows by expected gain (more rows to the sequence that accepts more) is greedy-identical and distribution-exact but breaks seeded identity across batch shapes, so it ships only behind a switch, measured against the fixed share.
+
+### 5.5 Prefill and decode
+
+**The fused pass (C2).** A decode step is bound by the weight read (the stream GEMMs read 17.56 GB in ~76 ms of a ~100 ms step); a prefill chunk is bound by compute (~0.45-0.5 ms a token). Per projection, one launch reads each weight tile once and computes both: the decode rows with the stream GEMM's arithmetic, the chunk's rows with the prefill GEMM's, each path's device code reused unchanged, so each output is bit for bit what its own kernel gives (the prefill is already chunk-size-invariant: contended 256-token and full 2,048-token chunks give the same bits). The state-bearing kernels (attention and its KV writes, the DeltaNet conv and recurrence) stay per sequence. The pass then costs about the larger of the read and the chunk's compute plus the state kernels: with a 256-token chunk ~130-150 ms, so each decoding conversation keeps ~45-50 tokens/s (today ~24 beside a prefill) while the prefill runs at ~1.7-2K tokens/s. The chunk size becomes the scheduler's dial between the two. A mixed pass through one GEMM (prefill rows and decode rows in the same tiles) stays rejected: the decode rows' bits would depend on their tile-mates.
+
+**Scheduling (C1, output-identical by construction).** A warm append (<= 2K new tokens) runs ahead of any long cold prime, as its own chunk: it is a follow-up's whole TTFT; queued cold primes go shortest first; while several decode, the prime's share of the time is capped so no conversation stalls. These are policy only and change no output; the side stream's SM split and the contended chunk size stay as measured on 2026-10-17 until C2 replaces them.
+
+### 5.6 Memory budget and admission control (phase 0, merged)
+
+`ling-serve` plans its own footprint before allocating anything (weights, the sessions' slots at `--max-context`, the drafter's rings, 4 GB of scratch) and refuses to start (exit 3, saying by how much) unless `--host-reserve-mb` (default 16,384) of MemAvailable is left; while serving, a generation request arriving with MemAvailable below `--admit-reserve-mb` (default 8,192) is answered HTTP 503 `host_memory_low` with `Retry-After` before anything is queued, and `ling:memory_refusals_total` counts it. Neither changes a number the engine computes. What it does not cover is memory allocated *after* the start (§2.6): §5.2's graphs-at-start and §5.3's pool close that, and until they land the 503 check is the only runtime guard besides Mightling's PSI watchdog.
+
+### 5.7 Exactness checks
+
+- `--batch-check` generalised to N: every batched step re-run alone and compared bit for bit (tokens, state, accepted drafts), as two-sequence batches are checked today;
+- agentlong greedy at N streams against one stream, `n_streams.py --compare`, 16/16 turns at every N a phase enables;
+- `ling-stream-tests`: memcmp per batched kernel (the 33-64-row GEMM tier, the N-sequence gdn kernel, paged attention against flat).
+
+## 6. Phases
+
+Each phase merges into main once its exactness gate passes and nothing regresses (one stream's agentlong tokens/s within noise of main, every earlier gate still green). Expected gains are from §3.1's model and are measured, not assumed, at each gate.
+
+| Phase | What | Gate | Expected |
+|---|---|---|---|
+| P0 | Admission control on host memory (§5.6) | the start and 503 refusals; agentlong greedy 16/16 unchanged | safety only (**merged 2026-10-27, `e1eac84`**) |
+| C1 | Scheduling: warm appends first, shortest prime first, the prime's share capped (§5.5) | greedy 16/16 at 2 and 4 warm; §4 items 1-2 measured | C's TTFT under a cold prime from tens of seconds to ~1 s |
+| C2 | The fused pass: one weight read for a decode verify and a prefill chunk, each path's arithmetic unchanged (§5.5) | memcmp of each fused projection against its two kernels; `--interleave-check`; greedy 16/16 at 2 and 4 warm and cold | decode beside a prime ~130-150 ms instead of 205-313; warm rounds from ~145 s towards ~80 s at four |
+| P2 | Three and four sequences in one pass: the row share by batch size, graphs per batch size captured at start (§5.2), the batched DeltaNet path in the persistent kernel | `--batch-check` at 3 and 4; greedy 16/16; no memory growth after start beyond 1 GB at 4 sessions | four decoding at ~145 -> ~185 tokens/s instead of pairs in turn (144 ms a step each) |
+| P1 | The tree inside a batch of two: 2 x up to 24 rows, `kMaxStreamRows` 64 and the 33-64-row tier | `--batch-check` with trees; greedy 2-vs-1 16/16; one stream unchanged | built (branch `batching/p1-tree-batch`): +3% at two (129.0 ms and 135 steps against 119.6 and 150 for 1,000 tokens), less than the +8-9% hoped for, because the FFN megakernel does not take more than 32 rows; parked behind C1, C2 and P2 |
+| P4 | Paged KV and shared prefix pages (§5.3) | memcmp paged vs flat attention; greedy 8-vs-1 16/16; eight 262,144 sessions start | 8+ resident sessions at full context |
+| P5 | FP8 KV (32 KB a token) behind the quality gate | VALIDATION §13's quality gate (not exact: a switch, off by default) | 2x the sessions per GB |
+
+In that order: C1 and C2 are what make four conversations each move (§3.3), P2 what makes them fast once they all decode; the owner's bar for 1.8.0 (§4) needs P0, C1, C2 and P2. P4 is what lets a node hold Night Shift's and the user's conversations together at full context. Single-stream speed work goes on beside this on a second engine machine.
