@@ -83,6 +83,7 @@
 #include "serve/admission.hpp"
 #include "serve/api.hpp"
 #include "tokenizer/tokenizer.hpp"
+#include "serve/image_input.hpp"
 
 namespace ling::serve {
 namespace {
@@ -204,6 +205,12 @@ struct ServerContext {
   // below this many MB (0: never).
   long admit_reserve_mb = 8192;
   Metrics metrics;
+  // Images (VISION §20.3 (c)): on when the engine has the tower; <|image_pad|>'s id, each image's id in prompts, the
+  // processor's settings.
+  bool vision = false;
+  int image_pad = -1;
+  ImageRegistry* images = nullptr;
+  ProcessorConfig processor;
 };
 
 // What a job reports back, called on the engine thread.
@@ -228,6 +235,7 @@ struct Job {
   std::chrono::steady_clock::time_point received = std::chrono::steady_clock::now();
   Request req;
   std::vector<int> prompt;
+  std::vector<PromptImage> images;  // the prompt's images (VISION §20.3 (c))
   JobSink sink;
   std::shared_ptr<std::atomic<bool>> cancelled;
   int session = -1;    // the session it runs in (bound when the scheduler admits it)
@@ -386,7 +394,7 @@ class Scheduler {
     try {
       if (exceeds_context(j.prompt.size(), eng.max_context())) throw ContextOverflow(j.prompt.size(), eng.max_context());
       eng.activate_session(j.session, j.req.session_key, j.fresh);
-      r->cur = eng.begin_prefill(j.prompt);
+      r->cur = eng.begin_prefill(j.prompt, false, j.images.empty() ? nullptr : &j.images);
     } catch (const std::exception& e) {
       fail(*r, e);
       eng.touch_session(j.session);
@@ -875,6 +883,10 @@ class Handler : public proxygen::RequestHandler {
                     {"owned_by", "ling-engine"}, {"root", ctx_.model_name},
                     {"max_model_len", ctx_.engine->max_context()}};
       send_json(downstream_, 200, json{{"object", "list"}, {"data", json::array({model})}});
+    } else if (method_ == "GET" && (path_ == "/model_info" || path_ == "/get_model_info")) {
+      // SGLang's answer, which Mightling's launcher reads to advertise image input (VISION §20.6).
+      send_json(downstream_, 200,
+                json{{"model_path", ctx_.model_name}, {"is_generation", true}, {"has_image_understanding", ctx_.vision}});
     } else if (method_ == "GET" && path_ == "/metrics") {
       ResponseBuilder(downstream_)
           .status(200, "OK")
@@ -896,6 +908,18 @@ class Handler : public proxygen::RequestHandler {
     }
   }
 
+  // Images (VISION §20.3 (c), §20.6): each URL decoded and preprocessed here, on the HTTP thread; each <|image_pad|>
+  // of the tokenized prompt becomes the image's tokens, all its id (§20.7). Throws ImageError or invalid_argument.
+  void attach_images(Job& job) {
+    // Without the tower an image part rendered as `[image]` and no URL was collected: nothing to do (a literal
+    // <|image_pad|> in the text stays a token, as before).
+    if (!ctx_.vision) return;
+    int pads = 0;
+    for (int t : job.prompt) pads += t == ctx_.image_pad;
+    if (job.req.image_urls.empty() && pads == 0) return;
+    serve::attach_images(job.prompt, ctx_.image_pad, job.req.image_urls, *ctx_.images, ctx_.processor, job.images);
+  }
+
   void generate(bool chat) {
     if (too_large_) {
       send_json(downstream_, 413, error_body("request body too large", "invalid_request_error"));
@@ -906,13 +930,21 @@ class Handler : public proxygen::RequestHandler {
       std::string text;
       if (auto buf = body_.move()) text = buf->moveToFbString().toStdString();
       json body = json::parse(text);
-      job.req = parse_request(body, chat);
+      job.req = parse_request(body, chat, ctx_.vision);
       job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
+      job.prompt = job.req.prompt_ids.empty() ? ctx_.tok->encode(job.req.prompt_text) : job.req.prompt_ids;
+      if (!job.req.prompt_ids.empty())
+        for (int t : job.prompt)
+          if (t < 0 || t >= ctx_.engine->config().vocab)
+            throw std::invalid_argument("prompt token " + std::to_string(t) + " is outside the vocabulary");
+      attach_images(job);
+    } catch (const ImageError& e) {
+      send_json(downstream_, 400, error_body(e.what(), "invalid_request_error", e.code));
+      return;
     } catch (const std::exception& e) {
       send_json(downstream_, 400, error_body(e.what(), "invalid_request_error"));
       return;
     }
-    job.prompt = job.req.prompt_ids.empty() ? ctx_.tok->encode(job.req.prompt_text) : job.req.prompt_ids;
     if (exceeds_context(job.prompt.size(), ctx_.engine->max_context())) {  // refused before any header
       send_json(downstream_, 400, context_overflow_error(job.prompt.size(), ctx_.engine->max_context()));
       return;
@@ -1123,13 +1155,17 @@ class Handler : public proxygen::RequestHandler {
     try {
       std::string text;
       if (auto buf = body_.move()) text = buf->moveToFbString().toStdString();
-      job.req = parse_responses_request(json::parse(text));
+      job.req = parse_responses_request(json::parse(text), ctx_.vision);
       job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
+      job.prompt = ctx_.tok->encode(job.req.prompt_text);
+      attach_images(job);
+    } catch (const ImageError& e) {
+      send_json(downstream_, 400, error_body(e.what(), "invalid_request_error", e.code));
+      return;
     } catch (const std::exception& e) {
       send_json(downstream_, 400, error_body(e.what(), "invalid_request_error"));
       return;
     }
-    job.prompt = ctx_.tok->encode(job.req.prompt_text);
     job.cancelled = ex_->cancelled;
     const Request req = job.req;
     const bool repetition_completed = ctx_.repetition_completed;
@@ -1354,6 +1390,9 @@ int main(int argc, char** argv) {
   std::string repetition_arg, repetition_report = "incomplete";
   std::string draft_head = "sparse", sparse_head_dir;  // the drafter's head (BACKLOG 19)
   int sparse_head_dynamic = 16384;
+  std::string vision = "on", jpeg = "gpu";  // images (VISION §20.3)
+  long vision_max_pixels = 16777216;
+  int vision_cache_mb = 512;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -1368,6 +1407,10 @@ int main(int argc, char** argv) {
     else if (a == "--port") port = std::stoi(next());
     else if (a == "--served-model-name") name = next();
     else if (a == "--max-context") max_context = std::stoi(next());
+    else if (a == "--vision") vision = next();
+    else if (a == "--vision-max-pixels") vision_max_pixels = std::stol(next());
+    else if (a == "--vision-cache-mb") vision_cache_mb = std::stoi(next());
+    else if (a == "--jpeg-decoder") jpeg = next();
     else if (a == "--draft") draft_dir = next();
     else if (a == "--draft-block") draft_block = std::stoi(next());
     else if (a == "--tree") tree_nodes = std::stoi(next());
@@ -1401,7 +1444,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
     return 2;
   }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
@@ -1468,6 +1511,18 @@ int main(int argc, char** argv) {
   opts.sparse_head_dynamic = sparse_head_dynamic;
   opts.sessions = sessions;
   opts.side_prefill = side_prefill;
+  if (vision != "on" && vision != "off") {
+    std::cerr << "--vision is on or off\n";
+    return 2;
+  }
+  if (jpeg != "gpu" && jpeg != "cpu") {
+    std::cerr << "--jpeg-decoder is gpu or cpu\n";
+    return 2;
+  }
+  ling::serve::set_jpeg_decoder(jpeg == "gpu" ? ling::serve::JpegDecoder::Gpu : ling::serve::JpegDecoder::Cpu);
+  opts.vision = vision == "on";
+  opts.vision_max_pixels = vision_max_pixels;
+  opts.vision_cache_mb = vision_cache_mb;
   for (auto [var, dst] : {std::pair<const char*, long*>{"LING_HOST_RESERVE_MB", &host_reserve_mb},
                           std::pair<const char*, long*>{"LING_ADMIT_RESERVE_MB", &admit_reserve_mb}})
     if (const char* e = std::getenv(var)) {
@@ -1480,9 +1535,12 @@ int main(int argc, char** argv) {
     }
   if (host_reserve_mb > 0) {  // admission control at start: refuse before anything is allocated
     const ling::ModelConfig cfg = ling::ModelConfig::from_file(model_dir + "/config.json");
-    const ling::serve::MemoryPlan mp = ling::serve::plan_memory(
+    ling::serve::MemoryPlan mp = ling::serve::plan_memory(
         cfg, ling::serve::checkpoint_bytes(model_dir) + ling::serve::checkpoint_bytes(draft_dir), sessions, max_context,
         !draft_dir.empty());
+    // With images on (VISION §20.4) the tower's scratch at the largest image and the embedding cache come on top of
+    // the checkpoint's bytes (which hold the tower's weights): 1,100 MB at 65,536 patches, an upper bound below it.
+    if (opts.vision) mp.scratch += size_t(1100 + vision_cache_mb) << 20;
     const long avail = ling::serve::mem_available_mb();
     const std::string why = ling::serve::refuse_start(mp, avail, host_reserve_mb);
     if (!why.empty()) {
@@ -1501,6 +1559,11 @@ int main(int argc, char** argv) {
   ctx.engine = &engine;
   ctx.tok = &tok;
   ctx.im_end = tok.token_id("<|im_end|>");
+  static ling::serve::ImageRegistry image_registry;
+  ctx.vision = engine.has_vision();
+  ctx.image_pad = tok.token_id("<|image_pad|>");
+  ctx.images = &image_registry;
+  ctx.processor.max_pixels = vision_max_pixels;
   ctx.metrics.max_total_tokens = engine.sessions() * max_context;
   ctx.metrics.sessions = engine.sessions();
   ctx.metrics.protect_seconds = protect_seconds;

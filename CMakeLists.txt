@@ -54,6 +54,7 @@ add_library(ling_core STATIC
   src/core/model.cu
   src/core/engine.cpp
   src/core/prefix_kv.cpp
+  src/core/vision.cu
 )
 target_include_directories(ling_core PUBLIC src)
 target_link_libraries(ling_core PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::nvtx3 nlohmann_json::nlohmann_json)
@@ -64,9 +65,6 @@ add_library(ling_tokenizer STATIC src/tokenizer/tokenizer.cpp src/tokenizer/chat
 target_include_directories(ling_tokenizer PUBLIC src)
 target_link_libraries(ling_tokenizer PUBLIC PkgConfig::PCRE2 ICU::uc nlohmann_json::nlohmann_json)
 
-# ling-run: token ids or text in, tokens out; the correctness and speed harness.
-add_executable(ling-run tools/ling_run.cpp)
-target_link_libraries(ling-run PRIVATE ling_core ling_tokenizer)
 
 # ling-tokenize: prints token ids for each input line (tested against the reference tokenizer).
 add_executable(ling-tokenize tools/ling_tokenize.cpp)
@@ -77,8 +75,14 @@ add_executable(ling-tokenizer-threads-tests tests/tokenizer_threads_tests.cpp)
 target_link_libraries(ling-tokenizer-threads-tests PRIVATE ling_tokenizer Threads::Threads)
 
 # The API layer without the HTTP library, so it is testable on its own.
-add_library(ling_api STATIC src/serve/api.cpp)
-target_link_libraries(ling_api PUBLIC ling_core ling_tokenizer)
+# Image decoding (VISION §20.3 (c)): libpng, libwebp, libjpeg-turbo from the distribution; nvJPEG opened at run time.
+pkg_check_modules(IMAGE_LIBS REQUIRED IMPORTED_TARGET libpng libwebp libjpeg)
+add_library(ling_api STATIC src/serve/api.cpp src/serve/image_input.cpp)
+target_link_libraries(ling_api PUBLIC ling_core ling_tokenizer PkgConfig::IMAGE_LIBS ${CMAKE_DL_LIBS})
+
+# ling-run: token ids or text in, tokens out; the correctness and speed harness.
+add_executable(ling-run tools/ling_run.cpp)
+target_link_libraries(ling-run PRIVATE ling_api)
 
 # ling-template: the chat template, and the Responses-to-prompt conversion, without a model.
 add_executable(ling-template tools/ling_template.cpp)
@@ -123,9 +127,15 @@ add_test(NAME spec COMMAND ling-spec-tests)
 add_executable(ling-sampling-tests tests/sampling_tests.cpp)
 target_link_libraries(ling-sampling-tests PRIVATE ling_core)
 add_test(NAME sampling COMMAND ling-sampling-tests)
+add_executable(ling-vision-tests tests/vision_tests.cu)
+target_link_libraries(ling-vision-tests PRIVATE ling_core)
+add_test(NAME vision COMMAND ling-vision-tests)
 add_executable(ling-prefix-kv-tests tests/prefix_kv_tests.cpp)
 target_link_libraries(ling-prefix-kv-tests PRIVATE ling_core)
 
 add_executable(ling-api-tests tests/api_tests.cpp)
 target_link_libraries(ling-api-tests PRIVATE ling_api)
+add_executable(ling-vision-input-tests tests/vision_input_tests.cpp)
+target_link_libraries(ling-vision-input-tests PRIVATE ling_api)
+add_test(NAME vision_input COMMAND ling-vision-input-tests)
 add_test(NAME api COMMAND ling-api-tests)

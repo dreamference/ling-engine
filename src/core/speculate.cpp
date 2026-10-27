@@ -761,6 +761,11 @@ void Engine::plan_begin(StepPlan& sp, int B) {
     std::vector<int> seq(s.history);
     seq.push_back(sp.anchor);
     sp.lp = lookup_propose(seq, sp.E);
+    // An image's ids (VISION §20.7) are never proposed: the proposal stops before the first.
+    const int V = model_->config().vocab;
+    auto bad = std::find_if(sp.lp.tokens.begin(), sp.lp.tokens.end(), [V](int t) { return t < 0 || t >= V; });
+    sp.lp.tokens.erase(bad, sp.lp.tokens.end());
+    if (sp.lp.tokens.empty()) sp.lp.match = 0;
   }
   sp.use_lookup = opts_.lookup_mode == 2 && !sp.lp.tokens.empty() && sp.lp.match >= opts_.lookup_min_match;
   sp.rows.assign(1, sp.anchor);
@@ -926,6 +931,8 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   if (graph) {  // the position every graph of this step reads
     pin_->pos = s_->pos;
     check(cudaMemcpyAsync(pos_dev_, &pin_->pos, sizeof(int), cudaMemcpyHostToDevice, stream_), "position");
+    pin_->rdelta = s_->rope_delta;  // the rope delta after the prompt's images (VISION §20.3 (b))
+    check(cudaMemcpyAsync(rdelta_dev_, &pin_->rdelta, sizeof(int), cudaMemcpyHostToDevice, stream_), "rope delta");
   }
   if (!sp.use_lookup) plan_draft(sp, B, graph);
   if (tree_step(p, sp.use_lookup, row_logits != nullptr, B)) {  // BACKLOG 26: the chain and its tree
@@ -1097,6 +1104,9 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   if (graph) {  // the positions every graph of this step reads
     for (int i = 0; i < n; ++i) pin_->seq_pos[i] = plans[i].s->pos;
     check(cudaMemcpyAsync(pos_dev_, pin_->seq_pos, n * sizeof(int), cudaMemcpyHostToDevice, stream_), "positions");
+    for (int i = 0; i < n; ++i) pin_->seq_rdelta[i] = plans[i].s->rope_delta;
+    check(cudaMemcpyAsync(rdelta_dev_, pin_->seq_rdelta, n * sizeof(int), cudaMemcpyHostToDevice, stream_),
+          "rope deltas");
   }
   if (together) {
     for (int i = 0; i < n; ++i) {
