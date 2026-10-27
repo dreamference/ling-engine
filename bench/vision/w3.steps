@@ -1,4 +1,5 @@
 # Images window 3: phases (b) and (c): the exactness checks with image prompts (speculation, prefix resume inside and
+step vision-tests $HOME/ling-engine-vision/build/ling-vision-tests
 # after an image, step graphs, batches of two, chunked prefill).
 SRC=~/ling-engine-vision; B=$SRC/build; P=$V/../prompts.jsonl
 CK=$(ls -d ~/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4/snapshots/*)
