@@ -179,6 +179,28 @@ void prefill_swiglu_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uin
                           uint8_t* sf_out, cudaStream_t s, const uint8_t* gate_sf = nullptr,
                           const uint8_t* up_sf = nullptr);
 
+// A decode verify's rows and a prefill chunk's rows in one launch that reads each weight tile once (fused_gemm.cu,
+// BATCHING C2): yd [Md][N] = scale2 * xh . W^T exactly as stream_gemm_nvfp4 computes it (xh, xinv from
+// to_half_rows; Md <= 32), and the chunk's Mp rows exactly as prefill_gemm_nvfp4 computes them. W tiled, raw or
+// coded (then wsf, its raw scales, as the prefill takes them). Md or Mp may be 0. N % 128 == 0, K % 128 == 0.
+void fused_gemm_nvfp4(const __half* xh, const float* xinv, int Md, float* yd, float scale2, const uint8_t* xq,
+                      const uint8_t* xs, int Mp, const uint8_t* w, float alpha, float* y, int ldy, int N, int K,
+                      bool accumulate, cudaStream_t s, const uint8_t* wsf = nullptr);
+// The FFN's gate and up the same way: yd_gate and yd_up as stream_gemm_multi gives them, the chunk's rows as
+// prefill_swiglu_nvfp4 writes them.
+void fused_swiglu_nvfp4(const __half* xh, const float* xinv, int Md, float* yd_gate, float* yd_up, float scale2_gate,
+                        float scale2_up, const uint8_t* xq, const uint8_t* xs, int Mp, const uint8_t* gate,
+                        float alpha_gate, const uint8_t* up, float alpha_up, int N, int K, float out_input_scale,
+                        uint8_t* q_out, uint8_t* sf_out, cudaStream_t s, const uint8_t* gate_sf = nullptr,
+                        const uint8_t* up_sf = nullptr);
+// The FP8 projections the same way: yd as stream_gemm_fp8 gives it (wscale the per-tensor scale), the chunk's rows
+// as prefill_gemm_fp8 (FP32, ldy, accumulate) or prefill_gemm_fp8_bf16out (BF16) writes them.
+void fused_gemm_fp8(const __half* xh, const float* xinv, int Md, float* yd, float wscale, const uint8_t* xq, int Mp,
+                    const uint8_t* w, float alpha, float* y, int ldy, int N, int K, bool accumulate, cudaStream_t s);
+void fused_gemm_fp8_bf16out(const __half* xh, const float* xinv, int Md, float* yd, float wscale, const uint8_t* xq,
+                            int Mp, const uint8_t* w, float alpha, __nv_bfloat16* y, int ldy, int N, int K,
+                            cudaStream_t s);
+
 // ya = x . Wa^T, yb = x . Wb^T for two BF16 [48][K] matrices and any M, row-invariant (the prefill path's
 // DeltaNet a and b projections).
 void narrow_bf16(const float* x, int M, const __nv_bfloat16* wa, const __nv_bfloat16* wb, float* ya, float* yb, int N,

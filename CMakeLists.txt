@@ -40,6 +40,7 @@ add_library(ling_core STATIC
   src/core/kernels.cu
   src/core/stream_gemm.cu
   src/core/prefill_gemm.cu
+  src/core/fused_gemm.cu
   src/core/gemm_bf16.cu
   src/core/prefill_gdn.cu
   src/core/topk.cu
@@ -113,6 +114,9 @@ add_test(NAME stream COMMAND ling-stream-tests)
 add_executable(ling-prefill-tests tests/prefill_tests.cu)
 target_link_libraries(ling-prefill-tests PRIVATE ling_core)
 add_test(NAME prefill COMMAND ling-prefill-tests)
+add_executable(ling-fused-tests tests/fused_tests.cu)
+target_link_libraries(ling-fused-tests PRIVATE ling_core)
+add_test(NAME fused COMMAND ling-fused-tests)
 add_executable(ling-spec-tests tests/spec_tests.cpp)
 target_link_libraries(ling-spec-tests PRIVATE ling_core)
 add_test(NAME spec COMMAND ling-spec-tests)
