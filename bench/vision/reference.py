@@ -109,9 +109,18 @@ def sgl_tower(model_dir):
 
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29571")
+    sa = ServerArgs(model_path=model_dir)
+    try:  # v0.5.21: the process's config is published, and its ranks stated (one rank of everything)
+        from sglang.srt import runtime_context as rc
+        rc.publish(sa, role="scheduler")
+        ranks = {f: 0 for f in rc._parallel_fields() if f.endswith("_rank")}
+        rc.get_parallel().override_permanently(**ranks)
+        print("published; ranks", sorted(ranks), flush=True)
+    except Exception:
+        traceback.print_exc()
     try:
         from sglang.srt.server_args import set_global_server_args_for_scheduler
-        set_global_server_args_for_scheduler(ServerArgs(model_path=model_dir))
+        set_global_server_args_for_scheduler(sa)
     except Exception:
         pass
     if not dist.is_initialized():

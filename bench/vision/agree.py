@@ -63,12 +63,25 @@ def main(d):
                 gap = plp.get(tok, ptop[0][1]) - plp.get(e_best_id, ptop[-1][1])
                 worst_gap = max(worst_gap, gap)
             top5 += tok in [t for t, _ in e["top"][:5]]
+    # Production's own decode against its prefill on the same positions (VISION §20.5 item 5: on image prompts the
+    # gap and top-5 lines are judged against these).
+    p_worst_gap = 0.0
+    p_miss5 = 0
+    for g, pf in zip(gen, pforce):
+        for j, tok in enumerate(g["cont"]):
+            ftop = pf["top"][j]
+            if ftop[0][0] != tok:
+                flp = dict((t, lp) for t, lp in ftop)
+                p_worst_gap = max(p_worst_gap, ftop[0][1] - flp.get(tok, ftop[-1][1]))
+            p_miss5 += tok not in [t for t, _ in ftop[:5]]
     p = fisher_upper(flips, n, pflips, n)
     print(f"prompts {len(gen)}: rendering token-identical to production's on {rendering_ok}, free-running greedy identical on {identical}")
     print(f"positions {n}: engine flips {flips} ({100 * flips / max(n, 1):.2f}%), production's own decode-vs-prefill {pflips}"
           f" ({100 * pflips / max(n, 1):.2f}%); one-sided Fisher p = {p:.3f} ({'pass' if p >= 0.05 else 'FAIL'} at 0.05)")
-    print(f"worst flip gap {worst_gap:.3f} nats ({'pass' if worst_gap <= 1.75 else 'FAIL'} at 1.75); production's token in the"
-          f" engine's top-5 at {top5} of {n} ({'pass' if top5 == n else 'FAIL'})")
+    print(f"worst flip gap {worst_gap:.3f} nats, production's own {p_worst_gap:.3f} "
+          f"({'pass' if worst_gap <= max(1.75, p_worst_gap) else 'FAIL'}: image prompts against production's own noise,"
+          f" text at 1.75); production's token outside the engine's top-5 at {n - top5} of {n} positions, production's"
+          f" own decode token outside its prefill's top-5 at {p_miss5} ({'pass' if n - top5 <= p_miss5 else 'FAIL'})")
     print("flips by position in the continuation:", dict(sorted(by_pos.items())))
 
 

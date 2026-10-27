@@ -4,6 +4,11 @@
 SRC=~/ling-engine-vision; B=$SRC/build; P=$V/../prompts.jsonl
 M=$(ls -d ~/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4/snapshots/*)
 D=$HOME/.cache/dreamference/drafters/dflash2-nvfp4-scalesearch
+HUB=$HOME/.cache/huggingface
+IMG=lmsysorg/sglang@sha256:b1259f3ea3275f66237c498ea388919729018bc9f01c3d638391e06e2cf3f469
+step ref-sgl docker run --rm --gpus all --network none --name vision-refs -v $HUB:$HUB:ro -v $V/..:$V/.. -v $SRC:$SRC:ro \
+  -e HF_HUB_OFFLINE=1 -e ONLY_SGL=1 --entrypoint python3 $IMG $SRC/bench/vision/reference.py $M $V/../ref
+step vision-check-sgl bash -c "[ -e $V/../ref/icon.sgl.bf16 ] && $B/ling-run --model $M --vision-check $V/../ref || echo no SGLang dumps"
 step greedy $B/ling-run --model $M --vision-prompts $P --greedy-out $V/../engine-greedy.jsonl --max-tokens 48
 step cases python3 $SRC/bench/vision/agree.py cases $V/..
 step force bash -c "$B/ling-run --model $M --vision-prompts $P --force-file $V/../cases.jsonl > $V/../engine-force.jsonl"
