@@ -42,8 +42,11 @@
 // is first decoded alone (cold engine, full chunks, --max-tokens speculatively); then A is prefilled and
 // decodes while B prefills in chunks of --prefill-chunk-contended tokens (default 256) between A's steps, and
 // the two then take steps in turn, as ling-serve interleaves two requests. Per sequence the tokens, the state,
-// the steps and the accepted drafts must equal the run alone. Greedy and sampled (--temperature, default 1,
-// seeded by --seed or 1), and with the pair swapped.
+// the drafter's context, the steps and the accepted drafts must equal the run alone. Greedy and sampled
+// (--temperature, default 1, seeded by --seed or 1), and with the pair swapped. Tree verification (BACKLOG 26)
+// stays on, as in ling-serve: this is the check of the sampled tree beside a prefill (--batch-check runs the chain).
+// A drafter context that differs only in its last bits leaves greedy tokens alone but moves a sampled draft's q,
+// so the sampled runs see it first; the drafter's context is compared for the greedy ones.
 //
 // --side-prefill N (with --interleave-check): B's chunks run on the engine's side stream (EngineOptions::side_prefill:
 // a green context of N SMs, or a plain second stream for -1), each a full chunk launched while A goes on taking steps
@@ -62,11 +65,11 @@
 // each, greedily and sampled (--temperature, default 1, seeded by --seed or 1). Four runs per pair and mode: both
 // prefilled, then batched with the rows in the order [A, B] and in the order [B, A]; and one sequence prefilling
 // in chunks of --prefill-chunk-contended tokens while the other decodes alone, then the two batched, each way
-// round. Per sequence the tokens, the state, the steps and the accepted drafts must equal the prompt decoded
-// alone (speculatively, from a cold engine, under the same seed). With --graphs the runs alone and the batch both
-// replay step graphs (the batch path's own since stage 4). A batch verifies the chain, so the check runs with tree
-// verification (BACKLOG 26, on by default) off: the runs alone then take the chain as well, step for step (LING_TREE
-// set in the environment still overrides this).
+// round. Per sequence the tokens, the state, the drafter's context, the steps and the accepted drafts must equal the
+// prompt decoded alone (speculatively, from a cold engine, under the same seed). With --graphs the runs alone and the
+// batch both replay step graphs (the batch path's own since stage 4). A batch verifies the chain, so the check runs
+// with tree verification (BACKLOG 26, on by default) off: the runs alone then take the chain as well, step for step
+// (LING_TREE set in the environment still overrides this).
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -612,10 +615,10 @@ int main(int argc, char** argv) {
     };
     struct Result {
       std::vector<int> tokens;
-      uint64_t hash = 0;
+      uint64_t hash = 0, draft = 0;  // the state, and the drafter's context (Engine::draft_hash)
       long steps = 0, accepted = 0;
       bool operator==(const Result& o) const {
-        return tokens == o.tokens && hash == o.hash && steps == o.steps && accepted == o.accepted;
+        return tokens == o.tokens && hash == o.hash && draft == o.draft && steps == o.steps && accepted == o.accepted;
       }
     };
     auto result_of = [&](const Seq& q) {
@@ -623,6 +626,7 @@ int main(int argc, char** argv) {
       r.tokens = q.out;
       engine.select_session(q.session);
       r.hash = engine.state_hash();
+      r.draft = engine.draft_hash();
       r.steps = engine.session_spec_stats(q.session).steps;
       r.accepted = engine.session_spec_stats(q.session).accepted;
       return r;
@@ -731,11 +735,15 @@ int main(int argc, char** argv) {
                         ra.steps, ra.accepted, same_a ? "identical" : "DIFFERS", B.size(), cur.stats.chunks, chunks_beside,
                         rb.tokens.size(), rb.steps, rb.accepted, same_b ? "identical" : "DIFFERS");
             if (!same_a)
-              std::printf("  A alone: %zu out, %ld steps %ld accepted, state %s\n", alone[0].tokens.size(), alone[0].steps,
-                          alone[0].accepted, alone[0].hash == ra.hash ? "identical" : "differs");
+              std::printf("  A alone: %zu out, %ld steps %ld accepted, state %s, drafter context %s\n",
+                          alone[0].tokens.size(), alone[0].steps, alone[0].accepted,
+                          alone[0].hash == ra.hash ? "identical" : "differs",
+                          alone[0].draft == ra.draft ? "identical" : "differs");
             if (!same_b)
-              std::printf("  B alone: %zu out, %ld steps %ld accepted, state %s\n", alone[1].tokens.size(), alone[1].steps,
-                          alone[1].accepted, alone[1].hash == rb.hash ? "identical" : "differs");
+              std::printf("  B alone: %zu out, %ld steps %ld accepted, state %s, drafter context %s\n",
+                          alone[1].tokens.size(), alone[1].steps, alone[1].accepted,
+                          alone[1].hash == rb.hash ? "identical" : "differs",
+                          alone[1].draft == rb.draft ? "identical" : "differs");
           }
         }
       }
@@ -874,9 +882,11 @@ int main(int argc, char** argv) {
               if (!same[k]) {
                 size_t i = 0;
                 while (i < r[k].tokens.size() && i < alone[k].tokens.size() && r[k].tokens[i] == alone[k].tokens[i]) ++i;
-                std::printf("  %c alone: %zu out, %ld steps %ld accepted, state %s; first token difference at %zu\n",
+                std::printf("  %c alone: %zu out, %ld steps %ld accepted, state %s, drafter context %s; first token "
+                            "difference at %zu\n",
                             "AB"[k], alone[k].tokens.size(), alone[k].steps, alone[k].accepted,
-                            alone[k].hash == r[k].hash ? "identical" : "differs", i);
+                            alone[k].hash == r[k].hash ? "identical" : "differs",
+                            alone[k].draft == r[k].draft ? "identical" : "differs", i);
               }
           }
         }
