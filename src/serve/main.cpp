@@ -6,7 +6,7 @@
 //              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
-//              [--side-prefill N] [--draft-bf16] [--repetition-detection P,p,R,K|off]
+//              [--side-prefill N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off]
 //              [--repetition-report incomplete|completed]
 //
 // --sessions N (default 2; M4 §1) keeps N resident sessions, each with its own KV cache and state, so N
@@ -45,6 +45,12 @@
 // "repetition". --repetition-report completed reports such a stop on /v1/responses as a completed response with
 // `stop_reason: "repetition"` instead of the default `response.incomplete` (reason "repetition"), which Codex retries.
 //
+// --host-reserve-mb N (default 16384; LING_HOST_RESERVE_MB overrides) and --admit-reserve-mb N (default 8192;
+// LING_ADMIT_RESERVE_MB overrides) are the admission control on host memory (serve/admission.hpp; BATCHING §5.6,
+// phase 0): ling-serve refuses to start (exit 3, before allocating anything) when its weights, sessions and scratch
+// would leave less than the first of MemAvailable, and answers a generation request HTTP 503 (code host_memory_low)
+// while MemAvailable is below the second. 0 switches either off. Neither changes what an admitted request computes.
+//
 // With --draft, requests decode speculatively with the DFlash2 drafter (requests that set penalties
 // decode plainly). GET /metrics exports SGLang's counter names, so M0's replay harness reads them as is.
 #include <folly/SocketAddress.h>
@@ -74,6 +80,7 @@
 #include <thread>
 
 #include "core/engine.hpp"
+#include "serve/admission.hpp"
 #include "serve/api.hpp"
 #include "tokenizer/tokenizer.hpp"
 
@@ -91,6 +98,7 @@ struct Metrics {
   double accepted_drafts = 0, drafted = 0;
   double nonfinite = 0;  // requests ended because the logits were not finite
   double repetition_stops = 0;  // requests ended by the repetition stop rule (API §9)
+  double memory_refusals = 0;   // requests answered 503 because host memory was below the admission reserve
   SpecStats spec;  // the engine's speculation counters after the last request
   // Gauges the benchmark harness reads (its admission and its parallelism): requests running (up to
   // --batch at once, M4 §3) and queued, and the token pool a night's tasks are budgeted
@@ -149,6 +157,8 @@ struct Metrics {
     counter("ling:spec_accepted_tokens_total", accepted_drafts, "Drafted tokens accepted.");
     counter("ling:nonfinite_logits_total", nonfinite, "Requests ended because the logits were NaN or inf.");
     counter("ling:repetition_stops_total", repetition_stops, "Requests ended by the repetition stop rule.");
+    counter("ling:memory_refusals_total", memory_refusals,
+            "Generation requests answered 503 because host memory was below --admit-reserve-mb.");
     counter("ling:session_evictions_total", session_evictions, "Resident sessions replaced by a new session.");
     counter("ling:prefill_chunks_interleaved_total", prefill_chunks_interleaved,
             "Prefill chunks run between another request's decode steps.");
@@ -190,6 +200,9 @@ struct ServerContext {
   // completed response (--repetition-report completed) rather than response.incomplete.
   RepetitionDetection repetition = kRepetitionDefault;
   bool repetition_completed = false;
+  // Admission control (serve/admission.hpp): a generation request is refused with HTTP 503 while MemAvailable is
+  // below this many MB (0: never).
+  long admit_reserve_mb = 8192;
   Metrics metrics;
 };
 
@@ -834,6 +847,26 @@ class Handler : public proxygen::RequestHandler {
     delete this;
   }
 
+  // Admission control on host memory: answers 503 before anything is queued or streamed while MemAvailable is below
+  // the reserve (serve/admission.hpp). Returns whether it did.
+  bool refuse_for_memory() {
+    if (ctx_.admit_reserve_mb <= 0) return false;
+    const std::string why = refuse_request(mem_available_mb(), ctx_.admit_reserve_mb);
+    if (why.empty()) return false;
+    {
+      std::lock_guard<std::mutex> l(ctx_.metrics.mu);
+      ctx_.metrics.memory_refusals += 1;
+    }
+    std::fprintf(stderr, "request refused: %s\n", why.c_str());
+    ResponseBuilder(downstream_)
+        .status(503, "Service Unavailable")
+        .header("Content-Type", "application/json")
+        .header("Retry-After", "5")
+        .body(dump_json(error_body(why, "server_error", "host_memory_low")))
+        .sendWithEOM();
+    return true;
+  }
+
   void route() {
     if (method_ == "GET" && (path_ == "/health" || path_ == "/healthz")) {
       ResponseBuilder(downstream_).status(200, "OK").body("ok").sendWithEOM();
@@ -850,6 +883,10 @@ class Handler : public proxygen::RequestHandler {
           .sendWithEOM();
     } else if (method_ == "GET" && path_ == "/spec_stats") {
       send_json(downstream_, 200, ctx_.metrics.spec_json());
+    } else if (method_ == "POST" && (path_ == "/v1/responses" || path_ == "/v1/chat/completions" ||
+                                     path_ == "/v1/completions") &&
+               refuse_for_memory()) {
+      return;
     } else if (method_ == "POST" && path_ == "/v1/responses") {
       generate_responses();
     } else if (method_ == "POST" && (path_ == "/v1/chat/completions" || path_ == "/v1/completions")) {
@@ -1311,6 +1348,7 @@ int main(int argc, char** argv) {
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40;
+  long host_reserve_mb = 16384, admit_reserve_mb = 8192;
   double protect_seconds = 30;
   bool draft_bf16 = false;
   std::string repetition_arg, repetition_report = "incomplete";
@@ -1353,6 +1391,8 @@ int main(int argc, char** argv) {
     else if (a == "--batch") batch = std::stoi(next());
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else if (a == "--side-prefill") side_prefill = std::stoi(next());
+    else if (a == "--host-reserve-mb") host_reserve_mb = std::stol(next());
+    else if (a == "--admit-reserve-mb") admit_reserve_mb = std::stol(next());
     else if (a == "--repetition-detection") repetition_arg = next();
     else if (a == "--repetition-report") repetition_report = next();
     else {
@@ -1361,7 +1401,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]\n";
     return 2;
   }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
@@ -1428,6 +1468,31 @@ int main(int argc, char** argv) {
   opts.sparse_head_dynamic = sparse_head_dynamic;
   opts.sessions = sessions;
   opts.side_prefill = side_prefill;
+  for (auto [var, dst] : {std::pair<const char*, long*>{"LING_HOST_RESERVE_MB", &host_reserve_mb},
+                          std::pair<const char*, long*>{"LING_ADMIT_RESERVE_MB", &admit_reserve_mb}})
+    if (const char* e = std::getenv(var)) {
+      try {
+        *dst = std::stol(e);
+      } catch (const std::exception&) {
+        std::cerr << var << " must be an integer\n";
+        return 2;
+      }
+    }
+  if (host_reserve_mb > 0) {  // admission control at start: refuse before anything is allocated
+    const ling::ModelConfig cfg = ling::ModelConfig::from_file(model_dir + "/config.json");
+    const ling::serve::MemoryPlan mp = ling::serve::plan_memory(
+        cfg, ling::serve::checkpoint_bytes(model_dir) + ling::serve::checkpoint_bytes(draft_dir), sessions, max_context,
+        !draft_dir.empty());
+    const long avail = ling::serve::mem_available_mb();
+    const std::string why = ling::serve::refuse_start(mp, avail, host_reserve_mb);
+    if (!why.empty()) {
+      std::cerr << "ling-serve: refused to start: " << why << "\n";
+      return 3;
+    }
+    std::cerr << "memory: " << ling::serve::gb(mp.total()) << " planned (" << sessions << " sessions x "
+              << ling::serve::gb(mp.per_session) << "), " << avail << " MB available, " << host_reserve_mb
+              << " MB kept free; requests refused below " << admit_reserve_mb << " MB\n";
+  }
   std::cerr << "loading " << model_dir << " ...\n";
   ling::Engine engine(model_dir, opts);
   std::cerr << "loaded " << engine.model().device_bytes() / 1e9 << " GB of weights\n";
@@ -1439,6 +1504,7 @@ int main(int argc, char** argv) {
   ctx.metrics.max_total_tokens = engine.sessions() * max_context;
   ctx.metrics.sessions = engine.sessions();
   ctx.metrics.protect_seconds = protect_seconds;
+  ctx.admit_reserve_mb = admit_reserve_mb;
   if (batch < 1) {
     std::cerr << "--batch must be at least 1\n";
     return 2;
