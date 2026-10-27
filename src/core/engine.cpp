@@ -138,6 +138,30 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   const int kvsize = c.kv_heads * c.head_dim;
   alloc_scratch();
   pos_dev_ = alloc<int>(kernels::kMaxSeqs);
+  rdelta_dev_ = alloc<int>(kernels::kMaxSeqs);
+  check(cudaMemset(rdelta_dev_, 0, kernels::kMaxSeqs * sizeof(int)), "rope deltas");
+  mrope_dev_ = alloc<int>(size_t(std::max(opts_.prefill_chunk, kernels::kMaxStreamRows)) * 3);
+  // The vision tower and the embedding cache's reserve (VISION §20.4), before the prefix KV store sizes itself.
+  if (opts_.vision) {
+    const int max_patches = static_cast<int>(std::min<long>(opts_.vision_max_pixels / 256, 1 << 20)) & ~3;
+    vision_ = std::make_unique<VisionTower>(model_dir, max_patches);
+    cudaMemPoolProps props{};
+    props.allocType = cudaMemAllocationTypePinned;
+    props.location.type = cudaMemLocationTypeDevice;
+    check(cudaGetDevice(&props.location.id), "device");
+    check(cudaMemPoolCreate(&emb_pool_, &props), "embedding cache");
+    uint64_t keep_all = ~uint64_t(0);
+    check(cudaMemPoolSetAttribute(emb_pool_, cudaMemPoolAttrReleaseThreshold, &keep_all), "embedding cache");
+    emb_cap_ = size_t(std::max(opts_.vision_cache_mb, 0)) << 20;
+    if (emb_cap_) {  // reserve it now: the pool keeps what was freed
+      void* p = nullptr;
+      check(cudaMallocFromPoolAsync(&p, emb_cap_, emb_pool_, stream_), "embedding cache");
+      check(cudaFreeAsync(p, stream_), "embedding cache");
+      check(cudaStreamSynchronize(stream_), "embedding cache");
+    }
+    std::fprintf(stderr, "vision: tower %zu MB, scratch %zu MB for %d patches, embedding cache %zu MB\n",
+                 vision_->weight_bytes() >> 20, vision_->scratch_bytes() >> 20, max_patches, emb_cap_ >> 20);
+  }
   check(cudaHostAlloc(reinterpret_cast<void**>(&pin_), sizeof(StepPinned), cudaHostAllocDefault), "pinned step buffers");
   kernels::prepare_kernels();  // attributes are set here, never inside a graph capture
 
@@ -443,6 +467,11 @@ Engine::~Engine() {
   if (stream_) cudaStreamSynchronize(stream_);
   kv_tree_.reset();
   if (kv_arena_base_) cudaFree(kv_arena_base_);
+  for (auto& e : emb_) cudaFreeAsync(e.second.p, stream_);
+  emb_.clear();
+  if (stream_) cudaStreamSynchronize(stream_);
+  if (emb_pool_) cudaMemPoolDestroy(emb_pool_);
+  vision_.reset();
   if (side_.stream_) {
     cudaStreamSynchronize(side_.stream_);
     if (side_.logits_host_) cudaFreeHost(side_.logits_host_);
@@ -655,6 +684,26 @@ uint64_t Engine::state_hash() {
     mix(s_->gdn[i], gdn);
     mix(s_->conv[i], conv);
   }
+  return h;
+}
+
+uint64_t Engine::draft_hash() {
+  if (!draft_) return 0;
+  const DraftConfig& d = draft_->config();
+  const size_t dkv = size_t(d.kv_heads) * d.head_dim;
+  join_commit();
+  check(cudaStreamSynchronize(stream_), "draft_hash");
+  std::vector<__nv_bfloat16> host(size_t(ring_) * dkv);
+  uint64_t h = 1469598103934665603ull;
+  const int hi = static_cast<int>(s_->history.size());
+  for (int l = 0; l < d.layers; ++l)
+    for (const __nv_bfloat16* ring : {s_->dkc[l], s_->dvc[l]}) {
+      check(cudaMemcpy(host.data(), ring, host.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost), "draft_hash");
+      for (int p = dkv_from(*s_); p < hi; ++p) {
+        const unsigned char* b = reinterpret_cast<const unsigned char*>(host.data() + size_t(p % ring_) * dkv);
+        for (size_t i = 0; i < dkv * sizeof(__nv_bfloat16); ++i) h = (h ^ b[i]) * 1099511628211ull;
+      }
+    }
   return h;
 }
 
@@ -946,7 +995,9 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   if (seg_rows != M) throw std::runtime_error("forward: segments must tile the rows");
   // A segment's position. A captured graph (one sequence, the active one) reads it from pos_dev_ (dpos); the
   // batch path runs eagerly at each session's own position.
-  auto seg_pos = [&](const Seg& g, int off) { return use_dev_pos_ ? dpos(off) : kernels::DevPos(g.s->pos + off); };
+  auto seg_pos = [&](const Seg& g, int off) {
+    return use_dev_pos_ ? dpos(off) : kernels::DevPos(g.s->pos + off).with_rope(g.s->rope_delta, nullptr);
+  };
   // Several sequences (M4 stage 4): the state kernels take them all in one launch, each row at its sequence's
   // position and in its sequence's caches and state; a captured graph reads the positions from pos_dev_[i].
   const bool multi = segs.size() > 1;
@@ -956,8 +1007,12 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   for (int i = 0; i < sb.n; ++i) {
     sb.row0[i + 1] = segs[i].row0 + segs[i].rows;
     sb.pos[i] = segs[i].s->pos;
+    sb.rdelta[i] = segs[i].s->rope_delta;
   }
-  if (use_dev_pos_) sb.pos_dev = pos_dev_;
+  if (use_dev_pos_) {
+    sb.pos_dev = pos_dev_;
+    sb.rdelta_dev = rdelta_dev_;
+  }
   // A prompt's tokens take the prefill path whatever the chunk's size, so the state a prompt leaves does
   // not depend on how its prefill was split or where it resumed (the prefix checkpoints rely on it).
   quantized_ = pass == Pass::Prefill;
@@ -983,6 +1038,10 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   static const size_t hint_attn = std::getenv("LING_L2_HINT_ATTN") ? size_t(std::atof(std::getenv("LING_L2_HINT_ATTN")) * 1e6) : 0;
   check(cudaMemcpyAsync(ids_dev_, ids, M * sizeof(int), cudaMemcpyHostToDevice, stream_), "ids");
   kernels::embed(model_->embed(), ids_dev_, M, H, h_, stream_);
+  if (pass == Pass::Prefill)  // an image's rows: its embedding, BF16 to FP32 (VISION §20.3 (b))
+    for (const ImgRows& g : chunk_img_)
+      vision_kernels::embed_rows(g.src, g.count, H, h_ + size_t(g.row) * H, stream_);
+  const int* mrope = pass == Pass::Prefill && chunk_mrope_ ? mrope_dev_ : nullptr;
 
   // The megakernel's stage 4 (LING_MK_LAYERS): a persistent kernel adds its output into h_ itself and computes the next
   // norm (rmsnorm_half's, exactly) into xn_, xh_ and xinv_, so the add and the norm kernels are skipped. pre_normed: the
@@ -1077,7 +1136,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         kernels::attn_prepare(q_gate_ + r0 * 2 * qsize, k_ + r0 * kvsize, v_ + r0 * kvsize, L.q_norm, L.k_norm,
                               seg_pos(g, 0), g.rows, c.heads, c.kv_heads, c.head_dim, c.rotary_dim, c.rope_theta, c.eps,
                               q_ + r0 * qsize, gate_ + r0 * qsize, g.s->kcache[slot], g.s->vcache[slot], stream_,
-                              verify ? tree_ : nullptr);
+                              verify ? tree_ : nullptr, mrope);
         // Fixed key ranges at fixed positions for every pass (row-invariant), in slices of queries that
         // bound the partial results' scratch. A captured graph launches the ranges of the whole context.
         for (int q0 = 0; q0 < g.rows; q0 += kAttnSlice) {
@@ -1373,10 +1432,49 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   s_->pos += M;
 }
 
-Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool from_scratch) {
+Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool from_scratch,
+                                            const std::vector<PromptImage>* images) {
   if (prompt.empty()) throw std::runtime_error("empty prompt");
   side_join();
   PrefillCursor cur;
+  // Images (VISION §20.3 (b)): each run of an image's ids is one image; its grid gives its RoPE positions.
+  {
+    const int vocab = model_->config().vocab;
+    if (images) cur.images = *images;
+    const int L0 = static_cast<int>(prompt.size());
+    int next_pos = 0;
+    for (int i = 0; i < L0;) {
+      const int t = prompt[i];
+      if (t >= 0 && t < vocab) {
+        ++i;
+        ++next_pos;
+        continue;
+      }
+      if (t < kImageTokenBase) throw std::runtime_error("prompt token " + std::to_string(t) + " is outside the vocabulary");
+      if (!vision_) throw std::runtime_error("the prompt holds an image and the vision tower is off");
+      int k = 0;
+      while (k < static_cast<int>(cur.images.size()) && cur.images[k].token != t) ++k;
+      if (k == static_cast<int>(cur.images.size())) throw std::runtime_error("the prompt holds an image id with no image");
+      const PromptImage& im = cur.images[k];
+      PrefillCursor::Span sp;
+      sp.start = i;
+      sp.image = k;
+      sp.rows = im.grid_h / 2;
+      sp.cols = im.grid_w / 2;
+      sp.base = next_pos;
+      int j = i;
+      while (j < L0 && prompt[j] == t && j - i < im.tokens()) ++j;
+      sp.len = j - i;
+      if (sp.len != im.tokens())
+        throw std::runtime_error("an image's run of ids is " + std::to_string(sp.len) + " tokens, its grid needs " +
+                                 std::to_string(im.tokens()));
+      cur.spans.push_back(sp);
+      next_pos += std::max(sp.rows, sp.cols);
+      i = j;
+    }
+    // Every pass after this prompt turns at slot + delta; this prompt's own chunks read their table (chunk_begin).
+    s_->rope_delta = rope_delta_after(cur);
+  }
   cur.t0 = std::chrono::steady_clock::now();
   cur.session = active_session();
   cur.prompt = prompt;
@@ -1562,7 +1660,84 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   cur.next = reuse;
   cur.stats.reused_tokens = reuse;
   cur.stats.prefill_tokens = L - reuse;
+  for (const PrefillCursor::Span& sp : cur.spans)
+    cur.stats.image_tokens += std::max(0, sp.start + sp.len - std::max(sp.start, reuse));
   return cur;
+}
+
+void Engine::rope_rows(const PrefillCursor& cur, int from, int to, std::vector<int>& out) {
+  out.resize(size_t(3) * std::max(0, to - from));
+  // Text before the first span sits at its index; each span moves the text after it by max(rows, cols) - len.
+  int delta = 0;
+  size_t k = 0;
+  for (int i = from; i < to;) {
+    while (k < cur.spans.size() && cur.spans[k].start + cur.spans[k].len <= i) {
+      const PrefillCursor::Span& sp = cur.spans[k];
+      delta += std::max(sp.rows, sp.cols) - sp.len;
+      ++k;
+    }
+    int* o = out.data() + size_t(3) * (i - from);
+    if (k < cur.spans.size() && i >= cur.spans[k].start) {
+      const PrefillCursor::Span& sp = cur.spans[k];
+      const int j = i - sp.start;
+      o[0] = sp.base;
+      o[1] = sp.base + j / sp.cols;
+      o[2] = sp.base + j % sp.cols;
+    } else {
+      o[0] = o[1] = o[2] = i + delta;
+    }
+    ++i;
+  }
+}
+
+int Engine::rope_delta_after(const PrefillCursor& cur) {
+  int delta = 0;
+  for (const PrefillCursor::Span& sp : cur.spans) delta += std::max(sp.rows, sp.cols) - sp.len;
+  return delta;
+}
+
+const __nv_bfloat16* Engine::image_embedding(const PromptImage& im, const std::vector<int>& keep, EngineStats& stats) {
+  auto it = emb_.find(im.token);
+  if (it != emb_.end()) {
+    it->second.used = ++emb_clock_;
+    return it->second.p;
+  }
+  if (!vision_) throw std::runtime_error("the vision tower is off");
+  if (!im.patches || im.patches->size() != size_t(im.grid_h) * im.grid_w * vision_->config().patch_dim())
+    throw std::runtime_error("an image's patches are missing or the wrong size");
+  const size_t bytes = size_t(im.tokens()) * vision_->config().out * sizeof(__nv_bfloat16);
+  // Make room: least recently used first, never an image of the current prompt. The stream finishes what reads the
+  // evicted entries before they are freed.
+  while (emb_bytes_ + bytes > emb_cap_) {
+    auto victim = emb_.end();
+    for (auto e = emb_.begin(); e != emb_.end(); ++e)
+      if (std::find(keep.begin(), keep.end(), e->first) == keep.end() &&
+          (victim == emb_.end() || e->second.used < victim->second.used))
+        victim = e;
+    if (victim == emb_.end()) break;  // everything cached is this prompt's: the pool grows past its reserve
+    check(cudaStreamSynchronize(stream_), "embedding cache");
+    check(cudaFreeAsync(victim->second.p, stream_), "embedding cache");
+    emb_bytes_ -= victim->second.bytes;
+    emb_.erase(victim);
+  }
+  void* p = nullptr;
+  check(cudaMallocFromPoolAsync(&p, bytes, emb_pool_, stream_), "embedding cache");
+  cudaEvent_t e0 = nullptr, e1 = nullptr;
+  check(cudaEventCreate(&e0), "vision timing");
+  check(cudaEventCreate(&e1), "vision timing");
+  check(cudaEventRecord(e0, stream_), "vision timing");
+  vision_->forward(im.patches->data(), im.grid_h, im.grid_w, static_cast<__nv_bfloat16*>(p), stream_);
+  check(cudaEventRecord(e1, stream_), "vision timing");
+  check(cudaEventSynchronize(e1), "vision");
+  float ms = 0;
+  check(cudaEventElapsedTime(&ms, e0, e1), "vision timing");
+  cudaEventDestroy(e0);
+  cudaEventDestroy(e1);
+  stats.vision_seconds += ms / 1e3;
+  stats.images_encoded += 1;
+  emb_[im.token] = EmbEntry{static_cast<__nv_bfloat16*>(p), bytes, ++emb_clock_};
+  emb_bytes_ += bytes;
+  return static_cast<const __nv_bfloat16*>(p);
 }
 
 bool Engine::prefill_chunk(PrefillCursor& cur, int max_tokens) {
@@ -1619,13 +1794,42 @@ Engine::ChunkRun Engine::chunk_begin(PrefillCursor& cur, int max_tokens) {
   r.keep_at = keep_at;
   r.n = end - i;
   r.pos0 = s_->pos;
+  // Images (VISION §20.3 (b)): the chunk's rows of each image take the image's embedding (the tower runs here when
+  // the cache does not hold it), the ids are replaced by 0 for the embedding lookup, and every row of a prompt with
+  // images reads its RoPE positions from the table.
+  std::vector<int> ids;
+  const int* chunk_ids = prompt.data() + i;
+  chunk_img_.clear();
+  chunk_mrope_ = cur.has_images();
   try {
-    forward(prompt.data() + i, r.n, Pass::Prefill, keep_at);
+    if (chunk_mrope_) {
+      std::vector<int> keep;
+      for (const PromptImage& im : cur.images) keep.push_back(im.token);
+      for (const PrefillCursor::Span& sp : cur.spans) {
+        const int a = std::max(sp.start, i), b = std::min(sp.start + sp.len, end);
+        if (a >= b) continue;
+        const __nv_bfloat16* emb = image_embedding(cur.images[sp.image], keep, cur.stats);
+        chunk_img_.push_back({a - i, b - a, emb + size_t(a - sp.start) * model_->config().hidden});
+      }
+      ids.assign(prompt.begin() + i, prompt.begin() + end);
+      for (int& t : ids)
+        if (t >= kImageTokenBase) t = 0;
+      chunk_ids = ids.data();
+      std::vector<int> table;
+      rope_rows(cur, i, end, table);
+      check(cudaMemcpyAsync(mrope_dev_, table.data(), table.size() * sizeof(int), cudaMemcpyHostToDevice, stream_),
+            "rope table");
+    }
+    forward(chunk_ids, r.n, Pass::Prefill, keep_at);
   } catch (...) {
     keep_slot_ = nullptr;
+    chunk_img_.clear();
+    chunk_mrope_ = false;
     throw;
   }
   keep_slot_ = nullptr;
+  chunk_img_.clear();
+  chunk_mrope_ = false;
   return r;
 }
 
@@ -1742,8 +1946,9 @@ void Engine::side_abandon() {
   side_cur_ = nullptr;
 }
 
-const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, EngineStats* stats, bool from_scratch) {
-  PrefillCursor cur = begin_prefill(prompt, from_scratch);
+const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, EngineStats* stats, bool from_scratch,
+                                          const std::vector<PromptImage>* images) {
+  PrefillCursor cur = begin_prefill(prompt, from_scratch, images);
   while (!prefill_chunk(cur)) {
   }
   if (stats) *stats = cur.stats;

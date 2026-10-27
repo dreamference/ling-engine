@@ -1,0 +1,22 @@
+# Images window 5: the chunk-check item of window 3 (image prompt 4's continuation took 12 steps and 58 drafts against
+# 11 and 59), then the kernel tests, resumes inside images and SGLang's own tower as a second floor.
+# The chunk item: text prompts whose last chunk of 256 is at most 32 rows, on the build before the fix (the drafter
+# context compared bit for bit), on main (c5ec4ec, its own check) and on the fixed build; then the image prompts.
+SRC=~/ling-engine-vision; B=$SRC/build; P=$V/../prompts.jsonl; T=$V/../prompts-tails.jsonl
+M=$(ls -d ~/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4/snapshots/*)
+D=$HOME/.cache/dreamference/drafters/dflash2-nvfp4-scalesearch
+step tails-make bash -c "python3 $SRC/bench/chunk_tails.py $SRC/specs/DREAMFERENCE_LING_ENGINE_VISION.md > $T"
+step chunk-tails-nofix $V/../ling-run-nofix --model $M --draft $D --prompts-file $T --chunk-check 256 --max-tokens 32
+step chunk-tails-main $HOME/tree2/mainb/build/ling-run --model $M --draft $D --prompts-file $T --chunk-check 256 --max-tokens 32
+step chunk-tails $B/ling-run --model $M --draft $D --prompts-file $T --chunk-check 256 --max-tokens 32
+step chunk-check $B/ling-run --model $M --draft $D --vision-prompts $P --chunk-check 256 --max-tokens 32
+step vision-tests $B/ling-vision-tests
+HUB=$HOME/.cache/huggingface
+IMG=lmsysorg/sglang@sha256:b1259f3ea3275f66237c498ea388919729018bc9f01c3d638391e06e2cf3f469
+step ref-sgl docker run --rm --gpus all --network none --name vision-refs -v $HUB:$HUB:ro -v $V/..:$V/.. -v $SRC:$SRC:ro \
+  -e HF_HUB_OFFLINE=1 -e ONLY_SGL=1 --entrypoint python3 $IMG $SRC/bench/vision/reference.py $M $V/../ref
+step vision-check-sgl bash -c "[ -e $V/../ref/icon.sgl.bf16 ] && $B/ling-run --model $M --vision-check $V/../ref || echo no SGLang dumps"
+# Resumes inside an image: the same 8K-token image under two questions (a kept state inside it), two images whose
+# second differs (a resume between them), and the exactness of each against a prefill from scratch.
+step prefix-check-resume $B/ling-run --model $M --draft $D --vision-prompts $V/../prompts-resume.jsonl --prefix-check --sessions 1 --max-tokens 32
+step chunk-check-nofix $V/../ling-run-nofix --model $M --draft $D --vision-prompts $P --chunk-check 256 --max-tokens 32

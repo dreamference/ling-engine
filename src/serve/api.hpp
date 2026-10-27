@@ -57,6 +57,9 @@ struct Request {
   bool include_usage = false;
   std::string prompt_text;          // the rendered prompt (chat) or the given prompt (completions)
   std::vector<int> prompt_ids;      // set when a completions request sends token ids
+  // With vision (VISION §20.6): the URL of each image, in the order of the `<|image_pad|>` placeholders in
+  // prompt_text, which the server expands into each image's tokens.
+  std::vector<std::string> image_urls;
   int max_tokens = 0;               // 0 = up to the context limit
   SamplingParams sampling;
   std::vector<std::string> stop;
@@ -104,14 +107,16 @@ constexpr const char* kCustomToolInput = "input";
 // parameters; failing all that, the arguments text itself.
 std::string custom_tool_input(const std::string& arguments);
 
-// Throws std::invalid_argument with a message for the client.
-Request parse_request(const json& body, bool chat);
+// Throws std::invalid_argument with a message for the client. `vision`: the server has the vision tower, so
+// image parts render production's placeholder and fill Request::image_urls (without it they render `[image]`).
+Request parse_request(const json& body, bool chat, bool vision = false);
 
 // The Responses API (what Mightling's agent calls), converted to a chat request the way SGLang does:
 // instructions and developer messages become one leading system message, function calls and their
 // outputs become assistant tool calls and tool messages, reasoning items become reasoning_content, and
 // only `function` tools reach the template.
-Request parse_responses_request(const json& body);
+// With `vision`, images in function_call_output lists render too (VISION §20.6).
+Request parse_responses_request(const json& body, bool vision = false);
 
 struct ToolCall {
   std::string name;

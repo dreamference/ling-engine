@@ -1,0 +1,11 @@
+# Images window 3: phases (b) and (c): the exactness checks with image prompts (speculation, prefix resume inside and
+step vision-tests $HOME/ling-engine-vision/build/ling-vision-tests
+# after an image, step graphs, batches of two, chunked prefill).
+SRC=~/ling-engine-vision; B=$SRC/build; P=$V/../prompts.jsonl
+CK=$(ls -d ~/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4/snapshots/*)
+D=$HOME/.cache/dreamference/drafters/dflash2-nvfp4-scalesearch
+step spec-check $B/ling-run --model $CK --draft $D --vision-prompts $P --spec-check --max-tokens 48
+step prefix-check $B/ling-run --model $CK --draft $D --vision-prompts $P --prefix-check --sessions 2 --max-tokens 48
+step graph-check $B/ling-run --model $CK --draft $D --vision-prompts $P --graph-check --graphs --pdl --max-tokens 48
+step batch-check $B/ling-run --model $CK --draft $D --vision-prompts $P --batch-check --sessions 2 --graphs --pdl --max-tokens 48
+step chunk-check $B/ling-run --model $CK --draft $D --vision-prompts $P --chunk-check 256 --max-tokens 32

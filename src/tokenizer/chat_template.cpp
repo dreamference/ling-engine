@@ -20,7 +20,22 @@ bool ends_with(const std::string& s, const std::string& p) {
   return s.size() >= p.size() && s.compare(s.size() - p.size(), p.size(), p) == 0;
 }
 
-std::string render_content(const json& content, bool is_system) {
+// The URL an image part carries: `image_url` as an object with `url` or as a string, or `image` as a string.
+std::string image_url_of(const json& item) {
+  if (item.contains("image_url")) {
+    const json& u = item["image_url"];
+    if (u.is_string()) return u.get<std::string>();
+    if (u.is_object() && u.contains("url") && u["url"].is_string()) return u["url"].get<std::string>();
+  }
+  if (item.contains("image") && item["image"].is_string()) return item["image"].get<std::string>();
+  if (item.contains("file_id")) throw std::invalid_argument("input_image with file_id is not supported: send the image as a data: URL");
+  throw std::invalid_argument("an image part has no image_url");
+}
+
+// `images`: with vision (ChatOptions::images set), each image part renders production's placeholder and its URL is
+// appended here, in the order the placeholders appear; without it, the part renders as the text `[image]`.
+std::string render_content(const json& content, bool is_system, std::vector<std::string>* images = nullptr,
+                           bool vision = false) {
   if (content.is_null()) return {};
   if (content.is_string()) return content.get<std::string>();
   if (content.is_array()) {
@@ -29,9 +44,16 @@ std::string render_content(const json& content, bool is_system) {
       const std::string type = item.value("type", "");
       if (item.contains("image") || item.contains("image_url") || type == "image" || type == "image_url" ||
           type == "input_image") {
-        // No vision encoder yet: the image is stood in for by a placeholder, so the turn goes on. A 400
-        // here ends the turn in Codex (API §7).
-        out += "[image]";
+        if (!vision) {
+          // No vision encoder (--vision off): the image is stood in for by a placeholder, so the turn goes on. A
+          // 400 here ends the turn in Codex (API §7).
+          out += "[image]";
+          continue;
+        }
+        if (is_system) throw std::invalid_argument("System message cannot contain images.");
+        const std::string url = image_url_of(item);
+        if (images) images->push_back(url);
+        out += "<|vision_start|><|image_pad|><|vision_end|>";
         continue;
       }
       if (item.contains("video") || type == "video") {
@@ -85,6 +107,7 @@ std::string python_json(const json& v) {
 
 std::string render_chat(const json& messages, const json& tools, const ChatOptions& opts) {
   if (!messages.is_array() || messages.empty()) throw std::invalid_argument("No messages provided.");
+  const bool vision = opts.images != nullptr;
   std::string out;
   std::string reasoning;
   const bool thinking = !opts.enable_thinking.has_value() || *opts.enable_thinking;
@@ -126,12 +149,12 @@ std::string render_chat(const json& messages, const json& tools, const ChatOptio
         "there is no function call available, answer the question like normal with your current knowledge and "
         "do not tell the user about function calls\n</IMPORTANT>";
     if (has_system) {
-      const std::string content = trim(render_content(messages[0]["content"], true));
+      const std::string content = trim(render_content(messages[0]["content"], true, nullptr, vision));
       if (!content.empty()) out += "\n\n" + content;
     }
     out += "<|im_end|>\n";
   } else if (has_system) {
-    const std::string content = trim(render_content(messages[0]["content"], true));
+    const std::string content = trim(render_content(messages[0]["content"], true, nullptr, vision));
     if (!content.empty()) {
       out += "<|im_start|>system\n" + (reasoning.empty() ? std::string() : reasoning + "\n\n") + content +
              "<|im_end|>\n";
@@ -147,7 +170,7 @@ std::string render_chat(const json& messages, const json& tools, const ChatOptio
   for (long i = static_cast<long>(messages.size()) - 1; i >= 0; --i) {
     const json& m = messages[i];
     if (m.value("role", "") == "user") {
-      const std::string c = trim(render_content(m.contains("content") ? m["content"] : json(), false));
+      const std::string c = trim(render_content(m.contains("content") ? m["content"] : json(), false, nullptr, vision));
       if (!(starts_with(c, "<tool_response>") && ends_with(c, "</tool_response>"))) {
         last_query = i;
         break;
@@ -159,7 +182,10 @@ std::string render_chat(const json& messages, const json& tools, const ChatOptio
   for (size_t i = 0; i < messages.size(); ++i) {
     const json& m = messages[i];
     const std::string role = m.value("role", "");
-    const std::string content = trim(render_content(m.contains("content") ? m["content"] : json(), false));
+    // Images are collected where the content is written: every message but the first system message (written above).
+    const bool written = !(role == "system" && i == 0);
+    const std::string content =
+        trim(render_content(m.contains("content") ? m["content"] : json(), false, written ? opts.images : nullptr, vision));
     if (role == "system") {
       // Production's second patch: a later system message becomes a reminder in the conversation.
       if (i != 0) out += "<|im_start|>user\n<system-reminder>\n" + content + "\n</system-reminder><|im_end|>\n";

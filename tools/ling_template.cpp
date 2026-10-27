@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include "serve/api.hpp"
+#include "serve/image_input.hpp"
 #include "tokenizer/chat_template.hpp"
 #include "tokenizer/tokenizer.hpp"
 
@@ -28,6 +29,32 @@ int main(int argc, char** argv) {
       try {
         const ling::serve::Request r = ling::serve::parse_responses_request(rec.contains("body") ? rec["body"] : rec);
         std::cout << json{{"ids", tok.encode(r.prompt_text)}, {"text", r.prompt_text}}.dump() << "\n";
+      } catch (const std::exception& e) {
+        std::cout << json{{"error", e.what()}}.dump() << "\n";
+      }
+    }
+    return 0;
+  }
+  if (argc == 3 && std::string(argv[1]) == "--vision-ids") {
+    // ling-template --vision-ids TOKENIZER_JSON < bodies.jsonl (chat-completions bodies, images as data: URLs): the
+    // prompt ids ling-serve would prefill, each image's tokens shown as production shows them (<|image_pad|> repeated),
+    // without a GPU (JPEGs on the CPU decoder); bench/vision compares them with production's prompt_token_ids.
+    ling::Tokenizer tok(argv[2], ling::kProductionPretokenizer);
+    ling::serve::set_jpeg_decoder(ling::serve::JpegDecoder::Cpu);
+    ling::serve::ImageRegistry reg;
+    const int pad = tok.token_id("<|image_pad|>");
+    while (std::getline(std::cin, line)) {
+      if (line.empty()) continue;
+      try {
+        const ling::serve::Request r = ling::serve::parse_request(json::parse(line), true, true);
+        std::vector<int> ids = tok.encode(r.prompt_text);
+        std::vector<ling::PromptImage> images;
+        ling::serve::attach_images(ids, pad, r.image_urls, reg, ling::serve::ProcessorConfig{}, images);
+        json grids = json::array();
+        for (const auto& im : images) grids.push_back({1, im.grid_h, im.grid_w});
+        for (int& t : ids)
+          if (t >= ling::kImageTokenBase) t = pad;
+        std::cout << json{{"ids", ids}, {"grids", grids}}.dump() << "\n";
       } catch (const std::exception& e) {
         std::cout << json{{"error", e.what()}}.dump() << "\n";
       }

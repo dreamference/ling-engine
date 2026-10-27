@@ -171,7 +171,7 @@ std::string StopScanner::finish() {
   return out;
 }
 
-Request parse_request(const json& body, bool chat) {
+Request parse_request(const json& body, bool chat, bool vision) {
   if (!body.is_object()) throw std::invalid_argument("the request body must be a JSON object");
   Request r;
   r.chat = chat;
@@ -241,6 +241,7 @@ Request parse_request(const json& body, bool chat) {
     }
     if (body.contains("tools") && body["tools"].is_array() && body.value("tool_choice", json("auto")) != "none")
       r.tools = canonical_tools(body["tools"], body.contains("tool_choice") ? body["tool_choice"] : json("auto"));
+    if (vision) opts.images = &r.image_urls;
     r.prompt_text = render_chat(production_messages(body["messages"]), r.tools, opts);
     r.reasoning = !opts.enable_thinking.has_value() || *opts.enable_thinking;
   } else {
@@ -607,7 +608,7 @@ std::string call_id_of(const json& item) {
 }
 
 // One Responses input item as a chat message, or null to drop it.
-json normalize_item(const json& item) {
+json normalize_item(const json& item, bool vision) {
   const std::string type = item.value("type", "message");
   if (type == "custom_tool_call") {
     // Replayed as the one-parameter function call it was offered as, so the turn renders as the model
@@ -637,6 +638,23 @@ json normalize_item(const json& item) {
   }
   if (type == "function_call_output" || type == "custom_tool_call_output") {
     const json& out = item.contains("output") ? item["output"] : json("");
+    // With vision, a list holding images stays a list of parts, so the images render in the tool message
+    // (VISION §20.6: production flattens it to its text and drops the images, so `view_image` never reaches the
+    // model there). Without images, or without vision, the concatenated text as before.
+    bool has_image = false;
+    if (vision && out.is_array())
+      for (const json& p : out)
+        has_image = has_image || (p.is_object() && (p.value("type", "") == "input_image" || p.value("type", "") == "image_url"));
+    if (has_image) {
+      json parts = json::array();
+      for (const json& p : out) {
+        if (!p.is_object()) continue;
+        const std::string pt = p.value("type", "");
+        if (pt == "input_image" || pt == "image_url") parts.push_back(p);
+        else if (p.contains("text") && p["text"].is_string()) parts.push_back({{"type", "text"}, {"text", p["text"]}});
+      }
+      return json{{"role", "tool"}, {"tool_call_id", item.value("call_id", "")}, {"content", parts}};
+    }
     return json{{"role", "tool"}, {"tool_call_id", item.value("call_id", "")}, {"content", text_of_parts(out)}};
   }
   if (type == "reasoning") {
@@ -692,7 +710,7 @@ json as_parts(const json& c) {
 
 }  // namespace
 
-Request parse_responses_request(const json& body) {
+Request parse_responses_request(const json& body, bool vision) {
   if (!body.is_object()) throw std::invalid_argument("the request body must be a JSON object");
   json messages = json::array();
   if (body.contains("instructions") && body["instructions"].is_string() && !body["instructions"].get<std::string>().empty())
@@ -702,7 +720,7 @@ Request parse_responses_request(const json& body) {
     messages.push_back({{"role", "user"}, {"content", body["input"]}});
   } else if (body["input"].is_array()) {
     for (const json& item : body["input"]) {
-      json m = normalize_item(item);
+      json m = normalize_item(item, vision);
       if (!m.is_null()) messages.push_back(std::move(m));
     }
   } else {
@@ -822,7 +840,7 @@ Request parse_responses_request(const json& body) {
       chat["reasoning_effort"] = effort;
     }
   }
-  Request r = parse_request(chat, true);
+  Request r = parse_request(chat, true, vision);
   r.custom_tools = std::move(custom);
   if (body.contains("prompt_cache_key") && body["prompt_cache_key"].is_string())
     r.session_key = body["prompt_cache_key"].get<std::string>();

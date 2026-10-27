@@ -1,0 +1,23 @@
+# Images window 4: the engine's existing exactness checks on text, the vision branch against main (c5ec4ec, built in
+# ~/tree2/mainb): the test binaries, agentlong greedy (output identity per turn), and --spec-check, --batch-check,
+# --graph-check, --prefix-check on the integration's text prompts (as levers W8 ran them).
+SRC=~/ling-engine-vision; B=$SRC/build; MAIN=$HOME/tree2/mainb/build
+M=$(ls -d ~/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4/snapshots/*)
+D=$HOME/.cache/dreamference/drafters/dflash2-nvfp4-scalesearch
+S=$HOME/integ-exact/spec.jsonl; PB=$HOME/lv/prefix-branch.jsonl
+for t in kernel tree mk stream prefill spec sampling api prefix-kv vision vision-input; do step test-$t $B/ling-$t-tests; done
+al() {  # al LABEL BUILD: agentlong greedy on ling-serve from BUILD
+  setsid $2/ling-serve --model $M --draft $D --port 8300 --served-model-name RadixArk/Qwen3.8-27B-NVFP4 --max-context 65536 \
+    --draft-block 12 --graphs --pdl > $V/$1.serve.log 2>&1 8>&- < /dev/null &
+  local srv=$!
+  for i in $(seq 1 120); do curl -sf -m 2 localhost:8300/health > /dev/null && break; sleep 3; done
+  python3 $SRC/bench/agentlong/run.py --url http://127.0.0.1:8300 --mode greedy --label $1 --out $V/$1.jsonl
+  kill $srv; wait $srv 2>/dev/null
+}
+step al-main al al-main $MAIN
+step al-vision al al-vision $B
+step al-compare python3 $SRC/bench/agentlong/run.py --compare $V/al-main.jsonl $V/al-vision.jsonl
+step spec-check $B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --spec-check --graphs --pdl
+step batch-check $B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --batch-check --sessions 2 --graphs --pdl
+step graph-check $B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 400 --graph-check --seed 7 --pdl
+step prefix-check $B/ling-run --model $M --draft $D --prompts-file $PB --prefix-check --sessions 1 --pdl

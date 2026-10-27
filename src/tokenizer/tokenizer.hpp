@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -48,7 +49,12 @@ class Tokenizer {
   std::string byte_to_unicode_[256];
   std::unordered_map<std::string, uint8_t> unicode_to_byte_;
   void* regex_ = nullptr;  // pcre2_code*
+  // The BPE results of pieces seen before. encode() runs on every HTTP worker thread at once (ling-serve tokenizes
+  // each request on the thread that received it), so the cache is read under a shared lock and filled under an
+  // exclusive one: unguarded, two requests tokenized together corrupted the map and crashed the server (node-b,
+  // 2026-10-27, four agent streams). The ids are what the BPE gives with or without the cache.
   mutable std::unordered_map<std::string, std::vector<int>> cache_;
+  mutable std::shared_mutex cache_mu_;
 };
 
 // Turns tokens into text as they are generated, holding back bytes until they form whole UTF-8

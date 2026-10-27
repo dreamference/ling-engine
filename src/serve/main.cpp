@@ -6,7 +6,7 @@
 //              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
-//              [--side-prefill N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off]
+//              [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off]
 //              [--repetition-report incomplete|completed]
 //
 // --sessions N (default 2; M4 §1) keeps N resident sessions, each with its own KV cache and state, so N
@@ -27,6 +27,11 @@
 // request decodes, a prefill runs in full chunks on the engine's second stream, on a green context of N SMs (-1: a
 // plain second stream), at the same time as the other request's steps on the main stream, instead of alternating
 // contended chunks with them. The same kernels on the same inputs (ling-run --interleave-check --side-prefill N).
+// --side-share N (BATCHING §5.5, C1; default 16, 0 off): while two or more other requests decode, the side stream
+// waits after each prefill chunk (any request's) until N decode passes have run on the main stream alone, so the
+// decoding conversations take some steps at their speed alone instead of every step beside a chunk. At four warm
+// agent conversations (node-b, 2026-10-27) 16 raised the pooled decode from 25.7 to 35.6 tok/s with the rounds'
+// time unchanged (139.3 / 140.9 s). Only the order of units changes, as with the shortest prefill first.
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -83,6 +88,7 @@
 #include "serve/admission.hpp"
 #include "serve/api.hpp"
 #include "tokenizer/tokenizer.hpp"
+#include "serve/image_input.hpp"
 
 namespace ling::serve {
 namespace {
@@ -204,6 +210,12 @@ struct ServerContext {
   // below this many MB (0: never).
   long admit_reserve_mb = 8192;
   Metrics metrics;
+  // Images (VISION §20.3 (c)): on when the engine has the tower; <|image_pad|>'s id, each image's id in prompts, the
+  // processor's settings.
+  bool vision = false;
+  int image_pad = -1;
+  ImageRegistry* images = nullptr;
+  ProcessorConfig processor;
 };
 
 // What a job reports back, called on the engine thread.
@@ -228,6 +240,7 @@ struct Job {
   std::chrono::steady_clock::time_point received = std::chrono::steady_clock::now();
   Request req;
   std::vector<int> prompt;
+  std::vector<PromptImage> images;  // the prompt's images (VISION §20.3 (c))
   JobSink sink;
   std::shared_ptr<std::atomic<bool>> cancelled;
   int session = -1;    // the session it runs in (bound when the scheduler admits it)
@@ -272,7 +285,9 @@ struct Running {
   long steps0 = 0, drafted0 = 0, accepted0 = 0;
   int chunks_beside = 0;  // prefill chunks run while another request was decoding (contended size, or on the side)
   bool side_flight = false;  // one of its chunks is in flight on the engine's side stream
-  int batched = 0;        // its decode steps taken in a batch with another request (M4 stage 3)
+  bool yielding = false;     // its prefill is letting a shorter one go first, since yield_t0 (C1)
+  std::chrono::steady_clock::time_point yield_t0;
+  int batched = 0;       // its decode steps taken in a batch with another request (M4 stage 3)
   Periods alone, beside;  // step periods without and with another request's prefill in between
 };
 
@@ -288,8 +303,13 @@ struct Running {
 // one-row step on its turn; a prefill chunk still alternates with the decode steps.
 class Scheduler {
  public:
-  Scheduler(ServerContext& ctx, double protect_seconds, int batch, int contended)
-      : ctx_(ctx), protect_seconds_(protect_seconds), batch_(batch), contended_(contended), thread_([this] { run(); }) {}
+  Scheduler(ServerContext& ctx, double protect_seconds, int batch, int contended, int side_share = 0)
+      : ctx_(ctx),
+        protect_seconds_(protect_seconds),
+        batch_(batch),
+        contended_(contended),
+        side_share_(side_share),
+        thread_([this] { run(); }) {}
   ~Scheduler() {
     {
       std::lock_guard<std::mutex> l(mu_);
@@ -386,7 +406,7 @@ class Scheduler {
     try {
       if (exceeds_context(j.prompt.size(), eng.max_context())) throw ContextOverflow(j.prompt.size(), eng.max_context());
       eng.activate_session(j.session, j.req.session_key, j.fresh);
-      r->cur = eng.begin_prefill(j.prompt);
+      r->cur = eng.begin_prefill(j.prompt, false, j.images.empty() ? nullptr : &j.images);
     } catch (const std::exception& e) {
       fail(*r, e);
       eng.touch_session(j.session);
@@ -489,6 +509,7 @@ class Scheduler {
       steps[i].params = &r.job.req.sampling;
       steps[i].row_logits = r.job.req.logprobs ? &r.rows : nullptr;
     }
+    ++decode_passes_;
     try {
       eng.speculate_batch(steps);
     } catch (const std::exception& e) {  // not one sequence's rows: the step itself failed
@@ -524,10 +545,49 @@ class Scheduler {
       if (r.get() != &self && !r->prefilling) return true;
     return false;
   }
+  int others_decoding(const Running& self) const {
+    int n = 0;
+    for (const auto& r : running_)
+      if (r.get() != &self && !r->prefilling) ++n;
+    return n;
+  }
+  // Whether r's next side chunk waits (--side-share N): while two or more other requests decode, N decode passes
+  // run on the main stream alone after the last side chunk (any request's) before the next one starts.
+  bool hold_side(const Running& r) const {
+    if (side_share_ <= 0 || side_mark_ < 0 || others_decoding(r) < 2) return false;
+    return decode_passes_ - side_mark_ < side_share_;
+  }
   bool other_prefilling(const Running& self) const {
     for (const auto& r : running_)
       if (r.get() != &self && r->prefilling) return true;
     return false;
+  }
+
+  // The shortest prefill first (BATCHING §5.5, C1): of the requests waiting to prefill, the one with the fewest
+  // tokens left takes the next chunk. A warm follow-up's append is that request's whole time to first token, while a
+  // cold prompt of tens of thousands of tokens loses a chunk's time to it. Before, a long prefill on the side stream
+  // relaunched its next chunk the moment one finished, so a follow-up arriving meanwhile waited out the whole cold
+  // prompt (up to 55 s at four streams, W11). A request that has yielded for kMaxYield takes its next chunk anyway,
+  // so a long prompt still moves while short ones keep arriving. Only the order of units changes: every chunk runs
+  // in its own session's state, as it would alone.
+  static constexpr auto kMaxYield = std::chrono::seconds(5);
+  static int prefill_left(const Running& r) { return static_cast<int>(r.cur.prompt.size()) - r.cur.next; }
+  // Whether r lets a shorter prefill that is waiting take the next chunk (and r's yield clock).
+  bool yield_prefill(Running& r) const {
+    const int left = prefill_left(r);
+    bool shorter = false;
+    for (const auto& o : running_)
+      if (o.get() != &r && o->prefilling && !o->side_flight && prefill_left(*o) < left) shorter = true;
+    const auto now = std::chrono::steady_clock::now();
+    if (!shorter || (r.yielding && now - r.yield_t0 >= kMaxYield)) {
+      r.yielding = false;
+      return false;
+    }
+    if (!r.yielding) {
+      r.yielding = true;
+      r.yield_t0 = now;
+    }
+    return true;
   }
 
   // One prefill chunk or one decode step of `r`. Returns true when the request has ended (and was answered).
@@ -538,6 +598,7 @@ class Scheduler {
       if (eng.side_enabled() && (r.side_flight || (contended && !eng.side_busy()))) {
         // A full chunk on the side stream; the decoding request's turns go on while it runs.
         if (!r.side_flight) {
+          if (hold_side(r) || yield_prefill(r)) return false;
           eng.prefill_chunk_launch(r.cur, 0);
           r.side_flight = true;
           count_interleaved(r);
@@ -545,8 +606,10 @@ class Scheduler {
         }
         if (contended && !eng.side_ready()) return false;
         r.side_flight = false;
-        if (!eng.prefill_chunk_finish()) {
-          if (other_decoding(r)) {  // the next chunk at once
+        const bool last_chunk = eng.prefill_chunk_finish();
+        side_mark_ = decode_passes_;
+        if (!last_chunk) {
+          if (other_decoding(r) && !hold_side(r) && !yield_prefill(r)) {  // the next chunk at once, unless a short prefill waits
             eng.prefill_chunk_launch(r.cur, 0);
             r.side_flight = true;
             count_interleaved(r);
@@ -558,6 +621,7 @@ class Scheduler {
         return emit(r) && end(r);
       }
       if (eng.side_busy()) return false;  // another request's chunk is in flight: no prefill beside it
+      if (yield_prefill(r)) return false;
       const bool last = eng.prefill_chunk(r.cur, contended ? contended_ : 0);
       if (contended) count_interleaved(r);
       if (!last) return false;
@@ -570,6 +634,7 @@ class Scheduler {
     r.last_step = now;
     eng.select_session(r.job.session);
     ++r.passes;
+    ++decode_passes_;
     {
       std::lock_guard<std::mutex> m(ctx_.metrics.mu);
       ctx_.metrics.batch_rows = r.spec ? std::min(eng.draft_block(), eng.max_context() - static_cast<int>(eng.history().size())) : 1;
@@ -731,7 +796,9 @@ class Scheduler {
 
   ServerContext& ctx_;
   double protect_seconds_;
-  int batch_, contended_;
+  int batch_, contended_, side_share_;
+  long decode_passes_ = 0;  // decode passes run (a batched step counts once), for --side-share
+  long side_mark_ = -1;     // decode_passes_ when the last side chunk finished (--side-share)
   std::mutex mu_;
   std::condition_variable cv_;
   std::deque<Job> queue_;
@@ -875,6 +942,10 @@ class Handler : public proxygen::RequestHandler {
                     {"owned_by", "ling-engine"}, {"root", ctx_.model_name},
                     {"max_model_len", ctx_.engine->max_context()}};
       send_json(downstream_, 200, json{{"object", "list"}, {"data", json::array({model})}});
+    } else if (method_ == "GET" && (path_ == "/model_info" || path_ == "/get_model_info")) {
+      // SGLang's answer, which Mightling's launcher reads to advertise image input (VISION §20.6).
+      send_json(downstream_, 200,
+                json{{"model_path", ctx_.model_name}, {"is_generation", true}, {"has_image_understanding", ctx_.vision}});
     } else if (method_ == "GET" && path_ == "/metrics") {
       ResponseBuilder(downstream_)
           .status(200, "OK")
@@ -896,6 +967,18 @@ class Handler : public proxygen::RequestHandler {
     }
   }
 
+  // Images (VISION §20.3 (c), §20.6): each URL decoded and preprocessed here, on the HTTP thread; each <|image_pad|>
+  // of the tokenized prompt becomes the image's tokens, all its id (§20.7). Throws ImageError or invalid_argument.
+  void attach_images(Job& job) {
+    // Without the tower an image part rendered as `[image]` and no URL was collected: nothing to do (a literal
+    // <|image_pad|> in the text stays a token, as before).
+    if (!ctx_.vision) return;
+    int pads = 0;
+    for (int t : job.prompt) pads += t == ctx_.image_pad;
+    if (job.req.image_urls.empty() && pads == 0) return;
+    serve::attach_images(job.prompt, ctx_.image_pad, job.req.image_urls, *ctx_.images, ctx_.processor, job.images);
+  }
+
   void generate(bool chat) {
     if (too_large_) {
       send_json(downstream_, 413, error_body("request body too large", "invalid_request_error"));
@@ -906,13 +989,21 @@ class Handler : public proxygen::RequestHandler {
       std::string text;
       if (auto buf = body_.move()) text = buf->moveToFbString().toStdString();
       json body = json::parse(text);
-      job.req = parse_request(body, chat);
+      job.req = parse_request(body, chat, ctx_.vision);
       job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
+      job.prompt = job.req.prompt_ids.empty() ? ctx_.tok->encode(job.req.prompt_text) : job.req.prompt_ids;
+      if (!job.req.prompt_ids.empty())
+        for (int t : job.prompt)
+          if (t < 0 || t >= ctx_.engine->config().vocab)
+            throw std::invalid_argument("prompt token " + std::to_string(t) + " is outside the vocabulary");
+      attach_images(job);
+    } catch (const ImageError& e) {
+      send_json(downstream_, 400, error_body(e.what(), "invalid_request_error", e.code));
+      return;
     } catch (const std::exception& e) {
       send_json(downstream_, 400, error_body(e.what(), "invalid_request_error"));
       return;
     }
-    job.prompt = job.req.prompt_ids.empty() ? ctx_.tok->encode(job.req.prompt_text) : job.req.prompt_ids;
     if (exceeds_context(job.prompt.size(), ctx_.engine->max_context())) {  // refused before any header
       send_json(downstream_, 400, context_overflow_error(job.prompt.size(), ctx_.engine->max_context()));
       return;
@@ -1123,13 +1214,17 @@ class Handler : public proxygen::RequestHandler {
     try {
       std::string text;
       if (auto buf = body_.move()) text = buf->moveToFbString().toStdString();
-      job.req = parse_responses_request(json::parse(text));
+      job.req = parse_responses_request(json::parse(text), ctx_.vision);
       job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
+      job.prompt = ctx_.tok->encode(job.req.prompt_text);
+      attach_images(job);
+    } catch (const ImageError& e) {
+      send_json(downstream_, 400, error_body(e.what(), "invalid_request_error", e.code));
+      return;
     } catch (const std::exception& e) {
       send_json(downstream_, 400, error_body(e.what(), "invalid_request_error"));
       return;
     }
-    job.prompt = ctx_.tok->encode(job.req.prompt_text);
     job.cancelled = ex_->cancelled;
     const Request req = job.req;
     const bool repetition_completed = ctx_.repetition_completed;
@@ -1347,13 +1442,16 @@ int main(int argc, char** argv) {
   int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 7, prefix_kv_mb = -1;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
-  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40;
+  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40, side_share = 16;
   long host_reserve_mb = 16384, admit_reserve_mb = 8192;
   double protect_seconds = 30;
   bool draft_bf16 = false;
   std::string repetition_arg, repetition_report = "incomplete";
   std::string draft_head = "sparse", sparse_head_dir;  // the drafter's head (BACKLOG 19)
   int sparse_head_dynamic = 16384;
+  std::string vision = "on", jpeg = "gpu";  // images (VISION §20.3)
+  long vision_max_pixels = 16777216;
+  int vision_cache_mb = 512;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -1368,6 +1466,10 @@ int main(int argc, char** argv) {
     else if (a == "--port") port = std::stoi(next());
     else if (a == "--served-model-name") name = next();
     else if (a == "--max-context") max_context = std::stoi(next());
+    else if (a == "--vision") vision = next();
+    else if (a == "--vision-max-pixels") vision_max_pixels = std::stol(next());
+    else if (a == "--vision-cache-mb") vision_cache_mb = std::stoi(next());
+    else if (a == "--jpeg-decoder") jpeg = next();
     else if (a == "--draft") draft_dir = next();
     else if (a == "--draft-block") draft_block = std::stoi(next());
     else if (a == "--tree") tree_nodes = std::stoi(next());
@@ -1391,6 +1493,7 @@ int main(int argc, char** argv) {
     else if (a == "--batch") batch = std::stoi(next());
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else if (a == "--side-prefill") side_prefill = std::stoi(next());
+    else if (a == "--side-share") side_share = std::stoi(next());
     else if (a == "--host-reserve-mb") host_reserve_mb = std::stol(next());
     else if (a == "--admit-reserve-mb") admit_reserve_mb = std::stol(next());
     else if (a == "--repetition-detection") repetition_arg = next();
@@ -1401,7 +1504,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
     return 2;
   }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
@@ -1468,6 +1571,18 @@ int main(int argc, char** argv) {
   opts.sparse_head_dynamic = sparse_head_dynamic;
   opts.sessions = sessions;
   opts.side_prefill = side_prefill;
+  if (vision != "on" && vision != "off") {
+    std::cerr << "--vision is on or off\n";
+    return 2;
+  }
+  if (jpeg != "gpu" && jpeg != "cpu") {
+    std::cerr << "--jpeg-decoder is gpu or cpu\n";
+    return 2;
+  }
+  ling::serve::set_jpeg_decoder(jpeg == "gpu" ? ling::serve::JpegDecoder::Gpu : ling::serve::JpegDecoder::Cpu);
+  opts.vision = vision == "on";
+  opts.vision_max_pixels = vision_max_pixels;
+  opts.vision_cache_mb = vision_cache_mb;
   for (auto [var, dst] : {std::pair<const char*, long*>{"LING_HOST_RESERVE_MB", &host_reserve_mb},
                           std::pair<const char*, long*>{"LING_ADMIT_RESERVE_MB", &admit_reserve_mb}})
     if (const char* e = std::getenv(var)) {
@@ -1480,9 +1595,12 @@ int main(int argc, char** argv) {
     }
   if (host_reserve_mb > 0) {  // admission control at start: refuse before anything is allocated
     const ling::ModelConfig cfg = ling::ModelConfig::from_file(model_dir + "/config.json");
-    const ling::serve::MemoryPlan mp = ling::serve::plan_memory(
+    ling::serve::MemoryPlan mp = ling::serve::plan_memory(
         cfg, ling::serve::checkpoint_bytes(model_dir) + ling::serve::checkpoint_bytes(draft_dir), sessions, max_context,
         !draft_dir.empty());
+    // With images on (VISION §20.4) the tower's scratch at the largest image and the embedding cache come on top of
+    // the checkpoint's bytes (which hold the tower's weights): 1,100 MB at 65,536 patches, an upper bound below it.
+    if (opts.vision) mp.scratch += size_t(1100 + vision_cache_mb) << 20;
     const long avail = ling::serve::mem_available_mb();
     const std::string why = ling::serve::refuse_start(mp, avail, host_reserve_mb);
     if (!why.empty()) {
@@ -1501,6 +1619,11 @@ int main(int argc, char** argv) {
   ctx.engine = &engine;
   ctx.tok = &tok;
   ctx.im_end = tok.token_id("<|im_end|>");
+  static ling::serve::ImageRegistry image_registry;
+  ctx.vision = engine.has_vision();
+  ctx.image_pad = tok.token_id("<|image_pad|>");
+  ctx.images = &image_registry;
+  ctx.processor.max_pixels = vision_max_pixels;
   ctx.metrics.max_total_tokens = engine.sessions() * max_context;
   ctx.metrics.sessions = engine.sessions();
   ctx.metrics.protect_seconds = protect_seconds;
@@ -1534,7 +1657,7 @@ int main(int argc, char** argv) {
     name = name.substr(name.find_last_of('/') + 1);
   }
   ctx.model_name = name;
-  ling::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended);
+  ling::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended, side_share);
 
   proxygen::HTTPServerOptions options;
   options.threads = 2;

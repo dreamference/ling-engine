@@ -526,11 +526,14 @@ void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
   const int dkv = d.kv_heads * d.head_dim;
   // fc over the concatenated target features (already BF16), then the hidden norm. The context goes
   // straight to each layer's K and V: no input norm, no convolution (SGLang's prepare_context_hidden_for_kv).
+  // A prefill's rows (quantized_) always take the BF16 GEMM, as the target's projections take the prefill path
+  // whatever the chunk's size: a prompt's last few rows (a chunk of <= 32) must give the drafter the context a larger
+  // chunk gives them, or the speculative continuation depends on the chunking (--chunk-check).
   const Fp4Weight& fc4 = draft_->fc4();
-  if (rows <= kernels::kMaxStreamRows && fc4.w) {  // BACKLOG 33: the NVFP4 copy on the rows path
+  if (!quantized(rows) && fc4.w) {  // BACKLOG 33: the NVFP4 copy on the rows path
     kernels::bf16_to_half_rows(cap_ + size_t(cap_row0) * cap_stride_, rows, fc4.K, xh_fc_, xinv_, stream_);
     kernels::stream_gemm_nvfp4(xh_fc_, xinv_, rows, fc4.w, fc4.table, fc4.scale2, dctx_, fc4.N, fc4.K, stream_);
-  } else if (rows <= kernels::kMaxStreamRows)
+  } else if (!quantized(rows))
     kernels::bf16_rows_bf16in(cap_ + size_t(cap_row0) * cap_stride_, rows, draft_->fc().w, dctx_, d.hidden, cap_stride_,
                               stream_);
   else
@@ -758,6 +761,11 @@ void Engine::plan_begin(StepPlan& sp, int B) {
     std::vector<int> seq(s.history);
     seq.push_back(sp.anchor);
     sp.lp = lookup_propose(seq, sp.E);
+    // An image's ids (VISION §20.7) are never proposed: the proposal stops before the first.
+    const int V = model_->config().vocab;
+    auto bad = std::find_if(sp.lp.tokens.begin(), sp.lp.tokens.end(), [V](int t) { return t < 0 || t >= V; });
+    sp.lp.tokens.erase(bad, sp.lp.tokens.end());
+    if (sp.lp.tokens.empty()) sp.lp.match = 0;
   }
   sp.use_lookup = opts_.lookup_mode == 2 && !sp.lp.tokens.empty() && sp.lp.match >= opts_.lookup_min_match;
   sp.rows.assign(1, sp.anchor);
@@ -923,6 +931,8 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   if (graph) {  // the position every graph of this step reads
     pin_->pos = s_->pos;
     check(cudaMemcpyAsync(pos_dev_, &pin_->pos, sizeof(int), cudaMemcpyHostToDevice, stream_), "position");
+    pin_->rdelta = s_->rope_delta;  // the rope delta after the prompt's images (VISION §20.3 (b))
+    check(cudaMemcpyAsync(rdelta_dev_, &pin_->rdelta, sizeof(int), cudaMemcpyHostToDevice, stream_), "rope delta");
   }
   if (!sp.use_lookup) plan_draft(sp, B, graph);
   if (tree_step(p, sp.use_lookup, row_logits != nullptr, B)) {  // BACKLOG 26: the chain and its tree
@@ -1094,6 +1104,9 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   if (graph) {  // the positions every graph of this step reads
     for (int i = 0; i < n; ++i) pin_->seq_pos[i] = plans[i].s->pos;
     check(cudaMemcpyAsync(pos_dev_, pin_->seq_pos, n * sizeof(int), cudaMemcpyHostToDevice, stream_), "positions");
+    for (int i = 0; i < n; ++i) pin_->seq_rdelta[i] = plans[i].s->rope_delta;
+    check(cudaMemcpyAsync(rdelta_dev_, pin_->seq_rdelta, n * sizeof(int), cudaMemcpyHostToDevice, stream_),
+          "rope deltas");
   }
   if (together) {
     for (int i = 0; i < n; ++i) {

@@ -933,8 +933,8 @@ def test_tool_choice_required_yields_a_call(server):
 def test_image_input_does_not_fail_the_turn(server):
     """reports/api-compat-checklist.md: Codex's model catalog advertises image input, and Cline's default
     model info claims it, so a pasted screenshot reaches the server. Codex treats an HTTP 400 as terminal
-    for the turn. Check: until the vision encoder exists, an image part is answered (rendered as the
-    placeholder `[image]` in the prompt), not refused."""
+    for the turn. Check: an image part is answered, not refused (with the vision tower it is read, VISION §20;
+    without it, --vision off, it renders as the placeholder `[image]`). A 1 x 1 PNG is resized to the minimum."""
     png = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
     status, out = server.request("/v1/responses", {"input": [{"type": "message", "role": "user", "content": [
         {"type": "input_text", "text": "What is in this image?"}, {"type": "input_image", "image_url": png}]}],
