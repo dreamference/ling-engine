@@ -113,6 +113,17 @@ std::FILE* dump_file() {
   return f;
 }
 
+// LING_DUMP_HIDDEN=FILE (with LING_DUMP_STEPS; the acceptance probe of BACKLOG 26, follow-up 2b): for every step written to
+// the step dump, in the same order, int32 [magic 0x48494444, pos, E, hidden, rank], the drafted positions' final normed
+// hidden states [E][hidden] and their selector projections [E][rank] (float32). A copy to the host after the draft.
+std::FILE* hidden_dump_file() {
+  static std::FILE* f = [] {
+    const char* p = std::getenv("LING_DUMP_HIDDEN");
+    return p && *p ? std::fopen(p, "ab") : nullptr;
+  }();
+  return f;
+}
+
 }  // namespace
 
 // One sequence's part of a speculative step on the host: what speculate() kept in locals, so a batch can hold
@@ -126,6 +137,7 @@ struct Engine::StepPlan {
   LookupProposal lp;
   std::vector<int> rows;                // the anchor, then the drafted (or looked-up) tokens
   std::vector<std::vector<double>> q;   // the draft's distribution over its candidates, per drafted position
+  std::vector<float> hidden, sel;       // LING_DUMP_HIDDEN: the drafted positions' hidden states and selector projections
   std::vector<int> cand;                // the drafter's candidates [E][K16] (pin_ holds one sequence's at a time)
   std::vector<int> picks;               // the chain's candidate index per drafted position
   bool tree = false;                    // a tree verify (BACKLOG 26): tr's rows, then path its accepted rows
@@ -768,6 +780,14 @@ void Engine::plan_begin(StepPlan& sp, int B) {
 void Engine::plan_draft(StepPlan& sp, int B, bool graph) {
   // 1. Draft (the active session must be sp.s), and walk the selector's lattice (SGLang's sample_path).
   draft_propose(sp.anchor, B, graph);
+  if (hidden_dump_file() && dump_file()) {  // LING_DUMP_HIDDEN: the drafted positions' normed hidden states and selector
+    const auto& d = draft_->config();  // projections, for the acceptance probe (BACKLOG 26, follow-up 2b)
+    const int E = B - 1;
+    sp.hidden.resize(size_t(E) * d.hidden);
+    sp.sel.resize(size_t(E) * d.selector_rank);
+    check(cudaMemcpy(sp.hidden.data(), dh_, sp.hidden.size() * sizeof(float), cudaMemcpyDeviceToHost), "hidden dump");
+    check(cudaMemcpy(sp.sel.data(), dhp_, sp.sel.size() * sizeof(float), cudaMemcpyDeviceToHost), "selector dump");
+  }
   plan_walk(sp, B, pin_->cand, pin_->scores);
 }
 
@@ -975,6 +995,14 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
     std::fwrite(pin_->topk_vals, sizeof(float), size_t(V) * K, f);
     std::fwrite(pin_->topk_ids, sizeof(int), size_t(V) * K, f);
     std::fflush(f);
+    if (std::FILE* h = hidden_dump_file(); h && !sp.hidden.empty()) {
+      const auto& d = draft_->config();
+      const int hh[5] = {0x48494444, s_->pos, sp.E, d.hidden, d.selector_rank};
+      std::fwrite(hh, sizeof(int), 5, h);
+      std::fwrite(sp.hidden.data(), sizeof(float), sp.hidden.size(), h);
+      std::fwrite(sp.sel.data(), sizeof(float), sp.sel.size(), h);
+      std::fflush(h);
+    }
   }
   auto t2 = std::chrono::steady_clock::now();
   s_->spec.verify_seconds += std::chrono::duration<double>(t2 - t1).count();

@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "serve/admission.hpp"
 #include "serve/api.hpp"
 #include "tokenizer/chat_template.hpp"
 
@@ -852,6 +853,50 @@ EOF
       auto d = feed(p, t);
       EXPECT(d.tool_calls.empty() && d.content == t);
     }
+  }
+  // Admission control on host memory (serve/admission.hpp; BATCHING §5.6, phase 0).
+  {
+    using namespace ling::serve;
+    ling::ModelConfig c;  // Qwen3.8-27B's shapes (MODEL §5)
+    c.layers = 64;
+    c.kv_heads = 4;
+    c.head_dim = 256;
+    c.lin_k_heads = 16;
+    c.lin_v_heads = 48;
+    c.lin_k_dim = 128;
+    c.lin_v_dim = 128;
+    c.conv_kernel = 4;
+    for (int i = 0; i < 64; ++i) c.full_attention.push_back(i % 4 == 3);
+    // 64 KB of BF16 KV a token; the DeltaNet state 151 MB and the conv window 5.9 MB, twice (snap); the ring 168 MB.
+    const size_t s64 = session_bytes(c, 65536, true);
+    EXPECT(s64 == size_t(65536) * 65536 + 2 * (size_t(48) * 48 * 128 * 128 * 4 + size_t(48) * 10240 * 3 * 4) +
+                      kDraftRingBytes + size_t(65536) * 4);
+    EXPECT(s64 > size_t(4.6e9) && s64 < size_t(4.8e9));  // node-b, 2026-10-27: 4.2-4.6 GB a session measured
+    EXPECT(session_bytes(c, 262144, true) - s64 == size_t(262144 - 65536) * (65536 + 4));
+    const MemoryPlan two = plan_memory(c, size_t(23.47e9), 2, 65536, true);
+    EXPECT(two.total() == two.weights + 2 * s64 + kScratchBytes);
+    // The start refused when the plan and the reserve exceed what is available (the case that froze node-b would
+    // be eight such sessions beside another server), allowed when they fit; and the reason names the shortfall.
+    const long need_mb = static_cast<long>(two.total() >> 20);
+    EXPECT(refuse_start(two, need_mb + 16384, 16384).empty());
+    const std::string why = refuse_start(two, need_mb + 16383, 16384);
+    EXPECT(!why.empty() && why.find("short by 1 MB") != std::string::npos);
+    EXPECT(refuse_start(plan_memory(c, size_t(23.47e9), 8, 262144, true), 110000, 16384).find("8 sessions") !=
+           std::string::npos);
+    EXPECT(refuse_start(two, -1, 16384).empty());  // no /proc/meminfo: nothing to judge by
+    // A request is refused below the admission reserve only.
+    EXPECT(refuse_request(8192, 8192).empty());
+    EXPECT(refuse_request(8191, 8192).find("host memory low: 8191 MB") == 0);
+    EXPECT(refuse_request(-1, 8192).empty());
+    // MemAvailable read from a /proc/meminfo-shaped file.
+    const std::string path = "/tmp/ling-api-tests-meminfo";
+    if (FILE* f = std::fopen(path.c_str(), "w")) {
+      std::fputs("MemTotal:       127535456 kB\nMemFree:         1000 kB\nMemAvailable:   41870336 kB\n", f);
+      std::fclose(f);
+      EXPECT(mem_available_mb(path) == 40889);
+      std::remove(path.c_str());
+    }
+    EXPECT(mem_available_mb("/nonexistent/meminfo") == -1);
   }
   if (known_gaps) std::printf("%d known gaps (not failures; see reports/engine-issues-2026-10-09.md)\n", known_gaps);
   std::printf(failures ? "%d API TEST FAILURES\n" : "all api tests passed\n", failures);
