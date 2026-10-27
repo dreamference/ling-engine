@@ -1,10 +1,11 @@
 # ling-engine on AMD Strix Halo: a port to the AMD box, researched
 
-Part of the ling-engine specification; the index is [README.md](./README.md). Written on 2026-10-26 in answer to the owner's question of the same day, "can we port ling-engine to Windows so we can run it on the AMD box?". It has no section number in the former `SPEC.md`. **Status:** research done, and the first milestone passed on 2026-10-27. The Windows-only port is planned (§5); no engine code is ported yet. The measurements in §1 and §6 were taken on the box that evening over SSH with small probes, kept in `bench/amd/`; nothing was installed on it. §6.5 records the first milestone, which the owner approved once the study was written. **The owner's decisions:**
+Part of the ling-engine specification; the index is [README.md](./README.md). Written on 2026-10-26 in answer to the owner's question of the same day, "can we port ling-engine to Windows so we can run it on the AMD box?". It has no section number in the former `SPEC.md`. **Status (2026-10-27):** the first milestone passed at 140 W (§6.7), and **the owner postponed the AMD/Windows engine port to 2.0, to finish 1.x first.** The Windows-only plan of §5 is what a restart picks up. No engine code is ported. The probes and their results stay in `bench/amd/` and in `C:\llm\amd-port` on the box (§6.1). The measurements in §1 and §6 were taken on the box that evening over SSH with small probes, kept in `bench/amd/`; nothing was installed on it. §6.5 records the first milestone, which the owner approved once the study was written. **The owner's decisions:**
 
 - **2026-10-26:** there is no interim llama.cpp engine in Mightling.
 - **2026-10-27, superseding the Linux-first plan of 2026-10-26:** the port is **Windows only**. There is no Linux phase ("later, if ever") and the box's Linux dual boot is off.
-- **2026-10-27:** **the first milestone passed** at the box's 140 W setting (§6.7), so the Windows port proceeds as §5 plans it.
+- **2026-10-27:** **the first milestone passed** at the box's 140 W setting (§6.7).
+- **2026-10-27:** **the port is postponed to 2.0**, so that 1.x is finished first. §5 is the plan for when it restarts.
 
 Every figure is tagged: *measured* (on `amd-box`, 2026-10-26, the settings named), *third-party* (source named in §7), or *estimate* (the arithmetic is shown). Mightling's side of the AMD box (the client test box, the node pieces, the Windows memory model) is in Mightling's `specs/DREAMFERENCE_MIGHTLING_AMD_NODES.md` (cited as AMD_NODES), which this document builds on and does not repeat.
 
@@ -422,6 +423,7 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 | 2026-10-26 | If the first milestone passes, port on Linux and Windows, Linux first, each phase exact against a reference. *Superseded the next day* |
 | **2026-10-27** | **The port is Windows only.** No Linux phase: Linux is "later, if ever". The box's Linux dual boot is off |
 | 2026-10-27 | The box's front power knob set to 140 W. The first milestone was re-measured at it and **passed** (§6.7) |
+| **2026-10-27** | **The port is postponed to 2.0**, to finish 1.x first. The phases below start when 2.0 work begins |
 
 **Why Windows-only costs about what Linux-then-Windows did.**
 
