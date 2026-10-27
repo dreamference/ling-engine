@@ -285,7 +285,6 @@ struct Running {
   int chunks_beside = 0;  // prefill chunks run while another request was decoding (contended size, or on the side)
   bool side_flight = false;  // one of its chunks is in flight on the engine's side stream
   bool yielding = false;     // its prefill is letting a shorter one go first, since yield_t0 (C1)
-  long side_mark = -1;       // the scheduler's decode passes when its last side chunk finished (--side-share)
   std::chrono::steady_clock::time_point yield_t0;
   int batched = 0;       // its decode steps taken in a batch with another request (M4 stage 3)
   Periods alone, beside;  // step periods without and with another request's prefill in between
@@ -552,10 +551,10 @@ class Scheduler {
     return n;
   }
   // Whether r's next side chunk waits (--side-share N): while two or more other requests decode, N decode passes
-  // run on the main stream alone after each of r's chunks before its next chunk starts.
+  // run on the main stream alone after the last side chunk (any request's) before the next one starts.
   bool hold_side(const Running& r) const {
-    if (side_share_ <= 0 || r.side_mark < 0 || others_decoding(r) < 2) return false;
-    return decode_passes_ - r.side_mark < side_share_;
+    if (side_share_ <= 0 || side_mark_ < 0 || others_decoding(r) < 2) return false;
+    return decode_passes_ - side_mark_ < side_share_;
   }
   bool other_prefilling(const Running& self) const {
     for (const auto& r : running_)
@@ -606,8 +605,9 @@ class Scheduler {
         }
         if (contended && !eng.side_ready()) return false;
         r.side_flight = false;
-        if (!eng.prefill_chunk_finish()) {
-          r.side_mark = decode_passes_;
+        const bool last_chunk = eng.prefill_chunk_finish();
+        side_mark_ = decode_passes_;
+        if (!last_chunk) {
           if (other_decoding(r) && !hold_side(r) && !yield_prefill(r)) {  // the next chunk at once, unless a short prefill waits
             eng.prefill_chunk_launch(r.cur, 0);
             r.side_flight = true;
@@ -797,6 +797,7 @@ class Scheduler {
   double protect_seconds_;
   int batch_, contended_, side_share_;
   long decode_passes_ = 0;  // decode passes run (a batched step counts once), for --side-share
+  long side_mark_ = -1;     // decode_passes_ when the last side chunk finished (--side-share)
   std::mutex mu_;
   std::condition_variable cv_;
   std::deque<Job> queue_;
