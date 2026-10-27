@@ -18,11 +18,11 @@ Part of the ling-engine specification; the index is [README.md](./README.md). Wr
   - the step is about 104 ms;
   - the draft is about 8.2 ms of it with the sparse head (8.9 at its merge, 9.6-10.3 with the full head);
   - the step accepts about 6.7 tokens (the chain of 12 drafts plus the 16-row tree);
-  - the result is about 65.5 tokens/s.
+  - the result is about 65.5 tokens/s. agentlong's tokens/s and its per-step figures are sums over different spans of the turns, so 6.7 / 0.104 s is not exactly 65.5; the break-even below uses only ratios.
 
   Sampled, the step accepts 5.5-6.2 tokens.
 - **Where the draft's milliseconds go.** By bytes:
-  - the five layers' NVFP4 matrices: 0.94 GB, about 4.2 ms at the rows path's ~225 GB/s;
+  - the five layers' NVFP4 matrices: 0.94 GB, about 4.6 ms (0.92 ms per layer, measured in §3);
   - the sparse head's gathered rows: about 0.6 ms;
   - everything else (attention over the 2,048-key window, the convolutions, norms, the selector, top-k and the kernel boundaries of ~75 launches): about 3 ms.
 
