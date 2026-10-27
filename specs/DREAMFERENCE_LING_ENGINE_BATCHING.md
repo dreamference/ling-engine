@@ -71,6 +71,36 @@ So concurrency buys the engine nothing on warm agent turns either: the rounds ta
 
 C1 is what makes a follow-up's first token fast. It does not make the decoding conversations faster; that is C2. With the default `--sessions 2 --batch 2`, C waits ~20 s on main and C1 alike, for admission rather than for chunks (§3.5).
 
+**C1's other two knobs (2026-10-27, warm agentlong at four streams, greedy 16/16 against one stream in every run).**
+
+*The side stream's SM count.* Fewer SMs lose on both axes: the prefill takes longer, so more decode steps run beside it.
+
+| SMs | Rounds | Pooled decode | A in the probe |
+|---|---|---|---|
+| 24 | 168.0 s | 22.0 tok/s | 50.4 tok/s |
+| 32 | 150.9 s | 25.5 tok/s | 53.7 tok/s |
+| 40 (default, kept) | 139.3 s | 25.7 tok/s | 60.0 tok/s |
+
+*The prefill's share (`--side-share N`, merged with default 16).* While two or more other requests decode, the side stream waits after each chunk (any request's) until N decode passes have run on the main stream alone. A first version kept one mark per request; another request's chunk then took the side stream at once and nothing changed (N = 2 and 4: pooled 26.9 and 27.1).
+
+| N | Rounds s | Pooled decode tok/s | Per-stream tok/s | TTFT median / max s |
+|---|---|---|---|---|
+| 0 | 139.3 | 25.7 | 22.4 / 23.2 / 21.8 / 49.6 | 1.02 / 53.8 |
+| 4 | 142.6 | 28.9 | 23.4 / 26.7 / 28.7 / 54.0 | 1.03 / 55.3 |
+| 8 (two runs) | 144.4, 142.7 | 32.3, 31.8 | 23.9 / 36.5 / 34.6 / 58.8 | 1.08 / 53.2 |
+| 12 | 139.4 | 34.9 | 28.2 / 39.3 / 33.8 / 53.8 | 1.04 / 52.7 |
+| **16** | 140.9 | 35.6 | 27.3 / 44.2 / 36.9 / 53.9 | 1.17 / 52.4 |
+| 24 | 140.5 | 34.8 | 27.1 / 38.0 / 38.5 / 52.3 | 1.82 / 55.4 |
+| 32 | 141.1 | 37.1 | 28.9 / 40.3 / 42.4 / 53.8 | 2.12 / 53.5 |
+
+16 is the knee: decode up 39% at the same round time, before the follow-ups' median TTFT starts to rise. The probe with two conversations decoding while B primes (`probe.py --decoders 2`) measures the case the hold is for:
+- A and A2 decode at 70.1 / 77.5 tok/s with N = 16, against 42.8 / 49.5 with N = 0.
+- B's cold prime is unchanged (38.7 s against 38.3): the decodes finish sooner and free the GPU.
+- C's TTFT is 1.60 s against 1.28.
+With one conversation decoding (the plain probe) the hold is off and nothing moves: C 1.36 s, B 35.5 s, A 61.4 tok/s.
+
+At four conversations the 1.8.0 bar's per-conversation floor (34.6 tok/s) is now met by the pooled rate but not yet by the slowest conversation (27-29 tok/s). That is C2's job.
+
 ### 2.3 Exactness
 
 Engine greedy: 16/16 turns identical to one stream at 2, 3 and 4 streams cold and at 2 and 4 warm and, with `prompt_cache_key`, at 2, 3 and 4 warm (W11; its one-stream run is also 16/16 identical to the cold one-stream run). Seeded sampling: 12-15/16 identical. That is expected and exact: a batched step verifies the 12-row chain while a one-row step verifies the 16-row tree, so the accepted lengths and with them the random draws differ; each draw is still from the exact distribution (SPECULATION §10). SGLang sampled 0-1/16 (its speculative draws are unseeded: not a correctness signal); SGLang greedy is not batch-invariant: cold, 3/16, 2/16 and 2/16 turns identical to its one-stream run at 2, 4 and 8 streams, warm 2/16, 5/16 and 5/16 (and 0/16 identical to the engine's: different kernels, a different model of exactness).
@@ -193,8 +223,8 @@ Each phase merges into main once its exactness gate passes and nothing regresses
 | Phase | What | Gate | Expected |
 |---|---|---|---|
 | P0 | Admission control on host memory (§5.6) | the start and 503 refusals; agentlong greedy 16/16 unchanged | safety only (**merged 2026-10-27, `e1eac84`**) |
-| C1 | Scheduling: warm appends first, shortest prime first, the prime's share capped (§5.5) | greedy 16/16 at 2 and 4 warm; §4 items 1-2 measured | **merged 2026-10-27**: shortest prefill first with a 5 s yield cap (the prime's share cap and the SM split by decoding count still to measure); C's TTFT 20.5 -> 1.43 s, B and A unchanged (§2.2) |
-| C2 | The fused pass: one weight read for a decode verify and a prefill chunk, each path's arithmetic unchanged (§5.5) | memcmp of each fused projection against its two kernels; `--interleave-check`; greedy 16/16 at 2 and 4 warm and cold | decode beside a prime ~130-150 ms instead of 205-313; warm rounds from ~145 s towards ~80 s at four |
+| C1 | Scheduling: warm appends first, shortest prime first, the prime's share capped (§5.5) | greedy 16/16 at 2 and 4 warm; §4 items 1-2 measured | **merged 2026-10-27**: shortest prefill first with a 5 s yield cap, and `--side-share 16`. C's TTFT 20.5 -> 1.43 s; four warm conversations' pooled decode 25.7 -> 35.6 tok/s at the same round time; the side stream's SM count stays 40 (§2.2) |
+| C2 | The fused pass: one weight read for a decode verify and a prefill chunk, each path's arithmetic unchanged (§5.5) | memcmp of each fused projection against its two kernels; `--interleave-check`; greedy 16/16 at 2 and 4 warm and cold | decode beside a prime ~130-150 ms instead of 205-313; warm rounds from ~145 s towards ~80 s at four. Prototype (branches `batching/c2-fused-gemm`, `batching/c2-fp8-prefill`, not merged): every fused projection bit-exact (214 + 336 memcmp cases). An L2 prefetch of each FP8 weight tile two chunks ahead takes the FP8 prefill GEMM at 256 rows from 98 to 160 GB/s, exact, with agentlong 16/16 at one stream. Pass estimate 180-188 ms beside 12-16 decode rows; integration into ling-serve next |
 | P2 | Three and four sequences in one pass: the row share by batch size, graphs per batch size captured at start (§5.2), the batched DeltaNet path in the persistent kernel | `--batch-check` at 3 and 4; greedy 16/16; no memory growth after start beyond 1 GB at 4 sessions | four decoding at ~145 -> ~185 tokens/s instead of pairs in turn (144 ms a step each) |
 | P1 | The tree inside a batch of two: 2 x up to 24 rows, `kMaxStreamRows` 64 and the 33-64-row tier | `--batch-check` with trees; greedy 2-vs-1 16/16; one stream unchanged | built (branch `batching/p1-tree-batch`): +3% at two (129.0 ms and 135 steps against 119.6 and 150 for 1,000 tokens), less than the +8-9% hoped for, because the FFN megakernel does not take more than 32 rows; parked behind C1, C2 and P2 |
 | P4 | Paged KV and shared prefix pages (§5.3) | memcmp paged vs flat attention; greedy 8-vs-1 16/16; eight 262,144 sessions start | 8+ resident sessions at full context |
