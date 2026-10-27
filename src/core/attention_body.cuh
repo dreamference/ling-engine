@@ -32,6 +32,15 @@ __device__ float block_sum(float v, float* red) {
   return warp_sum(t);
 }
 
+// P4 (BATCHING §5.3): the element offset of position p of KV head h. pages null: the flat layout, h * hs + p * ps.
+// Otherwise p lies in the page at element offset pages[p / kKvPageTokens] and sits at h * hs + (p % kKvPageTokens) * ps
+// inside it (set_kv_layout gives hs = kKvPageTokens * D, ps = D for pages). Only the address changes: the same values
+// reach the same tiles, so every result is bit for bit the flat layout's.
+__device__ __forceinline__ size_t kv_off(const uint64_t* __restrict__ pages, int h, int p, size_t hs, size_t ps) {
+  return pages ? pages[p / kKvPageTokens] + h * hs + static_cast<size_t>(p % kKvPageTokens) * ps
+               : h * hs + static_cast<size_t>(p) * ps;
+}
+
 // The interleaved M-RoPE sections of Qwen3.8 ([11, 11, 10], mrope_interleaved; VISION §20.1): frequency i of the 32
 // takes the height position when i % 3 == 1 and i < 3 * 11, the width position when i % 3 == 2 and i < 3 * 10, the
 // temporal one otherwise. A text token's three positions are equal, so it is plain RoPE at that position.
@@ -49,6 +58,7 @@ __device__ __forceinline__ void attn_prepare_body(const float* __restrict__ q_ga
                                                   int Hkv, int D, int rot, float theta, float eps, float* __restrict__ q,
                                                   float* __restrict__ gate, __nv_bfloat16* __restrict__ kcache,
                                                   __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps,
+                                                  const uint64_t* __restrict__ pages,
                                                   int cpos,  // cpos: the cache slot (pos except in a tree)
                                                   int slot) {  // q heads, then k heads, then v heads (the launch's blockIdx.y)
   extern __shared__ float xn[];
@@ -56,7 +66,7 @@ __device__ __forceinline__ void attn_prepare_body(const float* __restrict__ q_ga
   const int d = threadIdx.x;
   if (slot >= Hq + Hkv) {  // v: copy into the cache
     const int kh = slot - Hq - Hkv;
-    vcache[kh * hs + cpos * ps + d] = __float2bfloat16(v[(static_cast<size_t>(m) * Hkv + kh) * D + d]);
+    vcache[kv_off(pages, kh, cpos, hs, ps) + d] = __float2bfloat16(v[(static_cast<size_t>(m) * Hkv + kh) * D + d]);
     return;
   }
   const bool is_q = slot < Hq;
@@ -84,7 +94,7 @@ __device__ __forceinline__ void attn_prepare_body(const float* __restrict__ q_ga
   if (is_q) {
     q[(static_cast<size_t>(m) * Hq + head) * D + d] = o;
   } else {
-    kcache[head * hs + cpos * ps + d] = __float2bfloat16(o);
+    kcache[kv_off(pages, head, cpos, hs, ps) + d] = __float2bfloat16(o);
   }
 }
 
@@ -130,10 +140,10 @@ __device__ __forceinline__ void cp_async16(void* smem_dst, const void* gmem_src,
 template <int TK>
 __device__ __forceinline__ void attn_prefetch_tile(const __nv_bfloat16* __restrict__ kcache,
                                                    const __nv_bfloat16* __restrict__ vcache, int k0, int khi, int kvh,
-                                                   size_t hs, size_t ps) {
+                                                   size_t hs, size_t ps, const uint64_t* __restrict__ pages) {
   const int n = min(TK, khi - k0);
   if (n <= 0) return;
-  const size_t off = kvh * hs + static_cast<size_t>(k0) * ps;
+  const size_t off = kv_off(pages, kvh, k0, hs, ps);  // a tile never crosses a page (TK divides kKvPageTokens)
   const uint32_t bytes = static_cast<uint32_t>(n) * kMmaD * 2;
   if (threadIdx.x == 0)
     asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(kcache + off), "r"(bytes) : "memory");
@@ -145,14 +155,14 @@ __device__ __forceinline__ void attn_prefetch_tile(const __nv_bfloat16* __restri
 template <int TK>
 __device__ __forceinline__ void attn_load_tile(__nv_bfloat16* stage, const __nv_bfloat16* __restrict__ kcache,
                                                const __nv_bfloat16* __restrict__ vcache, int k0, int khi, int kvh,
-                                               size_t hs, size_t ps) {
+                                               size_t hs, size_t ps, const uint64_t* __restrict__ pages) {
   constexpr int D = kMmaD, KS = kMmaKS;
   __nv_bfloat16* ks = stage;
   __nv_bfloat16* vs = stage + TK * KS;
   for (int i = threadIdx.x; i < TK * (D / 8); i += blockDim.x) {
     const int j = i / (D / 8), c = i % (D / 8), key = k0 + j;
     const bool valid = key < khi;
-    const size_t off = kvh * hs + static_cast<size_t>(valid ? key : 0) * ps + 8 * c;
+    const size_t off = kv_off(pages, kvh, valid ? key : 0, hs, ps) + 8 * c;
     cp_async16(ks + j * KS + 8 * c, kcache + off, valid);
     cp_async16(vs + j * KS + 8 * c, vcache + off, valid);
   }
@@ -165,7 +175,8 @@ __device__ __forceinline__ void attn_load_tile(__nv_bfloat16* stage, const __nv_
 template <int TK>
 __device__ __forceinline__ void attn_load_tile_tree(__nv_bfloat16* stage, const __nv_bfloat16* __restrict__ kcache,
                                                     const __nv_bfloat16* __restrict__ vcache, int k0, int khi, int kvh,
-                                                    size_t hs, size_t ps, int pos0, const int* __restrict__ path) {
+                                                    size_t hs, size_t ps, const uint64_t* __restrict__ pages, int pos0,
+                                                    const int* __restrict__ path) {
   constexpr int D = kMmaD, KS = kMmaKS;
   __nv_bfloat16* ks = stage;
   __nv_bfloat16* vs = stage + TK * KS;
@@ -173,7 +184,7 @@ __device__ __forceinline__ void attn_load_tile_tree(__nv_bfloat16* stage, const 
     const int j = i / (D / 8), c = i % (D / 8), key = k0 + j;
     const bool valid = key < khi;
     const int src = key < pos0 ? key : pos0 + path[min(key - pos0, kMaxStreamRows - 1)];
-    const size_t off = kvh * hs + static_cast<size_t>(valid ? src : 0) * ps + 8 * c;
+    const size_t off = kv_off(pages, kvh, valid ? src : 0, hs, ps) + 8 * c;  // src may be in another page
     cp_async16(ks + j * KS + 8 * c, kcache + off, valid);
     cp_async16(vs + j * KS + 8 * c, vcache + off, valid);
   }
@@ -214,7 +225,8 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t parity) {
 template <int TK>
 __device__ __forceinline__ void attn_bulk_tile(__nv_bfloat16* stage, const __nv_bfloat16* __restrict__ kcache,
                                                const __nv_bfloat16* __restrict__ vcache, int k0, int khi, int kvh,
-                                               size_t hs, size_t ps, uint64_t* bar) {
+                                               size_t hs, size_t ps, const uint64_t* __restrict__ pages,
+                                               uint64_t* bar) {
   static_assert(TK <= 32, "one key per lane");
   constexpr int D = kMmaD, KS = kMmaKS, kRowBytes = D * 2;
   const int lane = threadIdx.x & 31, valid = max(0, min(TK, khi - k0));
@@ -226,7 +238,7 @@ __device__ __forceinline__ void attn_bulk_tile(__nv_bfloat16* stage, const __nv_
                  : "memory");
   __syncwarp();
   if (lane < valid) {
-    const size_t off = kvh * hs + static_cast<size_t>(k0 + lane) * ps;
+    const size_t off = kv_off(pages, kvh, k0 + lane, hs, ps);
     asm volatile(
         "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
             smem_addr(stage + lane * KS)),
@@ -249,8 +261,10 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
                                                    const __nv_bfloat16* __restrict__ vcache, int pos0, int M, int Hq,
                                                    int Hkv, int splits, int chunk, float* __restrict__ scratch, size_t hs,
                                                    size_t ps, int pf, int bx, int kvh, int split,
-                                                   const TreeDesc* __restrict__ td = nullptr) {
+                                                   const TreeDesc* __restrict__ td = nullptr,
+                                                   const uint64_t* __restrict__ pages = nullptr) {
   constexpr int D = kMmaD, G = 6, KS = kMmaKS;
+  static_assert(kKvPageTokens % TK == 0, "a tile inside one KV page (P4)");
   extern __shared__ __align__(16) unsigned char smem[];
   auto stage = [&](int i) { return reinterpret_cast<__nv_bfloat16*>(smem + (i % NS) * mma_stage(TK)); };
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
@@ -418,9 +432,9 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
 #pragma unroll
   for (int p = 0; p < NS - 1; ++p) {
     if constexpr (BULK) {
-      if (warp == 0 && p < ntiles) attn_bulk_tile<TK>(stage(p), kcache, vcache, klo + p * TK, khi, kvh, hs, ps, &bar[p]);
+      if (warp == 0 && p < ntiles) attn_bulk_tile<TK>(stage(p), kcache, vcache, klo + p * TK, khi, kvh, hs, ps, pages, &bar[p]);
     } else {
-      if (p < ntiles) attn_load_tile<TK>(stage(p), kcache, vcache, klo + p * TK, khi, kvh, hs, ps);
+      if (p < ntiles) attn_load_tile<TK>(stage(p), kcache, vcache, klo + p * TK, khi, kvh, hs, ps, pages);
       else asm volatile("cp.async.commit_group;");
     }
   }
@@ -431,17 +445,17 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
     __syncthreads();  // tile it is visible to all, and stage (it - 1) % NS is free again
     if constexpr (BULK) {
       if (warp == 0 && it + NS - 1 < ntiles)
-        attn_bulk_tile<TK>(stage(it + NS - 1), kcache, vcache, k0 + (NS - 1) * TK, khi, kvh, hs, ps,
+        attn_bulk_tile<TK>(stage(it + NS - 1), kcache, vcache, k0 + (NS - 1) * TK, khi, kvh, hs, ps, pages,
                            &bar[(it + NS - 1) % NS]);
     } else {
-      if (it + NS - 1 < ntiles) attn_load_tile<TK>(stage(it + NS - 1), kcache, vcache, k0 + (NS - 1) * TK, khi, kvh, hs, ps);
+      if (it + NS - 1 < ntiles) attn_load_tile<TK>(stage(it + NS - 1), kcache, vcache, k0 + (NS - 1) * TK, khi, kvh, hs, ps, pages);
       else asm volatile("cp.async.commit_group;");
       // Tiles it + NS .. it + NS + pf - 1 on their way into L2 (the first iteration starts the whole window).
       if (pf > 0 && ps == static_cast<size_t>(D)) {
         if (it == 0)
           for (int p = NS; p < NS + pf - 1; ++p)
-            if (p < ntiles) attn_prefetch_tile<TK>(kcache, vcache, klo + p * TK, khi, kvh, hs, ps);
-        if (it + NS + pf - 1 < ntiles) attn_prefetch_tile<TK>(kcache, vcache, k0 + (NS + pf - 1) * TK, khi, kvh, hs, ps);
+            if (p < ntiles) attn_prefetch_tile<TK>(kcache, vcache, klo + p * TK, khi, kvh, hs, ps, pages);
+        if (it + NS + pf - 1 < ntiles) attn_prefetch_tile<TK>(kcache, vcache, k0 + (NS + pf - 1) * TK, khi, kvh, hs, ps, pages);
       }
     }
     const __nv_bfloat16* ks = stage(it);
@@ -457,7 +471,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
         for (int m = first_m; m <= last_m; ++m) any = any || td->var[m] == v;
         if (!any) continue;
         __syncthreads();  // every warp is done with stage 0
-        attn_load_tile_tree<TK>(stage(0), kcache, vcache, k0, khi, kvh, hs, ps, pos0, td->path[v]);
+        attn_load_tile_tree<TK>(stage(0), kcache, vcache, k0, khi, kvh, hs, ps, pages, pos0, td->path[v]);
         asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
         if (active) tile_compute(stage(0), k0, va && td->var[ra / G] == v, vb && td->var[rb / G] == v);

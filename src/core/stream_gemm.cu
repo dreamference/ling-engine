@@ -1500,6 +1500,7 @@ struct MkAttnArgs {
   float *q, *gate;
   __nv_bfloat16 *kcache, *vcache;
   size_t hs, ps;
+  const uint64_t* pages;  // P4: the session's KV page table, or nullptr (flat)
   DevPos pos0 = DevPos(0);
   const TreeDesc* td;  // a tree verify, or nullptr
   int M, K, Hq, Hkv, D, rot;
@@ -1586,9 +1587,9 @@ struct MkTileWait {
 // values; only those few values are saved around the call. One tile function for both GEMMs (one shared buffer).
 __device__ __noinline__ void mk_attn_range(const float* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, int p0, int M,
                                            int Hq, int Hkv, int S, int chunk, float* scratch, size_t hs, size_t ps, int pf,
-                                           int rb, int j, int s, const TreeDesc* td) {
+                                           int rb, int j, int s, const TreeDesc* td, const uint64_t* pages) {
   attention_mma_body<kMkAttnRows, kMkAttnTk, kMkAttnNs, false, true>(q, kc, vc, p0, M, Hq, Hkv, S, chunk, scratch, hs, ps,
-                                                                    pf, rb, j, s, td);
+                                                                    pf, rb, j, s, td, pages);
 }
 template <int NT, int PF>
 __device__ __noinline__ void mk_attn_tile(const __half* x, const float* xinv, int M, const StreamProblems& pr, int K,
@@ -1634,14 +1635,14 @@ __global__ void __launch_bounds__(kWarps * 32, 1) attn_persistent_kernel(MkAttnA
       {
         const int r = (a.td ? p0 + a.td->depth[m] : p0 + m) + rope_delta(a.pos0);  // the rope delta (VISION §20.3 (b))
         attn_prepare_body(a.qg, a.kk, a.vv, a.q_norm, a.k_norm, m, r, r, r, a.Hq, a.Hkv, D, a.rot, a.theta, a.eps, a.q,
-                          a.gate, a.kcache, a.vcache, a.hs, a.ps, p0 + m, slot);
+                          a.gate, a.kcache, a.vcache, a.hs, a.ps, a.pages, p0 + m, slot);
       }
       mk_done_ev(&c[kAtPrep + j], NP, ev ? ev + 1 + kMkMaxKv + j : nullptr);
     } else if (it.kind == 2) {  // attention: row block rb of group j over key range s
       MaybePdl{&waited}();
       mk_wait(&c[kAtPrep + j], NP);
       const int rb = it.i % nrb, s = it.i / nrb;
-      mk_attn_range(a.q, a.kcache, a.vcache, p0, a.M, a.Hq, a.Hkv, S, a.chunk, a.scratch, a.hs, a.ps, a.pf, rb, j, s, a.td);
+      mk_attn_range(a.q, a.kcache, a.vcache, p0, a.M, a.Hq, a.Hkv, S, a.chunk, a.scratch, a.hs, a.ps, a.pf, rb, j, s, a.td, a.pages);
       mk_done_ev(&c[kAtAttn + j], NA, ev ? ev + 1 + 2 * kMkMaxKv + j : nullptr);
     } else if (it.kind == 3) {  // combine row m of group j's query heads, with the sigmoid gate (sigmoid_mul's expression)
       MaybePdl{&waited}();
@@ -2143,6 +2144,7 @@ bool attn_persistent(const MkAttnParams& p, cudaStream_t s) {
   a.vcache = p.vcache;
   a.hs = kv_head_stride(p.D);
   a.ps = kv_pos_stride(p.Hkv, p.D);
+  a.pages = p.pages;
   a.pos0 = p.pos0;
   a.td = p.td;
   a.M = p.M;
