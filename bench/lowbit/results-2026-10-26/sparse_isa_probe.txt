@@ -1,0 +1,11 @@
+variant 1: accepted by ptxas
+variant 1: ran, 0 of 128 outputs differ from 16 (first 16)
+variant 2: accepted by ptxas
+variant 2: ran, 0 of 128 outputs differ from 32 (first 32)
+variant 3: accepted by ptxas
+variant 3: ran, 0 of 128 outputs differ from 64 (first 64)
+variant 4: rejected: ptxas /tmp/tmpxft_0001b030_00000000-6_sparse_isa_probe.ptx, line 35; error   : Illegal modifier '.scale_vec::2X' for instruction 'mma' with type '.ue4m3'
+variant 5: accepted by ptxas
+variant 5: ran, 0 of 128 outputs differ from 32 (first 32)
+variant 6: accepted by ptxas
+variant 6: ran, 0 of 128 outputs differ from 32 (first 32)
