@@ -469,7 +469,7 @@ The rule makes the references below checkable. It also keeps a later Linux build
 
 ---
 
-## 6. What was run on the box (2026-10-26 22:15 UTC to 2026-10-27 09:10 UTC, box clock)
+## 6. What was run on the box (2026-10-26 22:15 UTC to 2026-10-27 09:03 UTC, box clock)
 
 Scratch files are in `C:\llm\amd-port` on the box; the probes are also in this repository under `bench/amd/`. Nothing was installed, no driver or setting was changed, and the downloads came to 1.14 GB (the drafter).
 
@@ -650,7 +650,7 @@ Two findings came out of these runs:
 
 ### 6.7 The first milestone at 140 W: passed
 
-The owner set the box's front power knob to 140 W on 2026-10-27. *Measured* the same morning (box clock, 08:58–09:10 UTC) with the same code object as §6.6 (`-DKMAJOR -DNT -DKC=256 -DLUT -DXDB`), with no code changed. A `ling exec` test of the Windows fix agent was running at the time; it uses the GB10 node, not the GPU.
+The owner set the box's front power knob to 140 W on 2026-10-27. *Measured* the same morning (box clock, 08:57–09:03 UTC) with the same code object as §6.6 (`-DKMAJOR -DNT -DKC=256 -DLUT -DXDB`), with no code changed. A `ling exec` test of the Windows fix agent was running at the time; it uses the GB10 node, not the GPU.
 
 **The NVFP4 16-row kernel**, the gate's open item:
 
