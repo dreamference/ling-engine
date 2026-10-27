@@ -280,7 +280,9 @@ struct Running {
   long steps0 = 0, drafted0 = 0, accepted0 = 0;
   int chunks_beside = 0;  // prefill chunks run while another request was decoding (contended size, or on the side)
   bool side_flight = false;  // one of its chunks is in flight on the engine's side stream
-  int batched = 0;        // its decode steps taken in a batch with another request (M4 stage 3)
+  bool yielding = false;     // its prefill is letting a shorter one go first, since yield_t0 (C1)
+  std::chrono::steady_clock::time_point yield_t0;
+  int batched = 0;       // its decode steps taken in a batch with another request (M4 stage 3)
   Periods alone, beside;  // step periods without and with another request's prefill in between
 };
 
@@ -538,6 +540,33 @@ class Scheduler {
     return false;
   }
 
+  // The shortest prefill first (BATCHING §5.5, C1): of the requests waiting to prefill, the one with the fewest
+  // tokens left takes the next chunk. A warm follow-up's append is that request's whole time to first token, while a
+  // cold prompt of tens of thousands of tokens loses a chunk's time to it. Before, a long prefill on the side stream
+  // relaunched its next chunk the moment one finished, so a follow-up arriving meanwhile waited out the whole cold
+  // prompt (up to 55 s at four streams, W11). A request that has yielded for kMaxYield takes its next chunk anyway,
+  // so a long prompt still moves while short ones keep arriving. Only the order of units changes: every chunk runs
+  // in its own session's state, as it would alone.
+  static constexpr auto kMaxYield = std::chrono::seconds(5);
+  static int prefill_left(const Running& r) { return static_cast<int>(r.cur.prompt.size()) - r.cur.next; }
+  // Whether r lets a shorter prefill that is waiting take the next chunk (and r's yield clock).
+  bool yield_prefill(Running& r) const {
+    const int left = prefill_left(r);
+    bool shorter = false;
+    for (const auto& o : running_)
+      if (o.get() != &r && o->prefilling && !o->side_flight && prefill_left(*o) < left) shorter = true;
+    const auto now = std::chrono::steady_clock::now();
+    if (!shorter || (r.yielding && now - r.yield_t0 >= kMaxYield)) {
+      r.yielding = false;
+      return false;
+    }
+    if (!r.yielding) {
+      r.yielding = true;
+      r.yield_t0 = now;
+    }
+    return true;
+  }
+
   // One prefill chunk or one decode step of `r`. Returns true when the request has ended (and was answered).
   bool unit(Running& r) {
     Engine& eng = *ctx_.engine;
@@ -546,6 +575,7 @@ class Scheduler {
       if (eng.side_enabled() && (r.side_flight || (contended && !eng.side_busy()))) {
         // A full chunk on the side stream; the decoding request's turns go on while it runs.
         if (!r.side_flight) {
+          if (yield_prefill(r)) return false;
           eng.prefill_chunk_launch(r.cur, 0);
           r.side_flight = true;
           count_interleaved(r);
@@ -554,7 +584,7 @@ class Scheduler {
         if (contended && !eng.side_ready()) return false;
         r.side_flight = false;
         if (!eng.prefill_chunk_finish()) {
-          if (other_decoding(r)) {  // the next chunk at once
+          if (other_decoding(r) && !yield_prefill(r)) {  // the next chunk at once, unless a short prefill waits
             eng.prefill_chunk_launch(r.cur, 0);
             r.side_flight = true;
             count_interleaved(r);
@@ -566,6 +596,7 @@ class Scheduler {
         return emit(r) && end(r);
       }
       if (eng.side_busy()) return false;  // another request's chunk is in flight: no prefill beside it
+      if (yield_prefill(r)) return false;
       const bool last = eng.prefill_chunk(r.cur, contended ? contended_ : 0);
       if (contended) count_interleaved(r);
       if (!last) return false;
