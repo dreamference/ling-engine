@@ -85,7 +85,7 @@ bool test_attention(int n, int heads, std::mt19937& rng) {
     for (int h = 0; h < heads; ++h)
       for (int i = 0; i < n; ++i) {
         double m = -INFINITY, l = 0;
-        std::vector<double> o(D, 0.0);
+        std::vector<double> o(D, 0.0), mag(D, 0.0);  // mag: sum of P|v|, the scale of what was summed
         for (int j0 = 0; j0 < n; j0 += 64) {
           const int j1 = std::min(n, j0 + 64);
           std::vector<double> sv(j1 - j0);
@@ -100,19 +100,24 @@ bool test_attention(int n, int heads, std::mt19937& rng) {
           m = nm;
           l *= c;
           for (double& x : o) x *= c;
+          for (double& x : mag) x *= c;
           for (int j = j0; j < j1; ++j) {
             const double pj = std::exp2(sv[j - j0] - m);
             l += pj;
             const double pb = bfr(float(pj));
-            for (int d = 0; d < D; ++d) o[d] += pb * f[size_t(j) * 3 * H + 2 * H + h * D + d];
+            for (int d = 0; d < D; ++d) {
+              o[d] += pb * f[size_t(j) * 3 * H + 2 * H + h * D + d];
+              mag[d] += pb * std::abs(f[size_t(j) * 3 * H + 2 * H + h * D + d]);
+            }
           }
         }
-        // In BF16 units of the value (2^(exponent - 7)): rounding gives at most half a unit; the FP32 sums' order and
-        // a P value rounded the other way add a little.
+        // Allowed: half a BF16 unit of the value (the output's rounding) plus 2^-9 of the scale of what was summed (a P
+        // rounded the other way in FP32, the sums' order); a wrong fragment, mask or rescale errs by the scale itself.
         for (int d = 0; d < D; ++d) {
           const double want = o[d] / l;
-          const double ulp = std::ldexp(1.0, std::ilogb(std::max(std::abs(want), 1e-30)) - 7);
-          emu_worst = std::max(emu_worst, std::abs(double(__bfloat162float(out[size_t(i) * H + h * D + d])) - want) / ulp);
+          const double half_ulp = std::ldexp(1.0, std::ilogb(std::max(std::abs(want), 1e-30)) - 8);
+          const double allowed = half_ulp + std::ldexp(mag[d] / l, -9);
+          emu_worst = std::max(emu_worst, std::abs(double(__bfloat162float(out[size_t(i) * H + h * D + d])) - want) / allowed);
         }
       }
   }
@@ -138,7 +143,7 @@ bool test_attention(int n, int heads, std::mt19937& rng) {
   char what[64];
   std::snprintf(what, sizeof what, "attention n=%d heads=%d (|e| / RMS, exact softmax)", n, heads);
   report(what, worst, 3e-2);  // reported; BF16 P and output put the exact-softmax error at 1-2% of the RMS
-  std::snprintf(what, sizeof what, "attention n=%d heads=%d (BF16 units, the kernel's algorithm)", n, heads);
+  std::snprintf(what, sizeof what, "attention n=%d heads=%d (the kernel's algorithm, error / allowed)", n, heads);
   return report(what, emu_worst, 1.0);
 }
 
