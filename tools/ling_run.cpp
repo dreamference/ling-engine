@@ -401,7 +401,8 @@ int main(int argc, char** argv) {
       std::string line;
       while (std::getline(f, line)) {
         if (line.empty()) continue;
-        nlohmann::json body = nlohmann::json::parse(line);
+        // ordered_json: the tools' keys keep the request's order, as ling-serve parses a body (the template renders them).
+        nlohmann::ordered_json body = nlohmann::ordered_json::parse(line);
         for (auto& m : body["messages"])
           if (m.contains("content") && m["content"].is_array())
             for (auto& part : m["content"])
