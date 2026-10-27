@@ -1,4 +1,4 @@
-// Weight-streaming GEMM for 1 to 32 rows on tensor cores (decode, verify and the drafter).
+// Weight-streaming GEMM for 1 to 64 rows on tensor cores (decode, verify and the drafter).
 //
 // y[M][N] = gscale * x[M][K] . W[N][K]^T with W in NVFP4 (packed [N][K/2], E4M3 block scales [N][K/16])
 // or FP8 E4M3 ([N][K]), and x converted once to FP16 with a power-of-two scale per row.
@@ -178,8 +178,13 @@ __device__ __forceinline__ uint32_t word_of(const uint4& v, int i) {
 // stream and the output is added into it, y + (sum * gscale * xinv) rounded as add_inplace rounds it (no contraction).
 // DYNRED (the megakernel's spanning kernel): the warps' reduction buffer is the launch's dynamic shared memory instead
 // of a static array of this instantiation, so several instantiations in one kernel share it; the same arithmetic.
+// GROUPS (batching P1: 33 to 64 rows, a batched verify of two trees): the tokens come in GROUPS groups of NT x 8, group
+// q being tokens q x NT x 8 + g + 8j. Each chunk's weights are loaded and dequantized once and multiplied into every
+// group's accumulators in turn, so the weights are still read once per launch; the groups are reduced one after the
+// other through the same buffer. A token's column takes exactly the MMAs, chunks, warps and reduction order it takes
+// in a one-group launch (the MMA's columns are independent), so its result is the same bits whatever its group.
 template <int NT, int TILES, bool FP4, int PF, bool CODED, bool RESID = false, bool DYNRED = false, bool GATHER = false,
-          typename Wait>
+          int GROUPS = 1, typename Wait>
 __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, const float* __restrict__ xinv, int M,
                                                  const StreamProblems& pr, int K, int ksplit, float* __restrict__ part,
                                                  int bx, int by, Wait&& wait) {
@@ -202,11 +207,13 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
   const int per_split = (K / kChunk + ksplit - 1) / ksplit;
   const int cbeg = by * per_split, chunks = min(K / kChunk, cbeg + per_split);
 
-  float acc[TILES][NT][4];
+  float acc[GROUPS][TILES][NT][4];
 #pragma unroll
-  for (int i = 0; i < TILES; ++i)
+  for (int gr = 0; gr < GROUPS; ++gr)
 #pragma unroll
-    for (int j = 0; j < NT; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+    for (int i = 0; i < TILES; ++i)
+#pragma unroll
+      for (int j = 0; j < NT; ++j) acc[gr][i][j][0] = acc[gr][i][j][1] = acc[gr][i][j][2] = acc[gr][i][j][3] = 0.f;
 
   WeightRegs<TILES, FP4, CODED> buf[PF + 1];  // buf[0]: the chunk being computed; buf[1..PF]: in flight
   // GATHER: the row list is the previous kernel's output, so nothing is read before the wait; a block wholly past the
@@ -252,11 +259,14 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
   for (int c = cbeg + warp; c < chunks; c += kWarps) {
     if (c + PF * kWarps < chunks) load(buf[PF], c + PF * kWarps);
     const WeightRegs<TILES, FP4, CODED>& cur = buf[0];
-    // This chunk's activations: 32 halves (16 words) per token for tokens g + 8j.
+    uint32_t sc_h2[TILES][2][2];
+#pragma unroll
+    for (int gr = 0; gr < GROUPS; ++gr) {
+    // This chunk's activations: 32 halves (16 words) per token for tokens g + 8j (of group gr).
     uint32_t xw[NT][16];
 #pragma unroll
     for (int j = 0; j < NT; ++j) {
-      const int n = g + 8 * j;
+      const int n = gr * NT * 8 + g + 8 * j;
       if (n < M) {
         const uint4* p = reinterpret_cast<const uint4*>(x + static_cast<size_t>(n) * K + c * kChunk + t * 32);
 #pragma unroll
@@ -272,8 +282,7 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
         for (int q = 0; q < 16; ++q) xw[j][q] = 0u;
       }
     }
-    uint32_t sc_h2[TILES][2][2];
-    if constexpr (FP4) {
+    if (FP4 && gr == 0) {
 #pragma unroll
       for (int i = 0; i < TILES; ++i)
 #pragma unroll
@@ -308,30 +317,35 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
           }
         }
 #pragma unroll
-        for (int j = 0; j < NT; ++j) mma16816(acc[i][j], a[0][0], a[1][0], a[0][1], a[1][1], xw[j][2 * s], xw[j][2 * s + 1]);
+        for (int j = 0; j < NT; ++j)
+          mma16816(acc[gr][i][j], a[0][0], a[1][0], a[0][1], a[1][1], xw[j][2 * s], xw[j][2 * s + 1]);
       }
     }
+    }  // groups
 #pragma unroll
     for (int p = 0; p < PF; ++p) buf[p] = buf[p + 1];
   }
 
-  // Fixed-order reduction over the warps.
+  // Fixed-order reduction over the warps, group by group through one buffer.
+#pragma unroll
+  for (int gr = 0; gr < GROUPS; ++gr) {
+  if (gr > 0) __syncthreads();  // every thread is done reading the previous group's sums
 #pragma unroll
   for (int i = 0; i < TILES; ++i)
 #pragma unroll
     for (int j = 0; j < NT; ++j) {
-      red[warp][16 * i + g][8 * j + 2 * t] = acc[i][j][0];
-      red[warp][16 * i + g][8 * j + 2 * t + 1] = acc[i][j][1];
-      red[warp][16 * i + g + 8][8 * j + 2 * t] = acc[i][j][2];
-      red[warp][16 * i + g + 8][8 * j + 2 * t + 1] = acc[i][j][3];
+      red[warp][16 * i + g][8 * j + 2 * t] = acc[gr][i][j][0];
+      red[warp][16 * i + g][8 * j + 2 * t + 1] = acc[gr][i][j][1];
+      red[warp][16 * i + g + 8][8 * j + 2 * t] = acc[gr][i][j][2];
+      red[warp][16 * i + g + 8][8 * j + 2 * t + 1] = acc[gr][i][j][3];
     }
   __syncthreads();
   for (int e = threadIdx.x; e < TILES * 16 * NT * 8; e += blockDim.x) {
-    const int r = e / (NT * 8), n = e % (NT * 8);
+    const int r = e / (NT * 8), nl = e % (NT * 8), n = gr * NT * 8 + nl;
     if (n >= M || row0 + r >= N) continue;
     float sum = 0.f;
 #pragma unroll
-    for (int wi = 0; wi < kWarps; ++wi) sum += red[wi][r][n];
+    for (int wi = 0; wi < kWarps; ++wi) sum += red[wi][r][nl];
     if constexpr (GATHER) {
       y[static_cast<size_t>(n) * N + row0 + r] = row0 + r < nrows ? sum * gscale * xinv[n] : -INFINITY;
       continue;
@@ -346,24 +360,27 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
     } else
       part[(static_cast<size_t>(by) * M + n) * N + row0 + r] = sum;
   }
+  }  // groups
 }
 
 struct PdlBegin {
   __device__ __forceinline__ void operator()() const { pdl_begin(); }
 };
 
-template <int NT, int TILES, bool FP4, int PF, bool CODED = false>
+template <int NT, int TILES, bool FP4, int PF, bool CODED = false, int GROUPS = 1>
 __global__ void __launch_bounds__(kWarps * 32)
     stream_gemm_kernel(const __half* __restrict__ x, const float* __restrict__ xinv, int M, StreamProblems pr, int K,
                        int ksplit, float* __restrict__ part) {
-  stream_gemm_body<NT, TILES, FP4, PF, CODED>(x, xinv, M, pr, K, ksplit, part, blockIdx.x, blockIdx.y, PdlBegin{});
+  stream_gemm_body<NT, TILES, FP4, PF, CODED, false, false, false, GROUPS>(x, xinv, M, pr, K, ksplit, part, blockIdx.x,
+                                                                           blockIdx.y, PdlBegin{});
 }
 
-template <int NT>
+template <int NT, int GROUPS = 1>
 __global__ void __launch_bounds__(kWarps * 32)
     stream_gemm_gather_kernel(const __half* __restrict__ x, const float* __restrict__ xinv, int M, StreamProblems pr,
                               int K) {
-  stream_gemm_body<NT, 2, true, 2, false, false, false, true>(x, xinv, M, pr, K, 1, nullptr, blockIdx.x, 0, PdlBegin{});
+  stream_gemm_body<NT, 2, true, 2, false, false, false, true, GROUPS>(x, xinv, M, pr, K, 1, nullptr, blockIdx.x, 0,
+                                                                      PdlBegin{});
 }
 
 // The split-K partial sums, added in split order.
@@ -589,7 +606,7 @@ float* split_buffer(size_t floats) {
   return buf;
 }
 
-template <int NT, int TILES, bool FP4, int PF, bool CODED>
+template <int NT, int TILES, bool FP4, int PF, bool CODED, int GROUPS = 1>
 void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
   StreamProblems pr{};
   int blocks = 0;
@@ -606,8 +623,8 @@ void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, in
   const int ksplit = n == 1 ? choose_ksplit(blocks, K) : 1;
   float* part = ksplit > 1 ? split_buffer(size_t(ksplit) * M * t[0].N) : nullptr;
   const dim3 grid(blocks, ksplit);
-  launch_kernel("stream_gemm", stream_gemm_kernel<NT, TILES, FP4, PF, CODED>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K,
-                ksplit, part);
+  launch_kernel("stream_gemm", stream_gemm_kernel<NT, TILES, FP4, PF, CODED, GROUPS>, grid, dim3(kWarps * 32), 0, s, x, xinv,
+                M, pr, K, ksplit, part);
   if (ksplit > 1)
     launch_kernel("stream_gemm split", split_reduce_kernel, dim3((M * t[0].N + 255) / 256), dim3(256), 0, s, part, ksplit,
                   M, t[0].N, t[0].scale, xinv, t[0].y);
@@ -640,14 +657,14 @@ bool nt3_on() {
   return on;
 }
 
-template <int NT, bool FP4, int PF, bool CODED>
+template <int NT, bool FP4, int PF, bool CODED, int GROUPS = 1>
 void launch_t(int tiles, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
-  if (tiles == 1) launch<NT, 1, FP4, PF, CODED>(x, xinv, M, t, n, K, s);
-  else if (tiles == 2 || NT >= 3) launch<NT, 2, FP4, PF, CODED>(x, xinv, M, t, n, K, s);  // NT >= 3 x 4 tiles: no room
-  else launch<NT, (NT >= 3 ? 2 : 4), FP4, PF, CODED>(x, xinv, M, t, n, K, s);
+  if (tiles == 1) launch<NT, 1, FP4, PF, CODED, GROUPS>(x, xinv, M, t, n, K, s);
+  else if (tiles == 2 || NT >= 3 || GROUPS > 1) launch<NT, 2, FP4, PF, CODED, GROUPS>(x, xinv, M, t, n, K, s);  // no room
+  else launch<NT, (NT >= 3 || GROUPS > 1 ? 2 : 4), FP4, PF, CODED, GROUPS>(x, xinv, M, t, n, K, s);
 }
 
-template <int NT, bool FP4>
+template <int NT, bool FP4, int GROUPS = 1>
 void launch_k(int tiles, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
   static const int pf = sg_env("LING_SG_PF", kInFlight);
   const bool coded = FP4 && t[0].wscale != nullptr;  // dispatch keeps a launch's matrices of one kind
@@ -655,26 +672,26 @@ void launch_k(int tiles, const __half* x, const float* xinv, int M, const Stream
   // arithmetic in the same order, only more weight chunks in flight per warp.
   if (coded) {
     if constexpr (FP4) {
-      if (pf == 4) launch_t<NT, FP4, 4, true>(tiles, x, xinv, M, t, n, K, s);
-      else if (pf == 3) launch_t<NT, FP4, 3, true>(tiles, x, xinv, M, t, n, K, s);
-      else if (pf == 2) launch_t<NT, FP4, 2, true>(tiles, x, xinv, M, t, n, K, s);
-      else launch_t<NT, FP4, 1, true>(tiles, x, xinv, M, t, n, K, s);
+      if (pf == 4) launch_t<NT, FP4, 4, true, GROUPS>(tiles, x, xinv, M, t, n, K, s);
+      else if (pf == 3) launch_t<NT, FP4, 3, true, GROUPS>(tiles, x, xinv, M, t, n, K, s);
+      else if (pf == 2) launch_t<NT, FP4, 2, true, GROUPS>(tiles, x, xinv, M, t, n, K, s);
+      else launch_t<NT, FP4, 1, true, GROUPS>(tiles, x, xinv, M, t, n, K, s);
     }
   } else if (pf == 4) {
-    launch_t<NT, FP4, 4, false>(tiles, x, xinv, M, t, n, K, s);
+    launch_t<NT, FP4, 4, false, GROUPS>(tiles, x, xinv, M, t, n, K, s);
   } else if (pf == 3) {
-    launch_t<NT, FP4, 3, false>(tiles, x, xinv, M, t, n, K, s);
+    launch_t<NT, FP4, 3, false, GROUPS>(tiles, x, xinv, M, t, n, K, s);
   } else if (pf == 2) {
-    launch_t<NT, FP4, 2, false>(tiles, x, xinv, M, t, n, K, s);
+    launch_t<NT, FP4, 2, false, GROUPS>(tiles, x, xinv, M, t, n, K, s);
   } else {
-    launch_t<NT, FP4, 1, false>(tiles, x, xinv, M, t, n, K, s);
+    launch_t<NT, FP4, 1, false, GROUPS>(tiles, x, xinv, M, t, n, K, s);
   }
 }
 
 template <bool FP4>
 void dispatch(const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
   if (K % kChunk != 0) throw std::runtime_error("stream_gemm: K must be a multiple of 128");
-  if (M < 1 || M > kMaxStreamRows) throw std::runtime_error("stream_gemm: M must be in [1, 32]");
+  if (M < 1 || M > kMaxStreamRows) throw std::runtime_error("stream_gemm: M must be in [1, 64]");
   if (n < 1 || n > 4) throw std::runtime_error("stream_gemm: 1 to 4 matrices per launch");
   // B26: coded and raw NVFP4 blobs in one call go as two launches (a matrix's result does not depend on its
   // launch companions, so nothing changes but the launch count; only a checkpoint with a > 64-scale matrix next to
@@ -697,7 +714,10 @@ void dispatch(const __half* x, const float* xinv, int M, const StreamTarget* t, 
   if (M <= 8) launch_k<1, FP4>(narrow ? tn : tw, x, xinv, M, t, n, K, s);
   else if (M <= 16) launch_k<2, FP4>(narrow ? tn : tw, x, xinv, M, t, n, K, s);
   else if (M <= 24 && nt3_on()) launch_k<3, FP4>(narrow ? tn4 : tw4, x, xinv, M, t, n, K, s);
-  else launch_k<4, FP4>(narrow ? tn4 : tw4, x, xinv, M, t, n, K, s);
+  else if (M <= 32) launch_k<4, FP4>(narrow ? tn4 : tw4, x, xinv, M, t, n, K, s);
+  // Batching P1: 33 to 64 rows as two groups over one weight stream (stream_gemm_body's GROUPS), two tiles per block.
+  else if (M <= 48 && nt3_on()) launch_k<3, FP4, 2>(2, x, xinv, M, t, n, K, s);
+  else launch_k<4, FP4, 2>(2, x, xinv, M, t, n, K, s);
   const cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) throw std::runtime_error(std::string("stream_gemm: ") + cudaGetErrorString(e));
 }
@@ -956,7 +976,7 @@ struct MkFfnArgs {
   unsigned* c2;
   int c2_words;
 };
-constexpr int kMkFfnDownDone = 4 + kMaxStreamRows;
+constexpr int kMkFfnDownDone = 4 + kMaxSeqRows;
 
 // PF (LING_MK_FFN_PF, the occupancy probe for stage 4's layer-spanning kernels): chunks in flight per warp; above 2 the
 // registers allow one block per SM, the occupancy a kernel holding a mixer's bodies has. The same arithmetic.
@@ -987,9 +1007,9 @@ __device__ __forceinline__ void ffn_body(const MkFfnArgs& a) {
   // The row step over every block.
   const size_t n = size_t(a.M) * a.I, stride = size_t(G) * blockDim.x;
   unsigned* rowmax = c + 4;
-  __shared__ unsigned smax[kMaxStreamRows];
-  __shared__ float sc[kMaxStreamRows];
-  if (threadIdx.x < kMaxStreamRows) smax[threadIdx.x] = 0u;
+  __shared__ unsigned smax[kMaxSeqRows];
+  __shared__ float sc[kMaxSeqRows];
+  if (threadIdx.x < kMaxSeqRows) smax[threadIdx.x] = 0u;
   __syncthreads();
   for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride) {
     const float x = a.g[i];
@@ -1332,7 +1352,7 @@ __device__ __forceinline__ void gdn_mixer_body(const MkGdnArgs& a) {
     // The recurrence: item w of HV x 4 on warp w of the chain's blocks.
     const int warp = threadIdx.x >> 5;
     if (a.td) {  // a tree: item w of HV x 4 x (its gdn paths), as gdn_recurrent_tree_kernel's blocks (bx, path)
-      __shared__ int steps[kWarps][2 * kMaxStreamRows];
+      __shared__ int steps[kWarps][2 * kMaxSeqRows];
       const int items = a.HV * 4 * a.td->ngdn;
       for (int it = bid * kWarps + warp; it < items; it += a.chain * kWarps)
         gdn_recurrent_tree_body(a.mixed, a.g, a.beta, a.state, a.core, a.H, a.HV, a.td, it % (a.HV * 4), it / (a.HV * 4),
@@ -1388,7 +1408,7 @@ __device__ __forceinline__ void gdn_mixer_body(const MkGdnArgs& a) {
   mk_done(&c[kNormDone]);
   mk_wait(&c[kNormDone], G);
   MK_STAMP(7)
-  __shared__ float sc[kMaxStreamRows];
+  __shared__ float sc[kMaxSeqRows];
   if (threadIdx.x < a.M) {
     const float mx = __uint_as_float(mk_ld_acquire(&rowmax[threadIdx.x]));
     int e = 0;
@@ -1898,7 +1918,7 @@ void stream_gemm_fp8(const __half* x, const float* xinv, int M, const uint8_t* w
 void stream_gemm_gather_nvfp4(const __half* x, const float* xinv, int M, const uint8_t* w, const uint8_t* raw_scales,
                               float scale2, const int* rows, const int* nrows, int cap, float* y, int K, cudaStream_t s) {
   if (K % kChunk != 0 || cap % 32 != 0) throw std::runtime_error("stream_gemm_gather: K % 128 and cap % 32 must be 0");
-  if (M < 1 || M > kMaxStreamRows) throw std::runtime_error("stream_gemm_gather: M must be in [1, 32]");
+  if (M < 1 || M > kMaxStreamRows) throw std::runtime_error("stream_gemm_gather: M must be in [1, 64]");
   StreamProblems pr{};
   pr.w[0] = w;
   pr.gscale[0] = scale2;
@@ -1913,7 +1933,8 @@ void stream_gemm_gather_nvfp4(const __half* x, const float* xinv, int M, const u
   const dim3 grid(cap / 32, 1);
   if (M <= 8) launch_kernel("stream_gemm_gather", stream_gemm_gather_kernel<1>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K);
   else if (M <= 16) launch_kernel("stream_gemm_gather", stream_gemm_gather_kernel<2>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K);
-  else launch_kernel("stream_gemm_gather", stream_gemm_gather_kernel<4>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K);
+  else if (M <= 32) launch_kernel("stream_gemm_gather", stream_gemm_gather_kernel<4>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K);
+  else launch_kernel("stream_gemm_gather", stream_gemm_gather_kernel<4, 2>, grid, dim3(kWarps * 32), 0, s, x, xinv, M, pr, K);
   const cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) throw std::runtime_error(std::string("stream_gemm_gather: ") + cudaGetErrorString(e));
 }
@@ -1928,7 +1949,7 @@ void stream_gemm_multi(bool nvfp4, const __half* x, const float* xinv, int M, co
 static bool gdn_build(const MkGdnParams& p, MkGdnArgs& a) {
   static const int chain_env = sg_env("LING_MK_CHAIN", 24);
   const int chain = chain_env;
-  if (p.M < 1 || p.M > kMaxStreamRows || p.Dk != kGdnK || p.Dv != kGdnK || p.HV % p.H != 0) return false;
+  if (p.M < 1 || p.M > kMaxSeqRows || p.Dk != kGdnK || p.Dv != kGdnK || p.HV % p.H != 0) return false;
   if (chain < 1 || p.HV % (2 * chain) != 0 || p.K % kChunk || p.Vs % kChunk) return false;
   if (p.in_qkv.N != p.C || p.in_z.N != p.Vs || p.out.N != p.K || p.C % 32 || p.Vs % 32 || p.K % 32) return false;
   if (sg_env("LING_SG_PF", kInFlight) != 2 || sg_env("LING_SG_TW", kTilesWide) != 2 || sg_env("LING_SG_TN", kTilesNarrow) != 2 ||
@@ -2021,7 +2042,7 @@ static bool ffn_build(const __half* xh, const float* xinv, int M, const StreamTa
   if (tail && !mk_tail_rows(M)) return false;
   // Only the shapes dispatch() gives the four-kernel path: TILES 2 and PF 2 everywhere, one kind of blob.
   if ((up.wscale != nullptr) != coded || (down.wscale != nullptr) != coded) return false;
-  if (M < 1 || M > kMaxStreamRows || H % kChunk || I % kChunk || gate.N != I || up.N != I || down.N != H) return false;
+  if (M < 1 || M > kMaxSeqRows || H % kChunk || I % kChunk || gate.N != I || up.N != I || down.N != H) return false;
   if (sg_env("LING_SG_PF", kInFlight) != 2 || sg_env("LING_SG_TW", kTilesWide) != 2 || sg_env("LING_SG_TN", kTilesNarrow) != 2 ||
       sg_env("LING_SG_TW4", kTilesWide4) != 2 || sg_env("LING_SG_TN4", kTilesNarrow4) != 2 || sg_env("LING_KSPLIT", 0) != 0)
     return false;

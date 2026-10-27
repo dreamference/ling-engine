@@ -205,7 +205,7 @@ bool test_gemm() {
       }
     run(fp4, dx, MMAX, K, xh, xinv, fp4 ? dw4 : dw8, ds4, fp4 ? gs4 : gs8, dy, N);
     const std::vector<float> full = download(dy, size_t(MMAX) * N);
-    for (int M : {1, 2, 7, 8, 9, 15, 16, 17, 20, 24, 25, 32}) {
+    for (int M : {1, 2, 7, 8, 9, 15, 16, 17, 20, 24, 25, 32, 33, 40, 47, 48, 49, 56, 63, 64}) {
       run(fp4, dx, M, K, xh, xinv, fp4 ? dw4 : dw8, ds4, fp4 ? gs4 : gs8, dy, N);
       const std::vector<float> got = download(dy, size_t(M) * N);
       double worst = 0;
@@ -216,12 +216,47 @@ bool test_gemm() {
         for (int n = 0; n < N; ++n)
           worst = std::max(worst, std::abs(got[size_t(m) * N + n] - ref[size_t(m) * N + n]) / rms);
       }
-      const bool same = std::memcmp(got.data(), full.data(), got.size() * sizeof(float)) == 0;
+      bool same = std::memcmp(got.data(), full.data(), got.size() * sizeof(float)) == 0;
+      // Batching P1: past 32 rows, the second group's rows bit for bit those of a <= 32-row launch of them alone.
+      bool tail = true;
+      if (M > 32) {
+        run(fp4, dx + size_t(32) * K, M - 32, K, xh, xinv, fp4 ? dw4 : dw8, ds4, fp4 ? gs4 : gs8, dy, N);
+        const std::vector<float> alone = download(dy, size_t(M - 32) * N);
+        tail = std::memcmp(alone.data(), got.data() + size_t(32) * N, alone.size() * sizeof(float)) == 0;
+      }
+      same &= tail;
       const bool good = worst < 2e-3 && same;
       ok &= good;
-      std::printf("stream_gemm %-5s M=%-2d err/rms %.2e, rows identical to M=32: %s %s\n", fp4 ? "nvfp4" : "fp8", M,
-                  worst, same ? "yes" : "NO", good ? "ok" : "FAIL");
+      std::printf("stream_gemm %-5s M=%-2d err/rms %.2e, rows identical to M=64%s: %s %s\n", fp4 ? "nvfp4" : "fp8", M,
+                  worst, M > 32 ? " and rows 32+ to a launch of them alone" : "", same ? "yes" : "NO",
+                  good ? "ok" : "FAIL");
     }
+  }
+  // The gathered launch (the drafter's sparse head, BACKLOG 19) at 1 to 64 rows: column i of the first 512 rows of the
+  // blob in reverse order is bit for bit the tiled launch's element (rows 32+ too: its second group).
+  {
+    const int cap = 512;
+    std::vector<int> rows(cap);
+    for (int i = 0; i < cap; ++i) rows[i] = cap - 1 - i;
+    int* drows = upload(rows);
+    int* dn = upload(std::vector<int>{cap});
+    float* dg;
+    cudaMalloc(&dg, size_t(MMAX) * cap * sizeof(float));
+    run(true, dx, MMAX, K, xh, xinv, dw4, ds4, gs4, dy, N);
+    const std::vector<float> full = download(dy, size_t(MMAX) * N);
+    bool same = true;
+    for (int M : {1, 9, 24, 32, 33, 48, 64}) {
+      ling::kernels::to_half_rows(dx, M, K, xh, xinv, nullptr);
+      ling::kernels::stream_gemm_gather_nvfp4(xh, xinv, M, dw4, nullptr, gs4, drows, dn, cap, dg, K, nullptr);
+      const std::vector<float> got = download(dg, size_t(M) * cap);
+      for (int m = 0; m < M; ++m)
+        for (int i = 0; i < cap; ++i)
+          same &= std::memcmp(&got[size_t(m) * cap + i], &full[size_t(m) * N + rows[i]], sizeof(float)) == 0;
+    }
+    ok &= same;
+    std::printf("stream_gemm_gather nvfp4 M = 1 .. 64 identical to the tiled launch's elements: %s\n",
+                same ? "yes ok" : "NO FAIL");
+    cudaFree(drows), cudaFree(dn), cudaFree(dg);
   }
   // B26: the same NVFP4 matrix with 6-bit scale codes streams to the same bits, at every M, alone and in one launch
   // beside its raw copy; its tiled dequantization (with the raw scales) equals the raw blob's.
@@ -233,7 +268,7 @@ bool test_gemm() {
     cudaMalloc(&coded, ling::kernels::tiled_bytes_nvfp4_coded(N, K));
     cudaMalloc(&raw, s4.size());
     ling::kernels::retile_nvfp4_coded(rw4, ds4, map, coded, raw, N, K, nullptr);
-    for (int M : {1, 8, 12, 16, 17, 24, 32}) {
+    for (int M : {1, 8, 12, 16, 17, 24, 32, 40, 48, 64}) {
       ling::kernels::to_half_rows(dx, M, K, xh, xinv, nullptr);
       ling::kernels::stream_gemm_nvfp4(xh, xinv, M, dw4, nullptr, gs4, dy, N, K, nullptr);
       const auto a = download(dy, size_t(M) * N);
@@ -364,14 +399,18 @@ bool test_gemm_wide() {
     run(fp4, dx, MMAX, K, xh, xinv, fp4 ? dw4 : dw8, ds4, 0.5f, dy, N);
     const std::vector<float> full = download(dy, size_t(MMAX) * N);
     bool same = true;
-    for (int M : {1, 8, 9, 12, 16, 17, 24}) {
+    for (int M : {1, 8, 9, 12, 16, 17, 24, 32, 36, 48}) {
       run(fp4, dx, M, K, xh, xinv, fp4 ? dw4 : dw8, ds4, 0.5f, dy, N);
       const std::vector<float> got = download(dy, size_t(M) * N);
       same &= std::memcmp(got.data(), full.data(), got.size() * sizeof(float)) == 0;
     }
+    // Batching P1: rows 32 .. 63 of the 64-row launch against a 32-row launch of them alone.
+    run(fp4, dx + size_t(32) * K, 32, K, xh, xinv, fp4 ? dw4 : dw8, ds4, 0.5f, dy, N);
+    const std::vector<float> tail = download(dy, size_t(32) * N);
+    same &= std::memcmp(tail.data(), full.data() + size_t(32) * N, tail.size() * sizeof(float)) == 0;
     ok &= same;
-    std::printf("stream_gemm %-5s wide (N=%d) rows identical to M=32 for M = 1 .. 24: %s\n", fp4 ? "nvfp4" : "fp8", N,
-                same ? "yes ok" : "NO FAIL");
+    std::printf("stream_gemm %-5s wide (N=%d) rows identical to M=64 for M = 1 .. 48, rows 32+ to a 32-row launch: "
+                "%s\n", fp4 ? "nvfp4" : "fp8", N, same ? "yes ok" : "NO FAIL");
   }
   cudaFree(dw4), cudaFree(dw8), cudaFree(rw4), cudaFree(ds4), cudaFree(rw8), cudaFree(dx), cudaFree(xh), cudaFree(xinv),
       cudaFree(dy);
@@ -544,7 +583,7 @@ bool test_draft_head_batch() {
 bool test_bf16_rows() {
   std::mt19937 rng(9);
   std::normal_distribution<float> normal(0.f, 1.f);
-  const int N = 48, K = 5120, MMAX = 32;
+  const int N = 48, K = 5120, MMAX = 64;
   std::vector<__nv_bfloat16> w(size_t(N) * K);
   for (auto& v : w) v = __float2bfloat16(normal(rng) * 0.05f);
   std::vector<float> x(size_t(MMAX) * K);
@@ -556,7 +595,7 @@ bool test_bf16_rows() {
   ling::kernels::bf16_rows(dx, MMAX, dw, dy, N, K, nullptr);
   const std::vector<float> full = download(dy, size_t(MMAX) * N);
   bool ok = true;
-  for (int M : {1, 5, 16, 32}) {
+  for (int M : {1, 5, 16, 32, 33, 48, 64}) {
     ling::kernels::bf16_rows(dx, M, dw, dy, N, K, nullptr);
     const std::vector<float> got = download(dy, size_t(M) * N);
     double worst = 0;
@@ -569,7 +608,7 @@ bool test_bf16_rows() {
     const bool same = std::memcmp(got.data(), full.data(), got.size() * sizeof(float)) == 0;
     const bool good = worst < 1e-4 && same;
     ok &= good;
-    std::printf("bf16_rows M=%-2d max rel err %.2e, rows identical to M=32: %s %s\n", M, worst, same ? "yes" : "NO",
+    std::printf("bf16_rows M=%-2d max rel err %.2e, rows identical to M=64: %s %s\n", M, worst, same ? "yes" : "NO",
                 good ? "ok" : "FAIL");
   }
   cudaFree(dw), cudaFree(dx), cudaFree(dy);
@@ -1033,12 +1072,13 @@ void bench_groups() {
     fill_random_kernel<<<1024, 256>>>(reinterpret_cast<uint32_t*>(w), bytes * copies / 4, 7);
     float *x, *y[3], *xinv;
     __half* xh;
-    cudaMalloc(&x, size_t(32) * gr.K * sizeof(float));
-    fill_random_kernel<<<64, 256>>>(reinterpret_cast<uint32_t*>(x), size_t(32) * gr.K, 9);  // finite floats
-    cudaMalloc(&xh, size_t(32) * gr.K * sizeof(__half));
-    cudaMalloc(&xinv, 32 * sizeof(float));
-    for (int i = 0; i < gr.n; ++i) cudaMalloc(&y[i], size_t(32) * gr.N[i] * sizeof(float));
-    ling::kernels::to_half_rows(x, 32, gr.K, xh, xinv, nullptr);
+    const int R = ling::kernels::kMaxStreamRows;  // up to 64 rows (batching P1's second group)
+    cudaMalloc(&x, size_t(R) * gr.K * sizeof(float));
+    fill_random_kernel<<<64, 256>>>(reinterpret_cast<uint32_t*>(x), size_t(R) * gr.K, 9);  // finite floats
+    cudaMalloc(&xh, size_t(R) * gr.K * sizeof(__half));
+    cudaMalloc(&xinv, R * sizeof(float));
+    for (int i = 0; i < gr.n; ++i) cudaMalloc(&y[i], size_t(R) * gr.N[i] * sizeof(float));
+    ling::kernels::to_half_rows(x, R, gr.K, xh, xinv, nullptr);
     cudaEvent_t a, b;
     cudaEventCreate(&a), cudaEventCreate(&b);
     std::printf("group %-17s %6.1f MB x%-2d", gr.name, bytes / 1e6, gr.count);

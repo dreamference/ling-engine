@@ -470,7 +470,7 @@ __global__ void __launch_bounds__(32)
                               int HV, const TreeDesc* __restrict__ td) {
   pdl_begin();  // first statement: see launch.cuh
   __shared__ float qs[kGdnDk], ks[kGdnDk];
-  __shared__ int steps[2 * kMaxStreamRows];
+  __shared__ int steps[2 * kMaxSeqRows];
   const int bx = blockIdx.x, pth = blockIdx.y;
   if (pth >= td->ngdn) return;  // the launch covers the configuration's most paths
   gdn_recurrent_tree_body(mixed, g, beta, state_in, out, H, HV, td, bx, pth, threadIdx.x, qs, ks, steps);
@@ -478,10 +478,11 @@ __global__ void __launch_bounds__(32)
 
 // tree_gather: block (i, j) moves row rows[j] of buffer i to row j (j ascending is safe in place: rows[j] >= j, and no
 // earlier destination is a later source). One block per buffer, the rows in order.
-__global__ void tree_gather_kernel(const GatherBuf* __restrict__ bufs, const int* __restrict__ rows, int n, DevPos pos) {
+__global__ void tree_gather_kernel(const GatherBuf* __restrict__ bufs, const int* __restrict__ rows, int n, DevPos pos,
+                                   int row0) {
   pdl_begin();  // first statement: see launch.cuh
   const GatherBuf b = bufs[blockIdx.x];
-  const size_t off = b.pos_rel ? static_cast<size_t>(pos_value(pos)) : 0;
+  const size_t off = b.pos_rel ? static_cast<size_t>(pos_value(pos)) : static_cast<size_t>(row0);
   for (int j = 1; j < n; ++j) {
     const int r = rows[j];
     if (r == j) continue;
@@ -694,13 +695,25 @@ void gemv_bf16(const float* x, int M, const __nv_bfloat16* w, float* y, int N, i
 
 void bf16_rows(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s,
                const __nv_bfloat16* w2, float* y2) {
-  if (M < 1 || M > 32 || K % (kBf16RowsThreads * 8) != 0) throw std::runtime_error("bf16_rows: M <= 32, K % 1024 == 0");
+  if (M < 1 || M > kMaxStreamRows || K % (kBf16RowsThreads * 8) != 0)
+    throw std::runtime_error("bf16_rows: M <= 64, K % 1024 == 0");
+  if (M > 32) {  // batching P1: rows 0-31, then the rest, each row's sum exactly as in any launch (the matrices are small)
+    bf16_rows(x, 32, w, y, N, K, s, w2, y2);
+    bf16_rows(x + size_t(32) * K, M - 32, w, y + size_t(32) * N, N, K, s, w2, y2 ? y2 + size_t(32) * N : nullptr);
+    return;
+  }
   launch_kernel("bf16_rows", bf16_rows_kernel<float>, dim3(w2 ? 2 * N : N), dim3(kBf16RowsThreads), 0, s, x, M, w, y,
                 w2, y2, N, K);
 }
 
 void bf16_rows_bf16in(const __nv_bfloat16* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s) {
-  if (M < 1 || M > 32 || K % (kBf16RowsThreads * 8) != 0) throw std::runtime_error("bf16_rows: M <= 32, K % 1024 == 0");
+  if (M < 1 || M > kMaxStreamRows || K % (kBf16RowsThreads * 8) != 0)
+    throw std::runtime_error("bf16_rows: M <= 64, K % 1024 == 0");
+  if (M > 32) {  // as bf16_rows
+    bf16_rows_bf16in(x, 32, w, y, N, K, s);
+    bf16_rows_bf16in(x + size_t(32) * K, M - 32, w, y + size_t(32) * N, N, K, s);
+    return;
+  }
   launch_kernel("bf16_rows_bf16in", bf16_rows_kernel<__nv_bfloat16>, dim3(N), dim3(kBf16RowsThreads), 0, s, x, M, w,
                 y, nullptr, nullptr, N, K);
 }
@@ -773,9 +786,9 @@ void gdn_recurrent_tree(const float* mixed, const float* g, const float* beta, c
                 state_in, out, H, HV, td);
 }
 
-void tree_gather(const GatherBuf* bufs, int nbufs, const int* rows, int n, DevPos pos, cudaStream_t s) {
+void tree_gather(const GatherBuf* bufs, int nbufs, const int* rows, int n, DevPos pos, cudaStream_t s, int row0) {
   if (nbufs <= 0 || n <= 1) return;
-  launch_kernel("tree_gather", tree_gather_kernel, dim3(nbufs), dim3(256), 0, s, bufs, rows, n, pos);
+  launch_kernel("tree_gather", tree_gather_kernel, dim3(nbufs), dim3(256), 0, s, bufs, rows, n, pos, row0);
 }
 
 void gdn_conv_seqs(float* mixed, SeqPtrs<const float> state, const __nv_bfloat16* w, const SeqBatch& b, int C,

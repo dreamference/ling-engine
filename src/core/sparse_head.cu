@@ -199,7 +199,7 @@ void sparse_head_select(const float* p, int M, const __nv_bfloat16* us, int N, i
                         int cap, void* scratch, int* rows, int* nrows, cudaStream_t s) {
   if (R != kRank) throw std::runtime_error("sparse_head_select: built for rank 256");
   if (fixed_mask.n < 1 || fixed_mask.n > kMaxSeqs) throw std::runtime_error("sparse_head_select: 1 to kMaxSeqs masks");
-  if (M < 1 || M > kMaxStreamRows) throw std::runtime_error("sparse_head_select: M must be in [1, 32]");
+  if (M < 1 || M > kMaxSeqRows) throw std::runtime_error("sparse_head_select: M must be in [1, 32]");  // one sequence
   uint8_t* base = static_cast<uint8_t*>(scratch);
   uint32_t* keys = reinterpret_cast<uint32_t*>(base);
   uint8_t* flags = base + size_t(N) * 4;
@@ -243,12 +243,12 @@ void sparse_head_ids(const int* rows, int* ids, int n, cudaStream_t s) {
 
 void draft_head_rows(const SparseHeadBufs& b, const float* x, int n, int E, const uint8_t* const* masks, int K16,
                      float* vals, int* ids, cudaStream_t s) {
-  if (n < 1 || E < 1 || E > kMaxStreamRows) throw std::runtime_error("draft_head_rows: 1 to 32 rows per sequence");
+  if (n < 1 || E < 1 || E > kMaxSeqRows) throw std::runtime_error("draft_head_rows: 1 to 32 rows per sequence");
   auto check = [](cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string("draft_head_rows: ") + what + ": " + cudaGetErrorString(e));
   };
   // The full head's sequences, as many at a time as fit 32 rows (contiguous in x: in place; else copied together).
-  const int per = kMaxStreamRows / E;
+  const int per = kMaxSeqRows / E;
   std::vector<int> full;
   for (int i = 0; i < n; ++i)
     if (!masks[i]) full.push_back(i);

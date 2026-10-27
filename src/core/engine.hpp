@@ -19,6 +19,7 @@
 #include <chrono>
 #include <exception>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <random>
 #include <span>
@@ -294,6 +295,11 @@ class Engine {
     opts_.lookup_min_match = min_match;
   }
   int draft_block() const { return opts_.draft_block; }
+  // The most rows one sequence's step verifies: its tree's (the chain and the tree's nodes) with trees on, else the
+  // draft block. A batch's row share per sequence (batching P1, ling-serve's scheduler).
+  int step_rows() const;
+  // The rows of the last batched verify (speculate_batch), for the server's metrics.
+  int last_batch_rows() const { return last_batch_rows_; }
   void set_draft_block(int b);
   // Whether speculative steps run as CUDA graphs (false when asked for but unavailable: see step_graphs).
   bool step_graphs() const { return graphs_; }
@@ -351,6 +357,8 @@ class Engine {
   struct Seg {
     Session* s;
     int row0, rows;
+    // Batching P1: a batched verify's tree segment (its device TreeDesc), or nullptr (a chain). forward() takes tree_.
+    const kernels::TreeDesc* td = nullptr;
   };
   void forward_rows(const int* ids, int M, Pass pass, int keep_at, std::span<const Seg> segs);
   // The rows path's linear layers take x through an FP16 copy; `x_ready` reuses the previous call's copy
@@ -366,7 +374,7 @@ class Engine {
   void linear_fp8_residual(const Fp8Weight& w, const float* x, int M, bool x_ready = false);
   // The prefill path (quantized activations, prefill_gemm.cu) or the rows path (stream_gemm.cu)?
   bool quantized(int M) const { return quantized_ || M > kRowsMax; }
-  static constexpr int kRowsMax = 32;  // kernels::kMaxStreamRows
+  static constexpr int kRowsMax = kernels::kMaxStreamRows;  // only a verify has more than 32 rows (batching P1)
   static constexpr int kAttnSlice = 256;
   static constexpr int kResumeAlign = 32;  // kept states sit at multiples of this (the DeltaNet's chunk)  // prefill attention: queries per call (bounds the partials' scratch)
   bool quantized_ = false;                // set by forward(): the pass is a prefill
@@ -528,8 +536,8 @@ class Engine {
     float scores[kernels::kMaxStreamRows * 16 * 16];
     float topk_vals[kernels::kMaxStreamRows * 64];
     int topk_ids[kernels::kMaxStreamRows * 64];
-    kernels::TreeDesc tree;                     // a tree verify's description (BACKLOG 26)
-    int gather_rows[kernels::kMaxStreamRows];  // its accepted path's rows
+    kernels::TreeDesc tree[kernels::kMaxSeqs];  // a tree verify's description (BACKLOG 26), per slot of a batch (P1)
+    int gather_rows[kernels::kMaxSeqs * kernels::kMaxSeqRows];  // its accepted path's rows, kMaxSeqRows per slot
   };
   StepPinned* pin_ = nullptr;
 
@@ -592,16 +600,24 @@ class Engine {
   bool ckpt_match(const Checkpoint& k, const std::vector<int>& prompt, const std::vector<uint64_t>& prefix_hash) const;
 
   // A verify's per-layer DeltaNet inputs, kept for commit(): the in-projection before and after the conv,
-  // the decay and the write strength, for up to 32 rows.
+  // the decay and the write strength, for up to kMaxStreamRows rows (a batched verify's sequences one after another).
   std::vector<float*> v_pre_, v_post_, v_g_, v_beta_;
   float* conv_tmp_ = nullptr;
-  // Tree verification (BACKLOG 26): the device copy of pin_->tree, set as tree_ while a tree verify's pass runs;
-  // tree_grid_ gdn paths launched (fixed per configuration, the unused ones exit at once).
+  // Tree verification (BACKLOG 26): the device copy of pin_->tree[0], set as tree_ while a tree verify's pass runs;
+  // tree_grid_ gdn paths launched (fixed per configuration, the unused ones exit at once). Batching P1: kMaxSeqs
+  // descriptors, tree_dev_[i] a batched verify's slot i (copied from pin_->tree[i]); gather_rows_dev_ kMaxSeqRows per
+  // slot.
   kernels::TreeDesc* tree_dev_ = nullptr;
   const kernels::TreeDesc* tree_ = nullptr;
   int tree_grid_ = 1;
   int* gather_rows_dev_ = nullptr;
-  bool tree_step(const SamplingParams& p, bool use_lookup, bool want_logits, int B) const;
+  int last_batch_rows_ = 0;
+  // Whether a step of session s (B drafted rows, no lookup chain, no row logits) verifies a tree: the one rule for a
+  // step alone and for a sequence in a batch, so both make the same choice.
+  bool tree_step(const Session& s, bool use_lookup, bool want_logits, int B) const;
+  // The tree from sp's chain (its candidates, scores and picks); a full tree worth its rows becomes sp's rows and is
+  // described into td.
+  void plan_tree(StepPlan& sp, int B, const float* scores, bool want_logits, kernels::TreeDesc& td);
 
   // Drafter: target features [rows][layers * hidden] (BF16), its context KV per layer [max_context][kv],
   // and the block's buffers.
@@ -630,7 +646,7 @@ class Engine {
   // The drafter attends to the last sliding_window positions only, so its context KV is a ring of
   // ring_ positions per session, position p at p % ring_ (M4 §1). The slack past the window keeps a resume
   // usable when the session's history ran up to that many tokens past the new prompt (a re-rendered last
-  // output); the extra kMaxStreamRows cover a commit's rows.
+  // output); the extra kMaxSeqRows cover a commit's rows.
   int ring_ = 0;
   struct ShadowRecord {
     int pos;                  // the anchor's position
@@ -680,7 +696,8 @@ class Engine {
     kernels::GatherBuf* gather = nullptr;  // the buffers a tree's accepted path is gathered in (device)
     int ngather = 0;
     std::vector<cudaGraphExec_t> commit_graphs;    // by accepted count + 1
-    std::map<std::pair<int, int>, cudaGraphExec_t> batch_commit_graphs;  // a batched step's: (slot, count), slot > 0
+    // A batched step's: (slot, first row, count), slot > 0 (P1: the first row depends on the earlier slots' trees).
+    std::map<std::tuple<int, int, int>, cudaGraphExec_t> batch_commit_graphs;
     // With commit_overlap, commit_graphs and batch_commit_graphs hold the drafter's context KV only, and these the
     // DeltaNet replay on commit_stream_, keyed by (first row, count).
     std::map<std::pair<int, int>, cudaGraphExec_t> state_commit_graphs;

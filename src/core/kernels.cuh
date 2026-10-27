@@ -66,7 +66,8 @@ void gemv_nvfp4(const float* x, int M, const uint8_t* w, const uint8_t* wscale, 
 // y = wscale * x . W^T, W FP8 E4M3 [N][K]. K must be a multiple of 512.
 void gemv_fp8(const float* x, int M, const uint8_t* w, float wscale, float* y, int N, int K,
               cudaStream_t s);
-// y = x . W^T for narrow BF16 matrices and up to 32 rows, row-invariant (the rows path). K % 1024 == 0.
+// y = x . W^T for narrow BF16 matrices and up to 64 rows (33 to 64 as two launches of the first 32 and the rest: the
+// same arithmetic per row), row-invariant (the rows path). K % 1024 == 0.
 // With w2/y2: a second matrix of the same shape and input in the same launch.
 void bf16_rows(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s,
                const __nv_bfloat16* w2 = nullptr, float* y2 = nullptr);
@@ -75,10 +76,19 @@ void bf16_rows_bf16in(const __nv_bfloat16* x, int M, const __nv_bfloat16* w, flo
 // y = x . W^T, W BF16 [N][K].
 void gemv_bf16(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s);
 
-// ---- Weight-streaming GEMM on tensor cores for 1 to 32 rows (stream_gemm.cu): decode, verify, drafter. ----
+// ---- Weight-streaming GEMM on tensor cores for 1 to 64 rows (stream_gemm.cu): decode, verify, drafter. ----
 // Row-invariant: a row's result is bit-for-bit the same whatever M is, so a token verified in a block of
 // 16 gets exactly the numbers it would get decoded alone.
-constexpr int kMaxStreamRows = 32;
+//
+// Two limits (batching P1, specs/DREAMFERENCE_LING_ENGINE_BATCHING.md §5.1):
+//   - kMaxStreamRows, the rows of one pass: a batched verify's sequences together (two trees of up to 24 rows each
+//     since P1), and every buffer and pinned array sized by a pass's rows. 33 to 64 rows take the stream GEMMs' second
+//     row group (stream_gemm.cu, GROUPS = 2: the weights read once for both groups, each row's arithmetic unchanged);
+//   - kMaxSeqRows, the rows of one sequence: its draft block, its tree (TreeDesc), its commit, the drafter's ring slack,
+//     and the megakernels' tiers (the persistent FFN, DeltaNet and attention kernels take one sequence's verify, or
+//     a batch of two chains, up to 32 rows; a larger pass keeps the separate kernels, which compute the same bits).
+constexpr int kMaxStreamRows = 64;
+constexpr int kMaxSeqRows = 32;
 
 // Tree verification (BACKLOG 26): one verify's rows form a tree under the anchor (row 0) instead of a chain. Row m
 // sits at depth depth[m] (its position is pos0 + depth[m]) and its key and value at cache slot pos0 + m, as a chain's
@@ -93,13 +103,13 @@ constexpr int kMaxStreamRows = 32;
 constexpr int kMaxTreeVariants = 32;
 struct TreeDesc {
   int n = 0;
-  int depth[kMaxStreamRows] = {};
-  int var[kMaxStreamRows] = {};
+  int depth[kMaxSeqRows] = {};
+  int var[kMaxSeqRows] = {};
   int nvar = 0;
-  int path[kMaxTreeVariants][kMaxStreamRows] = {};
+  int path[kMaxTreeVariants][kMaxSeqRows] = {};
   int ngdn = 0;
   int gdn_len[kMaxTreeVariants] = {};
-  int gdn_step[kMaxTreeVariants][2 * kMaxStreamRows] = {};
+  int gdn_step[kMaxTreeVariants][2 * kMaxSeqRows] = {};
   static constexpr int kLeaf = 1 << 8, kWrite = 1 << 9;
 };
 // The verify's conv over a tree: post[m] from pre[m] and its ancestors' pre rows (or the window `state`, unwritten).
@@ -117,7 +127,9 @@ struct GatherBuf {
   int row_bytes;
   int pos_rel;
 };
-void tree_gather(const GatherBuf* bufs, int nbufs, const int* rows, int n, DevPos pos, cudaStream_t s);
+// row0: the sequence's first row in a batched verify (P1): a buffer that is not position-relative holds its row r at
+// row0 + r.
+void tree_gather(const GatherBuf* bufs, int nbufs, const int* rows, int n, DevPos pos, cudaStream_t s, int row0 = 0);
 // The weights stream_gemm reads are tiled (SPEC.md §8, stage 4): each (16-row tile, 128-value chunk) is
 // one contiguous block in the order the warp's lanes read it, so every load covers 512 contiguous bytes
 // (measured: the row-major pattern reads at 215 GB/s, contiguous blocks at 232). NVFP4 blocks carry
@@ -146,7 +158,7 @@ void dequant_tiled_nvfp4(const uint8_t* tw, float scale2, __nv_bfloat16* out, in
                          const uint8_t* raw_scales = nullptr);  // raw_scales: the coded blob's (B26)
 void dequant_tiled_fp8(const uint8_t* tw, float wscale, __nv_bfloat16* out, int N, int K, cudaStream_t s);
 
-// ---- Prefill GEMMs for more than 32 rows (prefill_gemm.cu): block-scaled tensor cores over the same tiled
+// ---- Prefill GEMMs for a prompt's chunks (prefill_gemm.cu): block-scaled tensor cores over the same tiled
 // weights, with the activations quantized as production quantizes them (SPEC.md §11). ----
 // x [M][K] -> NVFP4: q packed [M][K/2] (low nibble first), E4M3 scales sf [M][K/16], global scale
 // 1 / input_scale. K % 16 == 0.
@@ -297,7 +309,7 @@ void draft_head_rows(const SparseHeadBufs& b, const float* x, int n, int E, cons
 // copy into xh2 with xinv2, down into down.y) as one persistent kernel, bit for bit the four kernels. `counters` is
 // kMkFfnWords zeroed words, owned by this call site (the kernel leaves them zeroed). False: a shape or a stream GEMM
 // override (LING_SG_*, LING_KSPLIT) the kernel does not reproduce; nothing was launched.
-constexpr int kMkFfnWords = 5 + kMaxStreamRows;
+constexpr int kMkFfnWords = 5 + kMaxSeqRows;
 // The megakernel's stage 4 (LING_MK_LAYERS, BACKLOG 28): a persistent kernel's last GEMM adds its output into the
 // residual stream h itself (add_inplace's rounding), and, with norm_w, the next norm (rmsnorm_half's row, exactly)
 // follows in the same launch into out (FP32), xh and xinv. Passed as a pointer: nullptr keeps the separate kernels.
@@ -318,7 +330,7 @@ inline bool mk_tail_rows(int M) { return M > 8 && M <= 16; }
 // conv's output into mixed (from conv_state, left unwritten), the recurrence's into core (from state, left unwritten),
 // the gated norm's into normed and its FP16 copy into xh2/xinv2. Bit for bit the graph path's kernels. `counters` is
 // kMkGdnWords zeroed words owned by the call site. False: a shape or override it does not reproduce; nothing launched.
-constexpr int kMkGdnWords = 12 + kMaxStreamRows;
+constexpr int kMkGdnWords = 12 + kMaxSeqRows;
 struct MkGdnParams {
   const __half* xh;
   const float* xinv;

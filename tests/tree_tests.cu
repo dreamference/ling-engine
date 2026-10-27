@@ -279,6 +279,43 @@ void bench_attention() {
 
 }  // namespace
 
+// Batching P1: tree_gather moves a batched sequence's accepted path within its own rows, row0 on in the pass's buffers
+// and from its position in its caches; every other row is left as it was.
+bool check_gather(int row0, int pos) {
+  const int rows = 64, cap = 256, width = 16;  // bytes per row
+  std::vector<uint8_t> a(size_t(rows) * width), b(size_t(cap) * width);
+  for (size_t i = 0; i < a.size(); ++i) a[i] = static_cast<uint8_t>(i * 7 + 3);
+  for (size_t i = 0; i < b.size(); ++i) b[i] = static_cast<uint8_t>(i * 13 + 5);
+  const std::vector<int> path{0, 2, 3, 7, 11};
+  const int n = static_cast<int>(path.size());
+  uint8_t *da, *db;
+  int* dr;
+  cudaMalloc(&da, a.size());
+  cudaMalloc(&db, b.size());
+  cudaMalloc(&dr, n * sizeof(int));
+  cudaMemcpy(da, a.data(), a.size(), cudaMemcpyHostToDevice);
+  cudaMemcpy(db, b.data(), b.size(), cudaMemcpyHostToDevice);
+  cudaMemcpy(dr, path.data(), n * sizeof(int), cudaMemcpyHostToDevice);
+  const k::GatherBuf bufs[2] = {{reinterpret_cast<char*>(da), size_t(width), width, 0},
+                                {reinterpret_cast<char*>(db), size_t(width), width, 1}};
+  k::GatherBuf* dbufs;
+  cudaMalloc(&dbufs, sizeof(bufs));
+  cudaMemcpy(dbufs, bufs, sizeof(bufs), cudaMemcpyHostToDevice);
+  k::tree_gather(dbufs, 2, dr, n, k::DevPos(pos), nullptr, row0);
+  std::vector<uint8_t> ga(a.size()), gb(b.size());
+  cudaMemcpy(ga.data(), da, a.size(), cudaMemcpyDeviceToHost);
+  cudaMemcpy(gb.data(), db, b.size(), cudaMemcpyDeviceToHost);
+  std::vector<uint8_t> ea = a, eb = b;
+  for (int j = 0; j < n; ++j) {
+    std::memcpy(&ea[size_t(row0 + j) * width], &a[size_t(row0 + path[j]) * width], width);
+    std::memcpy(&eb[size_t(pos + j) * width], &b[size_t(pos + path[j]) * width], width);
+  }
+  const bool ok = ga == ea && gb == eb && cudaGetLastError() == cudaSuccess;
+  std::printf("tree_gather row0 %d, position %d: %s\n", row0, pos, ok ? "ok" : "FAIL");
+  cudaFree(da), cudaFree(db), cudaFree(dr), cudaFree(dbufs);
+  return ok;
+}
+
 int main(int argc, char** argv) {
   if (argc > 1 && std::string(argv[1]) == "--bench") {
     k::prepare_kernels();
@@ -296,6 +333,8 @@ int main(int argc, char** argv) {
                                  std::tuple{8, 7, 16}, std::tuple{8, 23, 16}, std::tuple{11, 0, 1}, std::tuple{3, 28, 2},
                                  std::tuple{1, 30, 16}, std::tuple{15, 16, 16}})
     ok &= check_gdn(rng, E, nodes, width);
+  for (auto [row0, pos] : {std::pair{0, 100}, std::pair{12, 100}, std::pair{24, 200}, std::pair{40, 7}})
+    ok &= check_gather(row0, pos);
   std::printf(ok ? "all tree tests passed\n" : "TREE TESTS FAILED\n");
   return ok ? 0 : 1;
 }

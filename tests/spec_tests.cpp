@@ -310,7 +310,7 @@ bool check_tree_desc(uint64_t seed) {
     ling::kernels::TreeDesc d;
     ling::describe_tree(t, d);
     const int n = t.rows();
-    ok &= n <= ling::kernels::kMaxStreamRows && n >= Ec + 1 && t.E == Ec;
+    ok &= n <= ling::kernels::kMaxSeqRows && n >= Ec + 1 && t.E == Ec;
     for (int r = 1; r <= Ec; ++r) ok &= t.parent[r] == r - 1;
     for (int r = 1; r < n; ++r) ok &= t.parent[r] < r && t.depth[r] == t.depth[t.parent[r]] + 1 && t.depth[r] <= E;
     for (int r = 0; r < n; ++r) ok &= d.var[r] >= 0 && d.var[r] < d.nvar && d.path[d.var[r]][t.depth[r]] == r;

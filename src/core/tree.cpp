@@ -48,7 +48,7 @@ DraftTree build_tree(int anchor, const int* cand, const float* scores, int E, in
     add(e, chain_tokens[e], chain_picks[e]);
     prob.push_back(prob[e] * soft(lattice(scores, e, t.pick[e], K16), K16, shape.temp)[chain_picks[e]]);
   }
-  const int limit = std::min(kernels::kMaxStreamRows, E + 1 + shape.nodes);  // E + 1 + nodes rows
+  const int limit = std::min(kernels::kMaxSeqRows, E + 1 + shape.nodes);  // E + 1 + nodes rows
   if (t.rows() >= limit) return t;
   // Best first over the children of every node (max-heap on the path probability; ties to the lower row, then
   // the lower candidate).
@@ -80,7 +80,7 @@ DraftTree build_tree(int anchor, const int* cand, const float* scores, int E, in
 
 int describe_tree(const DraftTree& t, kernels::TreeDesc& d) {
   const int n = t.rows();
-  if (n > kernels::kMaxStreamRows) throw std::runtime_error("tree: more rows than kMaxStreamRows");
+  if (n > kernels::kMaxSeqRows) throw std::runtime_error("tree: more rows than kMaxSeqRows");
   d = kernels::TreeDesc{};
   d.n = n;
   // Variants: one per leaf, in row order (the chain's end, row E, is the first leaf: variant 0 is the chain).

@@ -448,12 +448,15 @@ class Scheduler {
     return !r.prefilling && r.spec && ctx_.engine->can_batch(r.job.session, r.job.req.sampling);
   }
   // The requests that step with r (r first, then the others in running order) while their rows fit one pass;
-  // just r, or nothing, when there is no batch to form.
+  // just r, or nothing, when there is no batch to form. Batching P1: each sequence's row share is what its step
+  // verifies alone (its tree with trees on: up to 24 rows, else the draft block), so a batch of two verifies two trees
+  // in one pass of up to 48 rows; at most two sequences until P2 (three and four in one pass, §5.2 of the batching spec).
   std::vector<Running*> batch_with(Running& r) const {
     std::vector<Running*> b;
     if (!batchable(r)) return b;
     b.push_back(&r);
-    const int fit = kernels::kMaxStreamRows / ctx_.engine->draft_block();
+    constexpr int kMaxBatch = 2;  // P2 raises it
+    const int fit = std::min(kMaxBatch, kernels::kMaxStreamRows / ctx_.engine->step_rows());
     for (const auto& o : running_)
       if (o.get() != &r && static_cast<int>(b.size()) < fit && batchable(*o)) b.push_back(o.get());
     return b;
@@ -488,7 +491,7 @@ class Scheduler {
     {
       std::lock_guard<std::mutex> m(ctx_.metrics.mu);
       ctx_.metrics.batched_steps += 1;
-      ctx_.metrics.batch_rows = static_cast<int>(batch.size()) * eng.draft_block();  // a full block each
+      ctx_.metrics.batch_rows = eng.last_batch_rows();  // the verify's rows: each sequence's tree or chain
     }
     for (size_t i = 0; i < batch.size(); ++i) {
       Running& r = *batch[i];

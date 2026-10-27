@@ -56,9 +56,9 @@
 // in chunks of --prefill-chunk-contended tokens while the other decodes alone, then the two batched, each way
 // round. Per sequence the tokens, the state, the steps and the accepted drafts must equal the prompt decoded
 // alone (speculatively, from a cold engine, under the same seed). With --graphs the runs alone and the batch both
-// replay step graphs (the batch path's own since stage 4). A batch verifies the chain, so the check runs with tree
-// verification (BACKLOG 26, on by default) off: the runs alone then take the chain as well, step for step (LING_TREE
-// set in the environment still overrides this).
+// replay step graphs (the batch path's own since stage 4). Since batching P1 each sequence of a batch verifies the
+// tree it verifies alone (BACKLOG 26, on by default; LING_TREE=0 checks the chains), so the runs alone and the
+// batches take the same trees step for step, and the check covers the trees' per-segment kernels, gathers and commits.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -181,7 +181,6 @@ int main(int argc, char** argv) {
     opts.sparse_head_dir = sparse_head_dir;
     opts.sparse_head_dynamic = sparse_head_dynamic;
     opts.sessions = sessions;
-    if (batch_check) opts.tree_nodes = 0;  // the chain alone, as a batch verifies (see --batch-check above)
     opts.side_prefill = side_prefill;
     ling::Engine engine(model, opts);
     auto t1 = std::chrono::steady_clock::now();
