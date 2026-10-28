@@ -736,22 +736,22 @@ int Engine::kv_pages_free() {
 
 int Engine::kv_session_pages(int session) const { return kv_reclaimable({session}, false); }
 
-int Engine::kv_reclaimable(const std::vector<int>& sessions, bool store) const {
+int Engine::kv_reclaimable(const std::vector<int>& sessions, bool store, const std::vector<int>& store_keep) const {
   if (!kv_book_) return 0;
   std::vector<const std::vector<int>*> refs;
   for (int i : sessions) refs.push_back(&sessions_.at(i).kv_ids);
   std::vector<std::vector<int>> tree;
-  if (store && kv_tree_) tree = kv_tree_->page_lists();
+  if (store && kv_tree_) tree = kv_tree_->page_lists(store_keep);
   for (const std::vector<int>& t : tree) refs.push_back(&t);
   return kv_book_->reclaimable(refs);
 }
 
 int Engine::kv_store_pages() const { return kv_reclaimable({}, true); }
 
-bool Engine::kv_store_evict() {
+bool Engine::kv_store_evict(const std::vector<int>& keep) {
   if (!kv_tree_ || !kv_book_) return false;
   bool evicted = false;
-  kv_store_dropped([&] { evicted = kv_tree_->evict_lru_leaf(); });
+  kv_store_dropped([&] { evicted = kv_tree_->evict_lru_leaf(keep); });
   return evicted;
 }
 
@@ -763,10 +763,18 @@ void Engine::kv_store_dropped(const std::function<void()>& op) {
   if (kv_book_ && kv_book_->pending_pages() > pending) kv_record_release();
 }
 
-int Engine::kv_admit_need(int session, const std::vector<int>& prompt, uint64_t scope) const {
+int Engine::kv_admit_need(int session, const std::vector<int>& prompt, uint64_t scope, KvSource* src) const {
   if (!kv_book_ || prompt.empty()) return 0;
   const Session& s = sessions_.at(session);
-  return kv_resume_need(s, plan_resume(s, prompt, false, scope), prompt.size());
+  const ResumePlan plan = plan_resume(s, prompt, false, scope);
+  const int need = kv_resume_need(s, plan, prompt);
+  if (src) {
+    *src = KvSource{};
+    if (plan.from_kv) src->store_path = plan.kvm.path;
+    else if (plan.donor) src->donor = static_cast<int>(plan.donor - sessions_.data());
+    src->cold = std::max(need, kv_resume_need(s, plan_resume(s, prompt, true, scope), prompt));
+  }
+  return need;
 }
 
 int Engine::kv_step_need(int session, bool spec) const {
@@ -1814,7 +1822,7 @@ Engine::ResumePlan Engine::plan_resume(const Session& self, const std::vector<in
   return plan;
 }
 
-int Engine::kv_resume_need(const Session& self, const ResumePlan& plan, size_t L) const {
+int Engine::kv_resume_need(const Session& self, const ResumePlan& plan, const std::vector<int>& prompt) const {
   std::vector<int> tree;
   const std::vector<int>* donor = nullptr;
   if (plan.from_kv) {
@@ -1823,7 +1831,33 @@ int Engine::kv_resume_need(const Session& self, const ResumePlan& plan, size_t L
   } else if (plan.donor) {
     donor = &plan.donor->kv_ids;
   }
-  return kv_book_->resume_need(self.kv_ids, plan.reuse, kv_admit_pages(L), donor);
+  const int L = static_cast<int>(prompt.size());
+  const int pages = kv_admit_pages(prompt.size());
+  int need = kv_book_->resume_need(self.kv_ids, plan.reuse, pages, donor);
+  // The store's hold covers the pages up to its last cut: when that cut falls in the page position L is in, the store
+  // shares the page the first decode step writes, which copies it first (one page more; counted even when the store
+  // holds that run already, and only when the pool could hold it at all).
+  if (kv_tree_ && kv_tree_->paged() && L < opts_.max_context && pages < kv_book_->capacity()) {
+    const std::vector<int> cuts = kv_store_cuts(prompt, plan.branch_at);
+    if (!cuts.empty() && KvPool::index_of(cuts.back() - 1) == KvPool::index_of(L)) need += 1;
+  }
+  return need;
+}
+
+std::vector<int> Engine::kv_store_cuts(const std::vector<int>& prompt, int branch_at) const {
+  const int L = static_cast<int>(prompt.size());
+  auto align = [](int p) { return p - p % kResumeAlign; };
+  std::vector<int> cuts;
+  for (int i = 0, messages = 0; i < L && messages < 2; ++i)
+    if (prompt[i] == opts_.boundary_token) {
+      if (align(i + 1) > 0) cuts.push_back(align(i + 1));
+      ++messages;
+    }
+  if (branch_at > 0) cuts.push_back(branch_at);
+  std::erase_if(cuts, [&](int c) { return c >= L || c > opts_.checkpoint_limit; });
+  std::sort(cuts.begin(), cuts.end());
+  cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+  return cuts;
 }
 
 Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool from_scratch,
@@ -1839,7 +1873,7 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   // it needs them). Checked first, so a short pool changes nothing (ling-serve's scheduler admits a request only when
   // kv_admit_need pages are free).
   if (kv_book_) {
-    const int need = kv_resume_need(*s_, plan0, prompt.size());
+    const int need = kv_resume_need(*s_, plan0, prompt);
     if (need > kv_book_->free_pages()) kv_retire(false);
     if (need > kv_book_->free_pages()) kv_retire(true);
     if (need > kv_book_->free_pages())
@@ -1998,18 +2032,8 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   // What this prompt adds to the prefix KV store at its end: its first tokens up to the furthest of its first two
   // message ends and its branch point (the part another conversation can share), with states at those positions.
   if (kv_tree_) {
-    std::vector<int> cuts;
-    for (int i = 0, messages = 0; i < L && messages < 2; ++i)
-      if (prompt[i] == opts_.boundary_token) {
-        if (align(i + 1) > 0) cuts.push_back(align(i + 1));
-        ++messages;
-      }
-    if (branch_at > 0) cuts.push_back(branch_at);
-    std::erase_if(cuts, [&](int c) { return c >= L || c > opts_.checkpoint_limit; });
-    std::sort(cuts.begin(), cuts.end());
-    cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
-    cur.kv_q = cuts.empty() ? 0 : cuts.back();
-    cur.kv_cuts = cuts;
+    cur.kv_cuts = kv_store_cuts(prompt, branch_at);
+    cur.kv_q = cur.kv_cuts.empty() ? 0 : cur.kv_cuts.back();
   }
   cur.snap_at = align(L);  // the end-of-prompt state is kept here (the tokens after it are re-prefilled)
   cur.window = window;

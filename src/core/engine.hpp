@@ -436,13 +436,23 @@ class Engine {
   int kv_pages_pending() const { return kv_book_ ? kv_book_->pending_pages() : 0; }
   // The pages evicting session i frees (P4c: those it shares with another session or the prefix KV store stay).
   int kv_session_pages(int session) const;
-  // P4c: the pages freed once the listed sessions and, with `store`, the prefix KV store let go of theirs (a page
-  // every one of whose references is among them).
-  int kv_reclaimable(const std::vector<int>& sessions, bool store) const;
-  // P4c: the pages evicting the whole prefix KV store frees, and the eviction of its least recently used leaf (the
-  // pool's first reclaim, before idle sessions); false when the store is empty.
+  // P4c: the pages freed once the listed sessions and, with `store`, the prefix KV store's nodes other than
+  // `store_keep` let go of theirs (a page every one of whose references is among them).
+  int kv_reclaimable(const std::vector<int>& sessions, bool store, const std::vector<int>& store_keep = {}) const;
+  // P4c: the pages evicting the whole prefix KV store frees, and the eviction of its least recently used leaf other
+  // than the nodes in `keep` (the pool's first reclaim, before idle sessions); false when no such leaf is left.
   int kv_store_pages() const;
-  bool kv_store_evict();
+  bool kv_store_evict(const std::vector<int>& keep = {});
+  // P4c: where an admission's prompt resumes from, for the scheduler's reclaim (serve/kv_policy.hpp kv_reclaim): the
+  // session whose pages it maps (-1 for none, or the session's own), the prefix KV store nodes whose pages it maps
+  // (empty unless it resumes from the store), and what a prefill of it from scratch draws from the pool, the most
+  // its need can become whatever is evicted (evictions only make pages private, and every resume point maps fewer
+  // pages than none).
+  struct KvSource {
+    int donor = -1;
+    std::vector<int> store_path;
+    int cold = 0;
+  };
   // What begin_prefill of `prompt` in session i draws from the pool, net (KvPool::resume_need): it plans where the
   // prompt resumes as begin_prefill does (plan_resume: the session's own state, another session's, or the prefix KV
   // store's), maps that source's pages for [0, reuse) by reference, gives back the session's pages past the prompt's
@@ -450,7 +460,8 @@ class Engine {
   // (a private copy of the page the resume point falls in when it is shared). Exact for an unchanged engine, so a
   // scheduler that admits only when this many pages are free never sees begin_prefill throw; pages counted as
   // shared that are let go of before it runs make it throw KvPoolExhausted with nothing changed.
-  int kv_admit_need(int session, const std::vector<int>& prompt, uint64_t scope = 0) const;
+  // `src`, when given, gets the plan's source.
+  int kv_admit_need(int session, const std::vector<int>& prompt, uint64_t scope = 0, KvSource* src = nullptr) const;
   // The pages a prompt of `prompt_len` tokens maps in all (its end plus kKvGrowthPages pages): more than
   // kv_pages_total() and it can never run.
   int kv_admit_pages(size_t prompt_len) const { return KvPool::pages_for(kv_target(prompt_len)); }
@@ -804,8 +815,14 @@ class Engine {
   };
   // `scope`: the share scope the prompt runs in (self's history counts only when it is self's).
   ResumePlan plan_resume(const Session& self, const std::vector<int>& prompt, bool from_scratch, uint64_t scope) const;
-  // KvPool::resume_need of the plan, for session `self` and a prompt of L tokens.
-  int kv_resume_need(const Session& self, const ResumePlan& plan, size_t L) const;
+  // KvPool::resume_need of the plan, for session `self` and a prompt of L tokens, plus the page the first decode step
+  // copies when the prefix KV store will share it (kv_store_cuts: the store's last cut falls in the page that holds
+  // position L, so the store holds a reference to the page the session writes next).
+  int kv_resume_need(const Session& self, const ResumePlan& plan, const std::vector<int>& prompt) const;
+  // The positions a prefill of `prompt` (branch point `branch_at`) adds to the prefix KV store at its end, ascending:
+  // the end of its first two messages and its branch point, below its end and checkpoint_limit. The last one is
+  // PrefillCursor::kv_q.
+  std::vector<int> kv_store_cuts(const std::vector<int>& prompt, int branch_at) const;
 
   // A verify's per-layer DeltaNet inputs, kept for commit(): the in-projection before and after the conv,
   // the decay and the write strength, for up to 32 rows.
