@@ -64,6 +64,8 @@
 // would leave less than the first of MemAvailable, and answers a generation request HTTP 503 (code host_memory_low)
 // while MemAvailable is below the second. 0 switches either off. Neither changes what an admitted request computes.
 //
+// --plan-only: print the start plan (sessions, batch, context, planned_bytes) as one JSON line on stdout and exit 0 before
+// anything is allocated; the launcher's pre-load host-safety check runs it so it checks the engine's own plan.
 // --auto-size 1|0 (default 1; LING_AUTO_SIZE overrides; BATCHING §5.6, the owner's decision of 2026-10-28): what is
 // not given of --sessions and --max-context is chosen at start from MemAvailable by the same plan the start check
 // uses: the model's full context (config.json's max_position_embeddings) and as many sessions as fit, at most 4; the
@@ -1387,6 +1389,7 @@ int main(int argc, char** argv) {
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
   bool kv_pages = false;
+  bool plan_only = false;  // print the start plan as one JSON line and exit 0 before anything is allocated
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 0, batch = 0, contended = 256, side_prefill = 40, side_share = 16;
   // --sessions, --max-context and --batch as given; what is not given is chosen at start (--auto-size).
   std::optional<int> sessions_arg, max_context_arg, batch_arg;
@@ -1446,6 +1449,7 @@ int main(int argc, char** argv) {
     else if (a == "--host-reserve-mb") host_reserve_mb = std::stol(next());
     else if (a == "--admit-reserve-mb") admit_reserve_mb = std::stol(next());
     else if (a == "--auto-size") auto_size = std::stol(next());
+    else if (a == "--plan-only") plan_only = true;
     else if (a == "--repetition-detection") repetition_arg = next();
     else if (a == "--repetition-report") repetition_report = next();
     else {
@@ -1454,7 +1458,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
     return 2;
   }
   for (auto [flag, v] : {std::pair<const char*, std::optional<int>>{"--sessions", sessions_arg},
@@ -1586,6 +1590,16 @@ int main(int argc, char** argv) {
               << as::gb(mp.weights + mp.scratch) << ", " << as::gb(mp.per_session) << " a session, kept free "
               << (host_reserve_mb > 0 ? as::gb(size_t(host_reserve_mb) << 20) : std::string("none")) << ", planned "
               << as::gb(mp.total()) << "; requests refused below " << admit_reserve_mb << " MB\n";
+  }
+  if (plan_only) {  // the host-safety check of the launcher asks for this before it loads (BATCHING §5.6)
+    namespace as = ling::serve;
+    const ling::ModelConfig cfg = ling::ModelConfig::from_file(model_dir + "/config.json");
+    const size_t weights = as::checkpoint_bytes(model_dir) + as::checkpoint_bytes(draft_dir);
+    const size_t scratch = as::kScratchBytes + (opts.vision ? size_t(1100 + vision_cache_mb) << 20 : 0);
+    const as::MemoryPlan mp = as::plan_memory(cfg, weights, sessions, max_context, !draft_dir.empty(), scratch);
+    std::cout << "{\"sessions\":" << sessions << ",\"batch\":" << std::min(batch, sessions)
+              << ",\"max_context\":" << max_context << ",\"planned_bytes\":" << mp.total() << "}\n";
+    return 0;
   }
   opts.max_context = max_context;
   opts.sessions = sessions;
