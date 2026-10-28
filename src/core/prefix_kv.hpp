@@ -118,6 +118,8 @@ class PrefixKvTree {
   int buffers() const;
   bool paged() const { return paged_; }
   int pages_held() const;  // the page references the tree holds, a page counted once per node holding it
+  // Paged mode: each live node's page ids (its references; KvPool::reclaimable counts what evicting them frees).
+  std::vector<std::vector<int>> page_lists() const;
 
  private:
   struct Node {

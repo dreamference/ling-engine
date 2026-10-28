@@ -396,7 +396,25 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
       ops.store = [this](void* buf, int buf_start, int buf_len, int from, int to) {
         kv_copy(buf, buf_start, buf_len, from, to, true);
       };
-      kv_tree_ = std::make_unique<PrefixKvTree>(size, per_token, state, std::move(ops));
+      if (kv_book_) {
+        // P4c paged mode: a node holds a reference to each pool page of the active session its run overlaps (the
+        // session that just prefilled the prompt, kv_insert), no copy; the arena holds the states only.
+        ops.hold = [this](int from, int to) -> std::vector<int> {
+          const int a = KvPool::index_of(from), b = KvPool::index_of(to - 1);
+          if (b >= static_cast<int>(s_->kv_ids.size())) return {};
+          for (int j = a; j <= b; ++j)
+            if (s_->kv_ids[j] == 0) return {};
+          std::vector<int> ids;
+          for (int j = a; j <= b; ++j) {
+            kv_book_->retain(s_->kv_ids[j]);
+            ids.push_back(s_->kv_ids[j]);
+          }
+          return ids;
+        };
+        ops.retain = [this](int page) { kv_book_->retain(page); };
+        ops.drop = [this](int page) { kv_book_->release(page); };
+      }
+      kv_tree_ = std::make_unique<PrefixKvTree>(size, kv_book_ ? 0 : per_token, state, std::move(ops));
       std::fprintf(stderr, "prefix KV store: %zu MB of %d asked (%zu MB free after the engine's own memory, %zu kept free; %zu KB a token, %zu MB a state)\n",
                    size >> 20, mb, free_b >> 20, reserve >> 20, per_token >> 10, state >> 20);
     } else {
@@ -534,7 +552,7 @@ Engine::~Engine() {
 void Engine::reset() {
   reset_session();
   ckpts_.clear();
-  if (kv_tree_) kv_tree_->clear();
+  if (kv_tree_) kv_store_dropped([&] { kv_tree_->clear(); });
 }
 
 void Engine::reset_session() {
@@ -622,7 +640,7 @@ void Engine::reset_all() {
   }
   s_ = &sessions_[0];
   ckpts_.clear();
-  if (kv_tree_) kv_tree_->clear();
+  if (kv_tree_) kv_store_dropped([&] { kv_tree_->clear(); });
 }
 
 const SpecStats& Engine::session_spec_stats(int i) {
@@ -671,23 +689,13 @@ int Engine::sessions_resident() const {
 }
 
 void Engine::kv_pages_adopt(const Session& from, int n) {
-  // P4b: the active session's own pages for [0, n) first (begin_prefill checked that the pool has them); P4c maps
-  // `from`'s pages instead of copying them.
-  kv_ensure(*s_, 0, n, stream_);
-  // Whole pages: a position of the last page past n is beyond the history, never read before it is written again.
-  // Runs of pages contiguous in both tables go as one copy.
-  const int np = (n + kernels::kKvPageTokens - 1) / kernels::kKvPageTokens;
-  for (int j = 0; j < np;) {
-    int k = j + 1;
-    while (k < np && from.page_host[k] == from.page_host[k - 1] + kv_page_elems_ &&
-           s_->page_host[k] == s_->page_host[k - 1] + kv_page_elems_)
-      ++k;
-    if (from.page_host[j] != s_->page_host[j])
-      check(cudaMemcpyAsync(kv_pool_ + s_->page_host[j], kv_pool_ + from.page_host[j],
-                            size_t(k - j) * kv_page_elems_ * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream_),
-            "session KV page copy");
-    j = k;
-  }
+  // P4c: the active session maps `from`'s pages for [0, n) (a reference each), no copy. The last of them may be only
+  // partly inside [0, n): whichever of the two writes it next gets a private copy first (kv_ensure's copy-on-write;
+  // begin_prefill's own kv_ensure from n on does it for the active session before its first chunk).
+  const int pending = kv_book_->pending_pages();
+  kv_book_->share(s_->kv_ids, from.kv_ids, n);
+  kv_table_sync(*s_, stream_);
+  if (kv_book_->pending_pages() > pending) kv_record_release();  // pages the active session mapped there before
 }
 
 // ---- The KV page pool (P4b, BATCHING §5.3). ----
@@ -713,10 +721,33 @@ int Engine::kv_pages_free() {
   return kv_book_->free_pages();
 }
 
-int Engine::kv_session_pages(int session) const {
-  int n = 0;
-  for (int p : sessions_.at(session).kv_ids) n += p != 0;
-  return n;
+int Engine::kv_session_pages(int session) const { return kv_reclaimable({session}, false); }
+
+int Engine::kv_reclaimable(const std::vector<int>& sessions, bool store) const {
+  if (!kv_book_) return 0;
+  std::vector<const std::vector<int>*> refs;
+  for (int i : sessions) refs.push_back(&sessions_.at(i).kv_ids);
+  std::vector<std::vector<int>> tree;
+  if (store && kv_tree_) tree = kv_tree_->page_lists();
+  for (const std::vector<int>& t : tree) refs.push_back(&t);
+  return kv_book_->reclaimable(refs);
+}
+
+int Engine::kv_store_pages() const { return kv_reclaimable({}, true); }
+
+bool Engine::kv_store_evict() {
+  if (!kv_tree_ || !kv_book_) return false;
+  bool evicted = false;
+  kv_store_dropped([&] { evicted = kv_tree_->evict_lru_leaf(); });
+  return evicted;
+}
+
+void Engine::kv_store_dropped(const std::function<void()>& op) {
+  // A store call that may drop page references (an eviction, a clear, an insert making room): the pages it lets go
+  // of are freed only once every stream has passed this point, as any release.
+  const int pending = kv_book_ ? kv_book_->pending_pages() : 0;
+  op();
+  if (kv_book_ && kv_book_->pending_pages() > pending) kv_record_release();
 }
 
 int Engine::kv_admit_need(int session, size_t prompt_len) const {
@@ -1022,20 +1053,31 @@ void Engine::kv_copy(void* buf, int buf_start, int buf_len, int from, int to, bo
 
 void Engine::kv_restore(const PrefixKvTree::Match& m, int n) {
   join_commit();
-  if (kv_pages_) kv_ensure(*s_, 0, n, stream_);  // P4b: the pages the store's KV is copied into
+  if (kv_tree_->paged()) {
+    // P4c: the store's pages for [0, n) mapped into the active session (a reference each), no copy; the partly used
+    // last one is copied by begin_prefill's kv_ensure before the session writes it.
+    const int pending = kv_book_->pending_pages();
+    kv_book_->share(s_->kv_ids, kv_tree_->pages(m, n), n);
+    kv_table_sync(*s_, stream_);
+    if (kv_book_->pending_pages() > pending) kv_record_release();
+    return;
+  }
   for (const PrefixKvTree::Segment& g : kv_tree_->segments(m, n))
     kv_copy(const_cast<void*>(g.buf), g.buf_start, g.buf_len, g.from, g.to, false);
 }
 
 void Engine::kv_insert(const PrefillCursor& cur) {
-  const std::vector<std::pair<int, int>> want = kv_tree_->insert(cur.prompt, cur.kv_q, cur.kv_cuts, cur.kv_epoch);
-  // Each cut's state from the checkpoint store (this prefill saved them; one the store had no room for is left out).
-  for (const auto& [node, pos] : want)
-    for (const Checkpoint& k : ckpts_)
-      if (k.pos == pos && std::equal(k.tokens.begin(), k.tokens.end(), cur.prompt.begin())) {
-        if (void* st = kv_tree_->add_state(node, cur.kv_epoch)) copy_slot(state_view(st), ckpt_slots_[k.slot]);
-        break;
-      }
+  // Paged (P4c): the new nodes hold the active session's pages; making room in the budget may drop older nodes'.
+  kv_store_dropped([&] {
+    const std::vector<std::pair<int, int>> want = kv_tree_->insert(cur.prompt, cur.kv_q, cur.kv_cuts, cur.kv_epoch);
+    // Each cut's state from the checkpoint store (this prefill saved them; one the store had no room for is left out).
+    for (const auto& [node, pos] : want)
+      for (const Checkpoint& k : ckpts_)
+        if (k.pos == pos && std::equal(k.tokens.begin(), k.tokens.end(), cur.prompt.begin())) {
+          if (void* st = kv_tree_->add_state(node, cur.kv_epoch)) copy_slot(state_view(st), ckpt_slots_[k.slot]);
+          break;
+        }
+  });
 }
 
 void Engine::copy_slot(const StateSlot& dst, const StateSlot& src) {
@@ -1846,6 +1888,12 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
     // stops half way for memory); the session's pages past them were released above. The session's own pages below
     // that point stay and are rewritten in place: they are private, and every position past `reuse` is written by this
     // prefill or a later pass before anything reads it, as in a flat slot (a masked key is never read).
+    // P4c: the pages it shares (with the prefix KV store or another session) from the first whole page past `reuse`
+    // on are dropped instead (fresh pages, no copy of what is overwritten); kv_ensure copies the one `reuse` falls in.
+    const int pending = kv_book_->pending_pages();
+    kv_book_->unshare(s_->kv_ids, reuse);
+    kv_table_sync(*s_, stream_);
+    if (kv_book_->pending_pages() > pending) kv_record_release();
     kv_ensure(*s_, reuse, kv_target(prompt.size()), stream_);
   }
 
