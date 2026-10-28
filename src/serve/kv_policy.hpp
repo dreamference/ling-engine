@@ -49,21 +49,20 @@ using KvEvictNext = std::function<bool()>;
 // P4c: makes room for a unit (an admission, a decode step) by evicting holders, with pages shared between them.
 // need(): the unit's need planned now (it changes as holders go: a page the unit shares with an evicted holder becomes
 // its own, an evicted source makes it resume earlier); have(): the free and pending pages now. `kept`: the holders
-// that may go without changing where the unit resumes from, in eviction order, `reach_kept` have() once all of them
-// are gone (pages counted jointly); `source`: the unit's own source (its store path, its donor), `reach_all` have()
-// once those are gone too, and `bound` the most need() can be then (a prefill from scratch). Evicts along `kept`
-// while need() > have() when that can be enough (need() <= reach_kept: the need only falls along `kept`), else along
-// `kept` then `source` when `bound` <= reach_all or `must` (nothing else will free pages: evict until it fits or
-// nothing is left); otherwise nothing. Returns need() <= have() at the end.
+// that may go without changing where the unit resumes from, in eviction order; `need_kept` the unit's need once all of
+// them are gone and `reach_kept` have() then (pages counted jointly). `source`: the unit's own source (its store path,
+// its donor); `need_all` the most the unit can need once those are gone too (a prefill from scratch, a step) and
+// `reach_all` have() then. Evicts along `kept` while need() > have() when that is enough (need_kept <= reach_kept),
+// else along `kept` then `source` when that is (need_all <= reach_all) or `must` (nothing else will free pages: evict
+// until it fits or nothing is left); otherwise nothing. Returns need() <= have() at the end.
 inline bool kv_reclaim(const std::function<int()>& need, const std::function<int()>& have,
-                       const std::vector<KvEvictNext>& kept, int reach_kept, const std::vector<KvEvictNext>& source,
-                       int reach_all, int bound, bool must) {
-  const int n = need();
-  if (n <= have()) return true;
+                       const std::vector<KvEvictNext>& kept, int need_kept, int reach_kept,
+                       const std::vector<KvEvictNext>& source, int need_all, int reach_all, bool must) {
+  if (need() <= have()) return true;
   std::vector<const KvEvictNext*> order;
   for (const KvEvictNext& e : kept) order.push_back(&e);
-  if (n > reach_kept) {
-    if (!must && bound > reach_all) return false;
+  if (need_kept > reach_kept) {
+    if (!must && need_all > reach_all) return false;
     for (const KvEvictNext& e : source) order.push_back(&e);
   }
   for (const KvEvictNext* e : order)

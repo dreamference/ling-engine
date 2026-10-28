@@ -636,11 +636,16 @@ class Scheduler {
   // unit's own source (`src`: the store path and the session an admission resumes from) last. Evicted pages, and
   // pages already released, are free once the streams have passed their release (a later turn), or at once after a
   // synchronization when nothing runs. *evicted: whether it evicted anything.
-  bool kv_make_room(const std::function<int()>& need, int keep, const Engine::KvSource& src, bool* evicted = nullptr) {
+  // need(gone, from_scratch): the unit's need planned now (nullptr), or with those holders gone (Engine::KvGone; an
+  // admission from position 0 with from_scratch).
+  using KvNeed = std::function<int(const Engine::KvGone*, bool)>;
+  bool kv_make_room(const KvNeed& need_with, int keep, const Engine::KvSource& src, bool* evicted = nullptr) {
     Engine& eng = *ctx_.engine;
-    const int n = need();
-    if (n > eng.kv_pages_free() + eng.kv_pages_pending()) {
-      const KvPoolView kept = kv_view(keep, nullptr, src.donor, src.store_path), all = kv_view(keep);
+    const std::function<int()> need = [&] { return need_with(nullptr, false); };
+    if (need() > eng.kv_pages_free() + eng.kv_pages_pending()) {
+      Engine::KvGone gone_kept{{}, true, src.store_path}, gone_all{{}, true, {}};
+      const KvPoolView kept = kv_view(keep, &gone_kept.sessions, src.donor, src.store_path),
+                       all = kv_view(keep, &gone_all.sessions);
       std::vector<bool> excl(eng.sessions(), false), excl_kept;
       for (const auto& r : running_) excl[r->job.session] = true;
       if (keep >= 0) excl[keep] = true;
@@ -671,8 +676,8 @@ class Scheduler {
       const std::vector<KvEvictNext> kept_order = {store(src.store_path), session(excl_kept)};
       const std::vector<KvEvictNext> source_order = {store(no_nodes), session(excl)};
       kv_reclaim(need, [&eng] { return eng.kv_pages_free() + eng.kv_pages_pending(); }, kept_order,
-                 kept.free + kept.pending + kept.idle, source_order, all.free + all.pending + all.idle,
-                 std::max(src.cold, n), running_.empty() && src.cold > 0);
+                 need_with(&gone_kept, false), kept.free + kept.pending + kept.idle, source_order,
+                 need_with(&gone_all, true), all.free + all.pending + all.idle, running_.empty() && src.cold > 0);
       if (dropped > 0) {
         if (evicted) *evicted = true;
         std::fprintf(stderr, "KV pool: %d prefix KV store entries evicted for %d pages; %d free, %d pending\n", dropped,
@@ -687,12 +692,17 @@ class Scheduler {
     Engine& eng = *ctx_.engine;
     Engine::KvSource src;
     eng.kv_admit_need(s, j.prompt, j.req.share_scope, &src);
-    return kv_make_room([&] { return eng.kv_admit_need(s, j.prompt, j.req.share_scope); }, s, src, evicted);
+    return kv_make_room(
+        [&](const Engine::KvGone* gone, bool from_scratch) {
+          return eng.kv_admit_need(s, j.prompt, j.req.share_scope, nullptr, gone, from_scratch);
+        },
+        s, src, evicted);
   }
   // Whether r's next decode step has its KV pages (Engine::kv_step_need), making room as kv_make_room does.
   bool kv_room(Running& r) {
     Engine& eng = *ctx_.engine;
-    return kv_make_room([&] { return eng.kv_step_need(r.job.session, r.spec); }, r.job.session, Engine::KvSource{});
+    return kv_make_room([&](const Engine::KvGone* gone, bool) { return eng.kv_step_need(r.job.session, r.spec, gone); },
+                        r.job.session, Engine::KvSource{});
   }
   // A decode turn waited for pages. When every running request waits: pages being freed are waited for, else the
   // last resort ends the request admitted last as if it had reached the context limit (finish_reason "length") and

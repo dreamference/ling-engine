@@ -453,6 +453,14 @@ class Engine {
     std::vector<int> store_path;
     int cold = 0;
   };
+  // P4c: holders taken as gone when a need is planned (the scheduler's reclaim gates: what a unit needs once the
+  // holders evicted for it have let go, a page they shared with it its own then): sessions, and with `store` the
+  // prefix KV store's nodes other than `store_keep`.
+  struct KvGone {
+    std::vector<int> sessions;
+    bool store = false;
+    std::vector<int> store_keep;
+  };
   // What begin_prefill of `prompt` in session i draws from the pool, net (KvPool::resume_need): it plans where the
   // prompt resumes as begin_prefill does (plan_resume: the session's own state, another session's, or the prefix KV
   // store's), maps that source's pages for [0, reuse) by reference, gives back the session's pages past the prompt's
@@ -460,14 +468,17 @@ class Engine {
   // (a private copy of the page the resume point falls in when it is shared). Exact for an unchanged engine, so a
   // scheduler that admits only when this many pages are free never sees begin_prefill throw; pages counted as
   // shared that are let go of before it runs make it throw KvPoolExhausted with nothing changed.
-  // `src`, when given, gets the plan's source.
-  int kv_admit_need(int session, const std::vector<int>& prompt, uint64_t scope = 0, KvSource* src = nullptr) const;
+  // `src`, when given, gets the plan's source. With `gone`, planned as if those holders had let go (the plan's
+  // source among them is not taken out of the plan: the scheduler names it only with `from_scratch`, a prefill from
+  // position 0).
+  int kv_admit_need(int session, const std::vector<int>& prompt, uint64_t scope = 0, KvSource* src = nullptr,
+                    const KvGone* gone = nullptr, bool from_scratch = false) const;
   // The pages a prompt of `prompt_len` tokens maps in all (its end plus kKvGrowthPages pages): more than
   // kv_pages_total() and it can never run.
   int kv_admit_pages(size_t prompt_len) const { return KvPool::pages_for(kv_target(prompt_len)); }
   // The pages the next decode step of session i maps (a speculative one: every row its verify may write, the tree's
   // included; else one row). speculate() and speculate_batch() map them before anything else of the step.
-  int kv_step_need(int session, bool spec) const;
+  int kv_step_need(int session, bool spec, const KvGone* gone = nullptr) const;
   // Session i's pages released and the session emptied (an idle conversation evicted for the pool's sake: its next
   // turn prefills from scratch or from the prefix KV store). The slot becomes free for a new session.
   void kv_evict(int session);
@@ -818,7 +829,10 @@ class Engine {
   // KvPool::resume_need of the plan, for session `self` and a prompt of L tokens, plus the page the first decode step
   // copies when the prefix KV store will share it (kv_store_cuts: the store's last cut falls in the page that holds
   // position L, so the store holds a reference to the page the session writes next).
-  int kv_resume_need(const Session& self, const ResumePlan& plan, const std::vector<int>& prompt) const;
+  int kv_resume_need(const Session& self, const ResumePlan& plan, const std::vector<int>& prompt,
+                     const KvGone* gone = nullptr) const;
+  // The references of the holders `gone` names (tree: the store's lists, which refs points into).
+  void kv_gone_refs(const KvGone& gone, std::vector<std::vector<int>>& tree, KvPool::Refs& refs) const;
   // The positions a prefill of `prompt` (branch point `branch_at`) adds to the prefix KV store at its end, ascending:
   // the end of its first two messages and its branch point, below its end and checkpoint_limit. The last one is
   // PrefillCursor::kv_q.

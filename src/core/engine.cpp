@@ -738,12 +738,16 @@ int Engine::kv_session_pages(int session) const { return kv_reclaimable({session
 
 int Engine::kv_reclaimable(const std::vector<int>& sessions, bool store, const std::vector<int>& store_keep) const {
   if (!kv_book_) return 0;
-  std::vector<const std::vector<int>*> refs;
-  for (int i : sessions) refs.push_back(&sessions_.at(i).kv_ids);
   std::vector<std::vector<int>> tree;
-  if (store && kv_tree_) tree = kv_tree_->page_lists(store_keep);
-  for (const std::vector<int>& t : tree) refs.push_back(&t);
+  KvPool::Refs refs;
+  kv_gone_refs(KvGone{sessions, store, store_keep}, tree, refs);
   return kv_book_->reclaimable(refs);
+}
+
+void Engine::kv_gone_refs(const KvGone& gone, std::vector<std::vector<int>>& tree, KvPool::Refs& refs) const {
+  for (int i : gone.sessions) refs.push_back(&sessions_.at(i).kv_ids);
+  if (gone.store && kv_tree_) tree = kv_tree_->page_lists(gone.store_keep);
+  for (const std::vector<int>& t : tree) refs.push_back(&t);
 }
 
 int Engine::kv_store_pages() const { return kv_reclaimable({}, true); }
@@ -763,11 +767,12 @@ void Engine::kv_store_dropped(const std::function<void()>& op) {
   if (kv_book_ && kv_book_->pending_pages() > pending) kv_record_release();
 }
 
-int Engine::kv_admit_need(int session, const std::vector<int>& prompt, uint64_t scope, KvSource* src) const {
+int Engine::kv_admit_need(int session, const std::vector<int>& prompt, uint64_t scope, KvSource* src,
+                          const KvGone* gone, bool from_scratch) const {
   if (!kv_book_ || prompt.empty()) return 0;
   const Session& s = sessions_.at(session);
-  const ResumePlan plan = plan_resume(s, prompt, false, scope);
-  const int need = kv_resume_need(s, plan, prompt);
+  const ResumePlan plan = plan_resume(s, prompt, from_scratch, scope);
+  const int need = kv_resume_need(s, plan, prompt, gone);
   if (src) {
     *src = KvSource{};
     if (plan.from_kv) src->store_path = plan.kvm.path;
@@ -777,10 +782,13 @@ int Engine::kv_admit_need(int session, const std::vector<int>& prompt, uint64_t 
   return need;
 }
 
-int Engine::kv_step_need(int session, bool spec) const {
+int Engine::kv_step_need(int session, bool spec, const KvGone* gone) const {
   if (!kv_book_) return 0;
   const Session& s = sessions_.at(session);
-  return kv_book_->needed(s.kv_ids, s.pos, s.pos + kv_step_rows(s, spec));
+  std::vector<std::vector<int>> tree;
+  KvPool::Refs refs;
+  if (gone) kv_gone_refs(*gone, tree, refs);
+  return kv_book_->needed(s.kv_ids, s.pos, s.pos + kv_step_rows(s, spec), gone ? &refs : nullptr);
 }
 
 void Engine::kv_record_release() {
@@ -1822,7 +1830,8 @@ Engine::ResumePlan Engine::plan_resume(const Session& self, const std::vector<in
   return plan;
 }
 
-int Engine::kv_resume_need(const Session& self, const ResumePlan& plan, const std::vector<int>& prompt) const {
+int Engine::kv_resume_need(const Session& self, const ResumePlan& plan, const std::vector<int>& prompt,
+                           const KvGone* gone) const {
   std::vector<int> tree;
   const std::vector<int>* donor = nullptr;
   if (plan.from_kv) {
@@ -1833,7 +1842,10 @@ int Engine::kv_resume_need(const Session& self, const ResumePlan& plan, const st
   }
   const int L = static_cast<int>(prompt.size());
   const int pages = kv_admit_pages(prompt.size());
-  int need = kv_book_->resume_need(self.kv_ids, plan.reuse, pages, donor);
+  std::vector<std::vector<int>> gone_tree;
+  KvPool::Refs gone_refs;
+  if (gone) kv_gone_refs(*gone, gone_tree, gone_refs);
+  int need = kv_book_->resume_need(self.kv_ids, plan.reuse, pages, donor, gone ? &gone_refs : nullptr);
   // The store's hold covers the pages up to its last cut: when that cut falls in the page position L is in, the store
   // shares the page the first decode step writes, which copies it first (one page more; counted even when the store
   // holds that run already, and only when the pool could hold it at all).

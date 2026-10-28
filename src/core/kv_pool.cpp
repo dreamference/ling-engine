@@ -19,12 +19,30 @@ int KvPool::take() {
   return p;
 }
 
-int KvPool::needed(const std::vector<int>& table, int from, int to) const {
+namespace {
+// The references `gone` lists, per page.
+std::unordered_map<int, int> listed_refs(const KvPool::Refs* gone) {
+  std::unordered_map<int, int> listed;
+  if (gone)
+    for (const std::vector<int>* r : *gone)
+      if (r)
+        for (int p : *r)
+          if (p > 0) ++listed[p];
+  return listed;
+}
+}  // namespace
+
+int KvPool::needed(const std::vector<int>& table, int from, int to, const Refs* gone) const {
+  const std::unordered_map<int, int> listed = listed_refs(gone);
+  auto refs = [&](int p) {
+    const auto it = listed.find(p);
+    return refs_[p] - (it == listed.end() ? 0 : it->second);
+  };
   const int n = pages_for(to), w0 = index_of(from);
   int need = 0;
   for (int i = 0; i < n; ++i) {
     const int p = i < static_cast<int>(table.size()) ? table[i] : 0;
-    if (p == 0 || (i >= w0 && from < to && refs_[p] > 1)) ++need;
+    if (p == 0 || (i >= w0 && from < to && refs(p) > 1)) ++need;
   }
   return need;
 }
@@ -88,9 +106,12 @@ void KvPool::unshare(std::vector<int>& table, int n) {
     }
 }
 
-int KvPool::resume_need(const std::vector<int>& table, int reuse, int pages, const std::vector<int>* donor) const {
-  // The sequence of calls replayed on a copy of the table, with the reference changes it makes kept aside.
-  std::unordered_map<int, int> delta;
+int KvPool::resume_need(const std::vector<int>& table, int reuse, int pages, const std::vector<int>* donor,
+                        const Refs* gone) const {
+  // The sequence of calls replayed on a copy of the table, with the reference changes it makes kept aside (the
+  // references `gone` lists released before it).
+  std::unordered_map<int, int> delta = listed_refs(gone);
+  for (auto& [p, k] : delta) k = -k;
   auto refs = [&](int p) {
     const auto it = delta.find(p);
     return refs_.at(p) + (it == delta.end() ? 0 : it->second);
@@ -137,12 +158,8 @@ int KvPool::resume_need(const std::vector<int>& table, int reuse, int pages, con
   return std::max(take - freed, 0);
 }
 
-int KvPool::reclaimable(const std::vector<const std::vector<int>*>& refs) const {
-  std::unordered_map<int, int> listed;
-  for (const std::vector<int>* r : refs)
-    if (r)
-      for (int p : *r)
-        if (p > 0) ++listed[p];
+int KvPool::reclaimable(const Refs& refs) const {
+  const std::unordered_map<int, int> listed = listed_refs(&refs);
   int n = 0;
   for (const auto& [p, k] : listed) n += k >= refs_.at(p);
   return n;

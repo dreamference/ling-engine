@@ -221,12 +221,49 @@ void policy() {
   check(kv_verdict(10, v) == KvVerdict::Go && kv_verdict(15, v) == KvVerdict::Retire &&
             kv_verdict(35, v) == KvVerdict::Reclaim && kv_verdict(36, v) == KvVerdict::Wait,
         "verdicts: go, retire, reclaim, wait");
-  // Victims: least recently used first, only as many as needed, none when all would not do.
-  const std::vector<int> lru = {3, 1, 2}, pages = {4, 0, 9};
-  check(kv_victims(15, v, lru, pages).empty(), "no victim when the free and pending pages do");
-  check(kv_victims(17, v, lru, pages) == std::vector<int>{3}, "the least recently used first");
-  check(kv_victims(20, v, lru, pages) == (std::vector<int>{3, 2}), "a session holding nothing is skipped");
-  check(kv_victims(29, v, lru, pages).empty(), "nothing evicted when even all would not make enough");
+  // Reclaim (kv_reclaim): kept tier in order, stops once need() <= have(); source tier only when need() > reach_kept
+  // and (bound <= reach_all or must); nothing evicted when need() > reach_kept, bound > reach_all and !must.
+  std::vector<int> ev;
+  auto reclaim = [&](int need0, int bound, bool must) {
+    ev.clear();
+    int cur_need = need0, cur_have = 15, i0 = 0, i1 = 0, is = 0;
+    const int g0[] = {4}, g1[] = {0, 9}, gs[] = {4, 2};
+    const std::vector<KvEvictNext> kept = {
+        [&] {
+          if (i0 >= 1) return false;
+          cur_have += g0[i0++];
+          ev.push_back(0);
+          return true;
+        },
+        [&] {
+          if (i1 >= 2) return false;
+          cur_have += g1[i1++];
+          ev.push_back(1);
+          return true;
+        },
+    };
+    const std::vector<KvEvictNext> source = {[&] {
+      if (is >= 2) return false;
+      cur_have += gs[is++];
+      cur_need = std::max(cur_need, bound);
+      ev.push_back(2);
+      return true;
+    }};
+    return kv_reclaim([&] { return cur_need; }, [&] { return cur_have; }, kept, need0, 28, source, bound, 34, must);
+  };
+  check(reclaim(15, 20, false) && ev.empty(), "reclaim: no eviction when have() already covers need()");
+  check(reclaim(17, 30, false) && ev == std::vector<int>{0},
+        "reclaim: kept tier evicted first and stops as soon as need() <= have()");
+  check(reclaim(20, 30, false) && ev == (std::vector<int>{0, 1, 1}),
+        "reclaim: kept tier evicted in order, source tier untouched when kept is enough");
+  check(reclaim(29, 34, false) && ev == (std::vector<int>{0, 1, 1, 2, 2}),
+        "reclaim: source tier used when need() > reach_kept and bound <= reach_all");
+  check(!reclaim(29, 35, false) && ev.empty(),
+        "reclaim: nothing evicted when need() > reach_kept, bound > reach_all and !must");
+  check(reclaim(29, 32, true) && ev == (std::vector<int>{0, 1, 1, 2}),
+        "reclaim: with must=true evicts into source and stops as soon as need() <= have()");
+  check(!reclaim(29, 35, true) && ev == (std::vector<int>{0, 1, 1, 2, 2}),
+        "reclaim: with must=true evicts until nothing is left and returns need() <= have()");
   // The last resort: only when every running request waits and none could get its pages; the last admitted ends.
   const KvPoolView full{0, 0, 0};
   check(kv_last_resort({{1, true, 1}, {3, true, 1}, {2, true, 1}}, full) == 1, "the request admitted last ends");
@@ -240,29 +277,33 @@ void policy() {
   KvPool pool(13);
   std::vector<std::vector<int>> t(3);
   std::vector<int> pos(3, 0);
-  auto view = [&](int keep, const std::vector<bool>& busy, std::vector<int>* order, std::vector<int>* held) {
-    KvPoolView w{pool.free_pages(), pool.pending_pages(), 0};
-    for (int s = 0; s < 3; ++s) {  // the LRU order here is the session index
-      if (s == keep || busy[s]) continue;
-      int n = 0;
-      for (int p : t[s]) n += p != 0;
-      w.idle += n;
-      if (order) order->push_back(s);
-      if (held) held->push_back(n);
-    }
-    return w;
+  auto view = [&](int keep, const std::vector<bool>& busy) {
+    std::vector<const std::vector<int>*> refs;
+    for (int s = 0; s < 3; ++s)  // the LRU order here is the session index
+      if (s != keep && !busy[s]) refs.push_back(&t[s]);
+    return KvPoolView{pool.free_pages(), pool.pending_pages(), pool.reclaimable(refs)};
   };
   auto admit = [&](int s, int prompt, const std::vector<bool>& busy) {
-    const int need = pool.needed(t[s], 0, prompt + 2 * T);
-    std::vector<int> order, held;
-    const KvPoolView w = view(s, busy, &order, &held);
-    const KvVerdict d = kv_verdict(need, w);
-    if (d == KvVerdict::Wait) return false;
-    for (int x : kv_victims(need, w, order, held)) {
-      pool.truncate(t[x], 0);
-      pos[x] = 0;
-    }
-    pool.retire();  // nothing runs in this model: the deferred frees retire at once
+    auto need = [&] { return pool.needed(t[s], 0, prompt + 2 * T); };
+    auto have = [&] { return pool.free_pages() + pool.pending_pages(); };
+    const KvPoolView w = view(s, busy);
+    const int reach = w.free + w.pending + w.idle;
+    int next = 0;
+    const std::vector<KvEvictNext> kept = {[&] {
+      for (; next < 3; ++next) {
+        if (next == s || busy[next]) continue;
+        bool held = false;
+        for (int p : t[next]) held = held || p != 0;
+        if (!held) continue;
+        pool.truncate(t[next], 0);
+        pos[next] = 0;
+        pool.retire();  // nothing runs in this model: the deferred frees retire at once
+        ++next;
+        return true;
+      }
+      return false;
+    }};
+    if (!kv_reclaim(need, have, kept, need(), reach, {}, need(), reach, false)) return false;
     if (!pool.ensure(t[s], 0, prompt + 2 * T, nullptr)) return false;
     pos[s] = prompt;
     return true;
@@ -284,13 +325,13 @@ void policy() {
   for (; steps < 1000 && ended < 0; ++steps) {
     const int i = steps % 2, s = sess[i];
     runners[i].need = pool.needed(t[s], pos[s], pos[s] + 16);
-    if (kv_verdict(runners[i].need, view(-1, {true, false, true}, nullptr, nullptr)) == KvVerdict::Go) {
+    if (kv_verdict(runners[i].need, view(-1, {true, false, true})) == KvVerdict::Go) {
       pool.ensure(t[s], pos[s], pos[s] + 16, nullptr);
       pos[s] += 5;  // a step accepts a few of its 16 rows; the rest are rewritten by the next
       runners[i].waiting = false;
     } else {
       runners[i].waiting = true;
-      ended = kv_last_resort(runners, view(-1, {true, false, true}, nullptr, nullptr));
+      ended = kv_last_resort(runners, view(-1, {true, false, true}));
     }
   }
   check(ended == 1 && pool.free_pages() < 2, "a full pool ends the request admitted last");
@@ -310,11 +351,211 @@ void policy() {
     check(KvPool::net_need({0, 5, 0, 7}, 2) == 0 && KvPool::net_need({0, 5, 0, 7}, 3) == 1,
           "net need: holes below count, pages past are given back");
     // The conversation's next turn needs all 12 pages: its 10 stay, 2 come from evicting the idle session.
-    const KvPoolView w{p2.free_pages(), p2.pending_pages(), 2};
+    const KvPoolView w{p2.free_pages(), p2.pending_pages(), p2.reclaimable({&b})};
     check(kv_verdict(KvPool::net_need(a, 12), w) == KvVerdict::Reclaim, "the next turn reclaims the idle session");
     p2.truncate(b, 0);
     p2.retire();
     check(p2.ensure(a, 10 * T, 12 * T, nullptr) && p2.free_pages() == 0, "and the pool is exactly full");
+  }
+
+  // P4c played out with shared pages:
+  // (a) idle+idle: two idle sessions share most of their pages; each alone reclaims only its private pages, jointly
+  // they reclaim all; a need that only the pair covers is met by evicting both in LRU order.
+  {
+    KvPool p(7);  // 6 usable pages
+    std::vector<int> a, b, c;
+    p.ensure(a, 0, 5 * T, nullptr);        // a maps 5 pages
+    p.share(b, a, 3 * T);                  // b shares the first 3 with a
+    p.ensure(b, 3 * T, 4 * T, nullptr);    // and maps 1 private page; pool is full (0 free)
+    check(p.reclaimable({&a}) == 2 && p.reclaimable({&b}) == 1 && p.reclaimable({&a, &b}) == 6,
+          "idle+idle: each alone reclaims only its private pages, jointly they reclaim all");
+    std::vector<int> evicted;
+    int next = 0;
+    std::vector<int>* idle[2] = {&a, &b};
+    const int reach = p.free_pages() + p.reclaimable({&a, &b});
+    auto need = [&] { return p.resume_need(c, 0, 5, nullptr); };
+    auto have = [&] { return p.free_pages() + p.pending_pages(); };
+    const std::vector<KvEvictNext> kept = {[&] {
+      if (next >= 2) return false;
+      p.truncate(*idle[next], 0);
+      p.retire();
+      evicted.push_back(next++);
+      return true;
+    }};
+    check(kv_reclaim(need, have, kept, 5, reach, {}, 5, reach, false) && evicted == (std::vector<int>{0, 1}),
+          "idle+idle: need covered only by the pair evicts both in LRU order");
+    check(p.ensure(c, 0, 5 * T, nullptr) && p.free_pages() == 1, "idle+idle: the admitted unit fits");
+  }
+  // (b) keep+store: the admitting session `keep` shares pages with the store past its resume point; its need falls
+  // once the store is evicted (no unshare copy), fitting although the store's own joint count (excluding keep) was 0.
+  {
+    KvPool p(6);  // 5 usable pages
+    std::vector<int> keep, store;
+    p.ensure(keep, 0, 4 * T, nullptr);  // keep holds 4 pages, 1 page free
+    p.share(store, keep, 4 * T);        // store shares all 4 with keep
+    check(p.reclaimable({&store}) == 0, "keep+store: store's joint count excluding keep is 0");
+    auto need = [&] { return p.resume_need(keep, T, 5, nullptr); };
+    auto have = [&] { return p.free_pages() + p.pending_pages(); };
+    check(need() == 4 && have() == 1, "keep+store: before evicting the store, unsharing 3 shared pages needs 4 pages");
+    bool store_evicted = false;
+    const int reach = have() + p.reclaimable({&store});
+    const std::vector<KvEvictNext> kept = {[&] {
+      if (store_evicted) return false;
+      store_evicted = true;
+      p.truncate(store, 0);
+      p.retire();
+      return true;
+    }};
+    // The gate plans the need with the store gone (its shared pages keep's own then): 1, which the free page covers,
+    // so the store goes although nothing is reclaimable from it alone and `must` is false (something runs).
+    const KvPool::Refs gone = {&store};
+    const int need_kept = p.resume_need(keep, T, 5, nullptr, &gone);
+    check(need_kept == 1, "keep+store: planned with the store gone, the need is 1");
+    check(kv_reclaim(need, have, kept, need_kept, reach, {}, need_kept, reach, false) && store_evicted && need() == 1,
+          "keep+store: evicting the store drops resume_need to 1 so it fits");
+    p.truncate(keep, 5 * T);
+    p.unshare(keep, T);
+    p.retire();
+    check(p.ensure(keep, T, 5 * T, nullptr) && p.free_pages() == 0, "keep+store: the unit fits without unshare copies");
+  }
+  // (c) running+store: pages shared by a running session and the store free nothing when the store is evicted; reach
+  // is counted without them and kv_reclaim with !must returns false without evicting when nothing else is enough.
+  {
+    KvPool p(7);  // 6 usable pages
+    std::vector<int> running, store, keep;
+    p.ensure(running, 0, 4 * T, nullptr);  // running holds 4 pages
+    p.share(store, running, 4 * T);        // store shares those 4 pages (1 page private to store, 1 page free)
+    p.ensure(store, 4 * T, 5 * T, nullptr);
+    check(p.reclaimable({&store}) == 1, "running+store: evicting the store frees none of the running session's pages");
+    KvPool play = p;
+    std::vector<int> play_store = store;
+    play.truncate(play_store, 0);
+    play.retire();
+    check(play.free_pages() - p.free_pages() == 1, "running+store: truncating the store frees only its private page");
+    bool store_evicted = false;
+    auto need = [&] { return p.resume_need(keep, 0, 3, nullptr); };
+    auto have = [&] { return p.free_pages() + p.pending_pages(); };
+    const int reach = have() + p.reclaimable({&store});
+    const std::vector<KvEvictNext> kept = {[&] {
+      if (store_evicted) return false;
+      store_evicted = true;
+      p.truncate(store, 0);
+      p.retire();
+      return true;
+    }};
+    check(reach == 2 && !kv_reclaim(need, have, kept, 3, reach, {}, 3, reach, false) && !store_evicted,
+          "running+store: kv_reclaim with !must refuses without evicting when reach is not enough");
+  }
+  // (d) donor protection: a plan resuming from a donor session's pages evicts only the other idle session when that is
+  // enough (the donor survives); when it is not enough and must=true, the donor goes last, need() is re-planned as a
+  // cold prefill and the prompt fits.
+  {
+    KvPool p(7);  // 6 usable pages
+    std::vector<int> donor, other, keep;
+    p.ensure(donor, 0, 4 * T, nullptr);  // donor holds 4 pages
+    p.ensure(other, 0, 2 * T, nullptr);  // other idle session holds 2 pages; 0 free
+    check(p.reclaimable({&other}) == 2 && p.reclaimable({&other, &donor}) == 6,
+          "donor protection: kept and all reclaimable counts");
+    bool other_evicted = false, donor_evicted = false;
+    auto need = [&] {
+      return donor_evicted ? p.resume_need(keep, 0, 6, nullptr) : p.resume_need(keep, 4 * T, 6, &donor);
+    };
+    auto have = [&] { return p.free_pages() + p.pending_pages(); };
+    const int reach_kept = have() + p.reclaimable({&other});
+    const int reach_all = have() + p.reclaimable({&other, &donor});
+    const std::vector<KvEvictNext> kept = {[&] {
+      if (other_evicted) return false;
+      other_evicted = true;
+      p.truncate(other, 0);
+      p.retire();
+      return true;
+    }};
+    const std::vector<KvEvictNext> source = {[&] {
+      if (donor_evicted) return false;
+      donor_evicted = true;
+      p.truncate(donor, 0);
+      p.retire();
+      return true;
+    }};
+    const KvPool::Refs gone_kept = {&other};
+    const int need_kept = p.resume_need(keep, 4 * T, 6, &donor, &gone_kept);
+    check(need_kept == 2 && reach_kept == 2, "donor protection: with the other session gone the warm plan needs 2");
+    check(kv_reclaim(need, have, kept, need_kept, reach_kept, source, 6, reach_all, false) && other_evicted &&
+              !donor_evicted,
+          "donor protection: only the other idle session is evicted when it suffices, donor survives");
+    p.share(keep, donor, 4 * T);
+    p.truncate(keep, 6 * T);
+    p.unshare(keep, 4 * T);
+    p.retire();
+    check(p.ensure(keep, 4 * T, 6 * T, nullptr) && p.free_pages() == 0,
+          "donor protection: warm prefill from the surviving donor fits");
+  }
+  {
+    KvPool p(7);  // 6 usable pages
+    std::vector<int> donor, other, keep;
+    p.ensure(donor, 0, 5 * T, nullptr);  // donor holds 5 pages (keep reuses 3 of them)
+    p.ensure(other, 0, 1 * T, nullptr);  // other idle session holds 1 page; 0 free
+    check(p.reclaimable({&other}) == 1 && p.reclaimable({&other, &donor}) == 6,
+          "donor protection (cold fallback): kept reclaims 1, all reclaims 6");
+    std::vector<int> evicted;
+    bool donor_gone = false;
+    auto need = [&] { return donor_gone ? p.resume_need(keep, 0, 6, nullptr) : p.resume_need(keep, 3 * T, 6, &donor); };
+    auto have = [&] { return p.free_pages() + p.pending_pages(); };
+    const int reach_kept = have() + p.reclaimable({&other});
+    const int reach_all = have() + p.reclaimable({&other, &donor});
+    const std::vector<KvEvictNext> kept = {[&] {
+      if (!evicted.empty()) return false;
+      p.truncate(other, 0);
+      p.retire();
+      evicted.push_back(0);
+      return true;
+    }};
+    const std::vector<KvEvictNext> source = {[&] {
+      if (donor_gone) return false;
+      donor_gone = true;
+      p.truncate(donor, 0);
+      p.retire();
+      evicted.push_back(1);
+      return true;
+    }};
+    const KvPool::Refs gone_kept = {&other};
+    const int need_kept = p.resume_need(keep, 3 * T, 6, &donor, &gone_kept);
+    check(need_kept == 3 && reach_kept == 1, "donor protection (cold fallback): the warm plan needs 3, kept frees 1");
+    check(kv_reclaim(need, have, kept, need_kept, reach_kept, source, 6, reach_all, true) &&
+              evicted == (std::vector<int>{0, 1}) &&
+              need() == 6,
+          "donor protection (cold fallback): kept not enough, must: the donor goes last, need re-plans cold");
+    check(p.ensure(keep, 0, 6 * T, nullptr) && p.free_pages() == 0,
+          "donor protection (cold fallback): cold prefill fits once donor is evicted");
+  }
+  // (e) copy-on-write of the decode page: a session at position L (L % 64 != 0) whose page index_of(L) the store also
+  // references needs 1 page for the copy; after the store releases it, 0.
+  {
+    KvPool p(3);  // 2 usable pages
+    const int L = T + 10;
+    std::vector<int> s, store;
+    p.ensure(s, 0, L, nullptr);  // 2 pages mapped, 0 free
+    p.share(store, s, L);        // store also references page index_of(L)
+    check(p.reclaimable({&store}) == 0 && p.needed(s, L, L + 1) == 1,
+          "decode cow: shared page at index_of(L) needs 1 page for copy-on-write, store joint count is 0");
+    bool store_evicted = false;
+    auto need = [&] { return p.needed(s, L, L + 1); };
+    auto have = [&] { return p.free_pages() + p.pending_pages(); };
+    const int reach = have() + p.reclaimable({&store});
+    const std::vector<KvEvictNext> kept = {[&] {
+      if (store_evicted) return false;
+      store_evicted = true;
+      p.truncate(store, 0);
+      p.retire();
+      return true;
+    }};
+    const KvPool::Refs gone = {&store};
+    const int need_kept = p.needed(s, L, L + 1, &gone);
+    check(need_kept == 0, "decode cow: planned with the store gone, the step writes in place");
+    check(kv_reclaim(need, have, kept, need_kept, reach, {}, need_kept, reach, false) && store_evicted && need() == 0,
+          "decode cow: after the store is evicted, needed(s, L, L + 1) is 0");
+    std::vector<KvPool::Copy> copies;
+    check(p.ensure(s, L, L + 1, &copies) && copies.empty(), "decode cow: decode step writes in place without a copy");
   }
 }
 
