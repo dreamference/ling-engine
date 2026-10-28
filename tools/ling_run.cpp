@@ -954,7 +954,7 @@ int main(int argc, char** argv) {
         if (engine.kv_paged()) {  // P4b: a short pool takes idle sessions' pages, least recently used first
           std::vector<bool> busy(engine.sessions(), false);
           busy[si] = true;
-          while (engine.kv_admit_need(si, prompts[i].size()) > engine.kv_pages_free()) {
+          while (engine.kv_admit_need(si, prompts[i]) > engine.kv_pages_free()) {
             const int victim = engine.kv_lru_idle(busy);
             if (victim < 0) break;
             std::fprintf(stderr, "prefix-check: session %d evicted for KV pages\n", victim);

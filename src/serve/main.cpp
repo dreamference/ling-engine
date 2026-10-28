@@ -418,7 +418,7 @@ class Scheduler {
       if (eng.kv_paged() && eng.kv_admit_pages(queue_[j].prompt.size()) <= eng.kv_pages_total()) {
         // (A prompt whose pages the whole pool could never hold is admitted to be answered at once: start().)
         bool evicted = false;
-        if (!kv_make_room(eng.kv_admit_need(s, queue_[j].prompt.size()), s, &evicted)) {
+        if (!kv_make_room(eng.kv_admit_need(s, queue_[j].prompt), s, &evicted)) {
           kv_wait_ = true;
           // An eviction emptied sessions the other jobs' matches above may name: look again from the start.
           if (evicted) return false;

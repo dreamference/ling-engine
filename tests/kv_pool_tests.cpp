@@ -401,10 +401,47 @@ void resume() {
   check(d[0] != 0 && d[1] != 0, "unshare: keeps private pages");
 }
 
+// P4c regression: admission with shared pages. P4b counted a new prompt's pages as KvPool::net_need (the session's
+// unmapped pages below the prompt's end less its pages past it), assuming its pages below the end are its own and
+// rewritten in place. Once the prefix KV store shares them, a prompt that diverges early drops the shared ones past the
+// resume point (unshare) and maps fresh pages there: more than net_need. Engine::kv_admit_need now plans the resume
+// point first and counts KvPool::resume_need, which this checks against the calls begin_prefill makes: a pool with
+// exactly that many free pages runs them, one page fewer refuses, and so does P4b's count.
+void admission() {
+  const int reuse = T, prompt = 5 * T, pages = KvPool::pages_for(prompt + 2 * T);  // 7 page indices
+  auto run = [&](int spare, int* need, int* p4b) {
+    KvPool pool(1 + 5 + spare);
+    std::vector<int> a, store;
+    pool.ensure(a, 0, 5 * T, nullptr);  // the session's last prompt: 5 pages, the pool's other `spare` free
+    for (int i = 0; i < 4; ++i) {       // the store holds its first four (kv_insert, paged)
+      pool.retain(a[i]);
+      store.push_back(a[i]);
+    }
+    *need = pool.resume_need(a, reuse, pages, nullptr);
+    *p4b = KvPool::net_need(a, pages);
+    // begin_prefill: truncate past the prompt's pages, unshare past reuse, ensure(reuse, end).
+    pool.truncate(a, pages * T);
+    pool.unshare(a, reuse);
+    pool.retire();
+    std::vector<KvPool::Copy> copies;
+    const bool ok = pool.ensure(a, reuse, pages * T, &copies);
+    if (ok)
+      for (int i = 1; i < 4; ++i) check(a[i] != store[i] && pool.refs(store[i]) == 1, "admission: the store's pages untouched");
+    return ok;
+  };
+  int need = 0, p4b = 0;
+  check(run(64, &need, &p4b), "admission: a large pool runs the prefill");
+  check(need == 5 && p4b == 2, "admission: three shared pages past the resume point are mapped afresh (5), P4b counted 2");
+  check(run(need, &need, &p4b), "admission: exactly resume_need free pages suffice");
+  check(!run(need - 1, &need, &p4b), "admission: one page fewer does not");
+  check(!run(p4b, &need, &p4b), "admission: P4b's count would have admitted a prefill that cannot map its pages");
+}
+
 int main() {
   basics();
   sharing();
   resume();
+  admission();
   random_walk();
   plan();
   policy();
