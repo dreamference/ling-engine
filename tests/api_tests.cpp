@@ -2,7 +2,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -192,8 +194,125 @@ static void test_repetition() {
   }
 }
 
+// The Responses route's items and events (ResponseItems), the model's text pushed one byte at a time as tokens arrive:
+// every text delta names an item that is open (added, not yet done), each item's deltas add up to its final text, every
+// item added is done once, in output order, and whitespace after a call opens no item (SGLang's rule). Before
+// 2026-10-28 the "\n" between two calls went out as a delta of the message the first call had closed (night 17,
+// django-12741: "I'll make the changes now." and four calls to apply_patch, which the tools did not offer).
+struct ItemsRun {
+  json output;
+  int text_deltas = 0, orphan_deltas = 0, added = 0, done = 0;
+  bool consistent = true;  // per item: deltas == final text, done once, output_index == position
+};
+
+static ItemsRun run_items(const json& tools, bool reasoning, const std::string& text,
+                          std::vector<std::string> custom = {}) {
+  using ling::serve::ResponseItems;
+  ItemsRun r;
+  std::map<std::string, std::string> streamed;  // item id -> deltas so far
+  std::map<std::string, int> index_of;          // open item id -> output_index
+  std::set<std::string> seen;
+  auto emit = [&](const std::string& type, json p) {
+    if (type == "response.output_item.added") {
+      ++r.added;
+      const std::string id = p["item"]["id"];
+      if (seen.count(id)) r.consistent = false;
+      seen.insert(id);
+      index_of[id] = p["output_index"];
+    } else if (type == "response.output_text.delta" || type == "response.reasoning_text.delta") {
+      if (type == "response.output_text.delta") ++r.text_deltas;
+      const std::string id = p["item_id"];
+      if (!index_of.count(id) || index_of[id] != p["output_index"].get<int>()) ++r.orphan_deltas;
+      streamed[id] += p["delta"].get<std::string>();
+    } else if (type == "response.output_item.done") {
+      ++r.done;
+      const json& item = p["item"];
+      const std::string id = item["id"];
+      if (!index_of.count(id) || index_of[id] != p["output_index"].get<int>()) r.consistent = false;
+      if (item["type"] == "message" && item["content"][0]["text"] != streamed[id]) r.consistent = false;
+      if (item["type"] == "reasoning" && item["content"][0]["text"] != streamed[id]) r.consistent = false;
+      index_of.erase(id);
+    }
+  };
+  OutputParser p(reasoning, tools);
+  ResponseItems items(std::move(custom), emit);
+  for (char c : text) items.deliver(p.push(std::string(1, c)));
+  items.deliver(p.finish());
+  items.close();
+  r.output = items.output();
+  if (!index_of.empty()) r.consistent = false;  // an item added and never done
+  for (size_t i = 0; i < r.output.size(); ++i)
+    if (!seen.count(r.output[i]["id"].get<std::string>())) r.consistent = false;
+  return r;
+}
+
+static std::string types_of(const json& output) {
+  std::string t;
+  for (const json& item : output) t += (t.empty() ? "" : ",") + item["type"].get<std::string>();
+  return t;
+}
+
+static void test_response_items() {
+  const json exec_only = json::parse(R"([{"type":"function","function":{"name":"exec","parameters":{"type":"object",
+    "properties":{"input":{"type":"string"}},"required":["input"]}}}])");
+  const std::string patch_call =
+      "<tool_call>\n<function=apply_patch>\n<parameter=input>\n*** Begin Patch\n*** End Patch\n</parameter>\n"
+      "</function>\n</tool_call>";
+  const std::string exec_call =
+      "<tool_call>\n<function=exec>\n<parameter=input>\ntext(1);\n</parameter>\n</function>\n</tool_call>";
+  {
+    // django-12741's shape: a message, then four calls separated by "\n".
+    auto r = run_items(exec_only, false,
+                       "I'll make the changes now.\n\n" + patch_call + "\n" + patch_call + "\n" + patch_call + "\n" + patch_call);
+    EXPECT(r.orphan_deltas == 0);
+    EXPECT(r.consistent);
+    EXPECT(types_of(r.output) == "message,function_call,function_call,function_call,function_call");
+    EXPECT(r.added == 5 && r.done == 5);
+    EXPECT(r.text_deltas == static_cast<int>(std::string("I'll make the changes now.\n\n").size()));
+    EXPECT(r.output[0]["content"][0]["text"] == "I'll make the changes now.\n\n");
+  }
+  {
+    // Calls with no text before them: no whitespace-only message between or after them.
+    auto r = run_items(exec_only, false, exec_call + "\n" + exec_call + "\n\n");
+    EXPECT(r.orphan_deltas == 0 && r.consistent);
+    EXPECT(types_of(r.output) == "function_call,function_call");
+    EXPECT(r.text_deltas == 0);
+  }
+  {
+    // Text after a call opens a new message item; the whitespace before it is the separator.
+    auto r = run_items(exec_only, false, "First.\n\n" + exec_call + "\n\nThen this.");
+    EXPECT(r.orphan_deltas == 0 && r.consistent);
+    EXPECT(types_of(r.output) == "message,function_call,message");
+    if (r.output.size() == 3) {
+      EXPECT(r.output[0]["content"][0]["text"] == "First.\n\n");
+      EXPECT(r.output[2]["content"][0]["text"] == "Then this.");
+      EXPECT(r.output[0]["id"] != r.output[2]["id"]);
+    }
+    EXPECT(r.text_deltas == static_cast<int>(std::string("First.\n\nThen this.").size()));
+  }
+  {
+    // Reasoning, then text, then a call, then whitespace: reasoning, message, call.
+    auto r = run_items(exec_only, true, "Think.\n</think>\n\nNow.\n" + exec_call + "\n");
+    EXPECT(r.orphan_deltas == 0 && r.consistent);
+    EXPECT(types_of(r.output) == "reasoning,message,function_call");
+  }
+  {
+    // A custom tool's call keeps its events; the "\n" after it opens nothing.
+    auto r = run_items(exec_only, false, exec_call + "\n", {"exec"});
+    EXPECT(r.orphan_deltas == 0 && r.consistent);
+    EXPECT(types_of(r.output) == "custom_tool_call");
+  }
+  {
+    // Plain text only: one message, unchanged.
+    auto r = run_items(exec_only, false, "\n\nJust text.\n");
+    EXPECT(r.orphan_deltas == 0 && r.consistent);
+    EXPECT(types_of(r.output) == "message" && r.output[0]["content"][0]["text"] == "\n\nJust text.\n");
+  }
+}
+
 int main() {
   test_repetition();
+  test_response_items();
   const json tools = json::parse(R"([{"type":"function","function":{"name":"shell","parameters":{"type":"object",
     "properties":{"command":{"type":"array"},"timeout_ms":{"type":"integer"},"workdir":{"type":"string"}}}}}])");
   {

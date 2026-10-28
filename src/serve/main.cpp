@@ -1232,31 +1232,24 @@ class Handler : public proxygen::RequestHandler {
     const std::string model = ctx_.model_name;
     const long created = std::time(nullptr);
 
-    struct State {
-      OutputParser parser;
-      std::string id = new_id("resp_");
-      json output = json::array();   // finished items, in order
-      std::string reasoning, content;
-      std::string reasoning_id, message_id;
-      int reasoning_index = -1, message_index = -1;
-      bool reasoning_open = false, message_open = false;
-      bool keepalive = false;  // keep-alives are armed and nothing has been written yet
-      std::vector<std::string> custom_tools;
-      State(bool r, const json& t, std::vector<std::string> c) : parser(r, t), custom_tools(std::move(c)) {}
-      bool custom(const std::string& name) const {
-        return std::find(custom_tools.begin(), custom_tools.end(), name) != custom_tools.end();
-      }
-    };
-    auto st = std::make_shared<State>(req.reasoning, req.tools, req.custom_tools);
-    auto response_obj = [=](const std::string& status) {
-      return json{{"id", st->id}, {"object", "response"}, {"created_at", created}, {"status", status},
-                  {"model", model}, {"output", st->output}, {"tools", json::array()}};
-    };
     // Events are numbered when they are written, on the event base (emit_event), so a keep-alive written
     // by the timer and an event posted by the engine thread share one counter and stay consecutive.
     auto event = [=](const std::string& type, json payload) {
       if (!req.stream) return;
       post(ex, [ex, type, payload](proxygen::ResponseHandler*) { emit_event(*ex, type, payload); });
+    };
+    struct State {
+      OutputParser parser;
+      ResponseItems items;  // the output items and their events
+      std::string id = new_id("resp_");
+      bool keepalive = false;  // keep-alives are armed and nothing has been written yet
+      State(bool r, const json& t, std::vector<std::string> c, ResponseItems::Emit e)
+          : parser(r, t), items(std::move(c), std::move(e)) {}
+    };
+    auto st = std::make_shared<State>(req.reasoning, req.tools, req.custom_tools, event);
+    auto response_obj = [=](const std::string& status) {
+      return json{{"id", st->id}, {"object", "response"}, {"created_at", created}, {"status", status},
+                  {"model", model}, {"output", st->items.output()}, {"tools", json::array()}};
     };
     // Before the first write of any kind (the first token, done, or error): no keep-alive after it.
     auto stop_ticks = [=]() {
@@ -1264,79 +1257,7 @@ class Handler : public proxygen::RequestHandler {
       st->keepalive = false;
       stop_keepalive(ex);
     };
-    auto close_reasoning = [=]() {
-      if (!st->reasoning_open) return;
-      st->reasoning_open = false;
-      json item = {{"type", "reasoning"}, {"id", st->reasoning_id}, {"summary", json::array()},
-                   {"content", json::array({json{{"type", "reasoning_text"}, {"text", st->reasoning}}})}};
-      st->output.push_back(item);
-      event("response.output_item.done", {{"output_index", st->reasoning_index}, {"item", item}});
-    };
-    auto close_message = [=]() {
-      if (!st->message_open) return;
-      st->message_open = false;
-      json item = {{"type", "message"}, {"id", st->message_id}, {"role", "assistant"}, {"status", "completed"},
-                   {"content", json::array({json{{"type", "output_text"}, {"text", st->content}, {"annotations", json::array()}}})}};
-      st->output.push_back(item);
-      event("response.output_item.done", {{"output_index", st->message_index}, {"item", item}});
-    };
-    auto deliver = [=](const OutputParser::Delta& d) {
-      if (!d.reasoning.empty()) {
-        if (!st->reasoning_open && st->reasoning.empty()) {
-          st->reasoning_open = true;
-          st->reasoning_id = new_id("rs_");
-          st->reasoning_index = static_cast<int>(st->output.size());
-          event("response.output_item.added",
-                {{"output_index", st->reasoning_index},
-                 {"item", {{"type", "reasoning"}, {"id", st->reasoning_id}, {"summary", json::array()}, {"content", json::array()}}}});
-        }
-        st->reasoning += d.reasoning;
-        event("response.reasoning_text.delta",
-              {{"item_id", st->reasoning_id}, {"output_index", st->reasoning_index}, {"content_index", 0}, {"delta", d.reasoning}});
-      }
-      if (!d.content.empty()) {
-        close_reasoning();
-        if (!st->message_open && st->content.empty()) {
-          st->message_open = true;
-          st->message_id = new_id("msg_");
-          st->message_index = static_cast<int>(st->output.size());
-          event("response.output_item.added",
-                {{"output_index", st->message_index},
-                 {"item", {{"type", "message"}, {"id", st->message_id}, {"role", "assistant"}, {"status", "in_progress"}, {"content", json::array()}}}});
-        }
-        st->content += d.content;
-        event("response.output_text.delta",
-              {{"item_id", st->message_id}, {"output_index", st->message_index}, {"content_index", 0}, {"delta", d.content}});
-      }
-      for (const ToolCall& c : d.tool_calls) {
-        close_reasoning();
-        close_message();
-        const int index = static_cast<int>(st->output.size());
-        if (st->custom(c.name)) {
-          // A custom (freeform) tool call: the item is added with its `input` present and empty (Codex
-          // parses the item only with that field), the whole input is one custom_tool_call_input.delta
-          // keyed by item_id and call_id, then the done events.
-          const std::string input = custom_tool_input(c.arguments);
-          json item = {{"type", "custom_tool_call"}, {"id", new_id("ctc_")}, {"call_id", new_id("call_")},
-                       {"name", c.name}, {"input", ""}, {"status", "in_progress"}};
-          event("response.output_item.added", {{"output_index", index}, {"item", item}});
-          event("response.custom_tool_call_input.delta",
-                {{"item_id", item["id"]}, {"output_index", index}, {"call_id", item["call_id"]}, {"delta", input}});
-          event("response.custom_tool_call_input.done",
-                {{"item_id", item["id"]}, {"output_index", index}, {"call_id", item["call_id"]}, {"input", input}});
-          item["input"] = input;
-          item["status"] = "completed";
-          st->output.push_back(item);
-          event("response.output_item.done", {{"output_index", index}, {"item", item}});
-          continue;
-        }
-        json item = {{"type", "function_call"}, {"id", new_id("fc_")}, {"call_id", new_id("call_")},
-                     {"name", c.name}, {"arguments", c.arguments}, {"status", "completed"}};
-        event("response.output_item.added", {{"output_index", index}, {"item", item}});
-        st->output.push_back(item);
-        event("response.output_item.done", {{"output_index", index}, {"item", item}});
-      }
-    };
+    auto deliver = [=](const OutputParser::Delta& d) { st->items.deliver(d); };
 
     if (req.stream) {
       ResponseBuilder(downstream_)
@@ -1376,8 +1297,7 @@ class Handler : public proxygen::RequestHandler {
                         int reasoning_tokens) {
       stop_ticks();
       deliver(st->parser.finish());
-      close_reasoning();
-      close_message();
+      st->items.close();
       // A repetition stop (API §9) is response.incomplete with reason "repetition" (the ling launcher's loop guard
       // reads it; Codex alone retries it), or with --repetition-report completed a completed response; either way
       // the response says stop_reason "repetition", and every delta up to the loop's last token went out first.

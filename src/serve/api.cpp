@@ -857,4 +857,94 @@ std::string custom_tool_input(const std::string& arguments) {
   return arguments;
 }
 
+bool ResponseItems::custom(const std::string& name) const {
+  return std::find(custom_tools_.begin(), custom_tools_.end(), name) != custom_tools_.end();
+}
+
+void ResponseItems::close_reasoning() {
+  if (!reasoning_open_) return;
+  reasoning_open_ = false;
+  json item = {{"type", "reasoning"}, {"id", reasoning_id_}, {"summary", json::array()},
+               {"content", json::array({json{{"type", "reasoning_text"}, {"text", reasoning_}}})}};
+  output_.push_back(item);
+  emit_("response.output_item.done", {{"output_index", reasoning_index_}, {"item", item}});
+}
+
+void ResponseItems::close_message() {
+  if (!message_open_) return;
+  message_open_ = false;
+  json item = {{"type", "message"}, {"id", message_id_}, {"role", "assistant"}, {"status", "completed"},
+               {"content", json::array({json{{"type", "output_text"}, {"text", content_}, {"annotations", json::array()}}})}};
+  output_.push_back(item);
+  emit_("response.output_item.done", {{"output_index", message_index_}, {"item", item}});
+}
+
+void ResponseItems::close() {
+  close_reasoning();
+  close_message();
+}
+
+void ResponseItems::deliver(const OutputParser::Delta& d) {
+  if (!d.reasoning.empty()) {
+    close_message();
+    if (!reasoning_open_) {
+      reasoning_open_ = true;
+      reasoning_.clear();
+      reasoning_id_ = new_id("rs_");
+      reasoning_index_ = static_cast<int>(output_.size());
+      emit_("response.output_item.added",
+            {{"output_index", reasoning_index_},
+             {"item", {{"type", "reasoning"}, {"id", reasoning_id_}, {"summary", json::array()}, {"content", json::array()}}}});
+    }
+    reasoning_ += d.reasoning;
+    emit_("response.reasoning_text.delta",
+          {{"item_id", reasoning_id_}, {"output_index", reasoning_index_}, {"content_index", 0}, {"delta", d.reasoning}});
+  }
+  // Whitespace after a tool call separates calls (SGLang's rule): no item, no delta.
+  const bool after_call = !output_.empty() && !message_open_ && !reasoning_open_ &&
+                          (output_.back()["type"] == "function_call" || output_.back()["type"] == "custom_tool_call");
+  if (!d.content.empty() && !(after_call && strip(d.content).empty())) {
+    close_reasoning();
+    if (!message_open_) {
+      message_open_ = true;
+      content_.clear();
+      message_id_ = new_id("msg_");
+      message_index_ = static_cast<int>(output_.size());
+      emit_("response.output_item.added",
+            {{"output_index", message_index_},
+             {"item", {{"type", "message"}, {"id", message_id_}, {"role", "assistant"}, {"status", "in_progress"}, {"content", json::array()}}}});
+    }
+    content_ += d.content;
+    emit_("response.output_text.delta",
+          {{"item_id", message_id_}, {"output_index", message_index_}, {"content_index", 0}, {"delta", d.content}});
+  }
+  for (const ToolCall& c : d.tool_calls) {
+    close();
+    const int index = static_cast<int>(output_.size());
+    if (custom(c.name)) {
+      // A custom (freeform) tool call: the item is added with its `input` present and empty (Codex parses the item
+      // only with that field), the whole input is one custom_tool_call_input.delta keyed by item_id and call_id,
+      // then the done events.
+      const std::string input = custom_tool_input(c.arguments);
+      json item = {{"type", "custom_tool_call"}, {"id", new_id("ctc_")}, {"call_id", new_id("call_")},
+                   {"name", c.name}, {"input", ""}, {"status", "in_progress"}};
+      emit_("response.output_item.added", {{"output_index", index}, {"item", item}});
+      emit_("response.custom_tool_call_input.delta",
+            {{"item_id", item["id"]}, {"output_index", index}, {"call_id", item["call_id"]}, {"delta", input}});
+      emit_("response.custom_tool_call_input.done",
+            {{"item_id", item["id"]}, {"output_index", index}, {"call_id", item["call_id"]}, {"input", input}});
+      item["input"] = input;
+      item["status"] = "completed";
+      output_.push_back(item);
+      emit_("response.output_item.done", {{"output_index", index}, {"item", item}});
+      continue;
+    }
+    json item = {{"type", "function_call"}, {"id", new_id("fc_")}, {"call_id", new_id("call_")},
+                 {"name", c.name}, {"arguments", c.arguments}, {"status", "completed"}};
+    emit_("response.output_item.added", {{"output_index", index}, {"item", item}});
+    output_.push_back(item);
+    emit_("response.output_item.done", {{"output_index", index}, {"item", item}});
+  }
+}
+
 }  // namespace ling::serve
