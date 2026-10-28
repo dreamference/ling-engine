@@ -945,6 +945,11 @@ int main(int argc, char** argv) {
           std::vector<bool> busy(engine.sessions(), false);
           busy[si] = true;
           while (engine.kv_admit_need(si, prompts[i]) > engine.kv_pages_free()) {
+            if (engine.kv_store_evict()) {  // P4c: the prefix KV store's pages go first
+              std::fprintf(stderr, "prefix-check: a prefix KV store entry evicted for KV pages\n");
+              engine.kv_retire(true);
+              continue;
+            }
             const int victim = engine.kv_lru_idle(busy);
             if (victim < 0) break;
             std::fprintf(stderr, "prefix-check: session %d evicted for KV pages\n", victim);
