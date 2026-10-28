@@ -337,7 +337,7 @@ void resume() {
         const int src = static_cast<int>(rng() % h), k = std::min<int>(n, int(t[src].size()) * T);
         if (k > 0) pool.share(t[h], t[src], k);
       }
-      pool.ensure(t[h], static_cast<int>(t[h].size()) * T, n, nullptr);
+      pool.ensure(t[h], std::min<int>(static_cast<int>(t[h].size()) * T, n), n, nullptr);
     }
     pool.retire();
     const int self = static_cast<int>(rng() % 3), other = (self + 1 + static_cast<int>(rng() % 2)) % 3;
@@ -391,9 +391,14 @@ void resume() {
   check(pool.reclaimable({&a, &b, &store}) == 3, "reclaimable: with the store, every page");
   check(pool.reclaimable({&store}) == 0, "reclaimable: the store alone frees nothing the sessions map");
   // unshare(): shared pages at or past pages_for(n) dropped, private ones kept.
-  std::vector<int> c = b;
+  std::vector<int> c;
+  pool.share(c, a, 2 * T);  // a third holder of pages 0 and 1
   pool.unshare(c, T);
-  check(c[0] == b[0] && c[1] == 0 && pool.refs(b[1]) == 2, "unshare: drops the shared page past n, keeps the one below");
+  check(c[0] == a[0] && c[1] == 0 && pool.refs(a[1]) == 2, "unshare: drops the shared page past n, keeps the one below");
+  std::vector<int> d;
+  pool.ensure(d, 0, 2 * T, nullptr);
+  pool.unshare(d, 0);
+  check(d[0] != 0 && d[1] != 0, "unshare: keeps private pages");
 }
 
 int main() {
