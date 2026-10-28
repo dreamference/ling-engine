@@ -75,6 +75,9 @@ struct Request {
   // resident session first, and which sessions are protected from eviction (M4 §1). A hint only: the
   // token prefix decides what is reused. Empty when the request carries none.
   std::string session_key;
+  // The X-Ling-Share-Scope header (P4c, share_scope_of): requests share KV prefixes (resident sessions, checkpoints,
+  // the prefix KV store) only within one scope; 0 when the request carries none (the unscoped requests' scope).
+  uint64_t share_scope = 0;
   // `repetition_detection` (API §9): the fields the request set, -1 for those it left to the server's
   // default; `false` sets them all to 0 (off). resolve_repetition() makes the rule the request runs with.
   RepetitionDetection repetition{-1, -1, -1, -1};
@@ -214,6 +217,10 @@ class ResponseItems {
   int reasoning_index_ = -1, message_index_ = -1;
   bool reasoning_open_ = false, message_open_ = false;
 };
+
+// The share scope of an X-Ling-Share-Scope header value (P4c): an opaque string, FNV-1a 64 of its bytes with the low
+// bit set, so no value maps to 0, the scope of requests without the header ("" -> 0). Equal values share.
+uint64_t share_scope_of(const std::string& value);
 
 // JSON for the wire. Bytes that are not valid UTF-8 (a model can emit part of a character) become
 // U+FFFD instead of making the dump throw: a dump error must never end a stream.

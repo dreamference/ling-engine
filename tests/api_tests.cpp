@@ -313,6 +313,15 @@ static void test_response_items() {
 int main() {
   test_repetition();
   test_response_items();
+
+  {
+    // P4c: X-Ling-Share-Scope is opaque; absent or empty is the unscoped scope 0, any value a scope that is never 0.
+    EXPECT(share_scope_of("") == 0);
+    EXPECT(share_scope_of("team-a") != 0 && share_scope_of("team-a") == share_scope_of("team-a"));
+    EXPECT(share_scope_of("team-a") != share_scope_of("team-b"));
+    EXPECT(share_scope_of("team-a") != share_scope_of("Team-a"));
+    EXPECT((share_scope_of("x") & 1) == 1);
+  }
   const json tools = json::parse(R"([{"type":"function","function":{"name":"shell","parameters":{"type":"object",
     "properties":{"command":{"type":"array"},"timeout_ms":{"type":"integer"},"workdir":{"type":"string"}}}}}])");
   {
