@@ -569,11 +569,11 @@ void Engine::reset_session() {
   if (kv_pages_) kv_release(*s_, 0);  // P4b: the session's pages back to the pool
 }
 
-int Engine::match_session(const std::vector<int>& prompt, const std::string& key) const {
+int Engine::match_session(const std::vector<int>& prompt, const std::string& key, uint64_t scope) const {
   int best = -1, best_lcp = 0;
   for (size_t i = 0; i < sessions_.size(); ++i) {
     const Session& s = sessions_[i];
-    if (!s.owned || s.history.empty() || s.prompt_len == 0) continue;
+    if (!s.owned || s.history.empty() || s.prompt_len == 0 || s.scope != scope) continue;
     const size_t n = std::min(s.history.size(), prompt.size());
     size_t lcp = 0;
     while (lcp < n && s.history[lcp] == prompt[lcp]) ++lcp;
@@ -586,7 +586,7 @@ int Engine::match_session(const std::vector<int>& prompt, const std::string& key
   }
   if (best >= 0 || key.empty()) return best;
   for (size_t i = 0; i < sessions_.size(); ++i)
-    if (sessions_[i].owned && sessions_[i].key == key) return static_cast<int>(i);
+    if (sessions_[i].owned && sessions_[i].key == key && sessions_[i].scope == scope) return static_cast<int>(i);
   return -1;
 }
 
@@ -605,10 +605,23 @@ int Engine::free_session(double protect_seconds, const std::vector<bool>& pinned
   return best;
 }
 
-void Engine::activate_session(int i, const std::string& key, bool fresh) {
+void Engine::activate_session(int i, const std::string& key, bool fresh, uint64_t scope) {
   if (i < 0 || i >= static_cast<int>(sessions_.size())) throw std::runtime_error("no such session");
   side_join();  // a side chunk's session, store entries and donor KV are complete before anything binds or copies
   s_ = &sessions_[i];
+  if (s_->scope != scope) {
+    // P4c: another scope's history is never resumed from; its pages stay (begin_prefill rewrites, unshares or gives
+    // them back) and so does its state memory, which nothing reads before a prefill rewrites it.
+    s_->history.clear();
+    s_->sh_dirty = true;
+    s_->prompt_len = 0;
+    s_->turn_start = 0;
+    s_->snap_pos = -1;
+    s_->dkv_lo = 0;
+    s_->pos = 0;
+    s_->shadow.clear();
+    s_->scope = scope;
+  }
   if (fresh) {
     if (s_->owned) ++evictions_;
     s_->owned = true;
@@ -746,10 +759,10 @@ void Engine::kv_store_dropped(const std::function<void()>& op) {
   if (kv_book_ && kv_book_->pending_pages() > pending) kv_record_release();
 }
 
-int Engine::kv_admit_need(int session, const std::vector<int>& prompt) const {
+int Engine::kv_admit_need(int session, const std::vector<int>& prompt, uint64_t scope) const {
   if (!kv_book_ || prompt.empty()) return 0;
   const Session& s = sessions_.at(session);
-  return kv_resume_need(s, plan_resume(s, prompt, false), prompt.size());
+  return kv_resume_need(s, plan_resume(s, prompt, false, scope), prompt.size());
 }
 
 int Engine::kv_step_need(int session, bool spec) const {
@@ -1005,7 +1018,8 @@ uint64_t fnv_tokens(const int* t, size_t n) {
 }  // namespace
 
 bool Engine::ckpt_match(const Checkpoint& k, const std::vector<int>& prompt,
-                        const std::vector<uint64_t>& prefix_hash) const {
+                        const std::vector<uint64_t>& prefix_hash, uint64_t scope) const {
+  if (k.scope != scope) return false;
   if (k.pos > static_cast<int>(prompt.size()) || k.pos >= static_cast<int>(prefix_hash.size())) return false;
   if (prefix_hash[k.pos] != k.hash) return false;
   return std::equal(k.tokens.begin(), k.tokens.end(), prompt.begin());
@@ -1065,11 +1079,12 @@ void Engine::kv_restore(const PrefixKvTree::Match& m, int n) {
 void Engine::kv_insert(const PrefillCursor& cur) {
   // Paged (P4c): the new nodes hold the active session's pages; making room in the budget may drop older nodes'.
   kv_store_dropped([&] {
-    const std::vector<std::pair<int, int>> want = kv_tree_->insert(cur.prompt, cur.kv_q, cur.kv_cuts, cur.kv_epoch);
+    const std::vector<std::pair<int, int>> want =
+        kv_tree_->insert(cur.prompt, cur.kv_q, cur.kv_cuts, cur.kv_epoch, s_->scope);
     // Each cut's state from the checkpoint store (this prefill saved them; one the store had no room for is left out).
     for (const auto& [node, pos] : want)
       for (const Checkpoint& k : ckpts_)
-        if (k.pos == pos && std::equal(k.tokens.begin(), k.tokens.end(), cur.prompt.begin())) {
+        if (k.pos == pos && k.scope == s_->scope && std::equal(k.tokens.begin(), k.tokens.end(), cur.prompt.begin())) {
           if (void* st = kv_tree_->add_state(node, cur.kv_epoch)) copy_slot(state_view(st), ckpt_slots_[k.slot]);
           break;
         }
@@ -1089,7 +1104,8 @@ void Engine::copy_slot(const StateSlot& dst, const StateSlot& src) {
 void Engine::save_checkpoint(int pos, uint64_t epoch, const StateSlot* from, bool soft) {
   const uint64_t hash = fnv_tokens(s_->history.data(), pos);
   for (Checkpoint& k : ckpts_)
-    if (k.pos == pos && k.hash == hash && std::equal(k.tokens.begin(), k.tokens.end(), s_->history.begin())) {
+    if (k.pos == pos && k.hash == hash && k.scope == s_->scope &&
+        std::equal(k.tokens.begin(), k.tokens.end(), s_->history.begin())) {
       k.used = ++ckpt_clock_;
       return;
     }
@@ -1118,7 +1134,8 @@ void Engine::save_checkpoint(int pos, uint64_t epoch, const StateSlot* from, boo
   // Stream-ordered: the copy completes before any later restore reads the slot (one stream, M4 §1).
   if (from) copy_slot(ckpt_slots_[slot], *from);
   else copy_state(ckpt_slots_[slot], true);
-  ckpts_.push_back({pos, slot, hash, std::vector<int>(s_->history.begin(), s_->history.begin() + pos), ++ckpt_clock_, soft});
+  ckpts_.push_back({pos, slot, hash, std::vector<int>(s_->history.begin(), s_->history.begin() + pos), ++ckpt_clock_, soft,
+                    s_->scope});
   std::sort(ckpts_.begin(), ckpts_.end(), [](const Checkpoint& a, const Checkpoint& b) { return a.pos < b.pos; });
 }
 
@@ -1696,8 +1713,11 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   s_->pos += M;
 }
 
-Engine::ResumePlan Engine::plan_resume(const Session& self, const std::vector<int>& prompt, bool from_scratch) const {
-  // (begin_prefill's comment above its call says what is chosen and why.)
+Engine::ResumePlan Engine::plan_resume(const Session& self, const std::vector<int>& prompt, bool from_scratch,
+                                       uint64_t scope) const {
+  // (begin_prefill's comment above its call says what is chosen and why.) Share scopes (P4c): only the sessions,
+  // checkpoints and store entries of `scope` count; self's history only when it is that scope's (activate_session
+  // clears it otherwise).
   const int L = static_cast<int>(prompt.size());
   ResumePlan plan;
   const int window = plan.window = draft_ ? std::max(0, L - draft_->config().sliding_window) : 0;
@@ -1715,6 +1735,7 @@ Engine::ResumePlan Engine::plan_resume(const Session& self, const std::vector<in
   // Only states a prefill left count, never a session's current one after decoding: a decoded token went
   // through the rows path, and a prompt's state must be the same however it was reached.
   auto best_in = [&](const Session& s) {
+    if (s.scope != scope) return Source{};
     const int n = std::min(static_cast<int>(s.history.size()), L);
     int lcp = 0;
     while (lcp < n && s.history[lcp] == prompt[lcp]) ++lcp;
@@ -1722,7 +1743,7 @@ Engine::ResumePlan Engine::plan_resume(const Session& self, const std::vector<in
     Source r;
     if (s.snap_pos > 0 && usable(s.snap_pos)) r = {s.snap_pos, &s.snap};
     for (const Checkpoint& k : ckpts_)
-      if (k.pos > r.reuse && usable(k.pos) && ckpt_match(k, prompt, prefix_hash)) r = {k.pos, &ckpt_slots_[k.slot]};
+      if (k.pos > r.reuse && usable(k.pos) && ckpt_match(k, prompt, prefix_hash, scope)) r = {k.pos, &ckpt_slots_[k.slot]};
     return r;
   };
   Source src;
@@ -1746,11 +1767,11 @@ Engine::ResumePlan Engine::plan_resume(const Session& self, const std::vector<in
   const void*& kv_state = plan.kv_state;
   const StateSlot*& kv_ckpt = plan.kv_ckpt;
   if (kv_tree_ && !from_scratch) {
-    kvm = kv_tree_->match(prompt);
+    kvm = kv_tree_->match(prompt, scope);
     const int lim = std::min({kvm.len, draft_ ? window : L, L - 1});
     kv_reuse = kv_tree_->best_state(kvm, lim, &kv_state);
     for (const Checkpoint& k : ckpts_)
-      if (k.pos > kv_reuse && k.pos <= lim && ckpt_match(k, prompt, prefix_hash)) {
+      if (k.pos > kv_reuse && k.pos <= lim && ckpt_match(k, prompt, prefix_hash, scope)) {
         kv_reuse = k.pos;
         kv_state = nullptr;
         kv_ckpt = &ckpt_slots_[k.slot];
@@ -1776,12 +1797,13 @@ Engine::ResumePlan Engine::plan_resume(const Session& self, const std::vector<in
       return static_cast<int>(i);
     };
     for (const Session& s : sessions_) {
-      if (s.history.empty()) continue;
+      if (s.history.empty() || s.scope != scope) continue;
       const int l = lcp_of(s.history);
       if (&s == &self && s.prompt_len > 0 && l >= s.turn_start) continue;
       branch_at = std::max(branch_at, l);
     }
-    for (const Checkpoint& k : ckpts_) branch_at = std::max(branch_at, lcp_of(k.tokens));
+    for (const Checkpoint& k : ckpts_)
+      if (k.scope == scope) branch_at = std::max(branch_at, lcp_of(k.tokens));
     branch_at = std::max(branch_at, kvm.len);
     branch_at -= branch_at % kResumeAlign;
   }
@@ -1807,7 +1829,7 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   // Where the prompt resumes, planned before anything changes (P4c: the pool's need depends on the source's pages).
   // The truncation below does not change the choice: it keeps every position below the prompt's end, and the drafter
   // ring's valid start only moves to the cut, past any usable resume point.
-  const ResumePlan plan0 = plan_resume(*s_, prompt, from_scratch);
+  const ResumePlan plan0 = plan_resume(*s_, prompt, from_scratch, s_->scope);
   // P4b: the prompt's pages and kKvGrowthPages more are taken below, whatever the prompt resumes from, after the
   // session's pages past them are given back (their frees deferred as every release's: kv_ensure waits for them when
   // it needs them). Checked first, so a short pool changes nothing (ling-serve's scheduler admits a request only when
@@ -1895,7 +1917,7 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   cur.ckpt_epoch = ++ckpt_clock_;
   if (!prefix_hash.empty())
     for (Checkpoint& k : ckpts_)
-      if (ckpt_match(k, prompt, prefix_hash)) k.used = cur.ckpt_epoch;
+      if (ckpt_match(k, prompt, prefix_hash, s_->scope)) k.used = cur.ckpt_epoch;
   if (from_kv) {  // the KV of [0, kv_reuse) out of the store, the state from the store or the checkpoint store
     kv_restore(kvm, kv_reuse);
     s_->history.assign(prompt.begin(), prompt.begin() + kv_reuse);

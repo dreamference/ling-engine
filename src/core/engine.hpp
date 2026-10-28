@@ -370,14 +370,18 @@ class Engine {
   // what differs is at most its last turn's generation prompt and output (a next turn re-renders them). Among those the longest common prefix wins, the key's
   // session on a tie. When none is extended, the key's own session (the same thread, diverged: it
   // re-prefills from the divergence). The key is a hint: the token prefix decides what is reused.
-  int match_session(const std::vector<int>& prompt, const std::string& key) const;
+  // Share scopes (P4c, X-Ling-Share-Scope): only a session of the request's scope is bound or reused from (0 is the
+  // unscoped requests' scope, separate from every other).
+  int match_session(const std::vector<int>& prompt, const std::string& key, uint64_t scope = 0) const;
   // A slot for a new session: one never used, else the least recently used one that is neither in `pinned`
   // nor protected; -1 when there is none (the request waits). Protected: a session bound with a key (an
   // agent's thread) whose last request ran less than protect_seconds ago (M4 §7 question 6).
   int free_session(double protect_seconds, const std::vector<bool>& pinned) const;
   // Makes session i active. `fresh`: a new session takes the slot (an eviction when another held it).
   // Nothing is copied out or cleared: the slot's tokens stay usable as KV by a prompt that shares them.
-  void activate_session(int i, const std::string& key, bool fresh);
+  // `scope` (P4c): the request's share scope; a slot that held another scope's session keeps its pages (rewritten or
+  // given back by begin_prefill) but nothing of its history is reused.
+  void activate_session(int i, const std::string& key, bool fresh, uint64_t scope = 0);
   // Makes session i active for the next pass, with no other effect (the scheduler switches between the
   // sessions of its running requests, M4 §3).
   void select_session(int i);
@@ -415,7 +419,7 @@ class Engine {
   // (a private copy of the page the resume point falls in when it is shared). Exact for an unchanged engine, so a
   // scheduler that admits only when this many pages are free never sees begin_prefill throw; pages counted as
   // shared that are let go of before it runs make it throw KvPoolExhausted with nothing changed.
-  int kv_admit_need(int session, const std::vector<int>& prompt) const;
+  int kv_admit_need(int session, const std::vector<int>& prompt, uint64_t scope = 0) const;
   // The pages a prompt of `prompt_len` tokens maps in all (its end plus kKvGrowthPages pages): more than
   // kv_pages_total() and it can never run.
   int kv_admit_pages(size_t prompt_len) const { return KvPool::pages_for(kv_target(prompt_len)); }
@@ -728,6 +732,7 @@ class Engine {
     std::vector<int> tokens;
     uint64_t used = 0;
     bool soft = false;  // a message end or a branch point
+    uint64_t scope = 0;  // P4c: the share scope of the prompt it was taken from; only that scope resumes from it
   };
   uint64_t ckpt_clock_ = 0;
   std::vector<StateSlot> ckpt_slots_;
@@ -747,7 +752,8 @@ class Engine {
   void kv_restore(const PrefixKvTree::Match& m, int n);
   void kv_insert(const PrefillCursor& cur);  // the prompt's shared beginning into the store, at its prefill's end
   void copy_slot(const StateSlot& dst, const StateSlot& src);
-  bool ckpt_match(const Checkpoint& k, const std::vector<int>& prompt, const std::vector<uint64_t>& prefix_hash) const;
+  bool ckpt_match(const Checkpoint& k, const std::vector<int>& prompt, const std::vector<uint64_t>& prefix_hash,
+                  uint64_t scope) const;
   // Where a prompt resumes (begin_prefill's choice, P4c: planned before anything changes so that admission counts the
   // pages of the same source): the furthest kept state inside the prompt's common prefix with a session's history
   // (`self`'s own, else a donor's, whose pages it maps) or with the prefix KV store.
@@ -765,7 +771,8 @@ class Engine {
     int reuse = 0;                        // where the prompt resumes
     int branch_at = 0;                    // the branch point (BACKLOG 34)
   };
-  ResumePlan plan_resume(const Session& self, const std::vector<int>& prompt, bool from_scratch) const;
+  // `scope`: the share scope the prompt runs in (self's history counts only when it is self's).
+  ResumePlan plan_resume(const Session& self, const std::vector<int>& prompt, bool from_scratch, uint64_t scope) const;
   // KvPool::resume_need of the plan, for session `self` and a prompt of L tokens.
   int kv_resume_need(const Session& self, const ResumePlan& plan, size_t L) const;
 
@@ -872,6 +879,7 @@ class Engine {
     // The pool's bookkeeping.
     bool owned = false;  // a session has been bound to the slot
     std::string key;     // the prompt_cache_key it was bound with ("" without one)
+    uint64_t scope = 0;  // P4c: the share scope of its requests (X-Ling-Share-Scope; 0: unscoped)
     std::chrono::steady_clock::time_point last_used{};
   };
   std::vector<Session> sessions_;

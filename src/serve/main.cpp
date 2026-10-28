@@ -385,7 +385,7 @@ class Scheduler {
     std::vector<int> match(queue_.size());
     std::vector<bool> pinned = busy;
     for (size_t j = 0; j < queue_.size(); ++j) {
-      match[j] = eng.match_session(queue_[j].prompt, queue_[j].req.session_key);
+      match[j] = eng.match_session(queue_[j].prompt, queue_[j].req.session_key, queue_[j].req.share_scope);
       if (match[j] >= 0) pinned[match[j]] = true;
     }
     for (size_t j = 0; j < queue_.size(); ++j) {
@@ -397,7 +397,7 @@ class Scheduler {
       if (eng.kv_paged() && eng.kv_admit_pages(queue_[j].prompt.size()) <= eng.kv_pages_total()) {
         // (A prompt whose pages the whole pool could never hold is admitted to be answered at once: start().)
         bool evicted = false;
-        if (!kv_make_room(eng.kv_admit_need(s, queue_[j].prompt), s, &evicted)) {
+        if (!kv_make_room(eng.kv_admit_need(s, queue_[j].prompt, queue_[j].req.share_scope), s, &evicted)) {
           kv_wait_ = true;
           // An eviction emptied sessions the other jobs' matches above may name: look again from the start.
           if (evicted) return false;
@@ -454,7 +454,7 @@ class Scheduler {
       if (exceeds_context(j.prompt.size(), eng.max_context())) throw ContextOverflow(j.prompt.size(), eng.max_context());
       if (eng.kv_paged() && eng.kv_admit_pages(j.prompt.size()) > eng.kv_pages_total())
         throw KvPoolTooSmall(j.prompt.size(), eng.kv_pages_total());
-      eng.activate_session(j.session, j.req.session_key, j.fresh);
+      eng.activate_session(j.session, j.req.session_key, j.fresh, j.req.share_scope);
       r->cur = eng.begin_prefill(j.prompt, false, j.images.empty() ? nullptr : &j.images);
     } catch (const KvPoolExhausted& e) {
       // P4c: the pool is short after all (pages shared at admission's count were let go of meanwhile): while a
@@ -1078,6 +1078,7 @@ class Handler : public proxygen::RequestHandler {
   void onRequest(std::unique_ptr<HTTPMessage> headers) noexcept override {
     method_ = headers->getMethodString();
     path_ = headers->getPath();
+    share_scope_ = share_scope_of(headers->getHeaders().getSingleOrEmpty("X-Ling-Share-Scope"));
     ex_->downstream = downstream_;
     ex_->evb = folly::EventBaseManager::get()->getEventBase();
   }
@@ -1179,6 +1180,7 @@ class Handler : public proxygen::RequestHandler {
       if (auto buf = body_.move()) text = buf->moveToFbString().toStdString();
       json body = json::parse(text);
       job.req = parse_request(body, chat, ctx_.vision);
+      job.req.share_scope = share_scope_;
       job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
       job.prompt = job.req.prompt_ids.empty() ? ctx_.tok->encode(job.req.prompt_text) : job.req.prompt_ids;
       if (!job.req.prompt_ids.empty())
@@ -1404,6 +1406,7 @@ class Handler : public proxygen::RequestHandler {
       std::string text;
       if (auto buf = body_.move()) text = buf->moveToFbString().toStdString();
       job.req = parse_responses_request(json::parse(text), ctx_.vision);
+      job.req.share_scope = share_scope_;
       job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
       job.prompt = ctx_.tok->encode(job.req.prompt_text);
       attach_images(job);
@@ -1604,6 +1607,7 @@ class Handler : public proxygen::RequestHandler {
   ServerContext& ctx_;
   Scheduler& scheduler_;
   std::string method_, path_;
+  uint64_t share_scope_ = 0;  // X-Ling-Share-Scope (P4c, share_scope_of)
   folly::IOBufQueue body_{folly::IOBufQueue::cacheChainLength()};
   bool too_large_ = false;
   std::shared_ptr<Exchange> ex_ = std::make_shared<Exchange>();
