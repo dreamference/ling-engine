@@ -6,8 +6,9 @@
 //              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N] [--draft-off-below X]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
-//              [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0]
-//              [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N] | --no-kv-pages]
+//              [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N]
+//              [--auto-size 1|0] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]
+//              [--kv-pages [--kv-pool-mb N] | --no-kv-pages]
 //
 // --sessions N (default: chosen at start, --auto-size below; 2 without it; M4 §1) keeps N resident sessions, each with
 // its own KV cache and state, so N agent tasks that alternate keep their histories warm. A request runs in the session
@@ -32,6 +33,10 @@
 // decoding conversations take some steps at their speed alone instead of every step beside a chunk. At four warm
 // agent conversations (node-b, 2026-10-27) 16 raised the pooled decode from 25.7 to 35.6 tok/s with the rounds'
 // time unchanged (139.3 / 140.9 s). Only the order of units changes, as with the shortest prefill first.
+// --fair-pairing 1|0 (C3, design A1; default 0; LING_FAIR_PAIRING overrides): the request that joins a batched step
+// is the one with the fewest decode passes in the trailing 16 (serve/pairing.hpp), not the first in running order,
+// so at four decoding conversations each takes 2 passes in 4 instead of 4/2/1/1. Only which requests step together
+// changes. LING_STEP_TRACE=FILE writes one JSON line per scheduler unit (serve/step_trace.hpp).
 //
 // --draft-off-below X (BACKLOG 10; default 1.5, 0 off; LING_DRAFT_OFF_BELOW overrides it): the drafter-off guard. A
 // session whose running mean of tokens per speculative step falls below X decodes one plain row per step, with no
@@ -99,6 +104,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <deque>
 #include <functional>
@@ -114,6 +120,8 @@
 #include "tokenizer/tokenizer.hpp"
 #include "serve/image_input.hpp"
 #include "serve/kv_policy.hpp"
+#include "serve/pairing.hpp"
+#include "serve/step_trace.hpp"
 
 namespace ling::serve {
 namespace {
@@ -343,6 +351,7 @@ struct Running {
   long admitted = 0;     // the order of admission (P4b: the last resort ends the request admitted last)
   bool kv_wait = false;  // its last decode turn waited for KV pages (P4b)
   Periods alone, beside;  // step periods without and with another request's prefill in between
+  PassWindow window;      // the decode passes it took part in, in the trailing kFairWindow (--fair-pairing)
 };
 
 // The engine thread (M4 §3). Up to `batch` requests run at once, each in its own resident session: a request
@@ -357,12 +366,14 @@ struct Running {
 // one-row step on its turn; a prefill chunk still alternates with the decode steps.
 class Scheduler {
  public:
-  Scheduler(ServerContext& ctx, double protect_seconds, int batch, int contended, int side_share = 0)
+  Scheduler(ServerContext& ctx, double protect_seconds, int batch, int contended, int side_share = 0,
+            bool fair_pairing = false)
       : ctx_(ctx),
         protect_seconds_(protect_seconds),
         batch_(batch),
         contended_(contended),
         side_share_(side_share),
+        fair_pairing_(fair_pairing),
         thread_([this] { run(); }) {}
   ~Scheduler() {
     {
@@ -553,10 +564,13 @@ class Scheduler {
       const bool kv_blocked = ctx_.engine->kv_paged() && !r.prefilling && !kv_room(r);
       r.kv_wait = kv_blocked;
       std::vector<Running*> batch = kv_blocked ? std::vector<Running*>() : batch_with(r);
+      const double t0 = trace_.on() ? trace_.now() : 0;
+      unit_kind_ = nullptr;
       if (kv_blocked) {
         kv_stalled(ended);
       } else if (batch.size() >= 2) {
         batch_step(batch, ended);
+        unit_kind_ = "decode";
       } else {
         bool done = false;
         try {
@@ -566,13 +580,16 @@ class Scheduler {
           done = true;
         }
         if (done) ended.push_back(&r);
+        batch = {&r};
       }
+      if (trace_.on() && unit_kind_) trace_unit(t0, k, batch);
       if (ended.empty()) continue;
       for (Running* e : ended) {
         if (e->side_flight) ctx_.engine->side_abandon();  // its chunk's pass finishes before the session is reused
         ctx_.engine->touch_session(e->job.session);  // the session's clock restarts however the request ended
         running_.erase(std::find_if(running_.begin(), running_.end(), [&](const auto& p) { return p.get() == e; }));
       }
+      if (running_.empty()) trace_.flush();
       {
         std::lock_guard<std::mutex> l(mu_);
         dirty_ = true;  // its session may be what a queued job waits for
@@ -597,7 +614,8 @@ class Scheduler {
     const int fit = kernels::kMaxStreamRows / eng.draft_block();
     int kv_need = eng.kv_paged() ? eng.kv_step_need(r.job.session, true) : 0;
     const int kv_free = eng.kv_paged() ? eng.kv_pages_free() : 0;
-    for (const auto& o : running_)
+    for (size_t i : partner_order()) {
+      const auto& o = running_[i];
       if (o.get() != &r && static_cast<int>(b.size()) < fit && batchable(*o)) {
         if (eng.kv_paged()) {
           const int n = eng.kv_step_need(o->job.session, true);
@@ -606,7 +624,41 @@ class Scheduler {
         }
         b.push_back(o.get());
       }
+    }
     return b;
+  }
+  // The order the running requests are tried in as partners (serve/pairing.hpp): running order, or with
+  // --fair-pairing 1 the fewest decode passes in the trailing kFairWindow first.
+  std::vector<size_t> partner_order() const {
+    std::vector<PairCandidate> c(running_.size());
+    if (fair_pairing_)
+      for (size_t i = 0; i < running_.size(); ++i)
+        c[i] = {false, running_[i]->window.count(decode_passes_), running_[i]->window.last()};
+    return pair_order(c, fair_pairing_);
+  }
+
+  // One line of the step trace (LING_STEP_TRACE) for the unit just run: `batch` holds its requests.
+  void trace_unit(double t0, size_t turn, const std::vector<Running*>& batch) {
+    StepRecord s;
+    s.t = trace_.now();
+    s.ms = (s.t - t0) * 1e3;
+    s.pass = decode_passes_;
+    s.kind = unit_kind_;
+    s.turn = turn;
+    const bool decode = std::strcmp(unit_kind_, "decode") == 0;
+    int alone_rows = 0;
+    if (decode && batch.size() == 1) {
+      std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+      alone_rows = ctx_.metrics.batch_rows;
+    }
+    for (Running* r : batch) {
+      s.sessions.push_back(r->job.session);
+      s.rows.push_back(!decode ? 0 : batch.size() == 1 ? alone_rows : ctx_.engine->draft_block());
+      s.tokens.push_back(decode ? static_cast<int>(r->pending.size()) : 0);
+      s.left.push_back(r->prefilling ? prefill_left(*r) : 0);
+    }
+    s.side = ctx_.engine->side_busy();
+    trace_.write(s);
   }
 
   // ---- The KV page pool (P4b, --kv-pages; serve/kv_policy.hpp). ----
@@ -757,6 +809,7 @@ class Scheduler {
       ++r.passes;
       ++r.batched;
       r.kv_wait = false;
+      r.window.record(decode_passes_ + 1);  // this pass
       steps[i].session = r.job.session;
       steps[i].anchor = r.pending.back();
       steps[i].params = &r.job.req.sampling;
@@ -851,16 +904,25 @@ class Scheduler {
       if (eng.side_enabled() && (r.side_flight || (contended && !eng.side_busy()))) {
         // A full chunk on the side stream; the decoding request's turns go on while it runs.
         if (!r.side_flight) {
-          if (hold_side(r) || yield_prefill(r)) return false;
+          if (hold_side(r)) {
+            unit_kind_ = "hold";
+            return false;
+          }
+          if (yield_prefill(r)) {
+            unit_kind_ = "yield";
+            return false;
+          }
           eng.prefill_chunk_launch(r.cur, 0);
           r.side_flight = true;
           count_interleaved(r);
+          unit_kind_ = "side_launch";
           return false;
         }
         if (contended && !eng.side_ready()) return false;
         r.side_flight = false;
         const bool last_chunk = eng.prefill_chunk_finish();
         side_mark_ = decode_passes_;
+        unit_kind_ = "side_finish";
         if (!last_chunk) {
           if (other_decoding(r) && !hold_side(r) && !yield_prefill(r)) {  // the next chunk at once, unless a short prefill waits
             eng.prefill_chunk_launch(r.cur, 0);
@@ -874,7 +936,11 @@ class Scheduler {
         return emit(r) && end(r);
       }
       if (eng.side_busy()) return false;  // another request's chunk is in flight: no prefill beside it
-      if (yield_prefill(r)) return false;
+      if (yield_prefill(r)) {
+        unit_kind_ = "yield";
+        return false;
+      }
+      unit_kind_ = "chunk";
       const bool last = eng.prefill_chunk(r.cur, contended ? contended_ : 0);
       if (contended) count_interleaved(r);
       if (!last) return false;
@@ -888,6 +954,8 @@ class Scheduler {
     eng.select_session(r.job.session);
     ++r.passes;
     ++decode_passes_;
+    r.window.record(decode_passes_);
+    unit_kind_ = "decode";
     {
       std::lock_guard<std::mutex> m(ctx_.metrics.mu);
       ctx_.metrics.batch_rows = r.spec && !eng.drafter_off(r.job.session, r.job.req.sampling)
@@ -1052,6 +1120,9 @@ class Scheduler {
   ServerContext& ctx_;
   double protect_seconds_;
   int batch_, contended_, side_share_;
+  bool fair_pairing_;  // --fair-pairing: partners by fewest recent decode passes (serve/pairing.hpp)
+  StepTrace trace_{std::getenv("LING_STEP_TRACE")};  // the per-step trace, when the variable names a file
+  const char* unit_kind_ = nullptr;  // what the last unit did, for the trace (null: nothing worth a line)
   long decode_passes_ = 0;  // decode passes run (a batched step counts once), for --side-share
   long side_mark_ = -1;     // decode_passes_ when the last side chunk finished (--side-share)
   std::mutex mu_;
@@ -1630,7 +1701,7 @@ int main(int argc, char** argv) {
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 0, batch = 0, contended = 256, side_prefill = 40, side_share = 16;
   // --sessions, --max-context and --batch as given; what is not given is chosen at start (--auto-size).
   std::optional<int> sessions_arg, max_context_arg, batch_arg;
-  long host_reserve_mb = 16384, admit_reserve_mb = 8192, auto_size = 1;
+  long host_reserve_mb = 16384, admit_reserve_mb = 8192, auto_size = 1, fair_pairing = 0;
   double protect_seconds = 30;
   bool draft_bf16 = false;
   std::string repetition_arg, repetition_report = "incomplete";
@@ -1688,6 +1759,7 @@ int main(int argc, char** argv) {
     else if (a == "--host-reserve-mb") host_reserve_mb = std::stol(next());
     else if (a == "--admit-reserve-mb") admit_reserve_mb = std::stol(next());
     else if (a == "--auto-size") auto_size = std::stol(next());
+    else if (a == "--fair-pairing") fair_pairing = std::stol(next());
     else if (a == "--plan-only") plan_only = true;
     else if (a == "--repetition-detection") repetition_arg = next();
     else if (a == "--repetition-report") repetition_report = next();
@@ -1697,7 +1769,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N] | --no-kv-pages] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N] | --no-kv-pages] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
     return 2;
   }
   for (auto [flag, v] : {std::pair<const char*, std::optional<int>>{"--sessions", sessions_arg},
@@ -1784,7 +1856,8 @@ int main(int argc, char** argv) {
   opts.vision_cache_mb = vision_cache_mb;
   for (auto [var, dst] : {std::pair<const char*, long*>{"LING_HOST_RESERVE_MB", &host_reserve_mb},
                           std::pair<const char*, long*>{"LING_ADMIT_RESERVE_MB", &admit_reserve_mb},
-                          std::pair<const char*, long*>{"LING_AUTO_SIZE", &auto_size}})
+                          std::pair<const char*, long*>{"LING_AUTO_SIZE", &auto_size},
+                          std::pair<const char*, long*>{"LING_FAIR_PAIRING", &fair_pairing}})
     if (const char* e = std::getenv(var)) {
       try {
         *dst = std::stol(e);
@@ -1904,7 +1977,7 @@ int main(int argc, char** argv) {
     name = name.substr(name.find_last_of('/') + 1);
   }
   ctx.model_name = name;
-  ling::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended, side_share);
+  ling::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended, side_share, fair_pairing != 0);
 
   proxygen::HTTPServerOptions options;
   options.threads = 2;
