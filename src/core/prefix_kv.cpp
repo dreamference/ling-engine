@@ -220,11 +220,11 @@ bool PrefixKvTree::make_room(size_t need, uint64_t epoch) {
   return true;
 }
 
-bool PrefixKvTree::evict_lru_leaf() {
+bool PrefixKvTree::evict_lru_leaf(const std::vector<int>& keep) {
   int victim = -1;
   for (size_t i = 1; i < nodes_.size(); ++i) {
     const Node& n = nodes_[i];
-    if (!n.live || !n.kids.empty()) continue;
+    if (!n.live || !n.kids.empty() || std::find(keep.begin(), keep.end(), static_cast<int>(i)) != keep.end()) continue;
     if (victim < 0 || n.used < nodes_[victim].used) victim = static_cast<int>(i);
   }
   if (victim < 0) return false;
@@ -352,10 +352,12 @@ int PrefixKvTree::pages_held() const {
   return n;
 }
 
-std::vector<std::vector<int>> PrefixKvTree::page_lists() const {
+std::vector<std::vector<int>> PrefixKvTree::page_lists(const std::vector<int>& skip) const {
   std::vector<std::vector<int>> out;
   for (size_t i = 1; i < nodes_.size(); ++i)
-    if (nodes_[i].live && !nodes_[i].pages.empty()) out.push_back(nodes_[i].pages);
+    if (nodes_[i].live && !nodes_[i].pages.empty() &&
+        std::find(skip.begin(), skip.end(), static_cast<int>(i)) == skip.end())
+      out.push_back(nodes_[i].pages);
   return out;
 }
 

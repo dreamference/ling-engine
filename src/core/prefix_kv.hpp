@@ -107,8 +107,9 @@ class PrefixKvTree {
   void* add_state(int node, uint64_t epoch);
 
   // Evicts the least recently used live leaf whatever its stamp (the engine's reclaim of pool pages before idle
-  // sessions, §5.3 "A full pool"); false when the tree is empty.
-  bool evict_lru_leaf();
+  // sessions, §5.3 "A full pool"), never one of the nodes in `keep` (P4c: the path an admitted prompt resumes from);
+  // false when no leaf is left to evict.
+  bool evict_lru_leaf(const std::vector<int>& keep = {});
 
   void clear();  // everything released, every page dropped (a cold engine)
   size_t bytes() const { return bytes_; }
@@ -118,8 +119,9 @@ class PrefixKvTree {
   int buffers() const;
   bool paged() const { return paged_; }
   int pages_held() const;  // the page references the tree holds, a page counted once per node holding it
-  // Paged mode: each live node's page ids (its references; KvPool::reclaimable counts what evicting them frees).
-  std::vector<std::vector<int>> page_lists() const;
+  // Paged mode: each live node's page ids (its references; KvPool::reclaimable counts what evicting them frees), the
+  // nodes in `skip` left out.
+  std::vector<std::vector<int>> page_lists(const std::vector<int>& skip = {}) const;
 
  private:
   struct Node {
