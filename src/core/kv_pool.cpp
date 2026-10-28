@@ -28,6 +28,17 @@ int KvPool::needed(const std::vector<int>& table, int from, int to) const {
   return need;
 }
 
+int KvPool::net_need(const std::vector<int>& table, int pages) {
+  int need = 0;
+  const int n = std::max(pages, static_cast<int>(table.size()));
+  for (int i = 0; i < n; ++i) {
+    const bool mapped = i < static_cast<int>(table.size()) && table[i] != 0;
+    if (i < pages) need += !mapped;
+    else need -= mapped;
+  }
+  return std::max(need, 0);
+}
+
 bool KvPool::ensure(std::vector<int>& table, int from, int to, std::vector<Copy>* copies) {
   if (from < 0 || to < from) throw std::invalid_argument("KvPool::ensure: bad range");
   if (needed(table, from, to) > free_pages()) return false;

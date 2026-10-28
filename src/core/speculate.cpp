@@ -947,6 +947,9 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
     if (row_logits) *row_logits = logits_;
     return {sample(logits_, p, s_->history)};
   }
+  // P4b: the KV pages of every row the verify may write, before anything of the step runs (all or nothing: a short
+  // pool throws KvPoolExhausted with nothing drawn or changed), so a replayed verify graph finds them mapped.
+  kv_ensure(*s_, s_->pos, s_->pos + kv_step_rows(*s_, true), stream_);
   // Graphs have the block's shape and the drafter's chain; a short block at the context's end or a lookup
   // chain runs eagerly. Either way the same kernels run, so the result is the same.
   const bool graph = graphs_ && B == opts_.draft_block && !(opts_.lookup_mode == 2);
@@ -982,6 +985,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
     }
   }
   const int V = sp.V, K = sp.K;  // rows verified, top K per row
+  kv_ensure(*s_, s_->pos, s_->pos + V, stream_);  // P4b: mapped above (kv_step_rows bounds V); a no-op check
   auto t1 = std::chrono::steady_clock::now();
   s_->spec.draft_seconds += std::chrono::duration<double>(t1 - t0).count();
 
@@ -1114,6 +1118,19 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   }
   const int B = opts_.draft_block, n = static_cast<int>(seqs.size());
   if (n > kernels::kMaxSeqs) throw std::runtime_error("speculate_batch: more sequences than kMaxSeqs");
+  if (kv_book_) {  // P4b: every sequence's verify pages first, all or nothing (see speculate)
+    int need = 0;
+    for (const SeqStep& q : seqs) need += kv_step_need(q.session, true);
+    if (need > kv_book_->free_pages()) kv_retire(false);
+    if (need > kv_book_->free_pages()) kv_retire(true);
+    if (need > kv_book_->free_pages())
+      throw KvPoolExhausted("KV page pool exhausted: the batch's step needs " + std::to_string(need) + " pages, " +
+                            std::to_string(kv_book_->free_pages()) + " free");
+    for (const SeqStep& q : seqs) {
+      Session& s = sessions_[q.session];
+      kv_ensure(s, s.pos, s.pos + kv_step_rows(s, true), stream_);
+    }
+  }
   const size_t vocab = model_->config().vocab;
   const int K16 = draft_->config().selector_top_k, E = B - 1;
   auto t0 = std::chrono::steady_clock::now();
@@ -1175,6 +1192,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     V += sp.V;
   }
   if (V > kernels::kMaxStreamRows) throw std::runtime_error("speculate_batch: more rows than kMaxStreamRows");
+  for (StepPlan& sp : plans) kv_ensure(*sp.s, sp.s->pos, sp.s->pos + sp.V, stream_);  // P4b: mapped above; a check
   auto t1 = std::chrono::steady_clock::now();
 
   // 2. One verify over every sequence's rows, then 3. each sequence's accept. A non-finite row fails only its own

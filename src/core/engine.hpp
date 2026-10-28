@@ -22,6 +22,7 @@
 #include <memory>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,7 @@
 #include "core/draft_guard.hpp"
 #include "core/drafter.hpp"
 #include "core/kernels.cuh"
+#include "core/kv_pool.hpp"
 #include "core/model.hpp"
 #include "core/prefix_kv.hpp"
 #include "core/sampling.hpp"
@@ -121,9 +123,13 @@ struct EngineOptions {
   bool prefill_bf16 = false;
   // P4 (BATCHING §5.3): the full-attention KV in 64-position pages of one pool, each session reading and writing its
   // positions through a page table, instead of a flat slot per session. Only addresses change, so every result is the
-  // flat layout's bit for bit. Step P4a: each session's table maps a fixed run of the pool (the flat slots' memory).
-  // LING_KV_PAGES=0/1 overrides.
+  // flat layout's bit for bit. P4b: a session maps pages lazily, as its passes reach them, and gives back the ones past
+  // a new prompt's end (Engine's KV page pool, below). LING_KV_PAGES=0/1 overrides.
   bool kv_pages = false;
+  // P4b: the pool's size in pages (each kKvPageTokens positions of every full-attention layer's K and V, 4 MiB for
+  // Qwen3.8-27B), besides the reserved page 0. 0, or more than can ever be mapped: sessions x max_context positions.
+  // ling-serve sets it from its memory plan (serve/admission.hpp) or --kv-pool-mb.
+  int kv_pool_pages = 0;
   // M4 §1: resident sessions, each a fixed slot with its own KV cache, DeltaNet and conv state, end-of-prompt
   // state, drafter context ring, history and RNG, all allocated here. Requests run one at a time in the
   // active session (select it with activate_session); the prefix checkpoints are shared by all of them.
@@ -214,6 +220,13 @@ struct SpecStats {
   // drafter's accepted tokens on the same steps. `shadow_best` adds up the better of the two per step.
   long shadow_steps[5] = {}, shadow_lookup[5] = {}, shadow_dflash[5] = {};
   long shadow_best = 0, shadow_total_steps = 0, shadow_dflash_all = 0;
+};
+
+// P4b: the KV page pool has no free page for a pass (Engine's KV page pool, below). Thrown before anything of the
+// pass is launched or changed; ling-serve's scheduler admits and steps requests so that it is never reached.
+class KvPoolExhausted : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
 };
 
 class Engine {
@@ -406,6 +419,41 @@ class Engine {
   void reset_all();
   int sessions_resident() const;
   long session_evictions() const { return evictions_; }
+  // ---- The KV page pool (P4b, BATCHING §5.3; with kv_pages only, else every count is 0). ----
+  // A session maps a page for every 64 positions it writes, when a pass first writes them (lazily); begin_prefill
+  // takes the prompt's pages and kKvGrowthPages more at once, and gives back the session's pages past those; a
+  // session's pages go only with the session (kv_evict, reset). A released page becomes free at a later step boundary,
+  // once every stream that could still read it has passed the point of its release (deferred frees).
+  static constexpr int kKvGrowthPages = 2;
+  bool kv_paged() const { return kv_pages_; }
+  int kv_pages_total() const { return kv_book_ ? kv_book_->capacity() : 0; }
+  // Free pages, after retiring the released ones whose readers have all finished.
+  int kv_pages_free();
+  int kv_pages_pending() const { return kv_book_ ? kv_book_->pending_pages() : 0; }
+  int kv_session_pages(int session) const;  // pages session i maps
+  // What begin_prefill of a prompt of `prompt_len` tokens in session i draws from the pool, net: every page index below
+  // the prompt's end plus kKvGrowthPages pages (kv_admit_pages) that the session does not map yet, less the pages it
+  // maps past that point, which begin_prefill gives back first (0 when those are more). Exact: begin_prefill rewrites
+  // the session's own pages below that point whatever it resumes from (P4b copies a donor's or the store's KV into
+  // them), so a scheduler that admits only when this many pages are free never sees begin_prefill throw.
+  int kv_admit_need(int session, size_t prompt_len) const;
+  // The pages a prompt of `prompt_len` tokens maps in all (its end plus kKvGrowthPages pages): more than
+  // kv_pages_total() and it can never run.
+  int kv_admit_pages(size_t prompt_len) const { return KvPool::pages_for(kv_target(prompt_len)); }
+  // The pages the next decode step of session i maps (a speculative one: every row its verify may write, the tree's
+  // included; else one row). speculate() and speculate_batch() map them before anything else of the step.
+  int kv_step_need(int session, bool spec) const;
+  // Session i's pages released and the session emptied (an idle conversation evicted for the pool's sake: its next
+  // turn prefills from scratch or from the prefix KV store). The slot becomes free for a new session.
+  void kv_evict(int session);
+  // The least recently used session that maps pages and is not in `busy` (running a request), or -1: what kv_evict
+  // reclaims first. Protection (free_session's protect_seconds) does not count here: the pool's need overrides it.
+  int kv_lru_idle(const std::vector<bool>& busy) const;
+  long kv_evictions() const { return kv_evictions_; }
+  // The step boundary: released pages whose readers have finished become free (wait: synchronize with those readers
+  // first). Returns whether nothing is left pending.
+  bool kv_retire(bool wait);
+
   // FNV-1a over every DeltaNet and conv state, bit for bit (the exactness tests compare runs with it).
   uint64_t state_hash();
   // FNV-1a over the drafter's context KV of the active session's positions [dkv_from, history), bit for bit; 0
@@ -451,6 +499,29 @@ class Engine {
   size_t kv_page_elems_ = 0;              // P4: elements per page (all full-attention layers' K and V)
   // P4: copies the KV of positions [0, n) of session `from` into the active session's pages, whole pages.
   void kv_pages_adopt(const Session& from, int n);
+  // P4b: the pool's bookkeeping (core/kv_pool.hpp), with kv_pages.
+  std::unique_ptr<KvPool> kv_book_;
+  long kv_evictions_ = 0;
+  // Deferred frees: an event recorded on each stream that may read a page (the main stream, the side prefill's stream,
+  // the commit stream) at every release; retire() runs once all three have passed them. A later record on a stream
+  // covers the earlier releases too, so one event per stream suffices.
+  cudaEvent_t kv_release_ev_[3] = {};
+  bool kv_release_rec_[3] = {};
+  cudaStream_t main_stream() const { return side_active_ ? side_.stream_ : stream_; }
+  cudaStream_t side_stream() const { return side_active_ ? stream_ : side_.stream_; }
+  int kv_target(size_t prompt_len) const;  // a prompt's end plus kKvGrowthPages pages, within max_context
+  // Rows the next step of s may write: 1, or a speculative step's verify rows (the tree's included).
+  int kv_step_rows(const Session& s, bool spec) const;
+  // Before a pass on stream st writes positions [from, to) of s: maps the pages (KvPool::ensure), makes the copies it
+  // asks for (copy-on-write; none in P4b, where no page is shared) and writes the changed table entries, all on st.
+  // Throws KvPoolExhausted, with nothing changed, when the pool is short even after waiting for the deferred frees.
+  // Never inside a graph capture (a captured table update would replay stale entries): there it only checks.
+  void kv_ensure(Session& s, int from, int to, cudaStream_t st);
+  // s's pages wholly at or past position n released (their table entries back to page 0 on the main stream), and
+  // the release recorded on every stream.
+  void kv_release(Session& s, int n);
+  void kv_table_sync(Session& s, cudaStream_t st);  // the device table to s.kv_ids, the changed entries only
+  void kv_record_release();
   bool prefill_bf16_ = false;             // opts_.prefill_bf16 or LING_PREFILL_BF16: BF16 DeltaNet intermediates
   // RMSNorm; on the rows path it also leaves the FP16 copy for the next linear call (x_ready).
   // On the prefill path it writes the quantized input of the next GEMMs instead (input scale `in_scale`,
@@ -757,7 +828,8 @@ class Engine {
     // per full-attention layer, [Hkv][max_context][D]; P4 (--kv-pages): the layer's K and V bases in the pool
     std::vector<__nv_bfloat16*> kcache, vcache;
     uint64_t* pages = nullptr;           // P4: the device page table (element offsets of its pages), or nullptr: flat
-    std::vector<uint64_t> page_host;     // P4: its host copy
+    std::vector<uint64_t> page_host;     // P4: what the device table holds (written only through kv_table_set)
+    std::vector<int> kv_ids;             // P4b: its pages' ids, KvPool's table (0: unmapped)
     std::vector<float*> gdn, conv;                // DeltaNet and conv state, per linear layer
     std::vector<int> history;  // the tokens whose KV the caches hold (kept when another session takes the slot)
     size_t prompt_len = 0;     // the last prefill's prompt: history past it is the current request's output

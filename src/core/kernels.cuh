@@ -153,6 +153,12 @@ void tree_gather(const GatherBuf* bufs, int nbufs, const int* rows, int n, DevPo
 // every full-attention layer's K and V (2 x layers). to_buf: into the buffer. A copy: the bits are unchanged.
 void kv_pages_copy(__nv_bfloat16* pool, const uint64_t* pages, int layer_kv, int Hkv, int D, __nv_bfloat16* buf,
                    int buf_start, int buf_len, int from, int to, bool to_buf, cudaStream_t s);
+// P4b: table[idx[i]] = val[i] for i < n, on stream s, before the pass that reads the table. The entries travel as the
+// kernel's parameters (kKvTableSetMax per launch, looped for more), never as a copy from a host buffer: a pinned
+// mirror that the host changes again before an earlier queued copy has run would hand that copy the newer value. The
+// table's pointer never changes, so a captured graph that baked it reads the new entries.
+constexpr int kKvTableSetMax = 256;
+void kv_table_set(uint64_t* table, const int* idx, const uint64_t* val, int n, cudaStream_t s);
 // The weights stream_gemm reads are tiled (SPEC.md §8, stage 4): each (16-row tile, 128-value chunk) is
 // one contiguous block in the order the warp's lanes read it, so every load covers 512 contiguous bytes
 // (measured: the row-major pattern reads at 215 GB/s, contiguous blocks at 232). NVFP4 blocks carry

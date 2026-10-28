@@ -1025,7 +1025,7 @@ EOF
       return choose_size(c, w, scratch, true, avail, reserve, 262144, s, ctx, on);
     };
     auto fits = [&](int n, int ctx, long avail, size_t scratch) {
-      return refuse_start(plan_memory(c, w, n, ctx, true, scratch), avail, reserve).empty();
+      return refuse_start(plan_memory(c, w, n, ctx, true, false, scratch), avail, reserve).empty();
     };
     for (size_t scratch : {kScratchBytes, vis}) {  // images off (§3.5's table) and on (the default)
       // Four sessions at the full context are refused (§3.5: 1 GB short), three fit: three at 262,144, batch three.
@@ -1034,7 +1034,7 @@ EOF
       EXPECT(a.sessions == 3 && a.max_context == 262144 && a.sessions_auto && a.context_auto && a.sized);
     }
     // The plan_memory default scratch is the start check's when images are off.
-    EXPECT(plan_memory(c, w, 3, 262144, true).total() == plan_memory(c, w, 3, 262144, true, kScratchBytes).total());
+    EXPECT(plan_memory(c, w, 3, 262144, true).total() == plan_memory(c, w, 3, 262144, true, false, kScratchBytes).total());
     // --sessions 4 given: the longest context four fit, halving from the full one (§3.5: 131,072 passes, 196,608 is
     // not a halving).
     {
