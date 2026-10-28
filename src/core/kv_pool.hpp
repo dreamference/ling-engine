@@ -50,6 +50,20 @@ class KvPool {
   void share(std::vector<int>& dst, const std::vector<int>& src, int n);
   // Releases the pages wholly at or past position n (the holder keeps positions [0, n)).
   void truncate(std::vector<int>& table, int n);
+  // P4c: drops the holder's shared pages (refs > 1) at page indices pages_for(n) and up, leaving those indices
+  // unmapped: a pass that rewrites every position there maps fresh pages instead of copying pages it overwrites.
+  void unshare(std::vector<int>& table, int n);
+  // P4c: what a prefill draws from the free list, net, when it resumes at position `reuse` and maps every page index
+  // below `pages` (Engine::begin_prefill, in this order): the holder maps `donor`'s pages for [0, reuse) instead of its
+  // own when `donor` is given (another session's table, or the prefix KV store's pages for that run; share()), gives
+  // back its pages at or past `pages` (truncate), drops its shared pages from pages_for(reuse) on (unshare), and
+  // ensure(reuse, end) takes a page for every unmapped index and a private copy of the shared page `reuse` falls in.
+  // Pages the holder's releases make free count as free (they are once retired); at least 0. Exact for that sequence.
+  int resume_need(const std::vector<int>& table, int reuse, int pages, const std::vector<int>* donor) const;
+  // P4c: the pages that become free once every reference listed in `refs` is released (each entry of each list one
+  // reference, 0 ignored: a holder's table, or the prefix KV store's references): a page counts when every reference
+  // to it is listed. What evicting those holders reclaims.
+  int reclaimable(const std::vector<const std::vector<int>*>& refs) const;
   void retain(int page);
   void release(int page);
   // The step boundary: pages released since the last call become free.
