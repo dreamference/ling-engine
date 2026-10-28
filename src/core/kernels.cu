@@ -485,10 +485,32 @@ __global__ void tree_gather_kernel(const GatherBuf* __restrict__ bufs, const int
   for (int j = 1; j < n; ++j) {
     const int r = rows[j];
     if (r == j) continue;
-    const int4* src = reinterpret_cast<const int4*>(b.base + (off + r) * b.stride);
-    int4* dst = reinterpret_cast<int4*>(b.base + (off + j) * b.stride);
+    // A paged KV buffer (P4): each row through its page table; the source and destination may be in different pages.
+    auto row = [&](size_t p) {
+      return b.pages ? b.base + b.pages[p / kKvPageTokens] * b.page_unit + (p % kKvPageTokens) * b.stride
+                     : b.base + p * b.stride;
+    };
+    const int4* src = reinterpret_cast<const int4*>(row(off + r));
+    int4* dst = reinterpret_cast<int4*>(row(off + j));
     for (int i = threadIdx.x; i < b.row_bytes / 16; i += blockDim.x) dst[i] = src[i];
     __syncthreads();
+  }
+}
+
+// kv_pages_copy: block (i, lkv) moves position from + i of layer-and-K/V lkv, every KV head, 16 bytes a thread.
+__global__ void kv_pages_copy_kernel(__nv_bfloat16* __restrict__ pool, const uint64_t* __restrict__ pages, int Hkv, int D,
+                                     __nv_bfloat16* __restrict__ buf, int buf_start, int buf_len, int from, bool to_buf) {
+  pdl_begin();  // first statement: see launch.cuh
+  const int p = from + blockIdx.x, lkv = blockIdx.y, per_head = D / 8;
+  const size_t page = pages[p / kKvPageTokens] + size_t(lkv) * Hkv * kKvPageTokens * D +
+                      static_cast<size_t>(p % kKvPageTokens) * D;
+  const size_t flat = (size_t(lkv) * Hkv * buf_len + static_cast<size_t>(p - buf_start)) * D;
+  for (int i = threadIdx.x; i < Hkv * per_head; i += blockDim.x) {
+    const int h = i / per_head, c = i % per_head;
+    int4* a = reinterpret_cast<int4*>(pool + page + size_t(h) * kKvPageTokens * D) + c;
+    int4* b = reinterpret_cast<int4*>(buf + flat + size_t(h) * buf_len * D) + c;
+    if (to_buf) *b = *a;
+    else *a = *b;
   }
 }
 
@@ -527,7 +549,8 @@ __global__ void attn_prepare_kernel(const float* __restrict__ q_gate, const floa
                                     int rot, float theta, float eps, float* __restrict__ q,
                                     float* __restrict__ gate, __nv_bfloat16* __restrict__ kcache,
                                     __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps,
-                                    const TreeDesc* __restrict__ td, const int* __restrict__ mrope) {
+                                    const TreeDesc* __restrict__ td, const int* __restrict__ mrope,
+                                    const uint64_t* __restrict__ pages) {
   pdl_begin();  // first statement: see launch.cuh
   const int m = blockIdx.x, p0 = pos_value(pos0);
   // In a tree (BACKLOG 26) the row's position is its depth's; its key and value still go to slot p0 + m. After an
@@ -542,7 +565,7 @@ __global__ void attn_prepare_kernel(const float* __restrict__ q_gate, const floa
     pt = ph = pw = (td ? p0 + td->depth[m] : p0 + m) + rope_delta(pos0);
   }
   attn_prepare_body(q_gate, k, v, q_norm, k_norm, m, pt, ph, pw, Hq, Hkv, D, rot, theta, eps, q, gate, kcache, vcache,
-                    hs, ps, p0 + m, blockIdx.y);
+                    hs, ps, pages, p0 + m, blockIdx.y);
 }
 
 // Several sequences' rows in one launch (M4 stage 4): row m belongs to sequence seq_of(m), at that sequence's
@@ -552,12 +575,12 @@ __global__ void attn_prepare_seqs_kernel(const float* __restrict__ q_gate, const
                                          const __nv_bfloat16* __restrict__ k_norm, SeqBatch b, int Hq, int Hkv, int D,
                                          int rot, float theta, float eps, float* __restrict__ q,
                                          float* __restrict__ gate, SeqPtrs<__nv_bfloat16> kc, SeqPtrs<__nv_bfloat16> vc,
-                                         size_t hs, size_t ps) {
+                                         size_t hs, size_t ps, SeqPtrs<const uint64_t> pg) {
   pdl_begin();  // first statement: see launch.cuh
   const int m = blockIdx.x, sq = seq_of(b, m);
   const int p = seq_pos(b, sq) + m - b.row0[sq], r = p + seq_rdelta(b, sq);
   attn_prepare_body(q_gate, k, v, q_norm, k_norm, m, r, r, r, Hq, Hkv, D, rot, theta, eps, q, gate, kc.p[sq], vc.p[sq], hs,
-                    ps, p, blockIdx.y);
+                    ps, pg.p[sq], p, blockIdx.y);
 }
 
 // The rows path's attention (attention_mma_body and its tiles): core/attention_body.cuh.
@@ -567,10 +590,10 @@ __global__ void __launch_bounds__(ROWS * 2)
     attention_mma_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                          const __nv_bfloat16* __restrict__ vcache, DevPos pos0_arg, int M, int Hq, int Hkv,
                          int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf,
-                         const TreeDesc* __restrict__ td) {
+                         const TreeDesc* __restrict__ td, const uint64_t* __restrict__ pages) {
   pdl_begin();  // first statement: see launch.cuh
   attention_mma_body<ROWS, TK, NS, BULK>(q, kcache, vcache, pos_value(pos0_arg), M, Hq, Hkv, splits, chunk, scratch, hs,
-                                         ps, pf, blockIdx.x, blockIdx.y, blockIdx.z, td);
+                                         ps, pf, blockIdx.x, blockIdx.y, blockIdx.z, td, pages);
 }
 
 // Several sequences in one launch (M4 stage 4): the x blocks of sequence i are [blk0[i], blk0[i + 1]); each block
@@ -583,7 +606,8 @@ template <int ROWS, int TK, int NS, bool BULK>
 __global__ void __launch_bounds__(ROWS * 2)
     attention_mma_seqs_kernel(const float* __restrict__ q, SeqPtrs<const __nv_bfloat16> kc,
                               SeqPtrs<const __nv_bfloat16> vc, SeqBatch b, AttnBlocks blocks, int Hq, int Hkv,
-                              int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf) {
+                              int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf,
+                              SeqPtrs<const uint64_t> pg) {
   pdl_begin();  // first statement: see launch.cuh
   int sq = 0;
   while (sq + 1 < b.n && static_cast<int>(blockIdx.x) >= blocks.blk0[sq + 1]) ++sq;
@@ -591,7 +615,7 @@ __global__ void __launch_bounds__(ROWS * 2)
   const size_t r0 = b.row0[sq];
   attention_mma_body<ROWS, TK, NS, BULK>(q + r0 * Hq * D, kc.p[sq], vc.p[sq], seq_pos(b, sq), b.row0[sq + 1] - b.row0[sq],
                                          Hq, Hkv, splits, chunk, scratch + r0 * Hq * splits * (D + 2), hs, ps, pf,
-                                         blockIdx.x - blocks.blk0[sq], blockIdx.y, blockIdx.z);
+                                         blockIdx.x - blocks.blk0[sq], blockIdx.y, blockIdx.z, nullptr, pg.p[sq]);
 }
 
 __global__ void attention_combine_kernel(const float* __restrict__ scratch, int splits, int D,
@@ -783,6 +807,14 @@ void gdn_recurrent_tree(const float* mixed, const float* g, const float* beta, c
                 state_in, out, H, HV, td);
 }
 
+void kv_pages_copy(__nv_bfloat16* pool, const uint64_t* pages, int layer_kv, int Hkv, int D, __nv_bfloat16* buf,
+                   int buf_start, int buf_len, int from, int to, bool to_buf, cudaStream_t s) {
+  if (to <= from) return;
+  if (D % 8) throw std::runtime_error("kv_pages_copy: head_dim a multiple of 8");
+  launch_kernel("kv_pages_copy", kv_pages_copy_kernel, dim3(to - from, layer_kv), dim3(128), 0, s, pool, pages, Hkv, D,
+                buf, buf_start, buf_len, from, to_buf);
+}
+
 void tree_gather(const GatherBuf* bufs, int nbufs, const int* rows, int n, DevPos pos, cudaStream_t s) {
   if (nbufs <= 0 || n <= 1) return;
   launch_kernel("tree_gather", tree_gather_kernel, dim3(nbufs), dim3(256), 0, s, bufs, rows, n, pos);
@@ -807,19 +839,19 @@ void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float
 void attn_prepare(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
                   const __nv_bfloat16* k_norm, DevPos pos0, int M, int Hq, int Hkv, int D, int rot, float theta,
                   float eps, float* q, float* gate, __nv_bfloat16* kcache, __nv_bfloat16* vcache,
-                  cudaStream_t s, const TreeDesc* td, const int* mrope) {
+                  cudaStream_t s, const TreeDesc* td, const int* mrope, const uint64_t* pages) {
   dim3 grid(M, Hq + 2 * Hkv);
   launch_kernel("attn_prepare", attn_prepare_kernel, grid, dim3(D), D * sizeof(float), s, q_gate, k, v, q_norm, k_norm,
-                pos0, Hq, Hkv, D, rot, theta, eps, q, gate, kcache, vcache, kv_hs(D), kv_ps(Hkv, D), td, mrope);
+                pos0, Hq, Hkv, D, rot, theta, eps, q, gate, kcache, vcache, kv_hs(D), kv_ps(Hkv, D), td, mrope, pages);
 }
 
 void attn_prepare_seqs(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
                        const __nv_bfloat16* k_norm, const SeqBatch& b, int Hq, int Hkv, int D, int rot, float theta,
                        float eps, float* q, float* gate, SeqPtrs<__nv_bfloat16> kc, SeqPtrs<__nv_bfloat16> vc,
-                       cudaStream_t s) {
+                       cudaStream_t s, SeqPtrs<const uint64_t> pages) {
   dim3 grid(b.row0[b.n], Hq + 2 * Hkv);
   launch_kernel("attn_prepare_seqs", attn_prepare_seqs_kernel, grid, dim3(D), D * sizeof(float), s, q_gate, k, v,
-                q_norm, k_norm, b, Hq, Hkv, D, rot, theta, eps, q, gate, kc, vc, kv_hs(D), kv_ps(Hkv, D));
+                q_norm, k_norm, b, Hq, Hkv, D, rot, theta, eps, q, gate, kc, vc, kv_hs(D), kv_ps(Hkv, D), pages);
 }
 
 // Fixed key ranges at fixed positions (row invariance); LING_ATTN_CHUNK picks the size for experiments.
@@ -861,7 +893,7 @@ void prepare_kernels() {
 
 void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, DevPos pos0, int M,
                     int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s, int fixed_ctx,
-                    const TreeDesc* td) {
+                    const TreeDesc* td, const uint64_t* pages) {
   if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
   if (pos0.dev && fixed_ctx <= 0) throw std::runtime_error("attention_rows: a device position needs a fixed context");
   if (td && g_attn_bulk) throw std::runtime_error("attention_rows: a tree verify needs the cp.async tiles (no --attn-bulk)");
@@ -873,14 +905,14 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows",
                     g_attn_bulk ? attention_mma_kernel<rows, tk, ns, true> : attention_mma_kernel<rows, tk, ns, false>,
                     dim3((R + rows - 1) / rows, Hkv, splits), dim3(rows * 2), mma_smem(tk, ns), s, q, kcache, vcache,
-                    pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, td);
+                    pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, td, pages);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel, dim3(M * Hq), dim3(D),
                     0, s, scratch, splits, D, out);
 }
 
 void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
                          const SeqBatch& b, int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s,
-                         int fixed_ctx) {
+                         int fixed_ctx, SeqPtrs<const uint64_t> pages) {
   if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
   if (b.pos_dev && fixed_ctx <= 0) throw std::runtime_error("attention_rows: a device position needs a fixed context");
   if (b.n < 1 || b.n > kMaxSeqs) throw std::runtime_error("attention_rows_seqs: 1 to kMaxSeqs sequences");
@@ -898,7 +930,7 @@ void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtr
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_seqs",
                     g_attn_bulk ? attention_mma_seqs_kernel<rows, tk, ns, true> : attention_mma_seqs_kernel<rows, tk, ns, false>,
                     dim3(blocks.blk0[b.n], Hkv, splits), dim3(rows * 2), mma_smem(tk, ns), s, q, kc, vc, b, blocks, Hq, Hkv,
-                    splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch);
+                    splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel,
                     dim3(b.row0[b.n] * Hq), dim3(D), 0, s, scratch, splits, D, out);
 }

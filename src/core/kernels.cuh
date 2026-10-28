@@ -50,6 +50,11 @@ __device__ __forceinline__ int rope_delta(const DevPos& p) { return p.rdelta_dev
 // [row0[i], row0[i + 1]) of the launch, at positions pos(i) + (row - row0[i]). Passed by value, so a launch captured
 // into a CUDA graph keeps the row split; the positions come from pos_dev (written before each replay) when set.
 constexpr int kMaxSeqs = 4;
+// P4 (BATCHING §5.3, --kv-pages): positions per KV page. A page holds them for every full-attention layer's K and V,
+// [layer][K, V][kv head][kKvPageTokens][D]; a session's page table holds each page's element offset into the pool
+// (uint64_t), one entry per kKvPageTokens positions, and a kernel given a null table reads the flat layout. A multiple
+// of the attention's 32-key tile, so no tile crosses a page.
+constexpr int kKvPageTokens = 64;
 struct SeqBatch {
   int n = 0;
   int row0[kMaxSeqs + 1] = {};
@@ -132,13 +137,22 @@ void gdn_recurrent_tree(const float* mixed, const float* g, const float* beta, c
 // After a tree verify's accept: the accepted path's rows rows[j] (j < n, rows[j] >= j, rows[0] = 0) moved to row j in
 // every buffer of `bufs` (row r of buffer i at base + (r + (pos_rel ? pos : 0)) * stride bytes, row_bytes long), in
 // place, j ascending.
+// A paged KV buffer (P4): `pages` is its session's page table and row r is at base + pages[r / kKvPageTokens] *
+// page_unit + (r % kKvPageTokens) * stride bytes (page_unit: the bytes of one table unit, an element).
 struct GatherBuf {
   char* base;
   size_t stride;
   int row_bytes;
   int pos_rel;
+  const uint64_t* pages = nullptr;
+  int page_unit = 0;
 };
 void tree_gather(const GatherBuf* bufs, int nbufs, const int* rows, int n, DevPos pos, cudaStream_t s);
+// P4: the KV of positions [from, to) between a session's pages (pool, its device page table) and a flat buffer
+// [layer_kv][kv head][buf_len][D] whose first position is buf_start (the prefix KV store's layout); layer_kv counts
+// every full-attention layer's K and V (2 x layers). to_buf: into the buffer. A copy: the bits are unchanged.
+void kv_pages_copy(__nv_bfloat16* pool, const uint64_t* pages, int layer_kv, int Hkv, int D, __nv_bfloat16* buf,
+                   int buf_start, int buf_len, int from, int to, bool to_buf, cudaStream_t s);
 // The weights stream_gemm reads are tiled (SPEC.md §8, stage 4): each (16-row tile, 128-value chunk) is
 // one contiguous block in the order the warp's lanes read it, so every load covers 512 contiguous bytes
 // (measured: the row-major pattern reads at 215 GB/s, contiguous blocks at 232). NVFP4 blocks carry
@@ -231,11 +245,11 @@ void gated_rmsnorm_fp8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* z, cons
 void attn_prepare_seqs(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
                        const __nv_bfloat16* k_norm, const SeqBatch& b, int Hq, int Hkv, int D, int rot, float theta,
                        float eps, float* q, float* gate, SeqPtrs<__nv_bfloat16> kc, SeqPtrs<__nv_bfloat16> vc,
-                       cudaStream_t s);
+                       cudaStream_t s, SeqPtrs<const uint64_t> pages = {});
 // attention_rows over every row of b (q and out [rows][Hq][D]), each sequence over its own caches.
 void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
                          const SeqBatch& b, int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s,
-                         int fixed_ctx = 0);
+                         int fixed_ctx = 0, SeqPtrs<const uint64_t> pages = {});
 // The verify's conv: each sequence's rows of mixed from its own window (read, not written).
 void gdn_conv_seqs(float* mixed, SeqPtrs<const float> state, const __nv_bfloat16* w, const SeqBatch& b, int C,
                    cudaStream_t s);
@@ -456,7 +470,8 @@ void set_kv_layout(size_t head_stride, size_t pos_stride);
 void attn_prepare(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
                   const __nv_bfloat16* k_norm, DevPos pos0, int M, int Hq, int Hkv, int D, int rot, float theta,
                   float eps, float* q, float* gate, __nv_bfloat16* kcache, __nv_bfloat16* vcache,
-                  cudaStream_t s, const TreeDesc* td = nullptr, const int* mrope = nullptr);
+                  cudaStream_t s, const TreeDesc* td = nullptr, const int* mrope = nullptr,
+                  const uint64_t* pages = nullptr);
 // mrope (a prefill chunk of a prompt with images): row m's RoPE positions are mrope[3m .. 3m + 2], (temporal, height,
 // width), each frequency taking its component as the interleaved M-RoPE sections say (attention_body.cuh); null: the
 // row's position is its slot plus pos0's rope delta for all three.
@@ -469,7 +484,8 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
 size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx);
 void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, DevPos pos0, int M,
                     int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s, int fixed_ctx = 0,
-                    const TreeDesc* td = nullptr);
+                    const TreeDesc* td = nullptr, const uint64_t* pages = nullptr);
+// P4: kcache/vcache are a layer's K and V bases in the pool and `pages` the session's page table (null: flat).
 // Sets the kernels' shared-memory attributes once, outside any graph capture.
 void prepare_kernels();
 // M3: attention_rows loads its key/value tiles with bulk copies (TMA, one 512-byte copy per key row) instead
@@ -505,6 +521,7 @@ struct MkAttnParams {
   const __nv_bfloat16 *q_norm, *k_norm;
   float *q_out, *gate;          // [M][Hq][D]
   __nv_bfloat16 *kcache, *vcache;
+  const uint64_t* pages = nullptr;  // P4: the session's KV page table (kcache/vcache the layer's bases), or flat
   DevPos pos0 = DevPos(0);
   float* scratch;               // attention_rows_scratch_floats(M, Hq, D, the context) floats
   float* attn;                  // [M][Hq D]

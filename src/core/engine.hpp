@@ -106,6 +106,11 @@ struct EngineOptions {
   // under MILESTONES §14's exactness policy until its KL and agreement checks pass (bench/prefill_bf16_check.sh).
   // The decode and verify rows path is untouched either way. LING_PREFILL_BF16=0/1 overrides.
   bool prefill_bf16 = false;
+  // P4 (BATCHING §5.3): the full-attention KV in 64-position pages of one pool, each session reading and writing its
+  // positions through a page table, instead of a flat slot per session. Only addresses change, so every result is the
+  // flat layout's bit for bit. Step P4a: each session's table maps a fixed run of the pool (the flat slots' memory).
+  // LING_KV_PAGES=0/1 overrides.
+  bool kv_pages = false;
   // M4 §1: resident sessions, each a fixed slot with its own KV cache, DeltaNet and conv state, end-of-prompt
   // state, drafter context ring, history and RNG, all allocated here. Requests run one at a time in the
   // active session (select it with activate_session); the prefix checkpoints are shared by all of them.
@@ -410,6 +415,11 @@ class Engine {
   static constexpr int kAttnSlice = 256;
   static constexpr int kResumeAlign = 32;  // kept states sit at multiples of this (the DeltaNet's chunk)  // prefill attention: queries per call (bounds the partials' scratch)
   bool quantized_ = false;                // set by forward(): the pass is a prefill
+  bool kv_pages_ = false;                 // opts_.kv_pages or LING_KV_PAGES (P4)
+  __nv_bfloat16* kv_pool_ = nullptr;      // P4: the pool, [page][layer][K, V][kv head][kKvPageTokens][D]; page 0 unused
+  size_t kv_page_elems_ = 0;              // P4: elements per page (all full-attention layers' K and V)
+  // P4: copies the KV of positions [0, n) of session `from` into the active session's pages, whole pages.
+  void kv_pages_adopt(const Session& from, int n);
   bool prefill_bf16_ = false;             // opts_.prefill_bf16 or LING_PREFILL_BF16: BF16 DeltaNet intermediates
   // RMSNorm; on the rows path it also leaves the FP16 copy for the next linear call (x_ready).
   // On the prefill path it writes the quantized input of the next GEMMs instead (input scale `in_scale`,
@@ -708,7 +718,10 @@ class Engine {
 
   // A resident session (M4 §1): everything that belongs to one sequence.
   struct Session {
-    std::vector<__nv_bfloat16*> kcache, vcache;  // per full-attention layer, [Hkv][max_context][D]
+    // per full-attention layer, [Hkv][max_context][D]; P4 (--kv-pages): the layer's K and V bases in the pool
+    std::vector<__nv_bfloat16*> kcache, vcache;
+    uint64_t* pages = nullptr;           // P4: the device page table (element offsets of its pages), or nullptr: flat
+    std::vector<uint64_t> page_host;     // P4: its host copy
     std::vector<float*> gdn, conv;                // DeltaNet and conv state, per linear layer
     std::vector<int> history;  // the tokens whose KV the caches hold (kept when another session takes the slot)
     size_t prompt_len = 0;     // the last prefill's prompt: history past it is the current request's output

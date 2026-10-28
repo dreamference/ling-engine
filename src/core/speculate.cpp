@@ -225,9 +225,11 @@ void Engine::alloc_drafter() {
     std::vector<kernels::GatherBuf> g = shared;
     for (size_t l = 0; l < s.kcache.size(); ++l)
       for (int h = 0; h < c.kv_heads; ++h) {
-        const size_t off = size_t(h) * opts_.max_context * D;
-        g.push_back({reinterpret_cast<char*>(s.kcache[l] + off), D * 2, int(D * 2), 1});
-        g.push_back({reinterpret_cast<char*>(s.vcache[l] + off), D * 2, int(D * 2), 1});
+        // P4: a head's run inside each page, rows through the session's page table (in element units)
+        const size_t off = size_t(h) * (s.pages ? kernels::kKvPageTokens : opts_.max_context) * D;
+        const int unit = s.pages ? int(sizeof(__nv_bfloat16)) : 0;
+        g.push_back({reinterpret_cast<char*>(s.kcache[l] + off), D * 2, int(D * 2), 1, s.pages, unit});
+        g.push_back({reinterpret_cast<char*>(s.vcache[l] + off), D * 2, int(D * 2), 1, s.pages, unit});
       }
     for (const kernels::GatherBuf& b : g)
       if (b.row_bytes % 16 != 0) throw std::runtime_error("tree gather: a row is not a multiple of 16 bytes");

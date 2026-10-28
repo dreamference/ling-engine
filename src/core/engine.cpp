@@ -78,6 +78,7 @@ template int* Engine::alloc<int>(size_t);
 template __half* Engine::alloc<__half>(size_t);
 template __nv_bfloat16* Engine::alloc<__nv_bfloat16>(size_t);
 template uint8_t* Engine::alloc<uint8_t>(size_t);
+template uint64_t* Engine::alloc<uint64_t>(size_t);
 
 // The scratch one pass writes (the activations of a prefill chunk, the quantized copies, the attention partials, the
 // last row's logits, the rows path's FP16 copies), into the members named now: the main set, or the side set while
@@ -165,19 +166,49 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   check(cudaHostAlloc(reinterpret_cast<void**>(&pin_), sizeof(StepPinned), cudaHostAllocDefault), "pinned step buffers");
   kernels::prepare_kernels();  // attributes are set here, never inside a graph capture
 
-  // Head-major KV caches: one KV head's keys are one contiguous stream for the attention kernels.
-  kernels::set_kv_layout(size_t(opts_.max_context) * c.head_dim, c.head_dim);
   // The session slots (M4 §1), each allocated in full here: nothing is allocated while serving.
   if (opts_.sessions < 1) throw std::runtime_error("sessions must be at least 1");
   sessions_.resize(opts_.sessions);
   layer_slot_.resize(c.layers);
   int n_full = 0;
   for (int i = 0; i < c.layers; ++i) layer_slot_[i] = c.full_attention[i] ? n_full++ : n_linear_++;
+  kv_pages_ = opts_.kv_pages;
+  if (const char* e = std::getenv("LING_KV_PAGES")) kv_pages_ = std::atoi(e) != 0;
+  constexpr int PT = kernels::kKvPageTokens;
+  const int pages_per_session = (opts_.max_context + PT - 1) / PT;
+  if (kv_pages_) {
+    // P4 (BATCHING §5.3): one pool of pages, each [layer][K, V][kv head][PT][D]; inside a page a KV head's positions
+    // are one contiguous run, as in the head-major slots. Page 0 is never mapped: a masked key's address lands there.
+    // P4a: session i maps pages 1 + i * pages_per_session onward, the same memory the flat slots take.
+    kernels::set_kv_layout(size_t(PT) * c.head_dim, c.head_dim);
+    kv_page_elems_ = size_t(n_full) * 2 * kvsize * PT;
+    kv_pool_ = alloc<__nv_bfloat16>(kv_page_elems_ * (size_t(opts_.sessions) * pages_per_session + 1));
+    std::fprintf(stderr, "KV pages: %d per session of %d positions, %.1f MB each, pool %.2f GB\n", pages_per_session,
+                 PT, kv_page_elems_ * 2 / 1e6,
+                 kv_page_elems_ * 2.0 * (size_t(opts_.sessions) * pages_per_session + 1) / 1e9);
+  } else {
+    // Head-major KV caches: one KV head's keys are one contiguous stream for the attention kernels.
+    kernels::set_kv_layout(size_t(opts_.max_context) * c.head_dim, c.head_dim);
+  }
   std::random_device seed_source;
   for (Session& s : sessions_) {
-    for (int i = 0; i < n_full; ++i) {
-      s.kcache.push_back(alloc<__nv_bfloat16>(size_t(opts_.max_context) * kvsize));
-      s.vcache.push_back(alloc<__nv_bfloat16>(size_t(opts_.max_context) * kvsize));
+    if (kv_pages_) {
+      const size_t idx = &s - sessions_.data();
+      for (int i = 0; i < n_full; ++i) {
+        s.kcache.push_back(kv_pool_ + size_t(i) * 2 * kvsize * PT);
+        s.vcache.push_back(kv_pool_ + (size_t(i) * 2 + 1) * kvsize * PT);
+      }
+      s.page_host.resize(pages_per_session);
+      for (int j = 0; j < pages_per_session; ++j)
+        s.page_host[j] = (1 + idx * pages_per_session + j) * kv_page_elems_;
+      s.pages = alloc<uint64_t>(pages_per_session);
+      check(cudaMemcpy(s.pages, s.page_host.data(), pages_per_session * sizeof(uint64_t), cudaMemcpyHostToDevice),
+            "KV page table");
+    } else {
+      for (int i = 0; i < n_full; ++i) {
+        s.kcache.push_back(alloc<__nv_bfloat16>(size_t(opts_.max_context) * kvsize));
+        s.vcache.push_back(alloc<__nv_bfloat16>(size_t(opts_.max_context) * kvsize));
+      }
     }
     for (int i = 0; i < n_linear_; ++i) {
       s.gdn.push_back(alloc<float>(size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim));
@@ -627,12 +658,30 @@ int Engine::sessions_resident() const {
   return n;
 }
 
+void Engine::kv_pages_adopt(const Session& from, int n) {
+  // Whole pages: a position of the last page past n is beyond the history, never read before it is written again.
+  // Runs of pages contiguous in both tables go as one copy.
+  const int np = (n + kernels::kKvPageTokens - 1) / kernels::kKvPageTokens;
+  for (int j = 0; j < np;) {
+    int k = j + 1;
+    while (k < np && from.page_host[k] == from.page_host[k - 1] + kv_page_elems_ &&
+           s_->page_host[k] == s_->page_host[k - 1] + kv_page_elems_)
+      ++k;
+    if (from.page_host[j] != s_->page_host[j])
+      check(cudaMemcpyAsync(kv_pool_ + s_->page_host[j], kv_pool_ + from.page_host[j],
+                            size_t(k - j) * kv_page_elems_ * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream_),
+            "session KV page copy");
+    j = k;
+  }
+}
+
 void Engine::adopt_prefix(const Session& from, int n) {
   join_commit();
   const ModelConfig& c = model_->config();
   // Head-major caches: each KV head's positions [0, n) are one contiguous run, max_context positions apart.
   const size_t row = size_t(c.head_dim) * sizeof(__nv_bfloat16), pitch = size_t(opts_.max_context) * row;
-  for (size_t l = 0; l < s_->kcache.size(); ++l) {
+  if (kv_pages_) kv_pages_adopt(from, n);
+  for (size_t l = 0; l < (kv_pages_ ? 0 : s_->kcache.size()); ++l) {
     check(cudaMemcpy2DAsync(s_->kcache[l], pitch, from.kcache[l], pitch, size_t(n) * row, c.kv_heads,
                             cudaMemcpyDeviceToDevice, stream_),
           "session KV copy");
@@ -793,6 +842,11 @@ void Engine::kv_copy(void* buf, int buf_start, int buf_len, int from, int to, bo
   const size_t D = c.head_dim, row = D * sizeof(__nv_bfloat16), cache_pitch = size_t(opts_.max_context) * row;
   const size_t buf_pitch = size_t(buf_len) * row, width = size_t(to - from) * row;
   auto* b = static_cast<__nv_bfloat16*>(buf);
+  if (kv_pages_) {  // P4: one launch over the positions, through the page table
+    kernels::kv_pages_copy(kv_pool_, s_->pages, static_cast<int>(s_->kcache.size()) * 2, c.kv_heads, c.head_dim, b,
+                           buf_start, buf_len, from, to, to_buf, stream_);
+    return;
+  }
   for (size_t l = 0; l < s_->kcache.size(); ++l)
     for (int kv = 0; kv < 2; ++kv) {
       __nv_bfloat16* cache = (kv == 0 ? s_->kcache : s_->vcache)[l] + size_t(from) * D;
@@ -1093,6 +1147,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       p.gate = gate_;
       p.kcache = g.s->kcache[slot];
       p.vcache = g.s->vcache[slot];
+      p.pages = g.s->pages;
       p.pos0 = seg_pos(g, 0);
       p.td = tree_;  // a tree verify's rows (BACKLOG 26), or nullptr
       p.scratch = attn_scratch_;
@@ -1122,28 +1177,30 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       if (multi) {
         kernels::SeqPtrs<__nv_bfloat16> kc, vc;
         kernels::SeqPtrs<const __nv_bfloat16> kcr, vcr;
+        kernels::SeqPtrs<const uint64_t> pg;
         for (int i = 0; i < sb.n; ++i) {
           kcr.p[i] = kc.p[i] = segs[i].s->kcache[slot];
           vcr.p[i] = vc.p[i] = segs[i].s->vcache[slot];
+          pg.p[i] = segs[i].s->pages;
         }
         kernels::attn_prepare_seqs(q_gate_, k_, v_, L.q_norm, L.k_norm, sb, c.heads, c.kv_heads, c.head_dim, c.rotary_dim,
-                                   c.rope_theta, c.eps, q_, gate_, kc, vc, stream_);
+                                   c.rope_theta, c.eps, q_, gate_, kc, vc, stream_, pg);
         kernels::attention_rows_seqs(q_, kcr, vcr, sb, c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_, stream_,
-                                     use_dev_pos_ ? opts_.max_context : 0);
+                                     use_dev_pos_ ? opts_.max_context : 0, pg);
       }
       for (const Seg& g : multi ? std::span<const Seg>() : segs) {
         const size_t r0 = g.row0;
         kernels::attn_prepare(q_gate_ + r0 * 2 * qsize, k_ + r0 * kvsize, v_ + r0 * kvsize, L.q_norm, L.k_norm,
                               seg_pos(g, 0), g.rows, c.heads, c.kv_heads, c.head_dim, c.rotary_dim, c.rope_theta, c.eps,
                               q_ + r0 * qsize, gate_ + r0 * qsize, g.s->kcache[slot], g.s->vcache[slot], stream_,
-                              verify ? tree_ : nullptr, mrope);
+                              verify ? tree_ : nullptr, mrope, g.s->pages);
         // Fixed key ranges at fixed positions for every pass (row-invariant), in slices of queries that
         // bound the partial results' scratch. A captured graph launches the ranges of the whole context.
         for (int q0 = 0; q0 < g.rows; q0 += kAttnSlice) {
           const int n = std::min(kAttnSlice, g.rows - q0);
           kernels::attention_rows(q_ + (r0 + q0) * qsize, g.s->kcache[slot], g.s->vcache[slot], seg_pos(g, q0), n,
                                   c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_ + (r0 + q0) * qsize, stream_,
-                                  use_dev_pos_ ? opts_.max_context : 0, verify ? tree_ : nullptr);
+                                  use_dev_pos_ ? opts_.max_context : 0, verify ? tree_ : nullptr, g.s->pages);
         }
       }
       if (quantized_) {

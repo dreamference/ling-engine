@@ -7,7 +7,7 @@
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
 //              [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off]
-//              [--repetition-report incomplete|completed]
+//              [--repetition-report incomplete|completed] [--kv-pages]
 //
 // --sessions N (default 2; M4 §1) keeps N resident sessions, each with its own KV cache and state, so N
 // agent tasks that alternate keep their histories warm. A request runs in the session it extends (its
@@ -40,6 +40,8 @@
 // how often a streamed request that has produced no token yet is sent a keep-alive (API §3, §4).
 // --prefill-bf16 keeps the prefill's DeltaNet intermediates in BF16 as production does (B34; not exact, off
 // by default: MILESTONES §14).
+// --kv-pages keeps the full-attention KV in 64-position pages behind a page table per session (BATCHING §5.3, P4;
+// off by default; exact: only addresses change; LING_KV_PAGES=0/1 overrides).
 // --draft-bf16 reads the drafter's fc and conv kernel projections in BF16, as its file has them, instead of the
 // NVFP4 copies rounded at load (BACKLOG 33; the default since 2026-10-20; LING_DRAFT_NVFP4=0/1 overrides). Only the
 // drafter's proposals change, so only acceptance can move: the verify decides every token either way.
@@ -1362,6 +1364,7 @@ int main(int argc, char** argv) {
   int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 7, prefix_kv_mb = -1;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
+  bool kv_pages = false;
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40, side_share = 16;
   long host_reserve_mb = 16384, admit_reserve_mb = 8192;
   double protect_seconds = 30;
@@ -1404,6 +1407,7 @@ int main(int argc, char** argv) {
     else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
     else if (a == "--keepalive-seconds") keepalive_seconds = std::stoi(next());
     else if (a == "--prefill-bf16") prefill_bf16 = true;
+    else if (a == "--kv-pages") kv_pages = true;
     else if (a == "--draft-bf16") draft_bf16 = true;
     else if (a == "--draft-head") draft_head = next();  // sparse (default) or full (BACKLOG 19)
     else if (a == "--sparse-head-dir") sparse_head_dir = next();
@@ -1485,6 +1489,7 @@ int main(int argc, char** argv) {
   opts.attention_bulk = attn_bulk;
   opts.attention_prefetch = attn_prefetch;
   opts.prefill_bf16 = prefill_bf16;
+  opts.kv_pages = kv_pages;
   opts.draft_nvfp4 = !draft_bf16;
   opts.draft_head = draft_head;
   opts.sparse_head_dir = sparse_head_dir;

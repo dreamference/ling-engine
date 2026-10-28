@@ -6,7 +6,7 @@
 //            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N]]
 //            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16] [--graph-check] [--seed N]
 //            [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N]]
-//            [--batch-check] [--side-prefill N] [--draft-bf16]
+//            [--batch-check] [--side-prefill N] [--draft-bf16] [--kv-pages]
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -14,6 +14,8 @@
 // (default 2, 0 off; M3); --prefill-bf16 keeps the prefill's DeltaNet intermediates in BF16 as production does
 // (B34; not exact, off by default: MILESTONES §14); --draft-bf16 reads the drafter's fc and conv kernel projections
 // in BF16 instead of the NVFP4 copies rounded at load (BACKLOG 33, the default; LING_DRAFT_NVFP4=0/1 overrides).
+// --kv-pages keeps the full-attention KV in 64-position pages behind a page table per session (BATCHING §5.3, P4;
+// exact: only addresses change; LING_KV_PAGES=0/1 overrides).
 //
 // --graph-check decodes each prompt speculatively twice from the same prefill, without and with step graphs,
 // greedily and then sampling (--temperature, default 1, top-k 20, top-p 0.95, seeded by --seed or 1), and
@@ -313,6 +315,7 @@ int main(int argc, char** argv) {
   float temperature = 0.f;
   bool ids_out = false, prompt_ids_out = false, spec = false, spec_check = false, prefix_check = false;
   bool graphs = false, pdl = false, attn_bulk = false, graph_check = false, prefill_bf16 = false;
+  bool kv_pages = false;
   uint64_t seed = 0;
   int attn_prefetch = 2;
   std::string draft;
@@ -355,6 +358,7 @@ int main(int argc, char** argv) {
     else if (a == "--attn-bulk") attn_bulk = true;
     else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
     else if (a == "--prefill-bf16") prefill_bf16 = true;
+    else if (a == "--kv-pages") kv_pages = true;
     else if (a == "--draft-bf16") draft_bf16 = true;
     else if (a == "--draft-head") draft_head = next();  // sparse (default) or full (BACKLOG 19)
     else if (a == "--sparse-head-dir") sparse_head_dir = next();
@@ -467,6 +471,7 @@ int main(int argc, char** argv) {
     opts.attention_bulk = attn_bulk;
     opts.attention_prefetch = attn_prefetch;
     opts.prefill_bf16 = prefill_bf16;
+    opts.kv_pages = kv_pages;
     opts.draft_nvfp4 = !draft_bf16;
     opts.draft_head = draft_head;
     opts.sparse_head_dir = sparse_head_dir;
