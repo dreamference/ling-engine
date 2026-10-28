@@ -75,10 +75,65 @@ void plan_only() {
   check(start_plan(c, kWeights, kScratchBytes, true, 8, 262144, 1000, 0, paged).refusal.empty(), "no reserve: no check");
 }
 
+// Auto-size with --kv-pages: n sessions fit when the pool holds one conversation at max_context and n x max_context / 2
+// positions (kPagedFitShare); the flat plan's n full slots are not asked for.
+void paged_auto_size() {
+  const ling::ModelConfig c = qwen();
+  const size_t vis = kScratchBytes + (size_t(1100 + 512) << 20);  // images on, the default 512 MB cache
+  const KvPlanInputs paged{true, 0, -1}, paged_store{true, size_t(1024) << 20, -1};
+  auto choose = [&](long avail, size_t scratch, const KvPlanInputs& kv, std::optional<int> s = {},
+                    std::optional<int> ctx = {}) {
+    return choose_size(c, kWeights, scratch, true, avail, kReserve, 262144, s, ctx, true, kv);
+  };
+  // §3.5's two node-b figures: 114.7 GB available, and 109,423 MiB with nothing else on the GPU (api_tests).
+  for (const long avail : {kNodeB, 109423L})
+    for (const size_t scratch : {kScratchBytes, vis}) {
+      const SizeChoice flat = choose(avail, scratch, {});
+      const SizeChoice p = choose(avail, scratch, paged), q = choose(avail, scratch, paged_store);
+      const StartPlan sp = start_plan(c, kWeights, scratch, true, p.sessions, p.max_context, avail, kReserve, paged);
+      std::printf("avail %ld MiB, images %s: flat %d x %d; paged %d x %d (pool %s); store 1 GB: %d x %d\n", avail,
+                  scratch == vis ? "on" : "off", flat.sessions, flat.max_context, p.sessions, p.max_context,
+                  describe_kv_pool(sp.plan).c_str(), q.sessions, q.max_context);
+      check(flat.max_context == 262144 && flat.sessions == 3, "flat: three sessions at 262,144 on node-b");
+      check(p.sized && p.sessions_auto && p.context_auto, "paged: chosen here");
+      check(p.sessions == 4 && p.max_context == 262144, "paged: four sessions at 262,144 on node-b");
+      check(q.sessions == 4 && q.max_context == 262144, "paged with a 1 GB store: four at 262,144");
+      check(sp.refusal.empty(), "paged: the choice starts");
+    }
+  // The rule bites: a host whose pool holds one conversation at 262,144 but not 4 x 131,072 positions runs fewer.
+  // Pool pages = (avail - weights - n x ~0.5 GB - scratch - reserve) / 4 MiB; 8,192 pages are 32 GiB.
+  const long tight = 16384 + 22383 + 4096 + 2048 + 24576;  // reserve, weights, scratch, sessions' fixed, 24 GiB pool
+  const SizeChoice t = choose(tight, kScratchBytes, paged);
+  const StartPlan tp = start_plan(c, kWeights, kScratchBytes, true, t.sessions, t.max_context, tight, kReserve, paged);
+  std::printf("avail %ld MiB: paged %d x %d (pool %s)\n", tight, t.sessions, t.max_context,
+              describe_kv_pool(tp.plan).c_str());
+  check(t.max_context == 262144 && t.sessions >= 2 && t.sessions < 4, "a smaller pool: fewer sessions at 262,144");
+  check(tp.plan.kv_pool_pages >= long(t.sessions) * 4096 / kPagedFitShare, "the chosen sessions satisfy the rule");
+  check(!paged_sessions_fit(start_plan(c, kWeights, kScratchBytes, true, 4, 262144, tight, kReserve, paged).plan, 4,
+                            262144),
+        "four do not");
+  check(start_plan(c, kWeights, kScratchBytes, true, 4, 262144, tight, kReserve, paged).refusal.empty(),
+        "but four given at 262,144 still start (the scheduler requeues)");
+  // Given values: both given is a check only; given sessions take the longest context they fit at.
+  const SizeChoice g = choose(kNodeB, kScratchBytes, paged, 4, 262144);
+  check(g.sessions == 4 && g.max_context == 262144 && !g.sessions_auto && !g.context_auto, "both given: as given");
+  const SizeChoice eight = choose(kNodeB, kScratchBytes, paged, 8);
+  std::printf("eight given on node-b: %d x %d\n", eight.sessions, eight.max_context);
+  check(eight.sessions == 8 && eight.max_context == 131072, "eight given: 131,072 (eight halves of 262,144 do not fit the pool)");
+  // One session, paged: its pool is capped at its own max_context and is never "too small" for it.
+  const SizeChoice one = choose(kNodeB, kScratchBytes, paged, 1);
+  const StartPlan op = start_plan(c, kWeights, kScratchBytes, true, 1, 262144, kNodeB, kReserve, paged);
+  check(one.sessions == 1 && one.max_context == 262144, "one session given: 262,144");
+  check(op.plan.kv_pool_pages == 4096 && op.refusal.empty(), "one session at 262,144 starts with 4,096 pages");
+  // Without --kv-pages auto-size is unchanged (the flat plan).
+  check(choose(kNodeB, kScratchBytes, {}).sessions == 3, "flat unchanged");
+}
+
 }  // namespace
 
 int main() {
   plan_only();
+  paged_auto_size();
   if (failures) {
     std::printf("%d check(s) failed\n", failures);
     return 1;

@@ -1807,14 +1807,9 @@ int main(int argc, char** argv) {
     const size_t scratch = as::kScratchBytes + (opts.vision ? size_t(1100 + vision_cache_mb) << 20 : 0);
     const long avail = as::mem_available_mb();
     const int full_context = as::model_full_context(model_dir + "/config.json");  // 0: sized from 65,536
-    const as::SizeChoice size = as::choose_size(cfg, weights, scratch, !draft_dir.empty(), avail, host_reserve_mb,
-                                                full_context, sessions_arg, max_context_arg, auto_size != 0);
-    sessions = size.sessions;
-    max_context = size.max_context;
-    batch = batch_arg.value_or(size.sessions_auto ? sessions : as::kDefaultBatch);
     // With --kv-pages the pool takes what the rest of the plan, the prefix KV store's budget (it still holds KV in P4b
     // and sizes itself after the engine, from what is free above its own reserve) and the reserve leave, or
-    // --kv-pool-mb.
+    // --kv-pool-mb; auto-size sizes by the same plan.
     as::KvPlanInputs kv{kv_pages, 0, kv_pool_mb};
     if (kv_pages) {
       long store_mb = opts.prefix_kv_mb;
@@ -1822,6 +1817,11 @@ int main(int argc, char** argv) {
       if (checkpoints <= 0 || store_mb < 0) store_mb = 0;
       kv.store_bytes = size_t(store_mb) << 20;
     }
+    const as::SizeChoice size = as::choose_size(cfg, weights, scratch, !draft_dir.empty(), avail, host_reserve_mb,
+                                                full_context, sessions_arg, max_context_arg, auto_size != 0, kv);
+    sessions = size.sessions;
+    max_context = size.max_context;
+    batch = batch_arg.value_or(size.sessions_auto ? sessions : as::kDefaultBatch);
     const as::StartPlan start = as::start_plan(cfg, weights, scratch, !draft_dir.empty(), sessions, max_context, avail,
                                                host_reserve_mb, kv);
     plan = start.plan;
