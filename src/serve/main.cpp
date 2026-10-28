@@ -7,7 +7,7 @@
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
 //              [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off]
-//              [--repetition-report incomplete|completed] [--kv-pages]
+//              [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N]]
 //
 // --sessions N (default 2; M4 §1) keeps N resident sessions, each with its own KV cache and state, so N
 // agent tasks that alternate keep their histories warm. A request runs in the session it extends (its
@@ -41,7 +41,11 @@
 // --prefill-bf16 keeps the prefill's DeltaNet intermediates in BF16 as production does (B34; not exact, off
 // by default: MILESTONES §14).
 // --kv-pages keeps the full-attention KV in 64-position pages behind a page table per session (BATCHING §5.3, P4;
-// off by default; exact: only addresses change; LING_KV_PAGES=0/1 overrides).
+// off by default; exact: only addresses change; LING_KV_PAGES=0/1 overrides). The pages come from one pool allocated
+// at start: what MemAvailable leaves after the memory plan, the prefix KV store's budget and --host-reserve-mb, at most
+// --sessions x --max-context positions; or --kv-pool-mb N, refused at start when the plan with it does not fit. A
+// session then costs its fixed part (~0.5 GB) and 64 KB for each position it holds, so --sessions 4 --max-context
+// 262144 starts on a 128 GB node.
 // --draft-bf16 reads the drafter's fc and conv kernel projections in BF16, as its file has them, instead of the
 // NVFP4 copies rounded at load (BACKLOG 33; the default since 2026-10-20; LING_DRAFT_NVFP4=0/1 overrides). Only the
 // drafter's proposals change, so only acceptance can move: the verify decides every token either way.
@@ -1445,6 +1449,7 @@ int main(int argc, char** argv) {
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
   bool kv_pages = false;
+  long kv_pool_mb = -1;  // P4b: -1, the pool from the memory plan
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40, side_share = 16;
   long host_reserve_mb = 16384, admit_reserve_mb = 8192;
   double protect_seconds = 30;
@@ -1488,6 +1493,7 @@ int main(int argc, char** argv) {
     else if (a == "--keepalive-seconds") keepalive_seconds = std::stoi(next());
     else if (a == "--prefill-bf16") prefill_bf16 = true;
     else if (a == "--kv-pages") kv_pages = true;
+    else if (a == "--kv-pool-mb") kv_pool_mb = std::stol(next());
     else if (a == "--draft-bf16") draft_bf16 = true;
     else if (a == "--draft-head") draft_head = next();  // sparse (default) or full (BACKLOG 19)
     else if (a == "--sparse-head-dir") sparse_head_dir = next();
@@ -1508,7 +1514,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N]] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
     return 2;
   }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
@@ -1598,23 +1604,51 @@ int main(int argc, char** argv) {
         return 2;
       }
     }
-  if (host_reserve_mb > 0) {  // admission control at start: refuse before anything is allocated
+  // P4b: the engine reads LING_KV_PAGES itself; the plan must agree with it.
+  if (const char* e = std::getenv("LING_KV_PAGES")) kv_pages = std::atoi(e) != 0;
+  if (kv_pool_mb >= 0 && !kv_pages) {
+    std::cerr << "--kv-pool-mb needs --kv-pages\n";
+    return 2;
+  }
+  if (host_reserve_mb > 0 || kv_pages) {  // admission control at start: refuse before anything is allocated
     const ling::ModelConfig cfg = ling::ModelConfig::from_file(model_dir + "/config.json");
     ling::serve::MemoryPlan mp = ling::serve::plan_memory(
         cfg, ling::serve::checkpoint_bytes(model_dir) + ling::serve::checkpoint_bytes(draft_dir), sessions, max_context,
-        !draft_dir.empty());
+        !draft_dir.empty(), kv_pages);
     // With images on (VISION §20.4) the tower's scratch at the largest image and the embedding cache come on top of
     // the checkpoint's bytes (which hold the tower's weights): 1,100 MB at 65,536 patches, an upper bound below it.
     if (opts.vision) mp.scratch += size_t(1100 + vision_cache_mb) << 20;
     const long avail = ling::serve::mem_available_mb();
-    const std::string why = ling::serve::refuse_start(mp, avail, host_reserve_mb);
-    if (!why.empty()) {
-      std::cerr << "ling-serve: refused to start: " << why << "\n";
-      return 3;
+    if (kv_pages) {
+      // The pool: what the rest of the plan, the prefix KV store's budget (it still holds KV in P4b and sizes itself
+      // after the engine, from what is free above its own reserve) and the reserve leave, or --kv-pool-mb.
+      long store_mb = opts.prefix_kv_mb;
+      if (const char* e = std::getenv("LING_PREFIX_KV_MB")) store_mb = std::atol(e);
+      if (checkpoints <= 0 || store_mb < 0) store_mb = 0;
+      ling::serve::plan_kv_pool(mp, cfg, max_context, host_reserve_mb > 0 ? avail : -1, host_reserve_mb,
+                                size_t(store_mb) << 20, kv_pool_mb);
+      if (kv_pool_mb < 0 && host_reserve_mb > 0 && avail >= 0) {
+        const std::string small = ling::serve::refuse_kv_pool(mp, max_context);
+        if (!small.empty()) {
+          std::cerr << "ling-serve: refused to start: " << small << "\n";
+          return 3;
+        }
+      }
+      opts.kv_pool_pages = static_cast<int>(mp.kv_pool_pages);
+      std::cerr << "KV page pool: " << ling::serve::describe_kv_pool(mp)
+                << (kv_pool_mb >= 0 ? " (--kv-pool-mb)" : " (from the memory plan)") << "\n";
     }
-    std::cerr << "memory: " << ling::serve::gb(mp.total()) << " planned (" << sessions << " sessions x "
-              << ling::serve::gb(mp.per_session) << "), " << avail << " MB available, " << host_reserve_mb
-              << " MB kept free; requests refused below " << admit_reserve_mb << " MB\n";
+    if (host_reserve_mb > 0) {
+      const std::string why = ling::serve::refuse_start(mp, avail, host_reserve_mb);
+      if (!why.empty()) {
+        std::cerr << "ling-serve: refused to start: " << why << "\n";
+        return 3;
+      }
+      std::cerr << "memory: " << ling::serve::gb(mp.total()) << " planned (" << sessions << " sessions x "
+                << ling::serve::gb(mp.per_session) << (kv_pages ? " beside the KV page pool" : "") << "), " << avail
+                << " MB available, " << host_reserve_mb << " MB kept free; requests refused below "
+                << admit_reserve_mb << " MB\n";
+    }
   }
   std::cerr << "loading " << model_dir << " ...\n";
   ling::Engine engine(model_dir, opts);
@@ -1630,6 +1664,9 @@ int main(int argc, char** argv) {
   ctx.images = &image_registry;
   ctx.processor.max_pixels = vision_max_pixels;
   ctx.metrics.max_total_tokens = engine.sessions() * max_context;
+  if (engine.kv_paged())  // P4b: the positions the pool can hold, when that is fewer
+    ctx.metrics.max_total_tokens = static_cast<int>(
+        std::min<long>(ctx.metrics.max_total_tokens, long(engine.kv_pages_total()) * ling::kernels::kKvPageTokens));
   ctx.metrics.sessions = engine.sessions();
   ctx.metrics.protect_seconds = protect_seconds;
   ctx.admit_reserve_mb = admit_reserve_mb;

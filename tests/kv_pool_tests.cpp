@@ -1,13 +1,15 @@
 // ling-kv-pool-tests: KvPool (core/kv_pool.hpp), P4b's page bookkeeping, on the host. Allocation, copy-on-write,
 // sharing, truncation, deferred frees, the all-or-nothing rule, and a random walk of holders against a model that
 // tracks, for every position each holder may read, which write produced it: a holder must never read a value another
-// holder wrote after sharing it (the property copy-on-write exists for). Exits 0 when everything holds.
+// holder wrote after sharing it (the property copy-on-write exists for). The memory plan's arithmetic with a page pool
+// (serve/admission.hpp, P4b). Exits 0 when everything holds.
 #include <cstdio>
 #include <map>
 #include <random>
 #include <vector>
 
 #include "core/kv_pool.hpp"
+#include "serve/admission.hpp"
 
 using ling::KvPool;
 
@@ -155,12 +157,66 @@ void random_walk() {
   std::printf("random walk: %d operations, %d refused for want of pages\n", ops, refused);
 }
 
+// The plan with a KV page pool (serve/admission.hpp; BATCHING §5.3 "The pool's size", with §3.5's node-b figures).
+void plan() {
+  using namespace ling::serve;
+  ling::ModelConfig c;  // Qwen3.8-27B's shapes (MODEL §5)
+  c.layers = 64;
+  c.kv_heads = 4;
+  c.head_dim = 256;
+  c.lin_k_heads = 16;
+  c.lin_v_heads = 48;
+  c.lin_k_dim = 128;
+  c.lin_v_dim = 128;
+  c.conv_kernel = 4;
+  for (int i = 0; i < 64; ++i) c.full_attention.push_back(i % 4 == 3);
+  check(kv_page_bytes(c) == size_t(4) << 20, "a page is 4 MiB");
+  check(kKvPageTokens == KvPool::kPageTokens, "the plan's page is the pool's");
+  // A session's fixed part: twice the DeltaNet and conv state, the drafter's ring and the history, ~0.5 GB.
+  const size_t fixed = session_bytes(c, 262144, true, true);
+  check(session_bytes(c, 262144, true) - fixed == size_t(262144) * 65536, "the fixed part leaves out the KV only");
+  check(fixed > size_t(0.45e9) && fixed < size_t(0.52e9), "a session's fixed part is ~0.5 GB");
+  // node-b (§3.5): 114.7 GB available, weights 23.47 GB, 4 GB of scratch, the reserve 16 GB, the store 1 GB.
+  const long avail = static_cast<long>(114.7e9 / (1 << 20)), reserve = 16384;
+  const size_t weights = size_t(23.47e9), store = size_t(1024) << 20;
+  check(!refuse_start(plan_memory(c, weights, 4, 262144, true), avail, reserve).empty(),
+        "flat: four sessions at 262,144 are refused on node-b");
+  MemoryPlan p = plan_memory(c, weights, 4, 262144, true, true);
+  const long pages = plan_kv_pool(p, c, 262144, avail, reserve, store, -1);
+  std::printf("plan on node-b: four sessions at 262,144, pool %s\n", describe_kv_pool(p).c_str());
+  check(pages > 15800 && pages < 16000 && p.kv_pool_pages == pages, "node-b's pool is ~15,900 pages");
+  check(p.kv_pool == size_t(pages + 1) * kv_page_bytes(c), "the pool's bytes count the reserved page");
+  check(refuse_start(p, avail, reserve).empty() && refuse_kv_pool(p, 262144).empty(), "paged: they start");
+  check(static_cast<long>((p.total() + store) >> 20) + reserve <= avail, "the pool leaves the reserve and the store");
+  // Capped at sessions x max_context: a small context takes no more than it could map.
+  MemoryPlan q = plan_memory(c, weights, 4, 65536, true, true);
+  check(plan_kv_pool(q, c, 65536, avail, reserve, store, -1) == 4 * 1024, "capped at sessions x max_context");
+  // --kv-pool-mb: that many MB of pages, refused at start when the plan with it does not fit.
+  MemoryPlan r = plan_memory(c, weights, 4, 262144, true, true);
+  check(plan_kv_pool(r, c, 262144, avail, reserve, store, 8192) == 2048 && refuse_start(r, avail, reserve).empty(),
+        "--kv-pool-mb 8192: 2,048 pages, fits");
+  MemoryPlan big = plan_memory(c, weights, 4, 262144, true, true);
+  plan_kv_pool(big, c, 262144, avail, reserve, store, 80000);
+  check(!refuse_start(big, avail, reserve).empty(), "--kv-pool-mb 80000 does not fit node-b: refused");
+  // Nothing to judge by: every session's max_context.
+  MemoryPlan u = plan_memory(c, weights, 2, 65536, true, true);
+  check(plan_kv_pool(u, c, 65536, -1, reserve, store, -1) == 2048, "no MemAvailable: sessions x max_context");
+  // A host that leaves less than one conversation: refused, and the pool never negative.
+  MemoryPlan t = plan_memory(c, weights, 4, 262144, true, true);
+  check(plan_kv_pool(t, c, 262144, 40000, reserve, store, -1) == 0 && !refuse_kv_pool(t, 262144).empty(),
+        "too little memory: no pool, refused");
+  MemoryPlan v = plan_memory(c, weights, 4, 262144, true, true);
+  check(plan_kv_pool(v, c, 262144, 50000, reserve, store, -1) > 0 && !refuse_kv_pool(v, 262144).empty(),
+        "a pool smaller than one conversation at max_context: refused");
+}
+
 }  // namespace
 
 int main() {
   basics();
   sharing();
   random_walk();
+  plan();
   std::printf(failures ? "KV POOL TESTS FAILED (%d)\n" : "all kv pool tests passed\n", failures);
   return failures ? 1 : 0;
 }

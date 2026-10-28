@@ -6,7 +6,7 @@
 //            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N]]
 //            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16] [--graph-check] [--seed N]
 //            [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N]]
-//            [--batch-check] [--side-prefill N] [--draft-bf16] [--kv-pages]
+//            [--batch-check] [--side-prefill N] [--draft-bf16] [--kv-pages [--kv-pool-mb N]]
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -15,7 +15,10 @@
 // (B34; not exact, off by default: MILESTONES §14); --draft-bf16 reads the drafter's fc and conv kernel projections
 // in BF16 instead of the NVFP4 copies rounded at load (BACKLOG 33, the default; LING_DRAFT_NVFP4=0/1 overrides).
 // --kv-pages keeps the full-attention KV in 64-position pages behind a page table per session (BATCHING §5.3, P4;
-// exact: only addresses change; LING_KV_PAGES=0/1 overrides).
+// exact: only addresses change; LING_KV_PAGES=0/1 overrides). --kv-pool-mb N gives the page pool N MB instead of
+// --sessions x --max-context positions (P4b), so the checks run with sessions that map pages as they go, give back the
+// ones past a new prompt and, in --prefix-check, evict idle sessions (least recently used first) when the pool is short,
+// as ling-serve's scheduler does.
 //
 // --graph-check decodes each prompt speculatively twice from the same prefill, without and with step graphs,
 // greedily and then sampling (--temperature, default 1, top-k 20, top-p 0.95, seeded by --seed or 1), and
@@ -88,6 +91,7 @@
 #include <vector>
 
 #include "core/engine.hpp"
+#include "serve/admission.hpp"
 #include "serve/api.hpp"
 #include "serve/image_input.hpp"
 #include "tokenizer/chat_template.hpp"
@@ -316,6 +320,7 @@ int main(int argc, char** argv) {
   bool ids_out = false, prompt_ids_out = false, spec = false, spec_check = false, prefix_check = false;
   bool graphs = false, pdl = false, attn_bulk = false, graph_check = false, prefill_bf16 = false;
   bool kv_pages = false;
+  long kv_pool_mb = -1;
   uint64_t seed = 0;
   int attn_prefetch = 2;
   std::string draft;
@@ -359,6 +364,7 @@ int main(int argc, char** argv) {
     else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
     else if (a == "--prefill-bf16") prefill_bf16 = true;
     else if (a == "--kv-pages") kv_pages = true;
+    else if (a == "--kv-pool-mb") kv_pool_mb = std::stol(next());
     else if (a == "--draft-bf16") draft_bf16 = true;
     else if (a == "--draft-head") draft_head = next();  // sparse (default) or full (BACKLOG 19)
     else if (a == "--sparse-head-dir") sparse_head_dir = next();
@@ -472,6 +478,10 @@ int main(int argc, char** argv) {
     opts.attention_prefetch = attn_prefetch;
     opts.prefill_bf16 = prefill_bf16;
     opts.kv_pages = kv_pages;
+    if (kv_pool_mb >= 0) {  // P4b: pages of the model's page size (64 positions of every full-attention layer's K and V)
+      const size_t page = ling::serve::kv_page_bytes(ling::ModelConfig::from_file(model + "/config.json"));
+      opts.kv_pool_pages = static_cast<int>(std::max<size_t>(1, (size_t(kv_pool_mb) << 20) / page));
+    }
     opts.draft_nvfp4 = !draft_bf16;
     opts.draft_head = draft_head;
     opts.sparse_head_dir = sparse_head_dir;
@@ -931,6 +941,17 @@ int main(int argc, char** argv) {
         int si = engine.match_session(prompts[i], "");
         const bool fresh_session = si < 0;
         if (fresh_session) si = engine.free_session(0.0, {});
+        if (engine.kv_paged()) {  // P4b: a short pool takes idle sessions' pages, least recently used first
+          std::vector<bool> busy(engine.sessions(), false);
+          busy[si] = true;
+          while (engine.kv_admit_need(si, prompts[i].size()) > engine.kv_pages_free()) {
+            const int victim = engine.kv_lru_idle(busy);
+            if (victim < 0) break;
+            std::fprintf(stderr, "prefix-check: session %d evicted for KV pages\n", victim);
+            engine.kv_evict(victim);
+            engine.kv_retire(true);
+          }
+        }
         engine.activate_session(si, "", fresh_session);
         ling::EngineStats st;
         const std::vector<float> resumed_logits = engine.prefill(prompts[i], &st, false, IMG);
