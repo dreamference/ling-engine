@@ -4,6 +4,7 @@
 // holder wrote after sharing it (the property copy-on-write exists for). The memory plan's arithmetic with a page pool
 // (serve/admission.hpp, P4b), and the scheduler's policy for a full pool (serve/kv_policy.hpp): admission, reclaim
 // order, the last resort, played out against a KvPool. Exits 0 when everything holds.
+#include <algorithm>
 #include <cstdio>
 #include <map>
 #include <random>
@@ -319,9 +320,86 @@ void policy() {
 
 }  // namespace
 
+// P4c: resume_need() against the calls it stands for, played on a copy of the pool: begin_prefill's share (a donor
+// session's or the store's pages for [0, reuse)), truncate past the prompt's pages, unshare past reuse, and
+// ensure(reuse, end); the free list after a retire must have shrunk by exactly the need (or not at all when the
+// releases give back more), and no page the donor holds may have been written (its references stay).
+void resume() {
+  std::mt19937 rng(11);
+  int cases = 0, shared_cases = 0;
+  for (int round = 0; round < 3000; ++round) {
+    KvPool pool(40);
+    std::vector<std::vector<int>> t(3);
+    // Random holders: each maps a run of pages, and some share another's prefix (sessions adopting, the store).
+    for (int h = 0; h < 3; ++h) {
+      const int n = 1 + static_cast<int>(rng() % 9) * T + static_cast<int>(rng() % T);
+      if (h > 0 && rng() % 2) {
+        const int src = static_cast<int>(rng() % h), k = std::min<int>(n, int(t[src].size()) * T);
+        if (k > 0) pool.share(t[h], t[src], k);
+      }
+      pool.ensure(t[h], static_cast<int>(t[h].size()) * T, n, nullptr);
+    }
+    pool.retire();
+    const int self = static_cast<int>(rng() % 3), other = (self + 1 + static_cast<int>(rng() % 2)) % 3;
+    const int prompt = 1 + static_cast<int>(rng() % (12 * T));
+    const int pages = KvPool::pages_for(std::min(prompt + 2 * T, 14 * T));
+    const bool adopt = rng() % 2 && !t[other].empty();
+    int reuse = static_cast<int>(rng() % (prompt));
+    if (adopt) reuse = std::min<int>(reuse, int(t[other].size()) * T);
+    else reuse = std::min<int>(reuse, int(t[self].size()) * T);
+    const std::vector<int> donor = t[other];
+    const int need = pool.resume_need(t[self], reuse, pages, adopt ? &donor : nullptr);
+    KvPool play = pool;
+    std::vector<int> table = t[self];
+    const int free0 = play.free_pages();
+    bool any_shared = false;
+    for (int p : table) any_shared = any_shared || (p && pool.refs(p) > 1);
+    if (adopt && reuse > 0) play.share(table, donor, reuse);
+    play.truncate(table, pages * T);
+    play.unshare(table, reuse);
+    play.retire();
+    std::vector<KvPool::Copy> copies;
+    if (!play.ensure(table, reuse, pages * T, &copies)) {
+      check(need > free0, "resume: ensure refused only when the need exceeds the free pages");
+      continue;
+    }
+    play.retire();
+    const int used = free0 - play.free_pages();
+    if (used != std::max(need, 0) && !(need == 0 && used < 0)) {
+      std::printf("  round %d: need %d, used %d (reuse %d, pages %d, adopt %d)\n", round, need, used, reuse, pages, adopt);
+      check(false, "resume: resume_need equals what the calls draw");
+    }
+    for (const KvPool::Copy& c : copies)
+      check(KvPool::index_of(reuse) == static_cast<int>(std::find(table.begin(), table.end(), c.dst) - table.begin()),
+            "resume: the only copy is the page reuse falls in");
+    for (int i = 0; i < static_cast<int>(donor.size()) && adopt; ++i)
+      check(play.refs(donor[i]) >= 1, "resume: the donor keeps its pages");
+    ++cases;
+    shared_cases += any_shared;
+  }
+  check(cases > 2000 && shared_cases > 500, "resume: enough cases, many with shared pages");
+
+  // reclaimable(): a page counts only when every reference to it is listed.
+  KvPool pool(10);
+  std::vector<int> a, b, store;
+  pool.ensure(a, 0, 3 * T, nullptr);
+  pool.share(b, a, 2 * T);  // b maps a's first two pages
+  store = {a[0]};
+  pool.retain(a[0]);  // the store holds page 0 too
+  check(pool.reclaimable({&a}) == 1, "reclaimable: a alone frees only its private page");
+  check(pool.reclaimable({&a, &b}) == 2, "reclaimable: a and b free pages 1 and 2, not the store's page 0");
+  check(pool.reclaimable({&a, &b, &store}) == 3, "reclaimable: with the store, every page");
+  check(pool.reclaimable({&store}) == 0, "reclaimable: the store alone frees nothing the sessions map");
+  // unshare(): shared pages at or past pages_for(n) dropped, private ones kept.
+  std::vector<int> c = b;
+  pool.unshare(c, T);
+  check(c[0] == b[0] && c[1] == 0 && pool.refs(b[1]) == 2, "unshare: drops the shared page past n, keeps the one below");
+}
+
 int main() {
   basics();
   sharing();
+  resume();
   random_walk();
   plan();
   policy();
