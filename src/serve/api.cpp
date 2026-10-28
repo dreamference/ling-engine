@@ -93,6 +93,16 @@ json canonical_tools(const json& tools, const json& tool_choice) {
 
 }  // namespace
 
+uint64_t share_scope_of(const std::string& value) {
+  if (value.empty()) return 0;
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char c : value) {
+    h ^= c;
+    h *= 0x100000001b3ull;
+  }
+  return h | 1;
+}
+
 std::string new_id(const std::string& prefix) {
   static thread_local std::mt19937_64 rng{std::random_device{}()};
   static const char* hex = "0123456789abcdef";

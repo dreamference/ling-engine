@@ -951,23 +951,36 @@ int main(int argc, char** argv) {
         int si = engine.match_session(prompts[i], "");
         const bool fresh_session = si < 0;
         if (fresh_session) si = engine.free_session(0.0, {});
-        if (engine.kv_paged()) {  // P4b: a short pool takes idle sessions' pages, least recently used first
+        // P4b: a short pool takes idle sessions' pages, least recently used first (P4c: the prefix KV store's first).
+        auto make_room = [&](const std::function<bool()>& short_of_pages) {
+          if (!engine.kv_paged()) return;
           std::vector<bool> busy(engine.sessions(), false);
           busy[si] = true;
-          while (engine.kv_admit_need(si, prompts[i].size()) > engine.kv_pages_free()) {
+          while (short_of_pages()) {
+            if (engine.kv_store_evict()) {
+              std::fprintf(stderr, "prefix-check: a prefix KV store entry evicted for KV pages\n");
+              engine.kv_retire(true);
+              continue;
+            }
             const int victim = engine.kv_lru_idle(busy);
             if (victim < 0) break;
             std::fprintf(stderr, "prefix-check: session %d evicted for KV pages\n", victim);
             engine.kv_evict(victim);
             engine.kv_retire(true);
           }
-        }
+        };
+        make_room([&] { return engine.kv_admit_need(si, prompts[i]) > engine.kv_pages_free(); });
         engine.activate_session(si, "", fresh_session);
         ling::EngineStats st;
         const std::vector<float> resumed_logits = engine.prefill(prompts[i], &st, false, IMG);
         const int resumed = argmax(resumed_logits);
         const uint64_t h_resumed = engine.state_hash();
         const After a_resumed = continue_spec(resumed_logits);
+        // The reference prefill maps all of the prompt's pages afresh: the pages the resumed one shares with a donor or
+        // the store stay theirs (P4c), so a short pool makes room again (only the session's own pages come back).
+        make_room([&] {
+          return engine.kv_admit_pages(prompts[i].size()) > engine.kv_pages_free() + engine.kv_reclaimable({si}, false);
+        });
         ling::EngineStats fresh_st;
         const std::vector<float> fresh_logits = engine.prefill(prompts[i], &fresh_st, /*from_scratch=*/true, IMG);
         const int fresh = argmax(fresh_logits);

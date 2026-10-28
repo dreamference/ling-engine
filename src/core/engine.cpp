@@ -396,7 +396,25 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
       ops.store = [this](void* buf, int buf_start, int buf_len, int from, int to) {
         kv_copy(buf, buf_start, buf_len, from, to, true);
       };
-      kv_tree_ = std::make_unique<PrefixKvTree>(size, per_token, state, std::move(ops));
+      if (kv_book_) {
+        // P4c paged mode: a node holds a reference to each pool page of the active session its run overlaps (the
+        // session that just prefilled the prompt, kv_insert), no copy; the arena holds the states only.
+        ops.hold = [this](int from, int to) -> std::vector<int> {
+          const int a = KvPool::index_of(from), b = KvPool::index_of(to - 1);
+          if (b >= static_cast<int>(s_->kv_ids.size())) return {};
+          for (int j = a; j <= b; ++j)
+            if (s_->kv_ids[j] == 0) return {};
+          std::vector<int> ids;
+          for (int j = a; j <= b; ++j) {
+            kv_book_->retain(s_->kv_ids[j]);
+            ids.push_back(s_->kv_ids[j]);
+          }
+          return ids;
+        };
+        ops.retain = [this](int page) { kv_book_->retain(page); };
+        ops.drop = [this](int page) { kv_book_->release(page); };
+      }
+      kv_tree_ = std::make_unique<PrefixKvTree>(size, kv_book_ ? 0 : per_token, state, std::move(ops));
       std::fprintf(stderr, "prefix KV store: %zu MB of %d asked (%zu MB free after the engine's own memory, %zu kept free; %zu KB a token, %zu MB a state)\n",
                    size >> 20, mb, free_b >> 20, reserve >> 20, per_token >> 10, state >> 20);
     } else {
@@ -534,7 +552,7 @@ Engine::~Engine() {
 void Engine::reset() {
   reset_session();
   ckpts_.clear();
-  if (kv_tree_) kv_tree_->clear();
+  if (kv_tree_) kv_store_dropped([&] { kv_tree_->clear(); });
 }
 
 void Engine::reset_session() {
@@ -552,11 +570,11 @@ void Engine::reset_session() {
   s_->guard.reset();  // the drafter-off guard's mean belongs to the forgotten history (BACKLOG 10)
 }
 
-int Engine::match_session(const std::vector<int>& prompt, const std::string& key) const {
+int Engine::match_session(const std::vector<int>& prompt, const std::string& key, uint64_t scope) const {
   int best = -1, best_lcp = 0;
   for (size_t i = 0; i < sessions_.size(); ++i) {
     const Session& s = sessions_[i];
-    if (!s.owned || s.history.empty() || s.prompt_len == 0) continue;
+    if (!s.owned || s.history.empty() || s.prompt_len == 0 || s.scope != scope) continue;
     const size_t n = std::min(s.history.size(), prompt.size());
     size_t lcp = 0;
     while (lcp < n && s.history[lcp] == prompt[lcp]) ++lcp;
@@ -569,7 +587,7 @@ int Engine::match_session(const std::vector<int>& prompt, const std::string& key
   }
   if (best >= 0 || key.empty()) return best;
   for (size_t i = 0; i < sessions_.size(); ++i)
-    if (sessions_[i].owned && sessions_[i].key == key) return static_cast<int>(i);
+    if (sessions_[i].owned && sessions_[i].key == key && sessions_[i].scope == scope) return static_cast<int>(i);
   return -1;
 }
 
@@ -588,10 +606,23 @@ int Engine::free_session(double protect_seconds, const std::vector<bool>& pinned
   return best;
 }
 
-void Engine::activate_session(int i, const std::string& key, bool fresh) {
+void Engine::activate_session(int i, const std::string& key, bool fresh, uint64_t scope) {
   if (i < 0 || i >= static_cast<int>(sessions_.size())) throw std::runtime_error("no such session");
   side_join();  // a side chunk's session, store entries and donor KV are complete before anything binds or copies
   s_ = &sessions_[i];
+  if (s_->scope != scope) {
+    // P4c: another scope's history is never resumed from; its pages stay (begin_prefill rewrites, unshares or gives
+    // them back) and so does its state memory, which nothing reads before a prefill rewrites it.
+    s_->history.clear();
+    s_->sh_dirty = true;
+    s_->prompt_len = 0;
+    s_->turn_start = 0;
+    s_->snap_pos = -1;
+    s_->dkv_lo = 0;
+    s_->pos = 0;
+    s_->shadow.clear();
+    s_->scope = scope;
+  }
   if (fresh) {
     if (s_->owned) ++evictions_;
     s_->owned = true;
@@ -622,7 +653,7 @@ void Engine::reset_all() {
   }
   s_ = &sessions_[0];
   ckpts_.clear();
-  if (kv_tree_) kv_tree_->clear();
+  if (kv_tree_) kv_store_dropped([&] { kv_tree_->clear(); });
 }
 
 const SpecStats& Engine::session_spec_stats(int i) {
@@ -671,23 +702,13 @@ int Engine::sessions_resident() const {
 }
 
 void Engine::kv_pages_adopt(const Session& from, int n) {
-  // P4b: the active session's own pages for [0, n) first (begin_prefill checked that the pool has them); P4c maps
-  // `from`'s pages instead of copying them.
-  kv_ensure(*s_, 0, n, stream_);
-  // Whole pages: a position of the last page past n is beyond the history, never read before it is written again.
-  // Runs of pages contiguous in both tables go as one copy.
-  const int np = (n + kernels::kKvPageTokens - 1) / kernels::kKvPageTokens;
-  for (int j = 0; j < np;) {
-    int k = j + 1;
-    while (k < np && from.page_host[k] == from.page_host[k - 1] + kv_page_elems_ &&
-           s_->page_host[k] == s_->page_host[k - 1] + kv_page_elems_)
-      ++k;
-    if (from.page_host[j] != s_->page_host[j])
-      check(cudaMemcpyAsync(kv_pool_ + s_->page_host[j], kv_pool_ + from.page_host[j],
-                            size_t(k - j) * kv_page_elems_ * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream_),
-            "session KV page copy");
-    j = k;
-  }
+  // P4c: the active session maps `from`'s pages for [0, n) (a reference each), no copy. The last of them may be only
+  // partly inside [0, n): whichever of the two writes it next gets a private copy first (kv_ensure's copy-on-write;
+  // begin_prefill's own kv_ensure from n on does it for the active session before its first chunk).
+  const int pending = kv_book_->pending_pages();
+  kv_book_->share(s_->kv_ids, from.kv_ids, n);
+  kv_table_sync(*s_, stream_);
+  if (kv_book_->pending_pages() > pending) kv_record_release();  // pages the active session mapped there before
 }
 
 // ---- The KV page pool (P4b, BATCHING §5.3). ----
@@ -713,22 +734,61 @@ int Engine::kv_pages_free() {
   return kv_book_->free_pages();
 }
 
-int Engine::kv_session_pages(int session) const {
-  int n = 0;
-  for (int p : sessions_.at(session).kv_ids) n += p != 0;
-  return n;
-}
+int Engine::kv_session_pages(int session) const { return kv_reclaimable({session}, false); }
 
-int Engine::kv_admit_need(int session, size_t prompt_len) const {
+int Engine::kv_reclaimable(const std::vector<int>& sessions, bool store, const std::vector<int>& store_keep) const {
   if (!kv_book_) return 0;
-  // The pages past the prompt's are given back by begin_prefill before it maps.
-  return KvPool::net_need(sessions_.at(session).kv_ids, kv_admit_pages(prompt_len));
+  std::vector<std::vector<int>> tree;
+  KvPool::Refs refs;
+  kv_gone_refs(KvGone{sessions, store, store_keep}, tree, refs);
+  return kv_book_->reclaimable(refs);
 }
 
-int Engine::kv_step_need(int session, bool spec) const {
+void Engine::kv_gone_refs(const KvGone& gone, std::vector<std::vector<int>>& tree, KvPool::Refs& refs) const {
+  for (int i : gone.sessions) refs.push_back(&sessions_.at(i).kv_ids);
+  if (gone.store && kv_tree_) tree = kv_tree_->page_lists(gone.store_keep);
+  for (const std::vector<int>& t : tree) refs.push_back(&t);
+}
+
+int Engine::kv_store_pages() const { return kv_reclaimable({}, true); }
+
+bool Engine::kv_store_evict(const std::vector<int>& keep) {
+  if (!kv_tree_ || !kv_book_) return false;
+  bool evicted = false;
+  kv_store_dropped([&] { evicted = kv_tree_->evict_lru_leaf(keep); });
+  return evicted;
+}
+
+void Engine::kv_store_dropped(const std::function<void()>& op) {
+  // A store call that may drop page references (an eviction, a clear, an insert making room): the pages it lets go
+  // of are freed only once every stream has passed this point, as any release.
+  const int pending = kv_book_ ? kv_book_->pending_pages() : 0;
+  op();
+  if (kv_book_ && kv_book_->pending_pages() > pending) kv_record_release();
+}
+
+int Engine::kv_admit_need(int session, const std::vector<int>& prompt, uint64_t scope, KvSource* src,
+                          const KvGone* gone, bool from_scratch) const {
+  if (!kv_book_ || prompt.empty()) return 0;
+  const Session& s = sessions_.at(session);
+  const ResumePlan plan = plan_resume(s, prompt, from_scratch, scope);
+  const int need = kv_resume_need(s, plan, prompt, gone);
+  if (src) {
+    *src = KvSource{};
+    if (plan.from_kv) src->store_path = plan.kvm.path;
+    else if (plan.donor) src->donor = static_cast<int>(plan.donor - sessions_.data());
+    src->cold = std::max(need, kv_resume_need(s, plan_resume(s, prompt, true, scope), prompt));
+  }
+  return need;
+}
+
+int Engine::kv_step_need(int session, bool spec, const KvGone* gone) const {
   if (!kv_book_) return 0;
   const Session& s = sessions_.at(session);
-  return kv_book_->needed(s.kv_ids, s.pos, s.pos + kv_step_rows(s, spec));
+  std::vector<std::vector<int>> tree;
+  KvPool::Refs refs;
+  if (gone) kv_gone_refs(*gone, tree, refs);
+  return kv_book_->needed(s.kv_ids, s.pos, s.pos + kv_step_rows(s, spec), gone ? &refs : nullptr);
 }
 
 void Engine::kv_record_release() {
@@ -978,7 +1038,8 @@ uint64_t fnv_tokens(const int* t, size_t n) {
 }  // namespace
 
 bool Engine::ckpt_match(const Checkpoint& k, const std::vector<int>& prompt,
-                        const std::vector<uint64_t>& prefix_hash) const {
+                        const std::vector<uint64_t>& prefix_hash, uint64_t scope) const {
+  if (k.scope != scope) return false;
   if (k.pos > static_cast<int>(prompt.size()) || k.pos >= static_cast<int>(prefix_hash.size())) return false;
   if (prefix_hash[k.pos] != k.hash) return false;
   return std::equal(k.tokens.begin(), k.tokens.end(), prompt.begin());
@@ -1022,20 +1083,32 @@ void Engine::kv_copy(void* buf, int buf_start, int buf_len, int from, int to, bo
 
 void Engine::kv_restore(const PrefixKvTree::Match& m, int n) {
   join_commit();
-  if (kv_pages_) kv_ensure(*s_, 0, n, stream_);  // P4b: the pages the store's KV is copied into
+  if (kv_tree_->paged()) {
+    // P4c: the store's pages for [0, n) mapped into the active session (a reference each), no copy; the partly used
+    // last one is copied by begin_prefill's kv_ensure before the session writes it.
+    const int pending = kv_book_->pending_pages();
+    kv_book_->share(s_->kv_ids, kv_tree_->pages(m, n), n);
+    kv_table_sync(*s_, stream_);
+    if (kv_book_->pending_pages() > pending) kv_record_release();
+    return;
+  }
   for (const PrefixKvTree::Segment& g : kv_tree_->segments(m, n))
     kv_copy(const_cast<void*>(g.buf), g.buf_start, g.buf_len, g.from, g.to, false);
 }
 
 void Engine::kv_insert(const PrefillCursor& cur) {
-  const std::vector<std::pair<int, int>> want = kv_tree_->insert(cur.prompt, cur.kv_q, cur.kv_cuts, cur.kv_epoch);
-  // Each cut's state from the checkpoint store (this prefill saved them; one the store had no room for is left out).
-  for (const auto& [node, pos] : want)
-    for (const Checkpoint& k : ckpts_)
-      if (k.pos == pos && std::equal(k.tokens.begin(), k.tokens.end(), cur.prompt.begin())) {
-        if (void* st = kv_tree_->add_state(node, cur.kv_epoch)) copy_slot(state_view(st), ckpt_slots_[k.slot]);
-        break;
-      }
+  // Paged (P4c): the new nodes hold the active session's pages; making room in the budget may drop older nodes'.
+  kv_store_dropped([&] {
+    const std::vector<std::pair<int, int>> want =
+        kv_tree_->insert(cur.prompt, cur.kv_q, cur.kv_cuts, cur.kv_epoch, s_->scope);
+    // Each cut's state from the checkpoint store (this prefill saved them; one the store had no room for is left out).
+    for (const auto& [node, pos] : want)
+      for (const Checkpoint& k : ckpts_)
+        if (k.pos == pos && k.scope == s_->scope && std::equal(k.tokens.begin(), k.tokens.end(), cur.prompt.begin())) {
+          if (void* st = kv_tree_->add_state(node, cur.kv_epoch)) copy_slot(state_view(st), ckpt_slots_[k.slot]);
+          break;
+        }
+  });
 }
 
 void Engine::copy_slot(const StateSlot& dst, const StateSlot& src) {
@@ -1051,7 +1124,8 @@ void Engine::copy_slot(const StateSlot& dst, const StateSlot& src) {
 void Engine::save_checkpoint(int pos, uint64_t epoch, const StateSlot* from, bool soft) {
   const uint64_t hash = fnv_tokens(s_->history.data(), pos);
   for (Checkpoint& k : ckpts_)
-    if (k.pos == pos && k.hash == hash && std::equal(k.tokens.begin(), k.tokens.end(), s_->history.begin())) {
+    if (k.pos == pos && k.hash == hash && k.scope == s_->scope &&
+        std::equal(k.tokens.begin(), k.tokens.end(), s_->history.begin())) {
       k.used = ++ckpt_clock_;
       return;
     }
@@ -1080,7 +1154,8 @@ void Engine::save_checkpoint(int pos, uint64_t epoch, const StateSlot* from, boo
   // Stream-ordered: the copy completes before any later restore reads the slot (one stream, M4 §1).
   if (from) copy_slot(ckpt_slots_[slot], *from);
   else copy_state(ckpt_slots_[slot], true);
-  ckpts_.push_back({pos, slot, hash, std::vector<int>(s_->history.begin(), s_->history.begin() + pos), ++ckpt_clock_, soft});
+  ckpts_.push_back({pos, slot, hash, std::vector<int>(s_->history.begin(), s_->history.begin() + pos), ++ckpt_clock_, soft,
+                    s_->scope});
   std::sort(ckpts_.begin(), ckpts_.end(), [](const Checkpoint& a, const Checkpoint& b) { return a.pos < b.pos; });
 }
 
@@ -1658,16 +1733,159 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   s_->pos += M;
 }
 
+Engine::ResumePlan Engine::plan_resume(const Session& self, const std::vector<int>& prompt, bool from_scratch,
+                                       uint64_t scope) const {
+  // (begin_prefill's comment above its call says what is chosen and why.) Share scopes (P4c): only the sessions,
+  // checkpoints and store entries of `scope` count; self's history only when it is that scope's (activate_session
+  // clears it otherwise).
+  const int L = static_cast<int>(prompt.size());
+  ResumePlan plan;
+  const int window = plan.window = draft_ ? std::max(0, L - draft_->config().sliding_window) : 0;
+  std::vector<uint64_t>& prefix_hash = plan.prefix_hash;  // of prompt[0, i), for the store's lookups and LRU stamps
+  if (!ckpts_.empty()) {
+    const int n = std::min(L, opts_.checkpoint_limit);
+    prefix_hash.resize(n + 1);
+    prefix_hash[0] = kFnvBasis;
+    for (int i = 0; i < n; ++i) prefix_hash[i + 1] = fnv_step(prefix_hash[i], prompt[i]);
+  }
+  struct Source {
+    int reuse = 0;
+    const StateSlot* from = nullptr;
+  };
+  // Only states a prefill left count, never a session's current one after decoding: a decoded token went
+  // through the rows path, and a prompt's state must be the same however it was reached.
+  auto best_in = [&](const Session& s) {
+    if (s.scope != scope) return Source{};
+    const int n = std::min(static_cast<int>(s.history.size()), L);
+    int lcp = 0;
+    while (lcp < n && s.history[lcp] == prompt[lcp]) ++lcp;
+    auto usable = [&](int p) { return p <= lcp && p < L && (!draft_ || p <= window || dkv_from(s) <= window); };
+    Source r;
+    if (s.snap_pos > 0 && usable(s.snap_pos)) r = {s.snap_pos, &s.snap};
+    for (const Checkpoint& k : ckpts_)
+      if (k.pos > r.reuse && usable(k.pos) && ckpt_match(k, prompt, prefix_hash, scope)) r = {k.pos, &ckpt_slots_[k.slot]};
+    return r;
+  };
+  Source src;
+  const Session* donor = nullptr;
+  if (!from_scratch) {
+    src = best_in(self);
+    for (const Session& s : sessions_) {
+      if (&s == &self) continue;
+      const Source d = best_in(s);
+      if (d.reuse > src.reuse) {
+        src = d;
+        donor = &s;
+      }
+    }
+  }
+  // The prefix KV store (BACKLOG 35): a donor beside the sessions. Its KV runs cover the prompt's first kvm.len tokens,
+  // and a state there (its own at a node's end, or the checkpoint store's) lets the prompt resume, up to the drafter's
+  // window (the store holds no drafter context) and short of the prompt's last token.
+  PrefixKvTree::Match& kvm = plan.kvm;
+  int& kv_reuse = plan.kv_reuse;
+  const void*& kv_state = plan.kv_state;
+  const StateSlot*& kv_ckpt = plan.kv_ckpt;
+  if (kv_tree_ && !from_scratch) {
+    kvm = kv_tree_->match(prompt, scope);
+    const int lim = std::min({kvm.len, draft_ ? window : L, L - 1});
+    kv_reuse = kv_tree_->best_state(kvm, lim, &kv_state);
+    for (const Checkpoint& k : ckpts_)
+      if (k.pos > kv_reuse && k.pos <= lim && ckpt_match(k, prompt, prefix_hash, scope)) {
+        kv_reuse = k.pos;
+        kv_state = nullptr;
+        kv_ckpt = &ckpt_slots_[k.slot];
+      }
+  }
+  plan.from_kv = kv_reuse > src.reuse;
+  plan.src_reuse = src.reuse;
+  plan.src_from = src.from;
+  plan.donor = donor;
+  plan.reuse = plan.from_kv ? kv_reuse : src.reuse;
+  // The branch point (BACKLOG 34; the hybrid models' radix rule): where this prompt leaves the longest prefix it
+  // shares with another conversation, a resident session's history or a stored entry, taken before this prefill
+  // truncates or replaces the active session's history. A checkpoint there lets the next prompt of either branch
+  // resume at it instead of at the last chunk multiple before it (agents' system prompts share ~5-11K tokens and
+  // differ after). The active session's own history counts only when the prompt does not extend it (its snap
+  // covers that).
+  int& branch_at = plan.branch_at;
+  if (branch_checkpoints_ && !ckpt_slots_.empty()) {
+    auto lcp_of = [&](const std::vector<int>& h) {
+      const size_t n = std::min(h.size(), prompt.size());
+      size_t i = 0;
+      while (i < n && h[i] == prompt[i]) ++i;
+      return static_cast<int>(i);
+    };
+    for (const Session& s : sessions_) {
+      if (s.history.empty() || s.scope != scope) continue;
+      const int l = lcp_of(s.history);
+      if (&s == &self && s.prompt_len > 0 && l >= s.turn_start) continue;
+      branch_at = std::max(branch_at, l);
+    }
+    for (const Checkpoint& k : ckpts_)
+      if (k.scope == scope) branch_at = std::max(branch_at, lcp_of(k.tokens));
+    branch_at = std::max(branch_at, kvm.len);
+    branch_at -= branch_at % kResumeAlign;
+  }
+  return plan;
+}
+
+int Engine::kv_resume_need(const Session& self, const ResumePlan& plan, const std::vector<int>& prompt,
+                           const KvGone* gone) const {
+  std::vector<int> tree;
+  const std::vector<int>* donor = nullptr;
+  if (plan.from_kv) {
+    tree = kv_tree_->pages(plan.kvm, plan.kv_reuse);
+    donor = &tree;
+  } else if (plan.donor) {
+    donor = &plan.donor->kv_ids;
+  }
+  const int L = static_cast<int>(prompt.size());
+  const int pages = kv_admit_pages(prompt.size());
+  std::vector<std::vector<int>> gone_tree;
+  KvPool::Refs gone_refs;
+  if (gone) kv_gone_refs(*gone, gone_tree, gone_refs);
+  int need = kv_book_->resume_need(self.kv_ids, plan.reuse, pages, donor, gone ? &gone_refs : nullptr);
+  // The store's hold covers the pages up to its last cut: when that cut falls in the page position L is in, the store
+  // shares the page the first decode step writes, which copies it first (one page more; counted even when the store
+  // holds that run already, and only when the pool could hold it at all).
+  if (kv_tree_ && kv_tree_->paged() && L < opts_.max_context && pages < kv_book_->capacity()) {
+    const std::vector<int> cuts = kv_store_cuts(prompt, plan.branch_at);
+    if (!cuts.empty() && KvPool::index_of(cuts.back() - 1) == KvPool::index_of(L)) need += 1;
+  }
+  return need;
+}
+
+std::vector<int> Engine::kv_store_cuts(const std::vector<int>& prompt, int branch_at) const {
+  const int L = static_cast<int>(prompt.size());
+  auto align = [](int p) { return p - p % kResumeAlign; };
+  std::vector<int> cuts;
+  for (int i = 0, messages = 0; i < L && messages < 2; ++i)
+    if (prompt[i] == opts_.boundary_token) {
+      if (align(i + 1) > 0) cuts.push_back(align(i + 1));
+      ++messages;
+    }
+  if (branch_at > 0) cuts.push_back(branch_at);
+  std::erase_if(cuts, [&](int c) { return c >= L || c > opts_.checkpoint_limit; });
+  std::sort(cuts.begin(), cuts.end());
+  cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+  return cuts;
+}
+
 Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool from_scratch,
                                             const std::vector<PromptImage>* images) {
   if (prompt.empty()) throw std::runtime_error("empty prompt");
   side_join();
+  // Where the prompt resumes, planned before anything changes (P4c: the pool's need depends on the source's pages).
+  // The truncation below does not change the choice: it keeps every position below the prompt's end, and the drafter
+  // ring's valid start only moves to the cut, past any usable resume point.
+  const ResumePlan plan0 = plan_resume(*s_, prompt, from_scratch, s_->scope);
   // P4b: the prompt's pages and kKvGrowthPages more are taken below, whatever the prompt resumes from, after the
   // session's pages past them are given back (their frees deferred as every release's: kv_ensure waits for them when
   // it needs them). Checked first, so a short pool changes nothing (ling-serve's scheduler admits a request only when
   // kv_admit_need pages are free).
   if (kv_book_) {
-    const int need = kv_admit_need(active_session(), prompt.size());
+    const int need = kv_resume_need(*s_, plan0, prompt);
     if (need > kv_book_->free_pages()) kv_retire(false);
     if (need > kv_book_->free_pages()) kv_retire(true);
     if (need > kv_book_->free_pages())
@@ -1734,95 +1952,22 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   // snap and the store only states a finished pass left, so whatever is copied from it is complete.
   // The drafter attends to the last `window` positions: resuming at p > window start needs its context
   // KV from the window start up to p, which the session's ring holds only from dkv_from() on.
-  const int window = draft_ ? std::max(0, L - draft_->config().sliding_window) : 0;
-  std::vector<uint64_t> prefix_hash;  // of prompt[0, i), for the store's lookups (and its LRU stamps, below)
-  if (!ckpts_.empty()) {
-    const int n = std::min(L, opts_.checkpoint_limit);
-    prefix_hash.resize(n + 1);
-    prefix_hash[0] = kFnvBasis;
-    for (int i = 0; i < n; ++i) prefix_hash[i + 1] = fnv_step(prefix_hash[i], prompt[i]);
-  }
-  struct Source {
-    int reuse = 0;
-    const StateSlot* from = nullptr;
-  };
-  // Only states a prefill left count, never a session's current one after decoding: a decoded token went
-  // through the rows path, and a prompt's state must be the same however it was reached.
-  auto best_in = [&](const Session& s) {
-    const int n = std::min(static_cast<int>(s.history.size()), L);
-    int lcp = 0;
-    while (lcp < n && s.history[lcp] == prompt[lcp]) ++lcp;
-    auto usable = [&](int p) { return p <= lcp && p < L && (!draft_ || p <= window || dkv_from(s) <= window); };
-    Source r;
-    if (s.snap_pos > 0 && usable(s.snap_pos)) r = {s.snap_pos, &s.snap};
-    for (const Checkpoint& k : ckpts_)
-      if (k.pos > r.reuse && usable(k.pos) && ckpt_match(k, prompt, prefix_hash)) r = {k.pos, &ckpt_slots_[k.slot]};
-    return r;
-  };
-  Source src;
-  const Session* donor = nullptr;
-  if (!from_scratch) {
-    src = best_in(*s_);
-    for (const Session& s : sessions_) {
-      if (&s == s_) continue;
-      const Source d = best_in(s);
-      if (d.reuse > src.reuse) {
-        src = d;
-        donor = &s;
-      }
-    }
-  }
-  // The prefix KV store (BACKLOG 35): a donor beside the sessions. Its KV runs cover the prompt's first kvm.len tokens,
-  // and a state there (its own at a node's end, or the checkpoint store's) lets the prompt resume, up to the drafter's
-  // window (the store holds no drafter context) and short of the prompt's last token.
-  PrefixKvTree::Match kvm;
-  int kv_reuse = 0;
-  const void* kv_state = nullptr;
-  const StateSlot* kv_ckpt = nullptr;
+  const ResumePlan& plan = plan0;
+  const int window = plan.window;
+  const std::vector<uint64_t>& prefix_hash = plan.prefix_hash;
+  const Session* donor = plan.donor;
+  const PrefixKvTree::Match& kvm = plan.kvm;
+  const int kv_reuse = plan.kv_reuse;
+  const bool from_kv = plan.from_kv;
+  const int branch_at = plan.branch_at;
   cur.kv_epoch = ++kv_epoch_;
-  if (kv_tree_ && !from_scratch) {
-    kvm = kv_tree_->match(prompt);
-    const int lim = std::min({kvm.len, draft_ ? window : L, L - 1});
-    kv_reuse = kv_tree_->best_state(kvm, lim, &kv_state);
-    for (const Checkpoint& k : ckpts_)
-      if (k.pos > kv_reuse && k.pos <= lim && ckpt_match(k, prompt, prefix_hash)) {
-        kv_reuse = k.pos;
-        kv_state = nullptr;
-        kv_ckpt = &ckpt_slots_[k.slot];
-      }
-    kv_tree_->touch(kvm, cur.kv_epoch);
-  }
-  const bool from_kv = kv_reuse > src.reuse;
-  // The branch point (BACKLOG 34; the hybrid models' radix rule): where this prompt leaves the longest prefix it
-  // shares with another conversation, a resident session's history or a stored entry, taken before this prefill
-  // truncates or replaces the active session's history. A checkpoint there lets the next prompt of either branch
-  // resume at it instead of at the last chunk multiple before it (agents' system prompts share ~5-11K tokens and
-  // differ after). The active session's own history counts only when the prompt does not extend it (its snap
-  // covers that).
-  int branch_at = 0;
-  if (branch_checkpoints_ && !ckpt_slots_.empty()) {
-    auto lcp_of = [&](const std::vector<int>& h) {
-      const size_t n = std::min(h.size(), prompt.size());
-      size_t i = 0;
-      while (i < n && h[i] == prompt[i]) ++i;
-      return static_cast<int>(i);
-    };
-    for (const Session& s : sessions_) {
-      if (s.history.empty()) continue;
-      const int l = lcp_of(s.history);
-      if (&s == s_ && s.prompt_len > 0 && l >= s.turn_start) continue;
-      branch_at = std::max(branch_at, l);
-    }
-    for (const Checkpoint& k : ckpts_) branch_at = std::max(branch_at, lcp_of(k.tokens));
-    branch_at = std::max(branch_at, kvm.len);
-    branch_at -= branch_at % kResumeAlign;
-  }
+  if (kv_tree_ && !from_scratch) kv_tree_->touch(kvm, cur.kv_epoch);
   // The store's clock (its LRU order): every entry on this prompt's prefix is used by this prefill, and the
   // entries it saves come after; save_checkpoint never evicts one of them for another.
   cur.ckpt_epoch = ++ckpt_clock_;
   if (!prefix_hash.empty())
     for (Checkpoint& k : ckpts_)
-      if (ckpt_match(k, prompt, prefix_hash)) k.used = cur.ckpt_epoch;
+      if (ckpt_match(k, prompt, prefix_hash, s_->scope)) k.used = cur.ckpt_epoch;
   if (from_kv) {  // the KV of [0, kv_reuse) out of the store, the state from the store or the checkpoint store
     kv_restore(kvm, kv_reuse);
     s_->history.assign(prompt.begin(), prompt.begin() + kv_reuse);
@@ -1830,14 +1975,14 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
     s_->dkv_lo = kv_reuse;  // no drafter context before kv_reuse (kv_reuse <= window)
     s_->snap_pos = -1;
     s_->shadow.clear();
-    copy_state(kv_state ? state_view(kv_state) : *kv_ckpt, false);
+    copy_state(plan.kv_state ? state_view(plan.kv_state) : *plan.kv_ckpt, false);
     cur.stats.store_tokens = kv_reuse;
   } else {
-    if (donor) adopt_prefix(*donor, src.reuse);
-    if (src.from) copy_state(*src.from, false);
+    if (donor) adopt_prefix(*donor, plan.src_reuse);
+    if (plan.src_from) copy_state(*plan.src_from, false);
     else reset_state();
   }
-  const int reuse = from_kv ? kv_reuse : src.reuse;
+  const int reuse = plan.reuse;
   s_->pos = reuse;
   truncate_history(reuse);
   if (draft_ && window > reuse) s_->dkv_lo = window;
@@ -1846,6 +1991,12 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
     // stops half way for memory); the session's pages past them were released above. The session's own pages below
     // that point stay and are rewritten in place: they are private, and every position past `reuse` is written by this
     // prefill or a later pass before anything reads it, as in a flat slot (a masked key is never read).
+    // P4c: the pages it shares (with the prefix KV store or another session) from the first whole page past `reuse`
+    // on are dropped instead (fresh pages, no copy of what is overwritten); kv_ensure copies the one `reuse` falls in.
+    const int pending = kv_book_->pending_pages();
+    kv_book_->unshare(s_->kv_ids, reuse);
+    kv_table_sync(*s_, stream_);
+    if (kv_book_->pending_pages() > pending) kv_record_release();
     kv_ensure(*s_, reuse, kv_target(prompt.size()), stream_);
   }
 
@@ -1893,18 +2044,8 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   // What this prompt adds to the prefix KV store at its end: its first tokens up to the furthest of its first two
   // message ends and its branch point (the part another conversation can share), with states at those positions.
   if (kv_tree_) {
-    std::vector<int> cuts;
-    for (int i = 0, messages = 0; i < L && messages < 2; ++i)
-      if (prompt[i] == opts_.boundary_token) {
-        if (align(i + 1) > 0) cuts.push_back(align(i + 1));
-        ++messages;
-      }
-    if (branch_at > 0) cuts.push_back(branch_at);
-    std::erase_if(cuts, [&](int c) { return c >= L || c > opts_.checkpoint_limit; });
-    std::sort(cuts.begin(), cuts.end());
-    cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
-    cur.kv_q = cuts.empty() ? 0 : cuts.back();
-    cur.kv_cuts = cuts;
+    cur.kv_cuts = kv_store_cuts(prompt, branch_at);
+    cur.kv_q = cur.kv_cuts.empty() ? 0 : cur.kv_cuts.back();
   }
   cur.snap_at = align(L);  // the end-of-prompt state is kept here (the tokens after it are re-prefilled)
   cur.window = window;

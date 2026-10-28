@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace ling {
 
@@ -18,12 +19,30 @@ int KvPool::take() {
   return p;
 }
 
-int KvPool::needed(const std::vector<int>& table, int from, int to) const {
+namespace {
+// The references `gone` lists, per page.
+std::unordered_map<int, int> listed_refs(const KvPool::Refs* gone) {
+  std::unordered_map<int, int> listed;
+  if (gone)
+    for (const std::vector<int>* r : *gone)
+      if (r)
+        for (int p : *r)
+          if (p > 0) ++listed[p];
+  return listed;
+}
+}  // namespace
+
+int KvPool::needed(const std::vector<int>& table, int from, int to, const Refs* gone) const {
+  const std::unordered_map<int, int> listed = listed_refs(gone);
+  auto refs = [&](int p) {
+    const auto it = listed.find(p);
+    return refs_[p] - (it == listed.end() ? 0 : it->second);
+  };
   const int n = pages_for(to), w0 = index_of(from);
   int need = 0;
   for (int i = 0; i < n; ++i) {
     const int p = i < static_cast<int>(table.size()) ? table[i] : 0;
-    if (p == 0 || (i >= w0 && from < to && refs_[p] > 1)) ++need;
+    if (p == 0 || (i >= w0 && from < to && refs(p) > 1)) ++need;
   }
   return need;
 }
@@ -77,6 +96,73 @@ void KvPool::truncate(std::vector<int>& table, int n) {
       release(table[i]);
       table[i] = 0;
     }
+}
+
+void KvPool::unshare(std::vector<int>& table, int n) {
+  for (int i = pages_for(std::max(n, 0)); i < static_cast<int>(table.size()); ++i)
+    if (table[i] != 0 && refs_[table[i]] > 1) {
+      release(table[i]);
+      table[i] = 0;
+    }
+}
+
+int KvPool::resume_need(const std::vector<int>& table, int reuse, int pages, const std::vector<int>* donor,
+                        const Refs* gone) const {
+  // The sequence of calls replayed on a copy of the table, with the reference changes it makes kept aside (the
+  // references `gone` lists released before it).
+  std::unordered_map<int, int> delta = listed_refs(gone);
+  for (auto& [p, k] : delta) k = -k;
+  auto refs = [&](int p) {
+    const auto it = delta.find(p);
+    return refs_.at(p) + (it == delta.end() ? 0 : it->second);
+  };
+  int take = 0, freed = 0;
+  auto drop = [&](int p) {
+    if (refs(p) == 1) ++freed;
+    --delta[p];
+  };
+  std::vector<int> t = table;
+  const int pr = pages_for(std::max(reuse, 0));
+  if (donor) {  // share()
+    if (pr > static_cast<int>(donor->size())) throw std::invalid_argument("KvPool::resume_need: donor does not hold [0, reuse)");
+    if (static_cast<int>(t.size()) < pr) t.resize(pr, 0);
+    for (int i = 0; i < pr; ++i) {
+      const int q = (*donor)[i];
+      if (q == 0) throw std::invalid_argument("KvPool::resume_need: donor has an unmapped page below reuse");
+      if (t[i] == q) continue;
+      ++delta[q];
+      if (t[i] != 0) drop(t[i]);
+      t[i] = q;
+    }
+  }
+  for (int i = pages; i < static_cast<int>(t.size()); ++i)  // truncate()
+    if (t[i] != 0) {
+      drop(t[i]);
+      t[i] = 0;
+    }
+  for (int i = pr; i < static_cast<int>(t.size()); ++i)  // unshare()
+    if (t[i] != 0 && refs(t[i]) > 1) {
+      drop(t[i]);
+      t[i] = 0;
+    }
+  const int w0 = index_of(std::max(reuse, 0));
+  for (int i = 0; i < pages; ++i) {  // ensure(reuse, end), end past reuse
+    const int p = i < static_cast<int>(t.size()) ? t[i] : 0;
+    if (p == 0) {
+      ++take;
+    } else if (i >= w0 && refs(p) > 1) {
+      ++take;
+      drop(p);
+    }
+  }
+  return std::max(take - freed, 0);
+}
+
+int KvPool::reclaimable(const Refs& refs) const {
+  const std::unordered_map<int, int> listed = listed_refs(&refs);
+  int n = 0;
+  for (const auto& [p, k] : listed) n += k >= refs_.at(p);
+  return n;
 }
 
 void KvPool::retain(int page) {

@@ -406,7 +406,7 @@ class Scheduler {
     std::vector<int> match(queue_.size());
     std::vector<bool> pinned = busy;
     for (size_t j = 0; j < queue_.size(); ++j) {
-      match[j] = eng.match_session(queue_[j].prompt, queue_[j].req.session_key);
+      match[j] = eng.match_session(queue_[j].prompt, queue_[j].req.session_key, queue_[j].req.share_scope);
       if (match[j] >= 0) pinned[match[j]] = true;
     }
     for (size_t j = 0; j < queue_.size(); ++j) {
@@ -418,7 +418,7 @@ class Scheduler {
       if (eng.kv_paged() && eng.kv_admit_pages(queue_[j].prompt.size()) <= eng.kv_pages_total()) {
         // (A prompt whose pages the whole pool could never hold is admitted to be answered at once: start().)
         bool evicted = false;
-        if (!kv_make_room(eng.kv_admit_need(s, queue_[j].prompt.size()), s, &evicted)) {
+        if (!kv_admit_room(s, queue_[j], &evicted)) {
           kv_wait_ = true;
           // An eviction emptied sessions the other jobs' matches above may name: look again from the start.
           if (evicted) return false;
@@ -475,8 +475,31 @@ class Scheduler {
       if (exceeds_context(j.prompt.size(), eng.max_context())) throw ContextOverflow(j.prompt.size(), eng.max_context());
       if (eng.kv_paged() && eng.kv_admit_pages(j.prompt.size()) > eng.kv_pages_total())
         throw KvPoolTooSmall(j.prompt.size(), eng.kv_pages_total());
-      eng.activate_session(j.session, j.req.session_key, j.fresh);
-      r->cur = eng.begin_prefill(j.prompt, false, j.images.empty() ? nullptr : &j.images);
+      eng.activate_session(j.session, j.req.session_key, j.fresh, j.req.share_scope);
+      try {
+        r->cur = eng.begin_prefill(j.prompt, false, j.images.empty() ? nullptr : &j.images);
+      } catch (const KvPoolExhausted&) {
+        // P4c: admission's count was short after all (begin_prefill changed nothing). While nothing runs nothing else
+        // will free pages: make room again (everything idle may go: the prompt fits once it has) and try once more.
+        if (!running_.empty()) throw;
+        kv_admit_room(j.session, j);
+        r->cur = eng.begin_prefill(j.prompt, false, j.images.empty() ? nullptr : &j.images);
+      }
+    } catch (const KvPoolExhausted& e) {
+      // P4c: the pool is short after all (pages shared at admission's count were let go of meanwhile): while a
+      // request runs, the job goes back to the front of the queue and is admitted again once one ends.
+      const int session = j.session;
+      if (running_.empty()) {
+        fail(*r, e);
+      } else {
+        std::fprintf(stderr, "KV pool: a prompt of %zu tokens waits (%s)\n", j.prompt.size(), e.what());
+        std::lock_guard<std::mutex> l(mu_);
+        queue_.push_front(std::move(j));
+        std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+        ctx_.metrics.queued += 1;
+      }
+      eng.touch_session(session);
+      return;
     } catch (const std::exception& e) {
       fail(*r, e);
       eng.touch_session(j.session);
@@ -585,51 +608,102 @@ class Scheduler {
   }
 
   // ---- The KV page pool (P4b, --kv-pages; serve/kv_policy.hpp). ----
-  // The pool as the policy sees it; the idle sessions (no running request, not `keep`) that hold pages, least
-  // recently used first, with their pages, into lru and pages when given.
-  KvPoolView kv_view(int keep, std::vector<int>* lru = nullptr, std::vector<int>* pages = nullptr) const {
+  // The pool as the policy sees it; the idle sessions (no running request, not `keep` or `donor`) that hold pages,
+  // least recently used first, into idle when given. v.idle counts what evicting all of them and the prefix KV store
+  // (its nodes other than `store_keep`) frees, jointly (P4c: a page shared by two of them counted once).
+  KvPoolView kv_view(int keep, std::vector<int>* idle = nullptr, int donor = -1,
+                     const std::vector<int>& store_keep = {}) const {
     Engine& eng = *ctx_.engine;
     std::vector<bool> excl(eng.sessions(), false);
     for (const auto& r : running_) excl[r->job.session] = true;
     if (keep >= 0) excl[keep] = true;
+    if (donor >= 0) excl[donor] = true;
     KvPoolView v;
     v.free = eng.kv_pages_free();
     v.pending = eng.kv_pages_pending();
+    std::vector<int> lru;
     for (int s; (s = eng.kv_lru_idle(excl)) >= 0;) {
-      const int n = eng.kv_session_pages(s);
-      v.idle += n;
-      if (lru) lru->push_back(s);
-      if (pages) pages->push_back(n);
+      lru.push_back(s);
       excl[s] = true;
     }
+    v.idle = eng.kv_reclaimable(lru, true, store_keep);
+    if (idle) *idle = std::move(lru);
     return v;
   }
-  // Whether `need` pages for a unit of session `keep` (an admission, a decode step) are free now. When evicting idle
-  // sessions (least recently used first; --session-protect-seconds does not hold against the pool's need) makes
-  // enough, they are evicted; their pages, and pages already released, are free once the streams have passed their
-  // release (a later turn), or at once after a synchronization when nothing runs.
-  // *evicted: whether it evicted a session.
-  bool kv_make_room(int need, int keep, bool* evicted = nullptr) {
+  // Whether the pages for a unit of session `keep` (an admission, a decode step; need() its pages, planned again after
+  // every eviction) are free now, evicting what kv_reclaim (serve/kv_policy.hpp) says: prefix KV store entries and
+  // idle sessions, least recently used first (--session-protect-seconds does not hold against the pool's need), the
+  // unit's own source (`src`: the store path and the session an admission resumes from) last. Evicted pages, and
+  // pages already released, are free once the streams have passed their release (a later turn), or at once after a
+  // synchronization when nothing runs. *evicted: whether it evicted anything.
+  // need(gone, from_scratch): the unit's need planned now (nullptr), or with those holders gone (Engine::KvGone; an
+  // admission from position 0 with from_scratch).
+  using KvNeed = std::function<int(const Engine::KvGone*, bool)>;
+  bool kv_make_room(const KvNeed& need_with, int keep, const Engine::KvSource& src, bool* evicted = nullptr) {
     Engine& eng = *ctx_.engine;
-    std::vector<int> lru, pages;
-    const KvPoolView v = kv_view(keep, &lru, &pages);
-    const KvVerdict verdict = kv_verdict(need, v);
-    if (verdict == KvVerdict::Go) return true;
-    if (verdict == KvVerdict::Wait) return false;
-    if (verdict == KvVerdict::Reclaim)
-      for (int s : kv_victims(need, v, lru, pages)) {
+    const std::function<int()> need = [&] { return need_with(nullptr, false); };
+    if (need() > eng.kv_pages_free() + eng.kv_pages_pending()) {
+      Engine::KvGone gone_kept{{}, true, src.store_path}, gone_all{{}, true, {}};
+      const KvPoolView kept = kv_view(keep, &gone_kept.sessions, src.donor, src.store_path),
+                       all = kv_view(keep, &gone_all.sessions);
+      std::vector<bool> excl(eng.sessions(), false), excl_kept;
+      for (const auto& r : running_) excl[r->job.session] = true;
+      if (keep >= 0) excl[keep] = true;
+      excl_kept = excl;
+      if (src.donor >= 0) excl_kept[src.donor] = true;
+      int dropped = 0;
+      auto store = [&](const std::vector<int>& keep_nodes) {
+        return [&eng, &dropped, &keep_nodes] {
+          if (!eng.kv_store_evict(keep_nodes)) return false;
+          ++dropped;
+          return true;
+        };
+      };
+      auto session = [&](const std::vector<bool>& busy) {
+        return [this, &eng, &busy, &need, evicted] {
+          const int s = eng.kv_lru_idle(busy);
+          if (s < 0) return false;
+          if (evicted) *evicted = true;
+          std::fprintf(stderr, "KV pool: idle session %d evicted (%d pages its own) for %d pages; %d free, %d pending\n",
+                       s, eng.kv_session_pages(s), need(), eng.kv_pages_free(), eng.kv_pages_pending());
+          eng.kv_evict(s);
+          std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+          ctx_.metrics.kv_evictions += 1;
+          return true;
+        };
+      };
+      const std::vector<int> no_nodes;
+      const std::vector<KvEvictNext> kept_order = {store(src.store_path), session(excl_kept)};
+      const std::vector<KvEvictNext> source_order = {store(no_nodes), session(excl)};
+      kv_reclaim(need, [&eng] { return eng.kv_pages_free() + eng.kv_pages_pending(); }, kept_order,
+                 need_with(&gone_kept, false), kept.free + kept.pending + kept.idle, source_order,
+                 need_with(&gone_all, true), all.free + all.pending + all.idle, running_.empty() && src.cold > 0);
+      if (dropped > 0) {
         if (evicted) *evicted = true;
-        std::fprintf(stderr, "KV pool: idle session %d evicted (%d pages) for %d pages; %d free, %d pending\n", s,
-                     eng.kv_session_pages(s), need, v.free, v.pending);
-        eng.kv_evict(s);
-        std::lock_guard<std::mutex> m(ctx_.metrics.mu);
-        ctx_.metrics.kv_evictions += 1;
+        std::fprintf(stderr, "KV pool: %d prefix KV store entries evicted for %d pages; %d free, %d pending\n", dropped,
+                     need(), eng.kv_pages_free(), eng.kv_pages_pending());
       }
+    }
     if (running_.empty()) eng.kv_retire(true);
-    return need <= eng.kv_pages_free();
+    return need() <= eng.kv_pages_free();
+  }
+  // Room for job j's admission in session s (kv_make_room, its need planned by Engine::kv_admit_need each time).
+  bool kv_admit_room(int s, const Job& j, bool* evicted = nullptr) {
+    Engine& eng = *ctx_.engine;
+    Engine::KvSource src;
+    eng.kv_admit_need(s, j.prompt, j.req.share_scope, &src);
+    return kv_make_room(
+        [&](const Engine::KvGone* gone, bool from_scratch) {
+          return eng.kv_admit_need(s, j.prompt, j.req.share_scope, nullptr, gone, from_scratch);
+        },
+        s, src, evicted);
   }
   // Whether r's next decode step has its KV pages (Engine::kv_step_need), making room as kv_make_room does.
-  bool kv_room(Running& r) { return kv_make_room(ctx_.engine->kv_step_need(r.job.session, r.spec), r.job.session); }
+  bool kv_room(Running& r) {
+    Engine& eng = *ctx_.engine;
+    return kv_make_room([&](const Engine::KvGone* gone, bool) { return eng.kv_step_need(r.job.session, r.spec, gone); },
+                        r.job.session, Engine::KvSource{});
+  }
   // A decode turn waited for pages. When every running request waits: pages being freed are waited for, else the
   // last resort ends the request admitted last as if it had reached the context limit (finish_reason "length") and
   // frees its pages; it is added to `ended`.
@@ -1070,6 +1144,7 @@ class Handler : public proxygen::RequestHandler {
   void onRequest(std::unique_ptr<HTTPMessage> headers) noexcept override {
     method_ = headers->getMethodString();
     path_ = headers->getPath();
+    share_scope_ = share_scope_of(headers->getHeaders().getSingleOrEmpty("X-Ling-Share-Scope"));
     ex_->downstream = downstream_;
     ex_->evb = folly::EventBaseManager::get()->getEventBase();
   }
@@ -1171,6 +1246,7 @@ class Handler : public proxygen::RequestHandler {
       if (auto buf = body_.move()) text = buf->moveToFbString().toStdString();
       json body = json::parse(text);
       job.req = parse_request(body, chat, ctx_.vision);
+      job.req.share_scope = share_scope_;
       job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
       job.prompt = job.req.prompt_ids.empty() ? ctx_.tok->encode(job.req.prompt_text) : job.req.prompt_ids;
       if (!job.req.prompt_ids.empty())
@@ -1396,6 +1472,7 @@ class Handler : public proxygen::RequestHandler {
       std::string text;
       if (auto buf = body_.move()) text = buf->moveToFbString().toStdString();
       job.req = parse_responses_request(json::parse(text), ctx_.vision);
+      job.req.share_scope = share_scope_;
       job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
       job.prompt = ctx_.tok->encode(job.req.prompt_text);
       attach_images(job);
@@ -1516,6 +1593,7 @@ class Handler : public proxygen::RequestHandler {
   ServerContext& ctx_;
   Scheduler& scheduler_;
   std::string method_, path_;
+  uint64_t share_scope_ = 0;  // X-Ling-Share-Scope (P4c, share_scope_of)
   folly::IOBufQueue body_{folly::IOBufQueue::cacheChainLength()};
   bool too_large_ = false;
   std::shared_ptr<Exchange> ex_ = std::make_shared<Exchange>();
