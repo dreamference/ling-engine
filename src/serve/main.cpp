@@ -3,7 +3,7 @@
 // time; the HTTP threads parse requests and stream server-sent events back.
 //
 //   ling-serve --model DIR [--host 0.0.0.0] [--port 8000] [--served-model-name NAME] [--max-context N]
-//              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs] [--pdl]
+//              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N] [--draft-off-below X]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
 //              [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off]
@@ -32,6 +32,12 @@
 // decoding conversations take some steps at their speed alone instead of every step beside a chunk. At four warm
 // agent conversations (node-b, 2026-10-27) 16 raised the pooled decode from 25.7 to 35.6 tok/s with the rounds'
 // time unchanged (139.3 / 140.9 s). Only the order of units changes, as with the shortest prefill first.
+//
+// --draft-off-below X (BACKLOG 10; default 1.5, 0 off; LING_DRAFT_OFF_BELOW overrides it): the drafter-off guard. A
+// session whose running mean of tokens per speculative step falls below X decodes one plain row per step, with no
+// drafter pass, and probes the drafter once every 16 plain steps until the mean is back at X + 0.25
+// (core/draft_guard.hpp). Greedy output is the same token for token; counted in /spec_stats (drafter_off_steps,
+// drafter_switches) and /metrics (ling:drafter_off_steps_total, ling:drafter_switches_total).
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -133,6 +139,7 @@ struct Metrics {
               {"batched_steps", spec.batched_steps}, {"tree_steps", spec.tree_steps},
               {"tree_branch_steps", spec.tree_branch_steps}, {"tree_off_chain", spec.tree_off_chain},
               {"sparse_steps", spec.sparse_steps}, {"sparse_fallbacks", spec.sparse_fallbacks},
+              {"drafter_off_steps", spec.drafter_off_steps}, {"drafter_switches", spec.drafter_switches},
               {"shadow_total_steps", spec.shadow_total_steps}, {"shadow_dflash_all", spec.shadow_dflash_all},
               {"shadow_best", spec.shadow_best}};
     for (int b = 0; b < 5; ++b) {
@@ -172,6 +179,10 @@ struct Metrics {
             "Prefill chunks run between another request's decode steps.");
     counter("ling:batched_steps_total", batched_steps,
             "Decode steps that verified two or more requests' rows in one pass.");
+    counter("ling:drafter_off_steps_total", spec.drafter_off_steps,
+            "Plain one-row steps taken because the drafter-off guard had switched a session's drafter off.");
+    counter("ling:drafter_switches_total", spec.drafter_switches,
+            "Times the drafter-off guard switched a session's drafter off or back on.");
     auto gauge = [&](const char* name, double v, const char* help) {
       out += std::string("# HELP ") + name + " " + help + "\n# TYPE " + name + " gauge\n";
       char buf[64];
@@ -639,7 +650,9 @@ class Scheduler {
     ++decode_passes_;
     {
       std::lock_guard<std::mutex> m(ctx_.metrics.mu);
-      ctx_.metrics.batch_rows = r.spec ? std::min(eng.draft_block(), eng.max_context() - static_cast<int>(eng.history().size())) : 1;
+      ctx_.metrics.batch_rows = r.spec && !eng.drafter_off(r.job.session, r.job.req.sampling)
+                                    ? std::min(eng.draft_block(), eng.max_context() - static_cast<int>(eng.history().size()))
+                                    : 1;
     }
     if (r.spec) {
       r.pending = eng.speculate(r.pending.back(), r.job.req.sampling, r.job.req.logprobs ? &r.rows : nullptr);
@@ -1361,6 +1374,7 @@ class Factory : public proxygen::RequestHandlerFactory {
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "0.0.0.0", name;
+  double draft_off_below = 1.5;  // the drafter-off guard (BACKLOG 10)
   int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 7, prefix_kv_mb = -1;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
@@ -1396,6 +1410,7 @@ int main(int argc, char** argv) {
     else if (a == "--draft") draft_dir = next();
     else if (a == "--draft-block") draft_block = std::stoi(next());
     else if (a == "--tree") tree_nodes = std::stoi(next());
+    else if (a == "--draft-off-below") draft_off_below = std::stod(next());
     else if (a == "--lookup") lookup = std::stoi(next());
     else if (a == "--lookup-min") lookup_min = std::stoi(next());
     else if (a == "--pretokenizer") pretokenizer = next();
@@ -1428,7 +1443,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
     return 2;
   }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
@@ -1479,6 +1494,7 @@ int main(int argc, char** argv) {
   opts.draft_dir = draft_dir;
   opts.draft_block = draft_block;
   opts.tree_nodes = tree_nodes;  // BACKLOG 26: 7 by default, 0 the chain alone (LING_TREE overrides)
+  opts.draft_off_below = draft_off_below;  // BACKLOG 10: 1.5 by default, 0 the guard off (LING_DRAFT_OFF_BELOW overrides)
   opts.lookup_mode = lookup;
   opts.lookup_min_match = lookup_min;
   opts.prefix_checkpoints = checkpoints;
