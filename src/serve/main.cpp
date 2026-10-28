@@ -68,7 +68,8 @@
 // would leave less than the first of MemAvailable, and answers a generation request HTTP 503 (code host_memory_low)
 // while MemAvailable is below the second. 0 switches either off. Neither changes what an admitted request computes.
 //
-// --plan-only: print the start plan (sessions, batch, context, planned_bytes) as one JSON line on stdout and exit 0 before
+// --plan-only: print the start plan (sessions, batch, context, planned_bytes; with --kv-pages the page pool, which
+// planned_bytes includes, and the host reserve) as one JSON line on stdout and exit 0 before
 // anything is allocated; the launcher's pre-load host-safety check runs it so it checks the engine's own plan.
 // --auto-size 1|0 (default 1; LING_AUTO_SIZE overrides; BATCHING §5.6, the owner's decision of 2026-10-28): what is
 // not given of --sessions and --max-context is chosen at start from MemAvailable by the same plan the start check
@@ -1796,6 +1797,7 @@ int main(int argc, char** argv) {
     std::cerr << "--kv-pool-mb needs --kv-pages\n";
     return 2;
   }
+  ling::serve::MemoryPlan plan;  // the start's plan, which --plan-only reports
   {  // sizing and admission control at start (serve/admission.hpp; BATCHING §5.6), before anything is allocated
     namespace as = ling::serve;
     const ling::ModelConfig cfg = ling::ModelConfig::from_file(model_dir + "/config.json");
@@ -1810,32 +1812,28 @@ int main(int argc, char** argv) {
     sessions = size.sessions;
     max_context = size.max_context;
     batch = batch_arg.value_or(size.sessions_auto ? sessions : as::kDefaultBatch);
-    as::MemoryPlan mp = as::plan_memory(cfg, weights, sessions, max_context, !draft_dir.empty(), kv_pages, scratch);
+    // With --kv-pages the pool takes what the rest of the plan, the prefix KV store's budget (it still holds KV in P4b
+    // and sizes itself after the engine, from what is free above its own reserve) and the reserve leave, or
+    // --kv-pool-mb.
+    as::KvPlanInputs kv{kv_pages, 0, kv_pool_mb};
     if (kv_pages) {
-      // The pool: what the rest of the plan, the prefix KV store's budget (it still holds KV in P4b and sizes itself
-      // after the engine, from what is free above its own reserve) and the reserve leave, or --kv-pool-mb.
       long store_mb = opts.prefix_kv_mb;
       if (const char* e = std::getenv("LING_PREFIX_KV_MB")) store_mb = std::atol(e);
       if (checkpoints <= 0 || store_mb < 0) store_mb = 0;
-      as::plan_kv_pool(mp, cfg, max_context, host_reserve_mb > 0 ? avail : -1, host_reserve_mb, size_t(store_mb) << 20,
-                       kv_pool_mb);
-      if (kv_pool_mb < 0 && host_reserve_mb > 0 && avail >= 0) {
-        const std::string small = as::refuse_kv_pool(mp, max_context);
-        if (!small.empty()) {
-          std::cerr << "ling-serve: refused to start: " << small << "\n";
-          return 3;
-        }
-      }
+      kv.store_bytes = size_t(store_mb) << 20;
+    }
+    const as::StartPlan start = as::start_plan(cfg, weights, scratch, !draft_dir.empty(), sessions, max_context, avail,
+                                               host_reserve_mb, kv);
+    plan = start.plan;
+    const as::MemoryPlan& mp = plan;
+    if (!start.refusal.empty()) {
+      std::cerr << "ling-serve: refused to start: " << start.refusal << "\n";
+      return 3;
+    }
+    if (kv_pages) {
       opts.kv_pool_pages = static_cast<int>(mp.kv_pool_pages);
       std::cerr << "KV page pool: " << as::describe_kv_pool(mp)
                 << (kv_pool_mb >= 0 ? " (--kv-pool-mb)" : " (from the memory plan)") << "\n";
-    }
-    if (host_reserve_mb > 0) {
-      const std::string why = as::refuse_start(mp, avail, host_reserve_mb);
-      if (!why.empty()) {
-        std::cerr << "ling-serve: refused to start: " << why << "\n";
-        return 3;
-      }
     }
     // One line: what runs, whether each was chosen here (auto), given, or a default (and why no sizing), and the
     // plan's numbers it was chosen by.
@@ -1853,13 +1851,7 @@ int main(int argc, char** argv) {
               << as::gb(mp.total()) << "; requests refused below " << admit_reserve_mb << " MB\n";
   }
   if (plan_only) {  // the host-safety check of the launcher asks for this before it loads (BATCHING §5.6)
-    namespace as = ling::serve;
-    const ling::ModelConfig cfg = ling::ModelConfig::from_file(model_dir + "/config.json");
-    const size_t weights = as::checkpoint_bytes(model_dir) + as::checkpoint_bytes(draft_dir);
-    const size_t scratch = as::kScratchBytes + (opts.vision ? size_t(1100 + vision_cache_mb) << 20 : 0);
-    const as::MemoryPlan mp = as::plan_memory(cfg, weights, sessions, max_context, !draft_dir.empty(), false, scratch);
-    std::cout << "{\"sessions\":" << sessions << ",\"batch\":" << std::min(batch, sessions)
-              << ",\"max_context\":" << max_context << ",\"planned_bytes\":" << mp.total() << "}\n";
+    std::cout << ling::serve::plan_json(sessions, batch, max_context, plan, kv_pages, host_reserve_mb) << "\n";
     return 0;
   }
   opts.max_context = max_context;

@@ -179,6 +179,44 @@ inline std::string refuse_start(const MemoryPlan& p, long avail_mb, long reserve
   return o.str();
 }
 
+// P4d: what the plan needs to know about the KV page pool. `store_bytes` is the prefix KV store's budget the pool
+// leaves (0 when the store sizes itself after the engine), `pool_mb` --kv-pool-mb (< 0: sized from the plan).
+struct KvPlanInputs {
+  bool on = false;
+  size_t store_bytes = 0;
+  long pool_mb = -1;
+};
+
+// The start's plan and why it is refused (empty when it starts), the one computation the start check, auto-size and
+// --plan-only share: plan_memory, with --kv-pages the pool (plan_kv_pool) and its floor (refuse_kv_pool, only for a
+// pool sized from a known MemAvailable), then refuse_start. With `reserve_mb` <= 0 nothing is judged.
+struct StartPlan {
+  MemoryPlan plan;
+  std::string refusal;
+};
+inline StartPlan start_plan(const ModelConfig& c, size_t weight_bytes, size_t scratch, bool drafter, int sessions,
+                            int max_context, long avail_mb, long reserve_mb, const KvPlanInputs& kv = {}) {
+  StartPlan s{plan_memory(c, weight_bytes, sessions, max_context, drafter, kv.on, scratch), {}};
+  if (kv.on) {
+    plan_kv_pool(s.plan, c, max_context, reserve_mb > 0 ? avail_mb : -1, reserve_mb, kv.store_bytes, kv.pool_mb);
+    if (kv.pool_mb < 0 && reserve_mb > 0 && avail_mb >= 0) s.refusal = refuse_kv_pool(s.plan, max_context);
+  }
+  if (s.refusal.empty() && reserve_mb > 0) s.refusal = refuse_start(s.plan, avail_mb, reserve_mb);
+  return s;
+}
+
+// --plan-only's line (read by Mightling's pre-load check): what runs and the plan's bytes, the page pool included.
+// sessions, batch, max_context and planned_bytes are the contract; the pool's fields and the reserve are additive.
+inline std::string plan_json(int sessions, int batch, int max_context, const MemoryPlan& p, bool kv_pages,
+                             long reserve_mb) {
+  std::ostringstream o;
+  o << "{\"sessions\":" << sessions << ",\"batch\":" << std::min(batch, sessions) << ",\"max_context\":" << max_context
+    << ",\"planned_bytes\":" << p.total() << ",\"kv_pages\":" << (kv_pages ? "true" : "false")
+    << ",\"kv_pool_bytes\":" << p.kv_pool << ",\"kv_pool_pages\":" << p.kv_pool_pages
+    << ",\"host_reserve_bytes\":" << (size_t(std::max(0L, reserve_mb)) << 20) << "}";
+  return o.str();
+}
+
 // Auto-size (BATCHING §5.6): the most sessions chosen without --sessions (the owner's cap on node-b until a larger
 // number is approved; also the engine's kMaxSeqs), and the shortest context chosen without --max-context.
 inline constexpr int kAutoSessionsCap = 4;
