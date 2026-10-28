@@ -164,3 +164,53 @@ toward ~32-35, pooled from 35.6 toward ~40; one stream unchanged (no chunk attac
 Graphs for the fused verify (§3, with P2's descriptors); fusing the megakernels' FFN and DeltaNet mixer with a chunk
 (the decode rows would regain the megakernels' ~5-8 ms); image prompts in a fused pass; three or four decode sessions
 in one fused verify (P2's row budget).
+
+## 10. Measured (2026-10-28, node-b windows W1-W3 and a node-c profiling window)
+
+**Exact everywhere; not faster. `--fused-pass` stays off and this branch is not merged.** The merge rule (per-stream decode
+up against main 0b500cc's W11) is not met.
+
+- **Exactness.** `ling-fused-tests` all identical. `--fused-check`: pairs (graphs, eager) and triples (graphs) carried
+  32-60 chunks, 0 alone, with the rider's state, drafter context and logits identical and greedy and seeded outputs
+  identical. The side path's `--interleave-check` passed. agentlong greedy 16/16: warm 1 against W11 `m1w`, warm 2 and 4
+  against warm 1, and cold 2 and 4 against `ref-e1g`.
+- **The carrying step** (1 decode row x 256-row chunk), node-b: 266.5-268.1 ms with the rider at 34.8K and 247-248 ms at
+  26.8K, against 98.8-105 ms for a decode step alone. Triples (2 decode rows): 230-283 ms. node-c (same build): 259-261 /
+  242-243 ms; with a plain second stream instead of the 40-SM green context, 251 / 235 ms; with a 128-row chunk,
+  188 / 179 ms. Graphs make ~4 ms of difference (eager pairs 266 ms too).
+- **Speed** (`streams_server.py`, `--sessions 4 --batch 4`), against W11:
+
+| run | per-stream decode | pooled | ms/pass | step beside a prefill | W11 pooled | W11 ms/pass |
+| --- | --- | --- | --- | --- | --- | --- |
+| warm 1 | 64.0 | 64.0 | 105.2 | - | 64.1 | 105.0 |
+| warm 2 | 39.9 / 50.4 | 43.6 | 152.4 | 261 ms | 43.2 | 153.8 |
+| warm 4 | 21.9 / 24.5 / 21.6 / 49.0 | 25.6 | 243.2 | 308 ms | 34.1 | 189.3 |
+| cold 2 | 29.1 / 29.6 | 29.3 | 229.9 | 241 ms (88% of steps) | | |
+| cold 4 | 24.6 / 36.1 / 44.9 / 26.4 | 29.4 | 229.5 | 242 ms (87%) | | |
+
+  Probe (3 reps): C TTFT 0.37 s, B 36.3 s, A 54.5 tok/s (C1: 1.36 s, 35.5 s, 61.4). With `--decoders 2`: A 40.0 tok/s
+  (C1: 70 / 78).
+
+**Why: Nsight (node-c, 2025.3.2, eager `--fused-check` on the pair, 100 carried steps, `fused_breakdown.py`).** Per
+carrying step under the profiler: GPU span 239.5 ms (green context) / 230.8 ms (plain stream), almost no idle time.
+- Main stream: fused projections **142.7 ms**, against the note's 129-134. The 256-row chunk prefilled alone spends
+  100.0 ms in its GEMMs, and a decode verify alone spends 92.8 ms in total. So the fused GEMMs save ~25 ms of
+  weight reads, but they cost 43 ms over the chunk's GEMMs alone.
+- Side stream: the chunk's attention **62.0 ms** (green, 40 SMs) / 55.4 ms (plain stream), against **30.5 ms** for
+  the same chunk alone on the whole GPU. bf16 narrow is 13.5 ms (7.2 alone); DeltaNet chunk recurrence and conv ~11 ms.
+- Overlap: the main stream runs alone 146 ms, the side stream alone 72 ms (green) / 65 ms (plain), both at once only
+  17-18 ms. Every projection is a handoff (`to_main` / `to_side`), so the chunk's state kernels (~80-90 ms) sit on the
+  critical path between projections. The note's §8 assumed ~25-30 ms there, overlapped with the verify's.
+- Net: fused step ≈ decode alone (~102) + chunk alone (151 at 256 rows; the 128-row step is 179-188 ≈ 102 + ~80).
+  What the shared weight read saves is spent on attention slowed by the concurrent GEMMs and on the lockstep.
+
+**What would have to change** (not started):
+1. Take the chunk's attention and DeltaNet chain off the critical path. For example, run the chunk one layer behind
+   the decode, so that its state kernels overlap the next layer's projections instead of waiting at a handoff. This
+   needs the fused GEMM to take two layers' weights, or the chunk's projections to go unfused.
+2. A faster fused GEMM. The decode rows cost ~43 ms inside it, against ~0 in the ideal; the prototype's L2-flushed
+   timings did not show this.
+3. Chunk attention that is not slowed ~2x by the concurrent GEMMs.
+
+Until one of these lands, the scheduler's present side-stream prefill (C1) is as fast or faster, and stays the
+default.
