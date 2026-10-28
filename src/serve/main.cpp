@@ -95,6 +95,7 @@
 #include "serve/api.hpp"
 #include "tokenizer/tokenizer.hpp"
 #include "serve/image_input.hpp"
+#include "serve/kv_policy.hpp"
 
 namespace ling::serve {
 namespace {
@@ -127,6 +128,9 @@ struct Metrics {
   // The session pool (M4 §1): slots, slots holding a session, evictions so far, the protection window.
   int sessions = 0, sessions_resident = 0;
   double session_evictions = 0, protect_seconds = 0;
+  // P4b (--kv-pages): the KV page pool's pages and free pages, and the requests ended by its last resort.
+  int kv_pages_total = 0, kv_pages_free = 0;
+  double kv_pool_exhausted = 0, kv_evictions = 0;
 
   json spec_json() {
     std::lock_guard<std::mutex> l(mu);
@@ -176,6 +180,11 @@ struct Metrics {
             "Prefill chunks run between another request's decode steps.");
     counter("ling:batched_steps_total", batched_steps,
             "Decode steps that verified two or more requests' rows in one pass.");
+    if (kv_pages_total > 0) {
+      counter("ling:kv_pool_exhausted_total", kv_pool_exhausted,
+              "Requests ended at finish_reason length because the KV page pool was exhausted (the last resort).");
+      counter("ling:kv_session_evictions_total", kv_evictions, "Idle sessions whose KV pages the pool took back.");
+    }
     auto gauge = [&](const char* name, double v, const char* help) {
       out += std::string("# HELP ") + name + " " + help + "\n# TYPE " + name + " gauge\n";
       char buf[64];
@@ -187,6 +196,10 @@ struct Metrics {
     gauge("sglang:max_total_num_tokens", max_total_tokens,
           "Tokens the resident sessions can hold (sessions times the context size).");
     gauge("ling:sessions", sessions, "Resident session slots.");
+    if (kv_pages_total > 0) {
+      gauge("ling:kv_pages_total", kv_pages_total, "Pages of the KV page pool (64 positions each, --kv-pages).");
+      gauge("ling:kv_pages_free", kv_pages_free, "Free pages of the KV page pool.");
+    }
     gauge("ling:sessions_resident", sessions_resident, "Slots holding a session.");
     gauge("ling:batch", batch, "Requests that run at once (each in its own session).");
     gauge("ling:prefill_chunk_contended", prefill_chunk_contended,
@@ -253,6 +266,16 @@ struct Job {
   bool fresh = false;  // a new session in that slot
 };
 
+// P4b (--kv-pages): a prompt whose KV pages (with the two of growth it is admitted with) exceed the whole page pool
+// could never be admitted; it is answered at once, as a context overflow.
+class KvPoolTooSmall : public std::invalid_argument {
+ public:
+  KvPoolTooSmall(size_t prompt_tokens, int pages)
+      : std::invalid_argument("the prompt's " + std::to_string(prompt_tokens) +
+                              " tokens need more KV pages than this server's pool holds (" + std::to_string(pages) +
+                              " pages of 64 positions): use a shorter prompt, or a larger --kv-pool-mb") {}
+};
+
 // Step periods of one decoding request: the time from the start of one of its steps (or its first token) to
 // the start of the next, split by whether another request was prefilling meanwhile (M4 §3: a prefill chunk
 // runs between two of its steps).
@@ -294,6 +317,8 @@ struct Running {
   bool yielding = false;     // its prefill is letting a shorter one go first, since yield_t0 (C1)
   std::chrono::steady_clock::time_point yield_t0;
   int batched = 0;       // its decode steps taken in a batch with another request (M4 stage 3)
+  long admitted = 0;     // the order of admission (P4b: the last resort ends the request admitted last)
+  bool kv_wait = false;  // its last decode turn waited for KV pages (P4b)
   Periods alone, beside;  // step periods without and with another request's prefill in between
 };
 
@@ -341,8 +366,11 @@ class Scheduler {
   // running request holds or a queued job continues are pinned, so a new session never takes them; a job
   // that continues a running request's session waits for it (one request per session at a time), and when
   // every other slot is pinned or protected a new session's job waits while the jobs behind it still run.
+  // P4b (--kv-pages): a job is admitted only when its prompt's KV pages and two more are free (kv_make_room may evict
+  // idle sessions for them); otherwise it waits and the jobs behind it may still run.
   bool pick(Job& out) {
     Engine& eng = *ctx_.engine;
+    kv_wait_ = false;
     for (auto it = queue_.begin(); it != queue_.end();) {
       if (!it->cancelled->load()) {
         ++it;
@@ -366,6 +394,14 @@ class Scheduler {
       const bool fresh = s < 0;
       if (fresh) s = eng.free_session(protect_seconds_, pinned);
       if (s < 0) continue;
+      if (eng.kv_paged()) {
+        // A prompt whose pages the whole pool could never hold is admitted to be answered at once (start()).
+        const int need = eng.kv_admit_need(s, queue_[j].prompt.size());
+        if (need <= eng.kv_pages_total() && !kv_make_room(need, s)) {
+          kv_wait_ = true;
+          continue;
+        }
+      }
       out = std::move(queue_[j]);
       out.session = s;
       out.fresh = fresh;
@@ -387,8 +423,9 @@ class Scheduler {
         const auto now = std::chrono::steady_clock::now();
         // A job that could not be placed is looked at again when something changed (a new job, a request
         // ended) or once a second (a protection expires, a waiting client leaves).
+        // A job waiting for KV pages that are being freed (P4b) is looked at again at every turn.
         const bool look = static_cast<int>(running_.size()) < batch_ && !queue_.empty() &&
-                          (dirty_ || now - last_look_ >= std::chrono::seconds(1));
+                          (dirty_ || kv_wait_ || now - last_look_ >= std::chrono::seconds(1));
         if (look) {
           dirty_ = false;
           last_look_ = now;
@@ -409,8 +446,11 @@ class Scheduler {
     auto r = std::make_unique<Running>();
     r->job = std::move(job);
     Job& j = r->job;
+    r->admitted = ++admitted_;
     try {
       if (exceeds_context(j.prompt.size(), eng.max_context())) throw ContextOverflow(j.prompt.size(), eng.max_context());
+      if (eng.kv_paged() && eng.kv_admit_need(j.session, j.prompt.size()) > eng.kv_pages_total())
+        throw KvPoolTooSmall(j.prompt.size(), eng.kv_pages_total());
       eng.activate_session(j.session, j.req.session_key, j.fresh);
       r->cur = eng.begin_prefill(j.prompt, false, j.images.empty() ? nullptr : &j.images);
     } catch (const std::exception& e) {
@@ -430,6 +470,10 @@ class Scheduler {
       r.job.sink.error(o->what(), kContextLengthExceeded);
       return;
     }
+    if (const auto* o = dynamic_cast<const KvPoolTooSmall*>(&e)) {
+      r.job.sink.error(o->what(), kContextLengthExceeded);
+      return;
+    }
     if (dynamic_cast<const NonFiniteLogits*>(&e)) {
       {
         std::lock_guard<std::mutex> l(ctx_.metrics.mu);
@@ -443,6 +487,7 @@ class Scheduler {
   void run() {
     while (admit()) {
       if (running_.empty()) continue;
+      kv_gauges();
       size_t k = turn_++ % running_.size();
       // A side chunk whose pass is done is finished (and the next one launched) before anything else, so the side
       // stream does not wait out another request's step.
@@ -454,8 +499,14 @@ class Scheduler {
           }
       Running& r = *running_[k];
       std::vector<Running*> ended;
-      std::vector<Running*> batch = batch_with(r);
-      if (batch.size() >= 2) {
+      // P4b: a decode step whose KV pages are not there waits while the others run; when every request waits, the
+      // last resort may end one (kv_stalled).
+      const bool kv_blocked = ctx_.engine->kv_paged() && !r.prefilling && !kv_room(r);
+      r.kv_wait = kv_blocked;
+      std::vector<Running*> batch = kv_blocked ? std::vector<Running*>() : batch_with(r);
+      if (kv_blocked) {
+        kv_stalled(ended);
+      } else if (batch.size() >= 2) {
         batch_step(batch, ended);
       } else {
         bool done = false;
@@ -488,14 +539,107 @@ class Scheduler {
   }
   // The requests that step with r (r first, then the others in running order) while their rows fit one pass;
   // just r, or nothing, when there is no batch to form.
+  // P4b: only requests whose step's KV pages are free join (r's are: kv_room).
   std::vector<Running*> batch_with(Running& r) const {
     std::vector<Running*> b;
     if (!batchable(r)) return b;
     b.push_back(&r);
-    const int fit = kernels::kMaxStreamRows / ctx_.engine->draft_block();
+    Engine& eng = *ctx_.engine;
+    const int fit = kernels::kMaxStreamRows / eng.draft_block();
+    int kv_need = eng.kv_paged() ? eng.kv_step_need(r.job.session, true) : 0;
+    const int kv_free = eng.kv_paged() ? eng.kv_pages_free() : 0;
     for (const auto& o : running_)
-      if (o.get() != &r && static_cast<int>(b.size()) < fit && batchable(*o)) b.push_back(o.get());
+      if (o.get() != &r && static_cast<int>(b.size()) < fit && batchable(*o)) {
+        if (eng.kv_paged()) {
+          const int n = eng.kv_step_need(o->job.session, true);
+          if (kv_need + n > kv_free) continue;
+          kv_need += n;
+        }
+        b.push_back(o.get());
+      }
     return b;
+  }
+
+  // ---- The KV page pool (P4b, --kv-pages; serve/kv_policy.hpp). ----
+  // The pool as the policy sees it; the idle sessions (no running request, not `keep`) that hold pages, least
+  // recently used first, with their pages, into lru and pages when given.
+  KvPoolView kv_view(int keep, std::vector<int>* lru = nullptr, std::vector<int>* pages = nullptr) const {
+    Engine& eng = *ctx_.engine;
+    std::vector<bool> excl(eng.sessions(), false);
+    for (const auto& r : running_) excl[r->job.session] = true;
+    if (keep >= 0) excl[keep] = true;
+    KvPoolView v;
+    v.free = eng.kv_pages_free();
+    v.pending = eng.kv_pages_pending();
+    for (int s; (s = eng.kv_lru_idle(excl)) >= 0;) {
+      const int n = eng.kv_session_pages(s);
+      v.idle += n;
+      if (lru) lru->push_back(s);
+      if (pages) pages->push_back(n);
+      excl[s] = true;
+    }
+    return v;
+  }
+  // Whether `need` pages for a unit of session `keep` (an admission, a decode step) are free now. When evicting idle
+  // sessions (least recently used first; --session-protect-seconds does not hold against the pool's need) makes
+  // enough, they are evicted; their pages, and pages already released, are free once the streams have passed their
+  // release (a later turn), or at once after a synchronization when nothing runs.
+  bool kv_make_room(int need, int keep) {
+    Engine& eng = *ctx_.engine;
+    std::vector<int> lru, pages;
+    const KvPoolView v = kv_view(keep, &lru, &pages);
+    const KvVerdict verdict = kv_verdict(need, v);
+    if (verdict == KvVerdict::Go) return true;
+    if (verdict == KvVerdict::Wait) return false;
+    if (verdict == KvVerdict::Reclaim)
+      for (int s : kv_victims(need, v, lru, pages)) {
+        std::fprintf(stderr, "KV pool: idle session %d evicted (%d pages) for %d pages; %d free, %d pending\n", s,
+                     eng.kv_session_pages(s), need, v.free, v.pending);
+        eng.kv_evict(s);
+        std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+        ctx_.metrics.kv_evictions += 1;
+      }
+    if (running_.empty()) eng.kv_retire(true);
+    return need <= eng.kv_pages_free();
+  }
+  // Whether r's next decode step has its KV pages (Engine::kv_step_need), making room as kv_make_room does.
+  bool kv_room(Running& r) { return kv_make_room(ctx_.engine->kv_step_need(r.job.session, r.spec), r.job.session); }
+  // A decode turn waited for pages. When every running request waits: pages being freed are waited for, else the
+  // last resort ends the request admitted last as if it had reached the context limit (finish_reason "length") and
+  // frees its pages; it is added to `ended`.
+  void kv_stalled(std::vector<Running*>& ended) {
+    Engine& eng = *ctx_.engine;
+    std::vector<KvRunner> rs;
+    for (const auto& o : running_) {
+      if (o->prefilling || !o->kv_wait) return;  // someone still makes progress
+      rs.push_back({o->admitted, true, eng.kv_step_need(o->job.session, o->spec)});
+    }
+    const KvPoolView v = kv_view(-1);
+    if (v.pending > 0) {  // nothing else can run: wait for the released pages' readers
+      eng.kv_retire(true);
+      return;
+    }
+    const int i = kv_last_resort(rs, v);
+    if (i < 0) return;
+    Running& victim = *running_[i];
+    std::fprintf(stderr, "KV pool exhausted: every running request waits for a page; session %d's request (%d tokens "
+                         "produced) ends at length\n", victim.job.session, victim.produced);
+    victim.finish = "length";
+    end(victim);
+    eng.kv_evict(victim.job.session);
+    {
+      std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+      ctx_.metrics.kv_pool_exhausted += 1;
+    }
+    ended.push_back(&victim);
+  }
+  void kv_gauges() {
+    Engine& eng = *ctx_.engine;
+    if (!eng.kv_paged()) return;
+    const int total = eng.kv_pages_total(), free = eng.kv_pages_free();
+    std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+    ctx_.metrics.kv_pages_total = total;
+    ctx_.metrics.kv_pages_free = free;
   }
 
   // One batched speculative step of the requests in `batch`, then each one's tokens emitted as unit() does;
@@ -510,6 +654,7 @@ class Scheduler {
       r.last_step = now;
       ++r.passes;
       ++r.batched;
+      r.kv_wait = false;
       steps[i].session = r.job.session;
       steps[i].anchor = r.pending.back();
       steps[i].params = &r.job.req.sampling;
@@ -810,6 +955,8 @@ class Scheduler {
   std::deque<Job> queue_;
   bool stop_ = false;
   bool dirty_ = false;  // the queue or the running set changed since pick() last looked
+  bool kv_wait_ = false;  // pick() left a job waiting for KV pages that eviction or retirement frees (P4b)
+  long admitted_ = 0;     // requests admitted so far (Running::admitted)
   std::chrono::steady_clock::time_point last_look_{};
   // Touched by the engine thread only.
   std::vector<std::unique_ptr<Running>> running_;

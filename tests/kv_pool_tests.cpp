@@ -2,7 +2,8 @@
 // sharing, truncation, deferred frees, the all-or-nothing rule, and a random walk of holders against a model that
 // tracks, for every position each holder may read, which write produced it: a holder must never read a value another
 // holder wrote after sharing it (the property copy-on-write exists for). The memory plan's arithmetic with a page pool
-// (serve/admission.hpp, P4b). Exits 0 when everything holds.
+// (serve/admission.hpp, P4b), and the scheduler's policy for a full pool (serve/kv_policy.hpp): admission, reclaim
+// order, the last resort, played out against a KvPool. Exits 0 when everything holds.
 #include <cstdio>
 #include <map>
 #include <random>
@@ -10,6 +11,7 @@
 
 #include "core/kv_pool.hpp"
 #include "serve/admission.hpp"
+#include "serve/kv_policy.hpp"
 
 using ling::KvPool;
 
@@ -210,6 +212,92 @@ void plan() {
         "a pool smaller than one conversation at max_context: refused");
 }
 
+// The scheduler's policy for a full pool (serve/kv_policy.hpp), on its own and played out on a KvPool.
+void policy() {
+  using namespace ling::serve;
+  // The verdicts: free now, after the deferred frees, after evicting idle sessions, or not at all.
+  const KvPoolView v{10, 5, 20};
+  check(kv_verdict(10, v) == KvVerdict::Go && kv_verdict(15, v) == KvVerdict::Retire &&
+            kv_verdict(35, v) == KvVerdict::Reclaim && kv_verdict(36, v) == KvVerdict::Wait,
+        "verdicts: go, retire, reclaim, wait");
+  // Victims: least recently used first, only as many as needed, none when all would not do.
+  const std::vector<int> lru = {3, 1, 2}, pages = {4, 0, 9};
+  check(kv_victims(15, v, lru, pages).empty(), "no victim when the free and pending pages do");
+  check(kv_victims(17, v, lru, pages) == std::vector<int>{3}, "the least recently used first");
+  check(kv_victims(20, v, lru, pages) == (std::vector<int>{3, 2}), "a session holding nothing is skipped");
+  check(kv_victims(29, v, lru, pages).empty(), "nothing evicted when even all would not make enough");
+  // The last resort: only when every running request waits and none could get its pages; the last admitted ends.
+  const KvPoolView full{0, 0, 0};
+  check(kv_last_resort({{1, true, 1}, {3, true, 1}, {2, true, 1}}, full) == 1, "the request admitted last ends");
+  check(kv_last_resort({{1, true, 1}, {3, false, 0}}, full) == -1, "not while one still makes progress");
+  check(kv_last_resort({{1, true, 1}, {2, true, 1}}, KvPoolView{0, 1, 0}) == -1, "not while pages are pending");
+  check(kv_last_resort({{1, true, 1}, {2, true, 1}}, KvPoolView{0, 0, 1}) == -1, "not while an idle session holds one");
+  check(kv_last_resort({}, full) == -1, "nothing to end");
+
+  // Played out: three sessions on a pool of 12 pages; a session's prompt is taken whole plus two pages at admission,
+  // each decode step needs the pages of its next rows, and an idle session's pages go back when reclaimed.
+  KvPool pool(13);
+  std::vector<std::vector<int>> t(3);
+  std::vector<int> pos(3, 0);
+  auto view = [&](int keep, const std::vector<bool>& busy, std::vector<int>* order, std::vector<int>* held) {
+    KvPoolView w{pool.free_pages(), pool.pending_pages(), 0};
+    for (int s = 0; s < 3; ++s) {  // the LRU order here is the session index
+      if (s == keep || busy[s]) continue;
+      int n = 0;
+      for (int p : t[s]) n += p != 0;
+      w.idle += n;
+      if (order) order->push_back(s);
+      if (held) held->push_back(n);
+    }
+    return w;
+  };
+  auto admit = [&](int s, int prompt, const std::vector<bool>& busy) {
+    const int need = pool.needed(t[s], 0, prompt + 2 * T);
+    std::vector<int> order, held;
+    const KvPoolView w = view(s, busy, &order, &held);
+    const KvVerdict d = kv_verdict(need, w);
+    if (d == KvVerdict::Wait) return false;
+    for (int x : kv_victims(need, w, order, held)) {
+      pool.truncate(t[x], 0);
+      pos[x] = 0;
+    }
+    pool.retire();  // nothing runs in this model: the deferred frees retire at once
+    if (!pool.ensure(t[s], 0, prompt + 2 * T, nullptr)) return false;
+    pos[s] = prompt;
+    return true;
+  };
+  check(admit(0, 4 * T, {false, false, false}) && pool.free_pages() == 6, "session 0 takes 4 + 2 pages");
+  check(admit(1, 3 * T, {true, false, false}) && pool.free_pages() == 1, "session 1 takes 3 + 2 pages");
+  // Session 2 wants 2 + 2 pages while 0 and 1 run: it waits (no idle session to reclaim).
+  check(!admit(2, 2 * T, {true, true, false}), "session 2 waits while both others run");
+  // Session 1's request ends (idle): session 2 is admitted and session 1, the only idle one, is evicted for it.
+  check(admit(2, 2 * T, {true, false, false}) && pool.free_pages() == 2,
+        "session 2 admitted after session 1 is reclaimed");
+  int held1 = 0;
+  for (int p : t[1]) held1 += p != 0;
+  check(held1 == 0, "the reclaimed session holds nothing");
+  // Sessions 0 and 2 decode until the pool is full; then both wait and the last resort ends session 2 (admitted last).
+  std::vector<KvRunner> runners = {{1, false, 0}, {3, false, 0}};
+  const int sess[2] = {0, 2};
+  int ended = -1, steps = 0;
+  for (; steps < 1000 && ended < 0; ++steps) {
+    const int i = steps % 2, s = sess[i];
+    runners[i].need = pool.needed(t[s], pos[s], pos[s] + 16);
+    if (kv_verdict(runners[i].need, view(-1, {true, false, true}, nullptr, nullptr)) == KvVerdict::Go) {
+      pool.ensure(t[s], pos[s], pos[s] + 16, nullptr);
+      pos[s] += 5;  // a step accepts a few of its 16 rows; the rest are rewritten by the next
+      runners[i].waiting = false;
+    } else {
+      runners[i].waiting = true;
+      ended = kv_last_resort(runners, view(-1, {true, false, true}, nullptr, nullptr));
+    }
+  }
+  check(ended == 1 && pool.free_pages() < 2, "a full pool ends the request admitted last");
+  pool.truncate(t[2], 0);
+  pool.retire();
+  check(pool.needed(t[0], pos[0], pos[0] + 16) <= pool.free_pages(), "its pages let the other one go on");
+}
+
 }  // namespace
 
 int main() {
@@ -217,6 +305,7 @@ int main() {
   sharing();
   random_walk();
   plan();
+  policy();
   std::printf(failures ? "KV POOL TESTS FAILED (%d)\n" : "all kv pool tests passed\n", failures);
   return failures ? 1 : 0;
 }
