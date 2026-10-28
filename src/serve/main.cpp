@@ -3,25 +3,25 @@
 // time; the HTTP threads parse requests and stream server-sent events back.
 //
 //   ling-serve --model DIR [--host 0.0.0.0] [--port 8000] [--served-model-name NAME] [--max-context N]
-//              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs] [--pdl]
+//              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N] [--draft-off-below X]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
-//              [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off]
-//              [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N]]
+//              [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0]
+//              [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages] [--kv-pages [--kv-pool-mb N]]
 //
-// --sessions N (default 2; M4 §1) keeps N resident sessions, each with its own KV cache and state, so N
-// agent tasks that alternate keep their histories warm. A request runs in the session it extends (its
-// prompt_cache_key's session is looked at first; the token prefix decides), else in a new session, which
-// takes a free slot or evicts the least recently used one. A session bound with a prompt_cache_key whose
-// last request ran less than --session-protect-seconds ago (default 30, 0 off; the owner's decision of 2026-10-11) is never evicted: a new
-// session's request waits in the queue instead, while requests that continue a resident session run.
+// --sessions N (default: chosen at start, --auto-size below; 2 without it; M4 §1) keeps N resident sessions, each with
+// its own KV cache and state, so N agent tasks that alternate keep their histories warm. A request runs in the session
+// it extends (its prompt_cache_key's session is looked at first; the token prefix decides), else in a new session,
+// which takes a free slot or evicts the least recently used one. A session bound with a prompt_cache_key whose last
+// request ran less than --session-protect-seconds ago (default 30, 0 off; the owner's decision of 2026-10-11) is never
+// evicted: a new session's request waits in the queue instead, while requests that continue a resident session run.
 //
-// --batch N (default 2, at most --sessions; M4 §3, stage 2) requests run at once, each in its own session,
-// interleaved: the running requests take turns, one prefill chunk or one decode step each. While another
-// request decodes, a prefill runs in chunks of --prefill-chunk-contended N tokens (default 256, a multiple
-// of 32 up to the prefill chunk of 2,048), so the decoding request's step period stays near twice its
-// normal step during a long prefill. A request that continues a running request's session waits for it.
-// Nothing numeric changes: every unit runs in its own session's state exactly as it would alone.
+// --batch N (default: the sessions when they are chosen at start, else 2; at most --sessions; M4 §3, stage 2) requests
+// run at once, each in its own session, interleaved: the running requests take turns, one prefill chunk or one decode
+// step each. While another request decodes, a prefill runs in chunks of --prefill-chunk-contended N tokens (default
+// 256, a multiple of 32 up to the prefill chunk of 2,048), so the decoding request's step period stays near twice its
+// normal step during a long prefill. A request that continues a running request's session waits for it. Nothing numeric
+// changes: every unit runs in its own session's state exactly as it would alone.
 //
 // --side-prefill N (drafts/M4-prefill-beside-decode-2026-10-17.md, option B; default 40, 0 off): while another
 // request decodes, a prefill runs in full chunks on the engine's second stream, on a green context of N SMs (-1: a
@@ -32,6 +32,12 @@
 // decoding conversations take some steps at their speed alone instead of every step beside a chunk. At four warm
 // agent conversations (node-b, 2026-10-27) 16 raised the pooled decode from 25.7 to 35.6 tok/s with the rounds'
 // time unchanged (139.3 / 140.9 s). Only the order of units changes, as with the shortest prefill first.
+//
+// --draft-off-below X (BACKLOG 10; default 1.5, 0 off; LING_DRAFT_OFF_BELOW overrides it): the drafter-off guard. A
+// session whose running mean of tokens per speculative step falls below X decodes one plain row per step, with no
+// drafter pass, and probes the drafter once every 16 plain steps until the mean is back at X + 0.25
+// (core/draft_guard.hpp). Greedy output is the same token for token; counted in /spec_stats (drafter_off_steps,
+// drafter_switches) and /metrics (ling:drafter_off_steps_total, ling:drafter_switches_total).
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -61,6 +67,16 @@
 // phase 0): ling-serve refuses to start (exit 3, before allocating anything) when its weights, sessions and scratch
 // would leave less than the first of MemAvailable, and answers a generation request HTTP 503 (code host_memory_low)
 // while MemAvailable is below the second. 0 switches either off. Neither changes what an admitted request computes.
+//
+// --plan-only: print the start plan (sessions, batch, context, planned_bytes) as one JSON line on stdout and exit 0 before
+// anything is allocated; the launcher's pre-load host-safety check runs it so it checks the engine's own plan.
+// --auto-size 1|0 (default 1; LING_AUTO_SIZE overrides; BATCHING §5.6, the owner's decision of 2026-10-28): what is
+// not given of --sessions and --max-context is chosen at start from MemAvailable by the same plan the start check
+// uses: the model's full context (config.json's max_position_embeddings) and as many sessions as fit, at most 4; the
+// context is halved, down to 32,768, only when one session does not fit. --batch, when not given, is then the chosen
+// sessions. Given values are kept; with both given, or --auto-size 0, or --host-reserve-mb 0, or MemAvailable
+// unreadable, the defaults are --sessions 2, --batch 2, --max-context 65,536 as before. One start line says what
+// was chosen and why. Placement only: a server sized so computes what the same three flags given by hand compute.
 //
 // With --draft, requests decode speculatively with the DFlash2 drafter (requests that set penalties
 // decode plainly). GET /metrics exports SGLang's counter names, so M0's replay harness reads them as is.
@@ -141,6 +157,7 @@ struct Metrics {
               {"batched_steps", spec.batched_steps}, {"tree_steps", spec.tree_steps},
               {"tree_branch_steps", spec.tree_branch_steps}, {"tree_off_chain", spec.tree_off_chain},
               {"sparse_steps", spec.sparse_steps}, {"sparse_fallbacks", spec.sparse_fallbacks},
+              {"drafter_off_steps", spec.drafter_off_steps}, {"drafter_switches", spec.drafter_switches},
               {"shadow_total_steps", spec.shadow_total_steps}, {"shadow_dflash_all", spec.shadow_dflash_all},
               {"shadow_best", spec.shadow_best}};
     for (int b = 0; b < 5; ++b) {
@@ -185,6 +202,10 @@ struct Metrics {
               "Requests ended at finish_reason length because the KV page pool was exhausted (the last resort).");
       counter("ling:kv_session_evictions_total", kv_evictions, "Idle sessions whose KV pages the pool took back.");
     }
+    counter("ling:drafter_off_steps_total", spec.drafter_off_steps,
+            "Plain one-row steps taken because the drafter-off guard had switched a session's drafter off.");
+    counter("ling:drafter_switches_total", spec.drafter_switches,
+            "Times the drafter-off guard switched a session's drafter off or back on.");
     auto gauge = [&](const char* name, double v, const char* help) {
       out += std::string("# HELP ") + name + " " + help + "\n# TYPE " + name + " gauge\n";
       char buf[64];
@@ -793,7 +814,9 @@ class Scheduler {
     ++decode_passes_;
     {
       std::lock_guard<std::mutex> m(ctx_.metrics.mu);
-      ctx_.metrics.batch_rows = r.spec ? std::min(eng.draft_block(), eng.max_context() - static_cast<int>(eng.history().size())) : 1;
+      ctx_.metrics.batch_rows = r.spec && !eng.drafter_off(r.job.session, r.job.req.sampling)
+                                    ? std::min(eng.draft_block(), eng.max_context() - static_cast<int>(eng.history().size()))
+                                    : 1;
     }
     if (r.spec) {
       r.pending = eng.speculate(r.pending.back(), r.job.req.sampling, r.job.req.logprobs ? &r.rows : nullptr);
@@ -1390,31 +1413,24 @@ class Handler : public proxygen::RequestHandler {
     const std::string model = ctx_.model_name;
     const long created = std::time(nullptr);
 
-    struct State {
-      OutputParser parser;
-      std::string id = new_id("resp_");
-      json output = json::array();   // finished items, in order
-      std::string reasoning, content;
-      std::string reasoning_id, message_id;
-      int reasoning_index = -1, message_index = -1;
-      bool reasoning_open = false, message_open = false;
-      bool keepalive = false;  // keep-alives are armed and nothing has been written yet
-      std::vector<std::string> custom_tools;
-      State(bool r, const json& t, std::vector<std::string> c) : parser(r, t), custom_tools(std::move(c)) {}
-      bool custom(const std::string& name) const {
-        return std::find(custom_tools.begin(), custom_tools.end(), name) != custom_tools.end();
-      }
-    };
-    auto st = std::make_shared<State>(req.reasoning, req.tools, req.custom_tools);
-    auto response_obj = [=](const std::string& status) {
-      return json{{"id", st->id}, {"object", "response"}, {"created_at", created}, {"status", status},
-                  {"model", model}, {"output", st->output}, {"tools", json::array()}};
-    };
     // Events are numbered when they are written, on the event base (emit_event), so a keep-alive written
     // by the timer and an event posted by the engine thread share one counter and stay consecutive.
     auto event = [=](const std::string& type, json payload) {
       if (!req.stream) return;
       post(ex, [ex, type, payload](proxygen::ResponseHandler*) { emit_event(*ex, type, payload); });
+    };
+    struct State {
+      OutputParser parser;
+      ResponseItems items;  // the output items and their events
+      std::string id = new_id("resp_");
+      bool keepalive = false;  // keep-alives are armed and nothing has been written yet
+      State(bool r, const json& t, std::vector<std::string> c, ResponseItems::Emit e)
+          : parser(r, t), items(std::move(c), std::move(e)) {}
+    };
+    auto st = std::make_shared<State>(req.reasoning, req.tools, req.custom_tools, event);
+    auto response_obj = [=](const std::string& status) {
+      return json{{"id", st->id}, {"object", "response"}, {"created_at", created}, {"status", status},
+                  {"model", model}, {"output", st->items.output()}, {"tools", json::array()}};
     };
     // Before the first write of any kind (the first token, done, or error): no keep-alive after it.
     auto stop_ticks = [=]() {
@@ -1422,79 +1438,7 @@ class Handler : public proxygen::RequestHandler {
       st->keepalive = false;
       stop_keepalive(ex);
     };
-    auto close_reasoning = [=]() {
-      if (!st->reasoning_open) return;
-      st->reasoning_open = false;
-      json item = {{"type", "reasoning"}, {"id", st->reasoning_id}, {"summary", json::array()},
-                   {"content", json::array({json{{"type", "reasoning_text"}, {"text", st->reasoning}}})}};
-      st->output.push_back(item);
-      event("response.output_item.done", {{"output_index", st->reasoning_index}, {"item", item}});
-    };
-    auto close_message = [=]() {
-      if (!st->message_open) return;
-      st->message_open = false;
-      json item = {{"type", "message"}, {"id", st->message_id}, {"role", "assistant"}, {"status", "completed"},
-                   {"content", json::array({json{{"type", "output_text"}, {"text", st->content}, {"annotations", json::array()}}})}};
-      st->output.push_back(item);
-      event("response.output_item.done", {{"output_index", st->message_index}, {"item", item}});
-    };
-    auto deliver = [=](const OutputParser::Delta& d) {
-      if (!d.reasoning.empty()) {
-        if (!st->reasoning_open && st->reasoning.empty()) {
-          st->reasoning_open = true;
-          st->reasoning_id = new_id("rs_");
-          st->reasoning_index = static_cast<int>(st->output.size());
-          event("response.output_item.added",
-                {{"output_index", st->reasoning_index},
-                 {"item", {{"type", "reasoning"}, {"id", st->reasoning_id}, {"summary", json::array()}, {"content", json::array()}}}});
-        }
-        st->reasoning += d.reasoning;
-        event("response.reasoning_text.delta",
-              {{"item_id", st->reasoning_id}, {"output_index", st->reasoning_index}, {"content_index", 0}, {"delta", d.reasoning}});
-      }
-      if (!d.content.empty()) {
-        close_reasoning();
-        if (!st->message_open && st->content.empty()) {
-          st->message_open = true;
-          st->message_id = new_id("msg_");
-          st->message_index = static_cast<int>(st->output.size());
-          event("response.output_item.added",
-                {{"output_index", st->message_index},
-                 {"item", {{"type", "message"}, {"id", st->message_id}, {"role", "assistant"}, {"status", "in_progress"}, {"content", json::array()}}}});
-        }
-        st->content += d.content;
-        event("response.output_text.delta",
-              {{"item_id", st->message_id}, {"output_index", st->message_index}, {"content_index", 0}, {"delta", d.content}});
-      }
-      for (const ToolCall& c : d.tool_calls) {
-        close_reasoning();
-        close_message();
-        const int index = static_cast<int>(st->output.size());
-        if (st->custom(c.name)) {
-          // A custom (freeform) tool call: the item is added with its `input` present and empty (Codex
-          // parses the item only with that field), the whole input is one custom_tool_call_input.delta
-          // keyed by item_id and call_id, then the done events.
-          const std::string input = custom_tool_input(c.arguments);
-          json item = {{"type", "custom_tool_call"}, {"id", new_id("ctc_")}, {"call_id", new_id("call_")},
-                       {"name", c.name}, {"input", ""}, {"status", "in_progress"}};
-          event("response.output_item.added", {{"output_index", index}, {"item", item}});
-          event("response.custom_tool_call_input.delta",
-                {{"item_id", item["id"]}, {"output_index", index}, {"call_id", item["call_id"]}, {"delta", input}});
-          event("response.custom_tool_call_input.done",
-                {{"item_id", item["id"]}, {"output_index", index}, {"call_id", item["call_id"]}, {"input", input}});
-          item["input"] = input;
-          item["status"] = "completed";
-          st->output.push_back(item);
-          event("response.output_item.done", {{"output_index", index}, {"item", item}});
-          continue;
-        }
-        json item = {{"type", "function_call"}, {"id", new_id("fc_")}, {"call_id", new_id("call_")},
-                     {"name", c.name}, {"arguments", c.arguments}, {"status", "completed"}};
-        event("response.output_item.added", {{"output_index", index}, {"item", item}});
-        st->output.push_back(item);
-        event("response.output_item.done", {{"output_index", index}, {"item", item}});
-      }
-    };
+    auto deliver = [=](const OutputParser::Delta& d) { st->items.deliver(d); };
 
     if (req.stream) {
       ResponseBuilder(downstream_)
@@ -1534,8 +1478,7 @@ class Handler : public proxygen::RequestHandler {
                         int reasoning_tokens) {
       stop_ticks();
       deliver(st->parser.finish());
-      close_reasoning();
-      close_message();
+      st->items.close();
       // A repetition stop (API §9) is response.incomplete with reason "repetition" (the ling launcher's loop guard
       // reads it; Codex alone retries it), or with --repetition-report completed a completed response; either way
       // the response says stop_reason "repetition", and every delta up to the loop's last token went out first.
@@ -1597,13 +1540,17 @@ class Factory : public proxygen::RequestHandlerFactory {
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "0.0.0.0", name;
-  int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 7, prefix_kv_mb = -1;
+  double draft_off_below = 1.5;  // the drafter-off guard (BACKLOG 10)
+  int port = 8000, max_context = 0, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 7, prefix_kv_mb = -1;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
   bool kv_pages = false;
   long kv_pool_mb = -1;  // P4b: -1, the pool from the memory plan
-  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40, side_share = 16;
-  long host_reserve_mb = 16384, admit_reserve_mb = 8192;
+  bool plan_only = false;  // print the start plan as one JSON line and exit 0 before anything is allocated
+  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 0, batch = 0, contended = 256, side_prefill = 40, side_share = 16;
+  // --sessions, --max-context and --batch as given; what is not given is chosen at start (--auto-size).
+  std::optional<int> sessions_arg, max_context_arg, batch_arg;
+  long host_reserve_mb = 16384, admit_reserve_mb = 8192, auto_size = 1;
   double protect_seconds = 30;
   bool draft_bf16 = false;
   std::string repetition_arg, repetition_report = "incomplete";
@@ -1625,7 +1572,7 @@ int main(int argc, char** argv) {
     else if (a == "--host") host = next();
     else if (a == "--port") port = std::stoi(next());
     else if (a == "--served-model-name") name = next();
-    else if (a == "--max-context") max_context = std::stoi(next());
+    else if (a == "--max-context") max_context_arg = std::stoi(next());
     else if (a == "--vision") vision = next();
     else if (a == "--vision-max-pixels") vision_max_pixels = std::stol(next());
     else if (a == "--vision-cache-mb") vision_cache_mb = std::stoi(next());
@@ -1633,6 +1580,7 @@ int main(int argc, char** argv) {
     else if (a == "--draft") draft_dir = next();
     else if (a == "--draft-block") draft_block = std::stoi(next());
     else if (a == "--tree") tree_nodes = std::stoi(next());
+    else if (a == "--draft-off-below") draft_off_below = std::stod(next());
     else if (a == "--lookup") lookup = std::stoi(next());
     else if (a == "--lookup-min") lookup_min = std::stoi(next());
     else if (a == "--pretokenizer") pretokenizer = next();
@@ -1650,14 +1598,16 @@ int main(int argc, char** argv) {
     else if (a == "--draft-head") draft_head = next();  // sparse (default) or full (BACKLOG 19)
     else if (a == "--sparse-head-dir") sparse_head_dir = next();
     else if (a == "--sparse-head-dynamic") sparse_head_dynamic = std::stoi(next());
-    else if (a == "--sessions") sessions = std::stoi(next());
+    else if (a == "--sessions") sessions_arg = std::stoi(next());
     else if (a == "--session-protect-seconds") protect_seconds = std::stod(next());
-    else if (a == "--batch") batch = std::stoi(next());
+    else if (a == "--batch") batch_arg = std::stoi(next());
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else if (a == "--side-prefill") side_prefill = std::stoi(next());
     else if (a == "--side-share") side_share = std::stoi(next());
     else if (a == "--host-reserve-mb") host_reserve_mb = std::stol(next());
     else if (a == "--admit-reserve-mb") admit_reserve_mb = std::stol(next());
+    else if (a == "--auto-size") auto_size = std::stol(next());
+    else if (a == "--plan-only") plan_only = true;
     else if (a == "--repetition-detection") repetition_arg = next();
     else if (a == "--repetition-report") repetition_report = next();
     else {
@@ -1666,9 +1616,15 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N]] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N]] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
     return 2;
   }
+  for (auto [flag, v] : {std::pair<const char*, std::optional<int>>{"--sessions", sessions_arg},
+                         {"--max-context", max_context_arg}, {"--batch", batch_arg}})
+    if (v && *v < 1) {
+      std::cerr << flag << " must be at least 1\n";
+      return 2;
+    }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
     try {
       keepalive_seconds = std::stoi(e);
@@ -1713,10 +1669,10 @@ int main(int argc, char** argv) {
   }
   ling::Tokenizer tok(model_dir + "/tokenizer.json", pretokenizer == "production" ? ling::kProductionPretokenizer : "");
   ling::EngineOptions opts;
-  opts.max_context = max_context;
   opts.draft_dir = draft_dir;
   opts.draft_block = draft_block;
   opts.tree_nodes = tree_nodes;  // BACKLOG 26: 7 by default, 0 the chain alone (LING_TREE overrides)
+  opts.draft_off_below = draft_off_below;  // BACKLOG 10: 1.5 by default, 0 the guard off (LING_DRAFT_OFF_BELOW overrides)
   opts.lookup_mode = lookup;
   opts.lookup_min_match = lookup_min;
   opts.prefix_checkpoints = checkpoints;
@@ -1732,7 +1688,6 @@ int main(int argc, char** argv) {
   opts.draft_head = draft_head;
   opts.sparse_head_dir = sparse_head_dir;
   opts.sparse_head_dynamic = sparse_head_dynamic;
-  opts.sessions = sessions;
   opts.side_prefill = side_prefill;
   if (vision != "on" && vision != "off") {
     std::cerr << "--vision is on or off\n";
@@ -1747,7 +1702,8 @@ int main(int argc, char** argv) {
   opts.vision_max_pixels = vision_max_pixels;
   opts.vision_cache_mb = vision_cache_mb;
   for (auto [var, dst] : {std::pair<const char*, long*>{"LING_HOST_RESERVE_MB", &host_reserve_mb},
-                          std::pair<const char*, long*>{"LING_ADMIT_RESERVE_MB", &admit_reserve_mb}})
+                          std::pair<const char*, long*>{"LING_ADMIT_RESERVE_MB", &admit_reserve_mb},
+                          std::pair<const char*, long*>{"LING_AUTO_SIZE", &auto_size}})
     if (const char* e = std::getenv(var)) {
       try {
         *dst = std::stol(e);
@@ -1762,46 +1718,74 @@ int main(int argc, char** argv) {
     std::cerr << "--kv-pool-mb needs --kv-pages\n";
     return 2;
   }
-  if (host_reserve_mb > 0 || kv_pages) {  // admission control at start: refuse before anything is allocated
+  {  // sizing and admission control at start (serve/admission.hpp; BATCHING §5.6), before anything is allocated
+    namespace as = ling::serve;
     const ling::ModelConfig cfg = ling::ModelConfig::from_file(model_dir + "/config.json");
-    ling::serve::MemoryPlan mp = ling::serve::plan_memory(
-        cfg, ling::serve::checkpoint_bytes(model_dir) + ling::serve::checkpoint_bytes(draft_dir), sessions, max_context,
-        !draft_dir.empty(), kv_pages);
+    const size_t weights = as::checkpoint_bytes(model_dir) + as::checkpoint_bytes(draft_dir);
     // With images on (VISION §20.4) the tower's scratch at the largest image and the embedding cache come on top of
     // the checkpoint's bytes (which hold the tower's weights): 1,100 MB at 65,536 patches, an upper bound below it.
-    if (opts.vision) mp.scratch += size_t(1100 + vision_cache_mb) << 20;
-    const long avail = ling::serve::mem_available_mb();
+    const size_t scratch = as::kScratchBytes + (opts.vision ? size_t(1100 + vision_cache_mb) << 20 : 0);
+    const long avail = as::mem_available_mb();
+    const int full_context = as::model_full_context(model_dir + "/config.json");  // 0: sized from 65,536
+    const as::SizeChoice size = as::choose_size(cfg, weights, scratch, !draft_dir.empty(), avail, host_reserve_mb,
+                                                full_context, sessions_arg, max_context_arg, auto_size != 0);
+    sessions = size.sessions;
+    max_context = size.max_context;
+    batch = batch_arg.value_or(size.sessions_auto ? sessions : as::kDefaultBatch);
+    as::MemoryPlan mp = as::plan_memory(cfg, weights, sessions, max_context, !draft_dir.empty(), kv_pages, scratch);
     if (kv_pages) {
       // The pool: what the rest of the plan, the prefix KV store's budget (it still holds KV in P4b and sizes itself
       // after the engine, from what is free above its own reserve) and the reserve leave, or --kv-pool-mb.
       long store_mb = opts.prefix_kv_mb;
       if (const char* e = std::getenv("LING_PREFIX_KV_MB")) store_mb = std::atol(e);
       if (checkpoints <= 0 || store_mb < 0) store_mb = 0;
-      ling::serve::plan_kv_pool(mp, cfg, max_context, host_reserve_mb > 0 ? avail : -1, host_reserve_mb,
-                                size_t(store_mb) << 20, kv_pool_mb);
+      as::plan_kv_pool(mp, cfg, max_context, host_reserve_mb > 0 ? avail : -1, host_reserve_mb, size_t(store_mb) << 20,
+                       kv_pool_mb);
       if (kv_pool_mb < 0 && host_reserve_mb > 0 && avail >= 0) {
-        const std::string small = ling::serve::refuse_kv_pool(mp, max_context);
+        const std::string small = as::refuse_kv_pool(mp, max_context);
         if (!small.empty()) {
           std::cerr << "ling-serve: refused to start: " << small << "\n";
           return 3;
         }
       }
       opts.kv_pool_pages = static_cast<int>(mp.kv_pool_pages);
-      std::cerr << "KV page pool: " << ling::serve::describe_kv_pool(mp)
+      std::cerr << "KV page pool: " << as::describe_kv_pool(mp)
                 << (kv_pool_mb >= 0 ? " (--kv-pool-mb)" : " (from the memory plan)") << "\n";
     }
     if (host_reserve_mb > 0) {
-      const std::string why = ling::serve::refuse_start(mp, avail, host_reserve_mb);
+      const std::string why = as::refuse_start(mp, avail, host_reserve_mb);
       if (!why.empty()) {
         std::cerr << "ling-serve: refused to start: " << why << "\n";
         return 3;
       }
-      std::cerr << "memory: " << ling::serve::gb(mp.total()) << " planned (" << sessions << " sessions x "
-                << ling::serve::gb(mp.per_session) << (kv_pages ? " beside the KV page pool" : "") << "), " << avail
-                << " MB available, " << host_reserve_mb << " MB kept free; requests refused below "
-                << admit_reserve_mb << " MB\n";
     }
+    // One line: what runs, whether each was chosen here (auto), given, or a default (and why no sizing), and the
+    // plan's numbers it was chosen by.
+    const char* off = auto_size == 0          ? "default, --auto-size 0"
+                      : host_reserve_mb <= 0 ? "default, --host-reserve-mb 0"
+                      : avail < 0            ? "default, MemAvailable unknown"
+                                             : "default";
+    auto why = [&](bool given, bool chosen) { return given ? "given" : chosen ? "auto" : off; };
+    std::cerr << "size: " << sessions << " sessions (" << why(bool(sessions_arg), size.sessions_auto) << "), batch "
+              << std::min(batch, sessions) << " (" << why(bool(batch_arg), size.sessions_auto) << "), context "
+              << max_context << " (" << why(bool(max_context_arg), size.context_auto) << "); memory: available "
+              << (avail >= 0 ? as::gb(size_t(avail) << 20) : std::string("unknown")) << ", weights and scratch "
+              << as::gb(mp.weights + mp.scratch) << ", " << as::gb(mp.per_session) << " a session, kept free "
+              << (host_reserve_mb > 0 ? as::gb(size_t(host_reserve_mb) << 20) : std::string("none")) << ", planned "
+              << as::gb(mp.total()) << "; requests refused below " << admit_reserve_mb << " MB\n";
   }
+  if (plan_only) {  // the host-safety check of the launcher asks for this before it loads (BATCHING §5.6)
+    namespace as = ling::serve;
+    const ling::ModelConfig cfg = ling::ModelConfig::from_file(model_dir + "/config.json");
+    const size_t weights = as::checkpoint_bytes(model_dir) + as::checkpoint_bytes(draft_dir);
+    const size_t scratch = as::kScratchBytes + (opts.vision ? size_t(1100 + vision_cache_mb) << 20 : 0);
+    const as::MemoryPlan mp = as::plan_memory(cfg, weights, sessions, max_context, !draft_dir.empty(), false, scratch);
+    std::cout << "{\"sessions\":" << sessions << ",\"batch\":" << std::min(batch, sessions)
+              << ",\"max_context\":" << max_context << ",\"planned_bytes\":" << mp.total() << "}\n";
+    return 0;
+  }
+  opts.max_context = max_context;
+  opts.sessions = sessions;
   std::cerr << "loading " << model_dir << " ...\n";
   ling::Engine engine(model_dir, opts);
   std::cerr << "loaded " << engine.model().device_bytes() / 1e9 << " GB of weights\n";
@@ -1822,10 +1806,6 @@ int main(int argc, char** argv) {
   ctx.metrics.sessions = engine.sessions();
   ctx.metrics.protect_seconds = protect_seconds;
   ctx.admit_reserve_mb = admit_reserve_mb;
-  if (batch < 1) {
-    std::cerr << "--batch must be at least 1\n";
-    return 2;
-  }
   batch = std::min(batch, engine.sessions());  // one running request per session
   if (contended < 32 || contended > engine.prefill_chunk_size()) {
     std::cerr << "--prefill-chunk-contended must be in [32, " << engine.prefill_chunk_size() << "]\n";

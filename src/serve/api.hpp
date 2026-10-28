@@ -2,6 +2,7 @@
 // generation job, and the Qwen3 output parsers (reasoning split, qwen3_coder tool calls).
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -180,6 +181,39 @@ class OutputParser {
 };
 
 std::string new_id(const std::string& prefix);
+
+// The Responses API's output items, built from the parser's deltas as they stream (generate_responses), and the
+// events that announce them: per item output_item.added, its deltas, output_item.done. A reasoning or message
+// item opens at its first text and is done when an item of another kind follows or at close(); a function_call
+// (or custom_tool_call, for a name in `custom_tools`) is added and done at once.
+// Text after a tool call follows SGLang's serving_responses (0.5.21 with production's patches): text that is only
+// whitespace there (the "\n" between two calls, which arrives in a push of its own) opens no item and is dropped,
+// and any other text opens a new message item. So no text delta ever names an item that is done: before
+// 2026-10-28 the "\n" went out as a delta of the message the call had closed (Codex logs "OutputTextDelta
+// without active item" and drops it: 57 times in 20 of night 17's 50 tasks) or, with no message before the call,
+// as a message of its own that Codex replayed in the next request (176 of the engine arm's 1,016 agent messages
+// that night were whitespace only; SGLang's arm had none).
+class ResponseItems {
+ public:
+  using Emit = std::function<void(const std::string& type, json payload)>;
+  ResponseItems(std::vector<std::string> custom_tools, Emit emit)
+      : custom_tools_(std::move(custom_tools)), emit_(std::move(emit)) {}
+  void deliver(const OutputParser::Delta& d);
+  void close();                                // the open reasoning or message item is done (the end of the answer)
+  const json& output() const { return output_; }  // the items that are done, in order
+
+ private:
+  void close_reasoning();
+  void close_message();
+  bool custom(const std::string& name) const;
+  std::vector<std::string> custom_tools_;
+  Emit emit_;
+  json output_ = json::array();
+  std::string reasoning_, content_;  // the open item's text so far
+  std::string reasoning_id_, message_id_;
+  int reasoning_index_ = -1, message_index_ = -1;
+  bool reasoning_open_ = false, message_open_ = false;
+};
 
 // JSON for the wire. Bytes that are not valid UTF-8 (a model can emit part of a character) become
 // U+FFFD instead of making the dump throw: a dump error must never end a stream.

@@ -549,6 +549,7 @@ void Engine::reset_session() {
   s_->pos = 0;
   s_->shadow.clear();
   if (kv_pages_) kv_release(*s_, 0);  // P4b: the session's pages back to the pool
+  s_->guard.reset();  // the drafter-off guard's mean belongs to the forgotten history (BACKLOG 10)
 }
 
 int Engine::match_session(const std::vector<int>& prompt, const std::string& key) const {
@@ -596,6 +597,7 @@ void Engine::activate_session(int i, const std::string& key, bool fresh) {
     s_->owned = true;
     s_->key = key;
     s_->shadow.clear();  // the lookup's records belong to the previous session's output
+    s_->guard.reset();   // and the drafter-off guard's mean to its steps (BACKLOG 10)
   } else if (!key.empty()) {
     s_->key = key;
   }
@@ -648,6 +650,8 @@ SpecStats Engine::spec_stats_total() const {
     t.tree_off_chain += a.tree_off_chain;
     t.sparse_steps += a.sparse_steps;
     t.sparse_fallbacks += a.sparse_fallbacks;
+    t.drafter_off_steps += a.drafter_off_steps;
+    t.drafter_switches += a.drafter_switches;
     for (int b = 0; b < 5; ++b) {
       t.shadow_steps[b] += a.shadow_steps[b];
       t.shadow_lookup[b] += a.shadow_lookup[b];

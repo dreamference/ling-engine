@@ -30,6 +30,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "core/draft_guard.hpp"
 #include "core/drafter.hpp"
 #include "core/kernels.cuh"
 #include "core/kv_pool.hpp"
@@ -66,6 +67,18 @@ struct EngineOptions {
   // least lookup_min_match tokens long, and the drafter's pass is skipped).
   int lookup_mode = 1;
   int lookup_min_match = 8;
+  // BACKLOG 10: the drafter-off guard (core/draft_guard.hpp, which justifies the numbers). Per session, when the running
+  // mean of tokens per speculative step (accepted + 1) falls below draft_off_below, the session's steps are plain
+  // one-row decodes (Engine::step, no drafter pass) with one speculative probe every 16 of them, until the mean is
+  // back at draft_off_below + draft_on_margin. 0: the guard off. A negative margin is for ling-run's check only
+  // (set_draft_guard). Greedy output is token for token the same either
+  // way; sampled output keeps its distribution but not its tokens (as speculative against plain decoding already
+  // does), so the guard is kept to greedy requests by default (the standing rule: a change merged without the owner
+  // leaves every output token as it was); draft_off_sampled = true extends it to sampled ones. LING_DRAFT_OFF_BELOW,
+  // LING_DRAFT_ON_MARGIN and LING_DRAFT_OFF_SAMPLED=0/1 override these.
+  double draft_off_below = 1.5;
+  double draft_on_margin = 0.25;
+  bool draft_off_sampled = false;
   // Prefix checkpoints: DeltaNet and conv states kept at chosen prompt positions (the end of the first two
   // messages, i.e. after `boundary_token`, and multiples of prefill_chunk up to checkpoint_limit), so a later
   // prompt that shares the prefix resumes there. Each costs ~157 MB; 0 turns them off.
@@ -199,6 +212,9 @@ struct SpecStats {
   long tree_steps = 0, tree_branch_steps = 0, tree_off_chain = 0;
   // BACKLOG 19: drafts with the sparse head, and the session's switches to the full head (its fallback).
   long sparse_steps = 0, sparse_fallbacks = 0;
+  // BACKLOG 10: plain one-row steps the drafter-off guard took instead of a speculative step (not counted in `steps`),
+  // and its switches (off, or back on).
+  long drafter_off_steps = 0, drafter_switches = 0;
   // Shadow scoring, per bucket of match length (3, 4-7, 8-15, 16-31, 32+): steps with a proposal, the
   // tokens the proposal would have had accepted (its agreement with what was generated next), and the
   // drafter's accepted tokens on the same steps. `shadow_best` adds up the better of the two per step.
@@ -327,6 +343,9 @@ class Engine {
   // Whether session i's next speculative step can join a batch: speculation possible for p and room for a full
   // draft block (a shorter block or a plain step runs alone, M4 §2).
   bool can_batch(int session, const SamplingParams& p) const;
+  // Whether session i's next step for p is a plain one-row step because its drafter-off guard is off and no probe is
+  // due (BACKLOG 10); speculate() then takes that step.
+  bool drafter_off(int session, const SamplingParams& p) const;
   void speculate_batch(std::span<SeqStep> seqs);
   // The active session's speculation counters (each session counts its own steps, M4 §3), its lookup
   // shadow records scored as far as known.
@@ -348,6 +367,18 @@ class Engine {
     opts_.lookup_mode = mode;
     opts_.lookup_min_match = min_match;
   }
+  // The drafter-off guard's threshold and margin (EngineOptions::draft_off_below, draft_on_margin), every session's
+  // guard reset; ling-run --spec-check compares runs with and without it. A margin of -off_below or less makes every
+  // probe switch the drafter back on and its next step switch it off again: the check's way through both switches.
+  void set_draft_guard(double off_below, double on_margin) {
+    opts_.draft_off_below = off_below;
+    opts_.draft_on_margin = on_margin;
+    guard_cfg_.off_below = off_below;
+    guard_cfg_.on_at = off_below + on_margin;
+    for (Session& s : sessions_) s.guard.reset();
+  }
+  double draft_off_below() const { return opts_.draft_off_below; }
+  double draft_on_margin() const { return opts_.draft_on_margin; }
   int draft_block() const { return opts_.draft_block; }
   void set_draft_block(int b);
   // Whether speculative steps run as CUDA graphs (false when asked for but unavailable: see step_graphs).
@@ -748,6 +779,11 @@ class Engine {
   int tree_grid_ = 1;
   int* gather_rows_dev_ = nullptr;
   bool tree_step(const SamplingParams& p, bool use_lookup, bool want_logits, int B) const;
+  // The drafter-off guard (BACKLOG 10): its configuration, and whether it applies to requests with p.
+  DraftGuardConfig guard_cfg_;
+  bool guarded(const SamplingParams& p) const {
+    return guard_cfg_.off_below > 0 && (p.temperature <= 0.f || opts_.draft_off_sampled);
+  }
 
   // Drafter: target features [rows][layers * hidden] (BF16), its context KV per layer [max_context][kv],
   // and the block's buffers.
@@ -810,6 +846,7 @@ class Engine {
     int rope_delta = 0;
     std::vector<ShadowRecord> shadow;
     SpecStats spec;  // this session's speculative steps
+    DraftGuard guard;  // BACKLOG 10: whether its next step drafts (reset with the session)
     std::mt19937_64 rng;
     cudaGraphExec_t draft_graph = nullptr;
     cudaGraphExec_t draft_graph_sparse = nullptr;  // the draft with the sparse head (BACKLOG 19)

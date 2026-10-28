@@ -3,7 +3,7 @@
 //
 //   ling-run --model DIR [--text "..." | --chat "..." | --ids 1,2,3] [--max-tokens N] [--temperature T]
 //            [--prompts-file F] [--ids-out] [--prompt-ids-out] [--max-context N]
-//            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N]]
+//            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N] [--draft-off-below X]]
 //            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16] [--graph-check] [--seed N]
 //            [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N]]
 //            [--batch-check] [--side-prefill N] [--draft-bf16] [--kv-pages [--kv-pool-mb N]]
@@ -26,8 +26,15 @@
 // wrong drafter context KV) are the same both ways. --seed N seeds sampling.
 //
 // --spec decodes with the DFlash2 drafter. --spec-check (greedy) decodes each prompt plainly and then
-// speculatively, and checks that the tokens are identical and that the recurrent state after the
-// speculative run equals the state of a plain run over the same tokens, bit for bit.
+// speculatively, and checks that the tokens are identical and that the recurrent state and the drafter's context
+// after the speculative run equal those of a plain run over the same tokens, bit for bit.
+//
+// --draft-off-below X (BACKLOG 10; default 1.5, 0 off; LING_DRAFT_OFF_BELOW overrides it) sets the drafter-off guard
+// (core/draft_guard.hpp) as ling-serve's flag does. With --spec-check it also runs the guard's check: the speculative
+// run three times, with the guard off, at X (a high X such as 100 trips it after its 16 warm-up steps; then 16 plain
+// steps per probe), and at X with every probe switching the drafter back on and its next step off again; each run's
+// tokens must equal plain decoding's and its state and drafter context a plain replay's (the drafter's context after
+// a mix of plain and speculative steps is what it would have been). Use --max-tokens 512 or more so it trips.
 //
 // --prefix-check prefills each prompt after the one before it (so it resumes from a kept state: the end of
 // the previous prompt or a prefix checkpoint), then again from scratch, and checks that the DeltaNet and
@@ -326,6 +333,7 @@ int main(int argc, char** argv) {
   std::string draft;
   int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256, side_prefill = 0;
   bool interleave_check = false, batch_check = false, batch_bench = false, draft_bf16 = false;
+  double draft_off_below = -1;  // the drafter-off guard (BACKLOG 10): the engine's default unless given
   std::string draft_head = "sparse", sparse_head_dir;  // the drafter's head (BACKLOG 19)
   int sparse_head_dynamic = 16384;
   std::string vision_prompts, vision_check, force_file, greedy_out;  // images (VISION §20.8)
@@ -354,6 +362,7 @@ int main(int argc, char** argv) {
     else if (a == "--spec") spec = true;
     else if (a == "--lookup") lookup = std::stoi(next());
     else if (a == "--lookup-min") lookup_min = std::stoi(next());
+    else if (a == "--draft-off-below") draft_off_below = std::stod(next());
     else if (a == "--spec-check") spec_check = true;
     else if (a == "--prefix-check") prefix_check = true;
     else if (a == "--graphs") graphs = true;
@@ -471,6 +480,7 @@ int main(int argc, char** argv) {
     opts.draft_block = block;
     opts.lookup_mode = lookup;
     opts.lookup_min_match = lookup_min;
+    if (draft_off_below >= 0) opts.draft_off_below = draft_off_below;
     opts.boundary_token = tok.token_id("<|im_end|>");
     opts.step_graphs = graphs;
     opts.pdl = pdl;
@@ -1025,32 +1035,53 @@ int main(int argc, char** argv) {
       }
       if (spec_check) {
         sp.temperature = 0.f;
-        double t_plain = 0, t_spec = 0;
+        double t_plain = 0;
         const std::vector<int> plain = generate(prompt, sp, false, true, &t_plain);
-        engine.reset_spec_stats();
-        const std::vector<int> fast = generate(prompt, sp, true, true, &t_spec);
-        const uint64_t h_spec = engine.state_hash();
-        const std::vector<int> processed(engine.history().begin() + prompt.size(), engine.history().end());
-        // The same tokens through plain decoding, from the same prefill.
-        engine.reset();
-        engine.prefill(prompt, nullptr, false, IMG);
-        for (int t : processed) engine.step(t);
-        const uint64_t h_plain = engine.state_hash();
-        const ling::SpecStats& st = engine.spec_stats();
-        const bool same = plain == fast, state = h_spec == h_plain;
-        failures += !same + !state;
-        std::printf("prompt %zu tokens: plain %zu tokens %.2f tok/s | spec %zu tokens %.2f tok/s, %ld steps, %.2f "
-                    "tokens/step | tokens %s, state %s\n",
-                    prompt.size(), plain.size(), plain.size() / t_plain, fast.size(), fast.size() / t_spec, st.steps,
-                    st.steps ? double(st.accepted + st.steps) / st.steps : 0.0, same ? "identical" : "DIFFER",
-                    state ? "identical" : "DIFFERS");
-        if (st.tree_steps)
-          std::printf("  tree: %ld steps, %ld left the chain (%ld off-chain tokens)\n", st.tree_steps, st.tree_branch_steps,
-                      st.tree_off_chain);
-        if (!same) {
-          size_t i = 0;
-          while (i < plain.size() && i < fast.size() && plain[i] == fast[i]) ++i;
-          std::printf("  first difference at output token %zu\n", i);
+        // One speculative run under the drafter-off guard at (off_below, margin), against the plain run: the tokens,
+        // and the state and the drafter's context against a plain replay of the same tokens from the same prefill.
+        auto spec_run = [&](const char* label, double off_below, double margin) {
+          engine.set_draft_guard(off_below, margin);
+          engine.reset_spec_stats();
+          double t_spec = 0;
+          const std::vector<int> fast = generate(prompt, sp, true, true, &t_spec);
+          const uint64_t h_spec = engine.state_hash(), d_spec = engine.draft_hash();
+          const ling::SpecStats st = engine.spec_stats();
+          const std::vector<int> processed(engine.history().begin() + prompt.size(), engine.history().end());
+          // The same tokens through plain decoding, from the same prefill.
+          engine.reset();
+          engine.prefill(prompt, nullptr, false, IMG);
+          for (int t : processed) engine.step(t);
+          const uint64_t h_plain = engine.state_hash(), d_plain = engine.draft_hash();
+          const bool same = plain == fast, state = h_spec == h_plain, ring = d_spec == d_plain;
+          failures += !same + !state + !ring;
+          std::printf("prompt %zu tokens%s: plain %zu tokens %.2f tok/s | spec %zu tokens %.2f tok/s, %ld steps, %.2f "
+                      "tokens/step | tokens %s, state %s, drafter context %s\n",
+                      prompt.size(), label, plain.size(), plain.size() / t_plain, fast.size(), fast.size() / t_spec,
+                      st.steps, st.steps ? double(st.accepted + st.steps) / st.steps : 0.0,
+                      same ? "identical" : "DIFFER", state ? "identical" : "DIFFERS", ring ? "identical" : "DIFFERS");
+          if (st.tree_steps)
+            std::printf("  tree: %ld steps, %ld left the chain (%ld off-chain tokens)\n", st.tree_steps,
+                        st.tree_branch_steps, st.tree_off_chain);
+          if (st.drafter_off_steps || st.drafter_switches)
+            std::printf("  drafter-off guard: %ld plain steps, %ld switches\n", st.drafter_off_steps,
+                        st.drafter_switches);
+          if (!same) {
+            size_t i = 0;
+            while (i < plain.size() && i < fast.size() && plain[i] == fast[i]) ++i;
+            std::printf("  first difference at output token %zu\n", i);
+          }
+        };
+        if (draft_off_below < 0) {
+          spec_run("", engine.draft_off_below(), engine.draft_on_margin());
+        } else {  // the guard's check (BACKLOG 10)
+          const double margin = engine.draft_on_margin();
+          spec_run(", guard off", 0, margin);
+          char label[96];
+          std::snprintf(label, sizeof label, ", guard at %.2f", draft_off_below);
+          spec_run(label, draft_off_below, margin);
+          std::snprintf(label, sizeof label, ", guard at %.2f, back on at every probe", draft_off_below);
+          spec_run(label, draft_off_below, -draft_off_below);
+          engine.set_draft_guard(draft_off_below, margin);
         }
         continue;
       }
@@ -1076,6 +1107,9 @@ int main(int argc, char** argv) {
         if (st.tree_steps)
           std::fprintf(stderr, "tree: %ld steps, %ld left the chain (%ld off-chain tokens)\n", st.tree_steps,
                        st.tree_branch_steps, st.tree_off_chain);
+        if (st.drafter_off_steps || st.drafter_switches)
+          std::fprintf(stderr, "drafter-off guard: %ld plain steps, %ld switches\n", st.drafter_off_steps,
+                       st.drafter_switches);
         if (st.sparse_steps || st.sparse_fallbacks)
           std::fprintf(stderr, "sparse head: %ld of %ld steps, %ld fallbacks to the full head\n", st.sparse_steps,
                        st.steps, st.sparse_fallbacks);
