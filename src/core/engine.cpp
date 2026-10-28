@@ -179,13 +179,21 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   if (kv_pages_) {
     // P4 (BATCHING §5.3): one pool of pages, each [layer][K, V][kv head][PT][D]; inside a page a KV head's positions
     // are one contiguous run, as in the head-major slots. Page 0 is never mapped: a masked key's address lands there.
-    // P4a: session i maps pages 1 + i * pages_per_session onward, the same memory the flat slots take.
+    // P4b: the pool holds opts_.kv_pool_pages pages (at most what every session at max_context could map), handed out
+    // as passes reach them (kv_ensure). Zeroed here, so its memory is committed at start, not while serving.
     kernels::set_kv_layout(size_t(PT) * c.head_dim, c.head_dim);
     kv_page_elems_ = size_t(n_full) * 2 * kvsize * PT;
-    kv_pool_ = alloc<__nv_bfloat16>(kv_page_elems_ * (size_t(opts_.sessions) * pages_per_session + 1));
-    std::fprintf(stderr, "KV pages: %d per session of %d positions, %.1f MB each, pool %.2f GB\n", pages_per_session,
-                 PT, kv_page_elems_ * 2 / 1e6,
-                 kv_page_elems_ * 2.0 * (size_t(opts_.sessions) * pages_per_session + 1) / 1e9);
+    const long cap = long(opts_.sessions) * pages_per_session;
+    const int pool_pages = static_cast<int>(opts_.kv_pool_pages > 0 ? std::min<long>(opts_.kv_pool_pages, cap) : cap);
+    kv_pool_ = alloc<__nv_bfloat16>(kv_page_elems_ * (size_t(pool_pages) + 1));
+    check(cudaMemset(kv_pool_, 0, kv_page_elems_ * (size_t(pool_pages) + 1) * sizeof(__nv_bfloat16)), "KV pool");
+    kv_book_ = std::make_unique<KvPool>(pool_pages + 1);
+    for (cudaEvent_t& ev : kv_release_ev_) check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "KV release");
+    std::fprintf(stderr,
+                 "KV pool: %.2f GB, %d pages of %d positions (%.1f MB each), %ld positions; %d pages map one session at "
+                 "max_context\n",
+                 kv_page_elems_ * 2.0 * pool_pages / 1e9, pool_pages, PT, kv_page_elems_ * 2 / 1e6,
+                 long(pool_pages) * PT, pages_per_session);
   } else {
     // Head-major KV caches: one KV head's keys are one contiguous stream for the attention kernels.
     kernels::set_kv_layout(size_t(opts_.max_context) * c.head_dim, c.head_dim);
@@ -193,17 +201,14 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   std::random_device seed_source;
   for (Session& s : sessions_) {
     if (kv_pages_) {
-      const size_t idx = &s - sessions_.data();
       for (int i = 0; i < n_full; ++i) {
         s.kcache.push_back(kv_pool_ + size_t(i) * 2 * kvsize * PT);
         s.vcache.push_back(kv_pool_ + (size_t(i) * 2 + 1) * kvsize * PT);
       }
-      s.page_host.resize(pages_per_session);
-      for (int j = 0; j < pages_per_session; ++j)
-        s.page_host[j] = (1 + idx * pages_per_session + j) * kv_page_elems_;
+      // Every entry at page 0 until a pass maps the page (kv_ensure).
+      s.page_host.assign(pages_per_session, 0);
       s.pages = alloc<uint64_t>(pages_per_session);
-      check(cudaMemcpy(s.pages, s.page_host.data(), pages_per_session * sizeof(uint64_t), cudaMemcpyHostToDevice),
-            "KV page table");
+      check(cudaMemset(s.pages, 0, pages_per_session * sizeof(uint64_t)), "KV page table");
     } else {
       for (int i = 0; i < n_full; ++i) {
         s.kcache.push_back(alloc<__nv_bfloat16>(size_t(opts_.max_context) * kvsize));
@@ -517,6 +522,8 @@ Engine::~Engine() {
   }
   for (void* p : buffers_) cudaFree(p);
   if (commit_done_) cudaEventDestroy(commit_done_);
+  for (cudaEvent_t ev : kv_release_ev_)
+    if (ev) cudaEventDestroy(ev);
   if (commit_stream_) cudaStreamDestroy(commit_stream_);
   for (cudaEvent_t ev : {fork_xn_, fork_qkv_, fork_done_})
     if (ev) cudaEventDestroy(ev);
@@ -541,6 +548,7 @@ void Engine::reset_session() {
   s_->dkv_lo = 0;
   s_->pos = 0;
   s_->shadow.clear();
+  if (kv_pages_) kv_release(*s_, 0);  // P4b: the session's pages back to the pool
 }
 
 int Engine::match_session(const std::vector<int>& prompt, const std::string& key) const {
@@ -659,6 +667,9 @@ int Engine::sessions_resident() const {
 }
 
 void Engine::kv_pages_adopt(const Session& from, int n) {
+  // P4b: the active session's own pages for [0, n) first (begin_prefill checked that the pool has them); P4c maps
+  // `from`'s pages instead of copying them.
+  kv_ensure(*s_, 0, n, stream_);
   // Whole pages: a position of the last page past n is beyond the history, never read before it is written again.
   // Runs of pages contiguous in both tables go as one copy.
   const int np = (n + kernels::kKvPageTokens - 1) / kernels::kKvPageTokens;
@@ -673,6 +684,157 @@ void Engine::kv_pages_adopt(const Session& from, int n) {
             "session KV page copy");
     j = k;
   }
+}
+
+// ---- The KV page pool (P4b, BATCHING §5.3). ----
+
+int Engine::kv_target(size_t prompt_len) const {
+  return static_cast<int>(
+      std::min<size_t>(prompt_len + size_t(kKvGrowthPages) * kernels::kKvPageTokens, size_t(opts_.max_context)));
+}
+
+int Engine::kv_step_rows(const Session& s, bool spec) const {
+  const int room = opts_.max_context - s.pos;
+  const int B = std::min(opts_.draft_block, room);
+  if (!spec || !draft_ || B < 2) return std::max(0, std::min(1, room));
+  // A tree verify's rows (speculate(): the chain's first tree_chain drafts and the anchor, then tree_nodes nodes), or
+  // the block; never more than the rows path takes.
+  const int tree = opts_.tree_nodes > 0 ? std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes : 0;
+  return std::min({std::max(B, tree), int(kernels::kMaxStreamRows), room});
+}
+
+int Engine::kv_pages_free() {
+  if (!kv_book_) return 0;
+  kv_retire(false);
+  return kv_book_->free_pages();
+}
+
+int Engine::kv_session_pages(int session) const {
+  int n = 0;
+  for (int p : sessions_.at(session).kv_ids) n += p != 0;
+  return n;
+}
+
+int Engine::kv_admit_need(int session, size_t prompt_len) const {
+  if (!kv_book_) return 0;
+  const std::vector<int>& t = sessions_.at(session).kv_ids;
+  const int np = KvPool::pages_for(kv_target(prompt_len));
+  int need = 0;
+  for (int j = 0; j < np; ++j) need += j >= static_cast<int>(t.size()) || t[j] == 0;
+  return need;
+}
+
+int Engine::kv_step_need(int session, bool spec) const {
+  if (!kv_book_) return 0;
+  const Session& s = sessions_.at(session);
+  return kv_book_->needed(s.kv_ids, s.pos, s.pos + kv_step_rows(s, spec));
+}
+
+void Engine::kv_record_release() {
+  // Every stream that could still read a released page: whatever is queued on it now finishes before retire().
+  const cudaStream_t streams[3] = {main_stream(), side_stream(), commit_stream_};
+  for (int i = 0; i < 3; ++i)
+    if (streams[i]) {
+      check(cudaEventRecord(kv_release_ev_[i], streams[i]), "KV release");
+      kv_release_rec_[i] = true;
+    }
+}
+
+bool Engine::kv_retire(bool wait) {
+  if (!kv_book_ || kv_book_->pending_pages() == 0) return true;
+  for (int i = 0; i < 3; ++i) {
+    if (!kv_release_rec_[i]) continue;
+    if (wait) {
+      check(cudaEventSynchronize(kv_release_ev_[i]), "KV release");
+    } else {
+      const cudaError_t e = cudaEventQuery(kv_release_ev_[i]);
+      if (e == cudaErrorNotReady) return false;
+      check(e, "KV release");
+    }
+  }
+  kv_book_->retire();
+  return true;
+}
+
+void Engine::kv_table_sync(Session& s, cudaStream_t st) {
+  std::vector<int> idx;
+  std::vector<uint64_t> val;
+  for (size_t j = 0; j < s.page_host.size(); ++j) {
+    const uint64_t want = j < s.kv_ids.size() ? uint64_t(s.kv_ids[j]) * kv_page_elems_ : 0;
+    if (want == s.page_host[j]) continue;
+    idx.push_back(static_cast<int>(j));
+    val.push_back(want);
+    s.page_host[j] = want;
+  }
+  if (!idx.empty()) kernels::kv_table_set(s.pages, idx.data(), val.data(), static_cast<int>(idx.size()), st);
+}
+
+void Engine::kv_ensure(Session& s, int from, int to, cudaStream_t st) {
+  if (!kv_book_) return;
+  to = std::min(to, opts_.max_context);
+  if (to <= from) return;
+  int need = kv_book_->needed(s.kv_ids, from, to);
+  if (need == 0) return;
+  // A captured pass replays without its host code: its pages are mapped before the capture or the replay
+  // (speculate, speculate_batch), never here.
+  if (use_dev_pos_) throw std::logic_error("KV pages to map inside a graph capture");
+  if (need > kv_book_->free_pages()) kv_retire(false);
+  if (need > kv_book_->free_pages()) kv_retire(true);
+  const int pending = kv_book_->pending_pages();
+  std::vector<KvPool::Copy> copies;
+  if (!kv_book_->ensure(s.kv_ids, from, to, &copies))
+    throw KvPoolExhausted("KV page pool exhausted: " + std::to_string(need) + " pages needed, " +
+                          std::to_string(kv_book_->free_pages()) + " free of " +
+                          std::to_string(kv_book_->capacity()));
+  // Copy-on-write (P4c; no page is shared in P4b): each copy on the writer's stream before its table entry changes.
+  const size_t page_bytes = kv_page_elems_ * sizeof(__nv_bfloat16);
+  for (const KvPool::Copy& c : copies)
+    check(cudaMemcpyAsync(kv_pool_ + size_t(c.dst) * kv_page_elems_, kv_pool_ + size_t(c.src) * kv_page_elems_,
+                          page_bytes, cudaMemcpyDeviceToDevice, st),
+          "KV page copy");
+  kv_table_sync(s, st);
+  if (kv_book_->pending_pages() > pending) kv_record_release();  // a copied page this holder let go of
+}
+
+void Engine::kv_release(Session& s, int n) {
+  if (!kv_book_) return;
+  const int pending = kv_book_->pending_pages();
+  kv_book_->truncate(s.kv_ids, n);
+  // Entries past the session's pages back to page 0, on the main stream (no other stream runs this session's work
+  // here: the side chunk was joined), after whatever it queued that reads them.
+  kv_table_sync(s, main_stream());
+  if (kv_book_->pending_pages() > pending) kv_record_release();
+}
+
+void Engine::kv_evict(int session) {
+  if (!kv_book_) return;
+  if (side_cur_ && side_cur_->session == session) throw std::logic_error("kv_evict: the session's chunk is in flight");
+  Session& s = sessions_.at(session);
+  if (s.kv_ids.empty() && s.history.empty()) return;
+  kv_release(s, 0);
+  s.history.clear();
+  s.sh_dirty = true;
+  s.prompt_len = 0;
+  s.turn_start = 0;
+  s.snap_pos = -1;
+  s.dkv_lo = 0;
+  s.pos = 0;
+  s.shadow.clear();
+  if (s.owned) ++kv_evictions_;
+  s.owned = false;  // free_session hands the slot out first; match_session never binds an empty history
+  s.key.clear();
+}
+
+int Engine::kv_lru_idle(const std::vector<bool>& busy) const {
+  int best = -1;
+  for (size_t i = 0; i < sessions_.size(); ++i) {
+    const Session& s = sessions_[i];
+    if ((i < busy.size() && busy[i]) || (side_cur_ && side_cur_->session == static_cast<int>(i))) continue;
+    bool holds = false;
+    for (int p : s.kv_ids) holds = holds || p != 0;
+    if (holds && (best < 0 || s.last_used < sessions_[best].last_used)) best = static_cast<int>(i);
+  }
+  return best;
 }
 
 void Engine::adopt_prefix(const Session& from, int n) {
@@ -859,6 +1021,7 @@ void Engine::kv_copy(void* buf, int buf_start, int buf_len, int from, int to, bo
 
 void Engine::kv_restore(const PrefixKvTree::Match& m, int n) {
   join_commit();
+  if (kv_pages_) kv_ensure(*s_, 0, n, stream_);  // P4b: the pages the store's KV is copied into
   for (const PrefixKvTree::Segment& g : kv_tree_->segments(m, n))
     kv_copy(const_cast<void*>(g.buf), g.buf_start, g.buf_len, g.from, g.to, false);
 }
@@ -1047,6 +1210,11 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
     seg_rows += g.rows;
   }
   if (seg_rows != M) throw std::runtime_error("forward: segments must tile the rows");
+  // P4b: every segment's pages for the rows it writes, on this pass's stream (the side stream for a side chunk) before
+  // the pass. Inside a capture kv_ensure only checks that they are mapped: speculate and speculate_batch map a step's
+  // pages before its graphs run.
+  if (kv_book_)
+    for (const Seg& g : segs) kv_ensure(*g.s, g.s->pos, g.s->pos + g.rows, stream_);
   // A segment's position. A captured graph (one sequence, the active one) reads it from pos_dev_ (dpos); the
   // batch path runs eagerly at each session's own position.
   auto seg_pos = [&](const Seg& g, int off) {
@@ -1493,6 +1661,17 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
                                             const std::vector<PromptImage>* images) {
   if (prompt.empty()) throw std::runtime_error("empty prompt");
   side_join();
+  // P4b: the prompt's pages and kKvGrowthPages more are taken below, whatever the prompt resumes from; checked first,
+  // so a short pool changes nothing (ling-serve's scheduler admits a request only when they are free).
+  if (kv_book_) {
+    const int need = kv_admit_need(active_session(), prompt.size());
+    if (need > kv_book_->free_pages()) kv_retire(false);
+    if (need > kv_book_->free_pages()) kv_retire(true);
+    if (need > kv_book_->free_pages())
+      throw KvPoolExhausted("KV page pool exhausted: the prompt needs " + std::to_string(need) + " pages, " +
+                            std::to_string(kv_book_->free_pages()) + " free of " +
+                            std::to_string(kv_book_->capacity()));
+  }
   PrefillCursor cur;
   // Images (VISION §20.3 (b)): each run of an image's ids is one image; its grid gives its RoPE positions.
   {
@@ -1654,6 +1833,15 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   s_->pos = reuse;
   truncate_history(reuse);
   if (draft_ && window > reuse) s_->dkv_lo = window;
+  if (kv_book_) {
+    // P4b: the pages up to the prompt's end and kKvGrowthPages more, mapped now (taken at admission, so a prefill never
+    // stops half way for memory), and the session's pages past them released. The session's own pages below that
+    // point stay and are rewritten in place: they are private, and every position past `reuse` is written by this
+    // prefill or a later pass before anything reads it, as in a flat slot (a masked key is never read).
+    const int target = kv_target(prompt.size());
+    kv_ensure(*s_, reuse, target, stream_);
+    kv_release(*s_, target);
+  }
 
   // Chunk ends: every prefill_chunk tokens, and the checkpoint positions (the end of each of the first
   // two messages, and chunk multiples up to checkpoint_limit), where the state is kept for later prompts.

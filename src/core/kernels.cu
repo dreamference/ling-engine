@@ -497,6 +497,17 @@ __global__ void tree_gather_kernel(const GatherBuf* __restrict__ bufs, const int
   }
 }
 
+// kv_table_set: thread i writes entry i (at most kKvTableSetMax per launch; 3 KB of parameters).
+struct KvTableEntries {
+  int idx[kKvTableSetMax];
+  unsigned long long val[kKvTableSetMax];
+};
+__global__ void kv_table_set_kernel(uint64_t* __restrict__ table, KvTableEntries e, int n) {
+  pdl_begin();  // first statement: see launch.cuh (the previous kernel may still read the old entries)
+  const int i = threadIdx.x;
+  if (i < n) table[e.idx[i]] = e.val[i];
+}
+
 // kv_pages_copy: block (i, lkv) moves position from + i of layer-and-K/V lkv, every KV head, 16 bytes a thread.
 __global__ void kv_pages_copy_kernel(__nv_bfloat16* __restrict__ pool, const uint64_t* __restrict__ pages, int Hkv, int D,
                                      __nv_bfloat16* __restrict__ buf, int buf_start, int buf_len, int from, bool to_buf) {
@@ -813,6 +824,18 @@ void kv_pages_copy(__nv_bfloat16* pool, const uint64_t* pages, int layer_kv, int
   if (D % 8) throw std::runtime_error("kv_pages_copy: head_dim a multiple of 8");
   launch_kernel("kv_pages_copy", kv_pages_copy_kernel, dim3(to - from, layer_kv), dim3(128), 0, s, pool, pages, Hkv, D,
                 buf, buf_start, buf_len, from, to_buf);
+}
+
+void kv_table_set(uint64_t* table, const int* idx, const uint64_t* val, int n, cudaStream_t s) {
+  for (int at = 0; at < n; at += kKvTableSetMax) {
+    const int m = std::min(kKvTableSetMax, n - at);
+    KvTableEntries e;
+    for (int i = 0; i < m; ++i) {
+      e.idx[i] = idx[at + i];
+      e.val[i] = val[at + i];
+    }
+    launch_kernel("kv_table_set", kv_table_set_kernel, dim3(1), dim3(kKvTableSetMax), 0, s, table, e, m);
+  }
 }
 
 void tree_gather(const GatherBuf* bufs, int nbufs, const int* rows, int n, DevPos pos, cudaStream_t s) {

@@ -5,7 +5,7 @@
 // tiles, L2 prefetch on and off, eager and with a device position over fixed ranges as a graph launches it, a tree
 // verify whose path crosses a page), attention_rows_seqs and attn_prepare_seqs over three sequences, attn_prepare's
 // writes, tree_gather and kv_pages_copy. memcmp of the outputs, and of the caches read back position by position.
-// Exits 0 when everything is identical.
+// P4b: kv_table_set, the page table's update. Exits 0 when everything is identical.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -338,6 +338,33 @@ int main() {
         ok &= same(&rk[(size_t(h) * 8192 + p) * D], &fk[(size_t(h) * big.max_ctx + p) * D], D * 2);
     cudaFree(buf);
     report("kv_pages_copy to the store's layout and back into another table", ok);
+  }
+  // ---- kv_table_set (P4b): table entries as kernel parameters, several launches queued back to back ----
+  {
+    // A table of 4,096 entries; three updates queued without a synchronization in between (the first of 700 entries,
+    // three launches), each built in the same host vectors, which change before the earlier launches have run: every
+    // launch must still write the values it was given (no copy reads a host buffer later).
+    const int n_entries = 4096;
+    uint64_t* table = nullptr;
+    cudaMalloc(&table, n_entries * sizeof(uint64_t));
+    cudaMemset(table, 0, n_entries * sizeof(uint64_t));
+    std::vector<uint64_t> model(n_entries, 0);
+    std::vector<int> idx;
+    std::vector<uint64_t> val;
+    std::vector<int> order(n_entries);
+    std::iota(order.begin(), order.end(), 0);
+    for (int round = 0; round < 3; ++round) {
+      std::shuffle(order.begin(), order.end(), rng);
+      const int m = round == 0 ? 700 : round == 1 ? 256 : 1;
+      idx.assign(order.begin(), order.begin() + m);
+      val.resize(m);
+      for (int i = 0; i < m; ++i) model[idx[i]] = val[i] = (uint64_t(rng()) << 20) * (round + 1) + i;
+      k::kv_table_set(table, idx.data(), val.data(), m, nullptr);
+    }
+    k::kv_table_set(table, idx.data(), val.data(), 0, nullptr);  // nothing to write: no launch
+    const std::vector<uint64_t> got = download(table, n_entries);
+    report("kv_table_set: 957 entries over five launches queued back to back, read back", got == model);
+    cudaFree(table);
   }
   const cudaError_t e = cudaDeviceSynchronize();
   if (e != cudaSuccess) {
