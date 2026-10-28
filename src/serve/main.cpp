@@ -394,11 +394,13 @@ class Scheduler {
       const bool fresh = s < 0;
       if (fresh) s = eng.free_session(protect_seconds_, pinned);
       if (s < 0) continue;
-      if (eng.kv_paged()) {
-        // A prompt whose pages the whole pool could never hold is admitted to be answered at once (start()).
-        const int need = eng.kv_admit_need(s, queue_[j].prompt.size());
-        if (need <= eng.kv_pages_total() && !kv_make_room(need, s)) {
+      if (eng.kv_paged() && eng.kv_admit_pages(queue_[j].prompt.size()) <= eng.kv_pages_total()) {
+        // (A prompt whose pages the whole pool could never hold is admitted to be answered at once: start().)
+        bool evicted = false;
+        if (!kv_make_room(eng.kv_admit_need(s, queue_[j].prompt.size()), s, &evicted)) {
           kv_wait_ = true;
+          // An eviction emptied sessions the other jobs' matches above may name: look again from the start.
+          if (evicted) return false;
           continue;
         }
       }
@@ -432,6 +434,7 @@ class Scheduler {
           if (pick(job)) break;
         }
         if (!running_.empty()) return true;
+        kv_gauges();  // the pool's gauges stay current while nothing runs
         if (queue_.empty()) cv_.wait(l);
         else cv_.wait_for(l, std::chrono::seconds(1));
       }
@@ -449,7 +452,7 @@ class Scheduler {
     r->admitted = ++admitted_;
     try {
       if (exceeds_context(j.prompt.size(), eng.max_context())) throw ContextOverflow(j.prompt.size(), eng.max_context());
-      if (eng.kv_paged() && eng.kv_admit_need(j.session, j.prompt.size()) > eng.kv_pages_total())
+      if (eng.kv_paged() && eng.kv_admit_pages(j.prompt.size()) > eng.kv_pages_total())
         throw KvPoolTooSmall(j.prompt.size(), eng.kv_pages_total());
       eng.activate_session(j.session, j.req.session_key, j.fresh);
       r->cur = eng.begin_prefill(j.prompt, false, j.images.empty() ? nullptr : &j.images);
@@ -584,7 +587,8 @@ class Scheduler {
   // sessions (least recently used first; --session-protect-seconds does not hold against the pool's need) makes
   // enough, they are evicted; their pages, and pages already released, are free once the streams have passed their
   // release (a later turn), or at once after a synchronization when nothing runs.
-  bool kv_make_room(int need, int keep) {
+  // *evicted: whether it evicted a session.
+  bool kv_make_room(int need, int keep, bool* evicted = nullptr) {
     Engine& eng = *ctx_.engine;
     std::vector<int> lru, pages;
     const KvPoolView v = kv_view(keep, &lru, &pages);
@@ -593,6 +597,7 @@ class Scheduler {
     if (verdict == KvVerdict::Wait) return false;
     if (verdict == KvVerdict::Reclaim)
       for (int s : kv_victims(need, v, lru, pages)) {
+        if (evicted) *evicted = true;
         std::fprintf(stderr, "KV pool: idle session %d evicted (%d pages) for %d pages; %d free, %d pending\n", s,
                      eng.kv_session_pages(s), need, v.free, v.pending);
         eng.kv_evict(s);

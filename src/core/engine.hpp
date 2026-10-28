@@ -400,11 +400,15 @@ class Engine {
   int kv_pages_free();
   int kv_pages_pending() const { return kv_book_ ? kv_book_->pending_pages() : 0; }
   int kv_session_pages(int session) const;  // pages session i maps
-  // The pages begin_prefill of a prompt of `prompt_len` tokens in session i takes from the free list: every page index
-  // below the prompt's end plus kKvGrowthPages pages that the session does not map yet. Exact (begin_prefill rewrites
-  // the session's own pages below that point whatever it resumes from; P4b copies a donor's or the store's KV into
+  // What begin_prefill of a prompt of `prompt_len` tokens in session i draws from the pool, net: every page index below
+  // the prompt's end plus kKvGrowthPages pages (kv_admit_pages) that the session does not map yet, less the pages it
+  // maps past that point, which begin_prefill gives back first (0 when those are more). Exact: begin_prefill rewrites
+  // the session's own pages below that point whatever it resumes from (P4b copies a donor's or the store's KV into
   // them), so a scheduler that admits only when this many pages are free never sees begin_prefill throw.
   int kv_admit_need(int session, size_t prompt_len) const;
+  // The pages a prompt of `prompt_len` tokens maps in all (its end plus kKvGrowthPages pages): more than
+  // kv_pages_total() and it can never run.
+  int kv_admit_pages(size_t prompt_len) const { return KvPool::pages_for(kv_target(prompt_len)); }
   // The pages the next decode step of session i maps (a speculative one: every row its verify may write, the tree's
   // included; else one row). speculate() and speculate_batch() map them before anything else of the step.
   int kv_step_need(int session, bool spec) const;

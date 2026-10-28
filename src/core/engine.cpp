@@ -717,11 +717,8 @@ int Engine::kv_session_pages(int session) const {
 
 int Engine::kv_admit_need(int session, size_t prompt_len) const {
   if (!kv_book_) return 0;
-  const std::vector<int>& t = sessions_.at(session).kv_ids;
-  const int np = KvPool::pages_for(kv_target(prompt_len));
-  int need = 0;
-  for (int j = 0; j < np; ++j) need += j >= static_cast<int>(t.size()) || t[j] == 0;
-  return need;
+  // The pages past the prompt's are given back by begin_prefill before it maps.
+  return KvPool::net_need(sessions_.at(session).kv_ids, kv_admit_pages(prompt_len));
 }
 
 int Engine::kv_step_need(int session, bool spec) const {
@@ -1661,8 +1658,10 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
                                             const std::vector<PromptImage>* images) {
   if (prompt.empty()) throw std::runtime_error("empty prompt");
   side_join();
-  // P4b: the prompt's pages and kKvGrowthPages more are taken below, whatever the prompt resumes from; checked first,
-  // so a short pool changes nothing (ling-serve's scheduler admits a request only when they are free).
+  // P4b: the prompt's pages and kKvGrowthPages more are taken below, whatever the prompt resumes from, after the
+  // session's pages past them are given back (their frees deferred as every release's: kv_ensure waits for them when
+  // it needs them). Checked first, so a short pool changes nothing (ling-serve's scheduler admits a request only when
+  // kv_admit_need pages are free).
   if (kv_book_) {
     const int need = kv_admit_need(active_session(), prompt.size());
     if (need > kv_book_->free_pages()) kv_retire(false);
@@ -1671,6 +1670,11 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
       throw KvPoolExhausted("KV page pool exhausted: the prompt needs " + std::to_string(need) + " pages, " +
                             std::to_string(kv_book_->free_pages()) + " free of " +
                             std::to_string(kv_book_->capacity()));
+    const int target = kv_target(prompt.size());
+    kv_release(*s_, target);
+    // The history past those pages goes with them, so nothing (a failed begin_prefill included) reads them.
+    if (static_cast<int>(s_->history.size()) > target) truncate_history(target);
+    s_->pos = std::min(s_->pos, target);
   }
   PrefillCursor cur;
   // Images (VISION §20.3 (b)): each run of an image's ids is one image; its grid gives its RoPE positions.
@@ -1835,12 +1839,10 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   if (draft_ && window > reuse) s_->dkv_lo = window;
   if (kv_book_) {
     // P4b: the pages up to the prompt's end and kKvGrowthPages more, mapped now (taken at admission, so a prefill never
-    // stops half way for memory), and the session's pages past them released. The session's own pages below that
-    // point stay and are rewritten in place: they are private, and every position past `reuse` is written by this
+    // stops half way for memory); the session's pages past them were released above. The session's own pages below
+    // that point stay and are rewritten in place: they are private, and every position past `reuse` is written by this
     // prefill or a later pass before anything reads it, as in a flat slot (a masked key is never read).
-    const int target = kv_target(prompt.size());
-    kv_ensure(*s_, reuse, target, stream_);
-    kv_release(*s_, target);
+    kv_ensure(*s_, reuse, kv_target(prompt.size()), stream_);
   }
 
   // Chunk ends: every prefill_chunk tokens, and the checkpoint positions (the end of each of the first

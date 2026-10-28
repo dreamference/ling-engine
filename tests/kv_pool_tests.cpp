@@ -296,6 +296,25 @@ void policy() {
   pool.truncate(t[2], 0);
   pool.retire();
   check(pool.needed(t[0], pos[0], pos[0] + 16) <= pool.free_pages(), "its pages let the other one go on");
+
+  // A new prompt in a session (KvPool::net_need, Engine::kv_admit_need): the missing pages below the prompt's end + 2,
+  // less the session's pages past it, which it gives back first.
+  {
+    KvPool p2(13);
+    std::vector<int> a, b;
+    p2.ensure(a, 0, 10 * T, nullptr);  // a conversation of 10 pages
+    p2.ensure(b, 0, 2 * T, nullptr);   // an idle one of 2
+    check(KvPool::net_need(a, 11) == 1 && KvPool::net_need(a, 4) == 0 && KvPool::net_need({}, 3) == 3,
+          "net need: grows by the missing pages, a shorter prompt draws nothing");
+    check(KvPool::net_need({0, 5, 0, 7}, 2) == 0 && KvPool::net_need({0, 5, 0, 7}, 3) == 1,
+          "net need: holes below count, pages past are given back");
+    // The conversation's next turn needs all 12 pages: its 10 stay, 2 come from evicting the idle session.
+    const KvPoolView w{p2.free_pages(), p2.pending_pages(), 2};
+    check(kv_verdict(KvPool::net_need(a, 12), w) == KvVerdict::Reclaim, "the next turn reclaims the idle session");
+    p2.truncate(b, 0);
+    p2.retire();
+    check(p2.ensure(a, 10 * T, 12 * T, nullptr) && p2.free_pages() == 0, "and the pool is exactly full");
+  }
 }
 
 }  // namespace

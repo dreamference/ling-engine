@@ -37,6 +37,10 @@ class KvPool {
 
   // The pages ensure(table, from, to) would take from the free list (new pages and copies).
   int needed(const std::vector<int>& table, int from, int to) const;
+  // What a holder that keeps its pages below index `pages` (rewriting them), maps the missing ones and gives back the
+  // ones at or past it draws from the pool, net: the unmapped indices below `pages` less the mapped ones past it, at
+  // least 0 (P4b: a new prompt in a session, Engine::kv_admit_need; no page is shared there).
+  static int net_need(const std::vector<int>& table, int pages);
   // Before a pass writes positions [from, to) of the holder of `table` (from <= to): maps a page for every index below
   // pages_for(to) that has none, and gives every index the write touches whose page is shared a private copy (appended
   // to *copies). All or nothing: false, with nothing changed, when the free list is short (see needed()).
