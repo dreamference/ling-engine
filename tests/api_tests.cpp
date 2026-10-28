@@ -1016,6 +1016,89 @@ EOF
       std::remove(path.c_str());
     }
     EXPECT(mem_available_mb("/nonexistent/meminfo") == -1);
+
+    // Auto-size (BATCHING §5.6, the owner's decision of 2026-10-28): what is not given is chosen by the same plan.
+    // node-b with nothing else on the GPU (§3.5): 109,423 MiB available, weights 23.47 GB, the 16,384 MiB reserve.
+    const size_t w = size_t(23.47e9), vis = kScratchBytes + (size_t(1100 + 512) << 20);
+    const long nodeb = 109423, reserve = 16384;
+    auto choose = [&](long avail, size_t scratch, std::optional<int> s, std::optional<int> ctx, bool on = true) {
+      return choose_size(c, w, scratch, true, avail, reserve, 262144, s, ctx, on);
+    };
+    auto fits = [&](int n, int ctx, long avail, size_t scratch) {
+      return refuse_start(plan_memory(c, w, n, ctx, true, scratch), avail, reserve).empty();
+    };
+    for (size_t scratch : {kScratchBytes, vis}) {  // images off (§3.5's table) and on (the default)
+      // Four sessions at the full context are refused (§3.5: 1 GB short), three fit: three at 262,144, batch three.
+      EXPECT(!fits(4, 262144, nodeb, scratch) && fits(3, 262144, nodeb, scratch));
+      const SizeChoice a = choose(nodeb, scratch, {}, {});
+      EXPECT(a.sessions == 3 && a.max_context == 262144 && a.sessions_auto && a.context_auto && a.sized);
+    }
+    // The plan_memory default scratch is the start check's when images are off.
+    EXPECT(plan_memory(c, w, 3, 262144, true).total() == plan_memory(c, w, 3, 262144, true, kScratchBytes).total());
+    // --sessions 4 given: the longest context four fit, halving from the full one (§3.5: 131,072 passes, 196,608 is
+    // not a halving).
+    {
+      const SizeChoice a = choose(nodeb, kScratchBytes, 4, {});
+      EXPECT(a.sessions == 4 && a.max_context == 131072 && !a.sessions_auto && a.context_auto);
+      EXPECT(!fits(4, 262144, nodeb, kScratchBytes) && fits(4, 131072, nodeb, kScratchBytes));
+    }
+    // --max-context given: only the sessions are chosen, up to the cap of four.
+    {
+      const SizeChoice a = choose(nodeb, vis, {}, 262144);
+      EXPECT(a.sessions == 3 && a.max_context == 262144 && a.sessions_auto && !a.context_auto);
+      const SizeChoice b = choose(nodeb, kScratchBytes, {}, 65536);
+      EXPECT(b.sessions == kAutoSessionsCap && b.max_context == 65536);
+      EXPECT(fits(kAutoSessionsCap + 1, 65536, nodeb, kScratchBytes));  // the cap, not the memory, stops it
+    }
+    // Both given: today's check exactly, nothing chosen (an over-large pair is left to the start check to refuse).
+    {
+      const SizeChoice a = choose(nodeb, kScratchBytes, 8, 262144);
+      EXPECT(a.sessions == 8 && a.max_context == 262144 && !a.sessions_auto && !a.context_auto);
+    }
+    // A smaller box: one session does not fit at 262,144 or 131,072, so the context halves to 65,536 and the
+    // sessions are then as many as fit there (one).
+    {
+      const SizeChoice a = choose(50000, kScratchBytes, {}, {});
+      EXPECT(a.sessions == 1 && a.max_context == 65536);
+      EXPECT(!fits(1, 131072, 50000, kScratchBytes) && fits(1, 65536, 50000, kScratchBytes) &&
+             !fits(2, 65536, 50000, kScratchBytes));
+    }
+    // Too small even for one session at the floor: one at the floor, which the start check refuses (exit 3).
+    {
+      const SizeChoice a = choose(40000, kScratchBytes, {}, {});
+      EXPECT(a.sessions == 1 && a.max_context == kAutoContextFloor);
+      EXPECT(!refuse_start(plan_memory(c, w, a.sessions, a.max_context, true), 40000, reserve).empty());
+      const SizeChoice b = choose(40000, kScratchBytes, 2, {});  // --sessions given: kept, the floor refused
+      EXPECT(b.sessions == 2 && b.max_context == kAutoContextFloor);
+    }
+    // Auto-size off, MemAvailable unknown, or no reserve: today's defaults fill in what was not given.
+    for (const SizeChoice& a : {choose(nodeb, kScratchBytes, {}, {}, false), choose(-1, kScratchBytes, {}, {}),
+                                choose_size(c, w, kScratchBytes, true, nodeb, 0, 262144, {}, {})}) {
+      EXPECT(a.sessions == kDefaultSessions && a.max_context == kDefaultContext && !a.sessions_auto &&
+             !a.context_auto && !a.sized);
+    }
+    {
+      const SizeChoice a = choose(nodeb, kScratchBytes, 3, {}, false);
+      EXPECT(a.sessions == 3 && a.max_context == kDefaultContext);
+    }
+    // A model without max_position_embeddings is sized from today's default context, never beyond it.
+    {
+      const SizeChoice a = choose_size(c, w, kScratchBytes, true, nodeb, reserve, 0, {}, {});
+      EXPECT(a.max_context == kDefaultContext && a.sessions == kAutoSessionsCap);
+    }
+    // The full context read from config.json: under text_config when there is one, else at the top; 0 without.
+    const std::string cfg = "/tmp/ling-api-tests-config.json";
+    for (auto [text, want] :
+         {std::pair<const char*, int>{R"({"text_config": {"max_position_embeddings": 262144}})", 262144},
+          {R"({"max_position_embeddings": 131072})", 131072}, {R"({"text_config": {}})", 0}, {"not json", 0}}) {
+      if (FILE* f = std::fopen(cfg.c_str(), "w")) {
+        std::fputs(text, f);
+        std::fclose(f);
+        EXPECT(model_full_context(cfg) == want);
+        std::remove(cfg.c_str());
+      }
+    }
+    EXPECT(model_full_context("/nonexistent/config.json") == 0);
   }
   if (known_gaps) std::printf("%d known gaps (not failures; see reports/engine-issues-2026-10-09.md)\n", known_gaps);
   std::printf(failures ? "%d API TEST FAILURES\n" : "all api tests passed\n", failures);

@@ -6,22 +6,22 @@
 //              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
-//              [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off]
-//              [--repetition-report incomplete|completed]
+//              [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0]
+//              [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]
 //
-// --sessions N (default 2; M4 §1) keeps N resident sessions, each with its own KV cache and state, so N
-// agent tasks that alternate keep their histories warm. A request runs in the session it extends (its
-// prompt_cache_key's session is looked at first; the token prefix decides), else in a new session, which
-// takes a free slot or evicts the least recently used one. A session bound with a prompt_cache_key whose
-// last request ran less than --session-protect-seconds ago (default 30, 0 off; the owner's decision of 2026-10-11) is never evicted: a new
-// session's request waits in the queue instead, while requests that continue a resident session run.
+// --sessions N (default: chosen at start, --auto-size below; 2 without it; M4 §1) keeps N resident sessions, each with
+// its own KV cache and state, so N agent tasks that alternate keep their histories warm. A request runs in the session
+// it extends (its prompt_cache_key's session is looked at first; the token prefix decides), else in a new session,
+// which takes a free slot or evicts the least recently used one. A session bound with a prompt_cache_key whose last
+// request ran less than --session-protect-seconds ago (default 30, 0 off; the owner's decision of 2026-10-11) is never
+// evicted: a new session's request waits in the queue instead, while requests that continue a resident session run.
 //
-// --batch N (default 2, at most --sessions; M4 §3, stage 2) requests run at once, each in its own session,
-// interleaved: the running requests take turns, one prefill chunk or one decode step each. While another
-// request decodes, a prefill runs in chunks of --prefill-chunk-contended N tokens (default 256, a multiple
-// of 32 up to the prefill chunk of 2,048), so the decoding request's step period stays near twice its
-// normal step during a long prefill. A request that continues a running request's session waits for it.
-// Nothing numeric changes: every unit runs in its own session's state exactly as it would alone.
+// --batch N (default: the sessions when they are chosen at start, else 2; at most --sessions; M4 §3, stage 2) requests
+// run at once, each in its own session, interleaved: the running requests take turns, one prefill chunk or one decode
+// step each. While another request decodes, a prefill runs in chunks of --prefill-chunk-contended N tokens (default
+// 256, a multiple of 32 up to the prefill chunk of 2,048), so the decoding request's step period stays near twice its
+// normal step during a long prefill. A request that continues a running request's session waits for it. Nothing numeric
+// changes: every unit runs in its own session's state exactly as it would alone.
 //
 // --side-prefill N (drafts/M4-prefill-beside-decode-2026-10-17.md, option B; default 40, 0 off): while another
 // request decodes, a prefill runs in full chunks on the engine's second stream, on a green context of N SMs (-1: a
@@ -55,6 +55,14 @@
 // phase 0): ling-serve refuses to start (exit 3, before allocating anything) when its weights, sessions and scratch
 // would leave less than the first of MemAvailable, and answers a generation request HTTP 503 (code host_memory_low)
 // while MemAvailable is below the second. 0 switches either off. Neither changes what an admitted request computes.
+//
+// --auto-size 1|0 (default 1; LING_AUTO_SIZE overrides; BATCHING §5.6, the owner's decision of 2026-10-28): what is
+// not given of --sessions and --max-context is chosen at start from MemAvailable by the same plan the start check
+// uses: the model's full context (config.json's max_position_embeddings) and as many sessions as fit, at most 4; the
+// context is halved, down to 32,768, only when one session does not fit. --batch, when not given, is then the chosen
+// sessions. Given values are kept; with both given, or --auto-size 0, or --host-reserve-mb 0, or MemAvailable
+// unreadable, the defaults are --sessions 2, --batch 2, --max-context 65,536 as before. One start line says what
+// was chosen and why. Placement only: a server sized so computes what the same three flags given by hand compute.
 //
 // With --draft, requests decode speculatively with the DFlash2 drafter (requests that set penalties
 // decode plainly). GET /metrics exports SGLang's counter names, so M0's replay harness reads them as is.
@@ -1359,11 +1367,13 @@ class Factory : public proxygen::RequestHandlerFactory {
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "0.0.0.0", name;
-  int port = 8000, max_context = 65536, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 7, prefix_kv_mb = -1;
+  int port = 8000, max_context = 0, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 7, prefix_kv_mb = -1;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
-  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 2, batch = 2, contended = 256, side_prefill = 40, side_share = 16;
-  long host_reserve_mb = 16384, admit_reserve_mb = 8192;
+  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 0, batch = 0, contended = 256, side_prefill = 40, side_share = 16;
+  // --sessions, --max-context and --batch as given; what is not given is chosen at start (--auto-size).
+  std::optional<int> sessions_arg, max_context_arg, batch_arg;
+  long host_reserve_mb = 16384, admit_reserve_mb = 8192, auto_size = 1;
   double protect_seconds = 30;
   bool draft_bf16 = false;
   std::string repetition_arg, repetition_report = "incomplete";
@@ -1385,7 +1395,7 @@ int main(int argc, char** argv) {
     else if (a == "--host") host = next();
     else if (a == "--port") port = std::stoi(next());
     else if (a == "--served-model-name") name = next();
-    else if (a == "--max-context") max_context = std::stoi(next());
+    else if (a == "--max-context") max_context_arg = std::stoi(next());
     else if (a == "--vision") vision = next();
     else if (a == "--vision-max-pixels") vision_max_pixels = std::stol(next());
     else if (a == "--vision-cache-mb") vision_cache_mb = std::stoi(next());
@@ -1408,14 +1418,15 @@ int main(int argc, char** argv) {
     else if (a == "--draft-head") draft_head = next();  // sparse (default) or full (BACKLOG 19)
     else if (a == "--sparse-head-dir") sparse_head_dir = next();
     else if (a == "--sparse-head-dynamic") sparse_head_dynamic = std::stoi(next());
-    else if (a == "--sessions") sessions = std::stoi(next());
+    else if (a == "--sessions") sessions_arg = std::stoi(next());
     else if (a == "--session-protect-seconds") protect_seconds = std::stod(next());
-    else if (a == "--batch") batch = std::stoi(next());
+    else if (a == "--batch") batch_arg = std::stoi(next());
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else if (a == "--side-prefill") side_prefill = std::stoi(next());
     else if (a == "--side-share") side_share = std::stoi(next());
     else if (a == "--host-reserve-mb") host_reserve_mb = std::stol(next());
     else if (a == "--admit-reserve-mb") admit_reserve_mb = std::stol(next());
+    else if (a == "--auto-size") auto_size = std::stol(next());
     else if (a == "--repetition-detection") repetition_arg = next();
     else if (a == "--repetition-report") repetition_report = next();
     else {
@@ -1424,9 +1435,15 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
     return 2;
   }
+  for (auto [flag, v] : {std::pair<const char*, std::optional<int>>{"--sessions", sessions_arg},
+                         {"--max-context", max_context_arg}, {"--batch", batch_arg}})
+    if (v && *v < 1) {
+      std::cerr << flag << " must be at least 1\n";
+      return 2;
+    }
   if (const char* e = std::getenv("LING_KEEPALIVE_SECONDS")) {  // overrides the flag, as the engine's variables do
     try {
       keepalive_seconds = std::stoi(e);
@@ -1471,7 +1488,6 @@ int main(int argc, char** argv) {
   }
   ling::Tokenizer tok(model_dir + "/tokenizer.json", pretokenizer == "production" ? ling::kProductionPretokenizer : "");
   ling::EngineOptions opts;
-  opts.max_context = max_context;
   opts.draft_dir = draft_dir;
   opts.draft_block = draft_block;
   opts.tree_nodes = tree_nodes;  // BACKLOG 26: 7 by default, 0 the chain alone (LING_TREE overrides)
@@ -1489,7 +1505,6 @@ int main(int argc, char** argv) {
   opts.draft_head = draft_head;
   opts.sparse_head_dir = sparse_head_dir;
   opts.sparse_head_dynamic = sparse_head_dynamic;
-  opts.sessions = sessions;
   opts.side_prefill = side_prefill;
   if (vision != "on" && vision != "off") {
     std::cerr << "--vision is on or off\n";
@@ -1504,7 +1519,8 @@ int main(int argc, char** argv) {
   opts.vision_max_pixels = vision_max_pixels;
   opts.vision_cache_mb = vision_cache_mb;
   for (auto [var, dst] : {std::pair<const char*, long*>{"LING_HOST_RESERVE_MB", &host_reserve_mb},
-                          std::pair<const char*, long*>{"LING_ADMIT_RESERVE_MB", &admit_reserve_mb}})
+                          std::pair<const char*, long*>{"LING_ADMIT_RESERVE_MB", &admit_reserve_mb},
+                          std::pair<const char*, long*>{"LING_AUTO_SIZE", &auto_size}})
     if (const char* e = std::getenv(var)) {
       try {
         *dst = std::stol(e);
@@ -1513,24 +1529,45 @@ int main(int argc, char** argv) {
         return 2;
       }
     }
-  if (host_reserve_mb > 0) {  // admission control at start: refuse before anything is allocated
+  {  // sizing and admission control at start (serve/admission.hpp; BATCHING §5.6), before anything is allocated
+    namespace as = ling::serve;
     const ling::ModelConfig cfg = ling::ModelConfig::from_file(model_dir + "/config.json");
-    ling::serve::MemoryPlan mp = ling::serve::plan_memory(
-        cfg, ling::serve::checkpoint_bytes(model_dir) + ling::serve::checkpoint_bytes(draft_dir), sessions, max_context,
-        !draft_dir.empty());
+    const size_t weights = as::checkpoint_bytes(model_dir) + as::checkpoint_bytes(draft_dir);
     // With images on (VISION §20.4) the tower's scratch at the largest image and the embedding cache come on top of
     // the checkpoint's bytes (which hold the tower's weights): 1,100 MB at 65,536 patches, an upper bound below it.
-    if (opts.vision) mp.scratch += size_t(1100 + vision_cache_mb) << 20;
-    const long avail = ling::serve::mem_available_mb();
-    const std::string why = ling::serve::refuse_start(mp, avail, host_reserve_mb);
-    if (!why.empty()) {
-      std::cerr << "ling-serve: refused to start: " << why << "\n";
-      return 3;
+    const size_t scratch = as::kScratchBytes + (opts.vision ? size_t(1100 + vision_cache_mb) << 20 : 0);
+    const long avail = as::mem_available_mb();
+    const int full_context = as::model_full_context(model_dir + "/config.json");  // 0: sized from 65,536
+    const as::SizeChoice size = as::choose_size(cfg, weights, scratch, !draft_dir.empty(), avail, host_reserve_mb,
+                                                full_context, sessions_arg, max_context_arg, auto_size != 0);
+    sessions = size.sessions;
+    max_context = size.max_context;
+    batch = batch_arg.value_or(size.sessions_auto ? sessions : as::kDefaultBatch);
+    const as::MemoryPlan mp = as::plan_memory(cfg, weights, sessions, max_context, !draft_dir.empty(), scratch);
+    if (host_reserve_mb > 0) {
+      const std::string why = as::refuse_start(mp, avail, host_reserve_mb);
+      if (!why.empty()) {
+        std::cerr << "ling-serve: refused to start: " << why << "\n";
+        return 3;
+      }
     }
-    std::cerr << "memory: " << ling::serve::gb(mp.total()) << " planned (" << sessions << " sessions x "
-              << ling::serve::gb(mp.per_session) << "), " << avail << " MB available, " << host_reserve_mb
-              << " MB kept free; requests refused below " << admit_reserve_mb << " MB\n";
+    // One line: what runs, whether each was chosen here (auto), given, or a default (and why no sizing), and the
+    // plan's numbers it was chosen by.
+    const char* off = auto_size == 0          ? "default, --auto-size 0"
+                      : host_reserve_mb <= 0 ? "default, --host-reserve-mb 0"
+                      : avail < 0            ? "default, MemAvailable unknown"
+                                             : "default";
+    auto why = [&](bool given, bool chosen) { return given ? "given" : chosen ? "auto" : off; };
+    std::cerr << "size: " << sessions << " sessions (" << why(bool(sessions_arg), size.sessions_auto) << "), batch "
+              << std::min(batch, sessions) << " (" << why(bool(batch_arg), size.sessions_auto) << "), context "
+              << max_context << " (" << why(bool(max_context_arg), size.context_auto) << "); memory: available "
+              << (avail >= 0 ? as::gb(size_t(avail) << 20) : std::string("unknown")) << ", weights and scratch "
+              << as::gb(mp.weights + mp.scratch) << ", " << as::gb(mp.per_session) << " a session, kept free "
+              << (host_reserve_mb > 0 ? as::gb(size_t(host_reserve_mb) << 20) : std::string("none")) << ", planned "
+              << as::gb(mp.total()) << "; requests refused below " << admit_reserve_mb << " MB\n";
   }
+  opts.max_context = max_context;
+  opts.sessions = sessions;
   std::cerr << "loading " << model_dir << " ...\n";
   ling::Engine engine(model_dir, opts);
   std::cerr << "loaded " << engine.model().device_bytes() / 1e9 << " GB of weights\n";
@@ -1548,10 +1585,6 @@ int main(int argc, char** argv) {
   ctx.metrics.sessions = engine.sessions();
   ctx.metrics.protect_seconds = protect_seconds;
   ctx.admit_reserve_mb = admit_reserve_mb;
-  if (batch < 1) {
-    std::cerr << "--batch must be at least 1\n";
-    return 2;
-  }
   batch = std::min(batch, engine.sessions());  // one running request per session
   if (contended < 32 || contended > engine.prefill_chunk_size()) {
     std::cerr << "--prefill-chunk-contended must be in [32, " << engine.prefill_chunk_size() << "]\n";
