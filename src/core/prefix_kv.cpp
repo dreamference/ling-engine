@@ -48,7 +48,8 @@ void ArenaAlloc::release(size_t offset) {
 }
 
 PrefixKvTree::PrefixKvTree(size_t budget_bytes, size_t bytes_per_token, size_t state_bytes, Ops ops)
-    : budget_(budget_bytes), per_token_(bytes_per_token), state_bytes_(state_bytes), ops_(std::move(ops)) {
+    : budget_(budget_bytes), per_token_(bytes_per_token), state_bytes_(state_bytes), ops_(std::move(ops)),
+      paged_(static_cast<bool>(ops_.hold)) {
   nodes_.emplace_back();
   nodes_[0].live = true;
 }
@@ -56,8 +57,11 @@ PrefixKvTree::PrefixKvTree(size_t budget_bytes, size_t bytes_per_token, size_t s
 PrefixKvTree::~PrefixKvTree() { clear(); }
 
 void PrefixKvTree::clear() {
-  for (Node& n : nodes_)
+  for (Node& n : nodes_) {
     if (n.live && n.state) ops_.release(n.state);
+    if (n.live)
+      for (int pg : n.pages) ops_.drop(pg);
+  }
   for (Buffer& b : bufs_)
     if (b.refs > 0 && b.ptr) ops_.release(b.ptr);
   nodes_.assign(1, Node{});
@@ -80,14 +84,14 @@ int PrefixKvTree::new_node() {
   return static_cast<int>(nodes_.size()) - 1;
 }
 
-PrefixKvTree::Match PrefixKvTree::match(const std::vector<int>& prompt) const {
+PrefixKvTree::Match PrefixKvTree::match(const std::vector<int>& prompt, uint64_t scope) const {
   Match m;
   int n = 0, pos = 0;
   const int L = static_cast<int>(prompt.size());
   while (pos < L) {
     int next = -1;
     for (int k : nodes_[n].kids)
-      if (nodes_[k].tokens[0] == prompt[pos]) {
+      if (nodes_[k].tokens[0] == prompt[pos] && (n != 0 || nodes_[k].scope == scope)) {
         next = k;
         break;
       }
@@ -121,6 +125,7 @@ int PrefixKvTree::best_state(const Match& m, int limit, const void** state) cons
 
 std::vector<PrefixKvTree::Segment> PrefixKvTree::segments(const Match& m, int n) const {
   std::vector<Segment> out;
+  if (paged_) return out;
   for (int k : m.path) {
     const Node& c = nodes_[k];
     if (c.start >= n) break;
@@ -128,6 +133,20 @@ std::vector<PrefixKvTree::Segment> PrefixKvTree::segments(const Match& m, int n)
     const int to = std::min(c.end, n);
     if (!out.empty() && out.back().buf == b.ptr && out.back().to == c.start) out.back().to = to;  // one run, split
     else out.push_back({b.ptr, b.start, b.len, c.start, to});
+  }
+  return out;
+}
+
+std::vector<int> PrefixKvTree::pages(const Match& m, int n) const {
+  const int count = KvPool::pages_for(n);
+  std::vector<int> out(count, 0);
+  // Path order is shallow to deep, so a deeper node's page overwrites a shallower one's at the index they share.
+  for (int k : m.path) {
+    const Node& c = nodes_[k];
+    if (c.start >= n) break;
+    const int first = KvPool::index_of(c.start);
+    const int last = std::min(KvPool::index_of(c.end - 1), count - 1);
+    for (int i = first; i <= last; ++i) out[i] = c.pages[i - first];
   }
   return out;
 }
@@ -145,7 +164,16 @@ int PrefixKvTree::split(int node, int at) {
   nb.end = a.end;
   nb.tokens.assign(a.tokens.begin() + (at - a.start), a.tokens.end());
   nb.buf = a.buf;
-  bufs_[a.buf].refs += 1;
+  if (a.buf >= 0) bufs_[a.buf].refs += 1;
+  if (paged_) {
+    // The child takes the pages of [at, end); the parent keeps those of [start, at). A page straddling `at` is in
+    // both, one more reference.
+    const int first = KvPool::index_of(a.start);
+    nb.pages.assign(a.pages.begin() + (KvPool::index_of(at) - first), a.pages.end());
+    a.pages.resize(KvPool::index_of(at - 1) - first + 1);
+    if (at % KvPool::kPageTokens != 0) ops_.retain(nb.pages.front());
+  }
+  nb.scope = a.scope;
   nb.state = a.state;
   nb.used = a.used;
   nb.kids = std::move(a.kids);
@@ -165,11 +193,14 @@ void PrefixKvTree::evict(int leaf) {
     ops_.release(n.state);
     bytes_ -= state_bytes_;
   }
-  Buffer& b = bufs_[n.buf];
-  if (--b.refs == 0) {
-    ops_.release(b.ptr);
-    b.ptr = nullptr;
-    bytes_ -= b.bytes;
+  for (int pg : n.pages) ops_.drop(pg);
+  if (n.buf >= 0) {
+    Buffer& b = bufs_[n.buf];
+    if (--b.refs == 0) {
+      ops_.release(b.ptr);
+      b.ptr = nullptr;
+      bytes_ -= b.bytes;
+    }
   }
   n = Node{};
   free_nodes_.push_back(leaf);
@@ -189,25 +220,68 @@ bool PrefixKvTree::make_room(size_t need, uint64_t epoch) {
   return true;
 }
 
+bool PrefixKvTree::evict_lru_leaf() {
+  int victim = -1;
+  for (size_t i = 1; i < nodes_.size(); ++i) {
+    const Node& n = nodes_[i];
+    if (!n.live || !n.kids.empty()) continue;
+    if (victim < 0 || n.used < nodes_[victim].used) victim = static_cast<int>(i);
+  }
+  if (victim < 0) return false;
+  evict(victim);
+  return true;
+}
+
 std::vector<std::pair<int, int>> PrefixKvTree::insert(const std::vector<int>& prompt, int q,
-                                                      const std::vector<int>& cuts, uint64_t epoch) {
+                                                      const std::vector<int>& cuts, uint64_t epoch, uint64_t scope) {
   q = std::min(q, static_cast<int>(prompt.size()));
   if (q <= 0) return {};
   const std::vector<int> head(prompt.begin(), prompt.begin() + q);
-  Match m = match(head);
+  Match m = match(head, scope);
   // A match that ends inside a run, and every cut inside a matched run, become node ends.
   if (!m.path.empty() && nodes_[m.path.back()].end > m.len) split(m.path.back(), m.len);
   for (int c : cuts) {
     if (c <= 0 || c >= m.len) continue;
-    for (int k : match(head).path)
+    for (int k : match(head, scope).path)
       if (nodes_[k].start < c && c < nodes_[k].end) {
         split(k, c);
         break;
       }
   }
-  m = match(head);
+  m = match(head, scope);
   touch(m, epoch);
-  if (m.len < q && make_room(static_cast<size_t>(q - m.len) * per_token_, epoch)) {
+  if (paged_ && m.len < q) {
+    // The KV stays in the session's pages: each new node holds those overlapping its run, nothing is charged.
+    int parent = m.path.empty() ? 0 : m.path.back();
+    std::vector<int> ends;
+    for (int c : cuts)
+      if (c > m.len && c < q) ends.push_back(c);
+    ends.push_back(q);
+    int start = m.len;
+    for (int e : ends) {
+      if (e <= start) continue;  // a repeated cut
+      std::vector<int> held = ops_.hold(start, e);
+      const size_t want = static_cast<size_t>(KvPool::index_of(e - 1) - KvPool::index_of(start) + 1);
+      if (held.size() != want || std::find(held.begin(), held.end(), 0) != held.end()) {
+        for (int pg : held)
+          if (pg != 0) ops_.drop(pg);
+        break;
+      }
+      const int k = new_node();
+      Node& n = nodes_[k];
+      n.parent = parent;
+      n.start = start;
+      n.end = e;
+      n.tokens.assign(head.begin() + start, head.begin() + e);
+      n.pages = std::move(held);
+      n.scope = scope;
+      n.used = epoch;
+      nodes_[parent].kids.push_back(k);
+      parent = k;
+      start = e;
+    }
+    m = match(head, scope);
+  } else if (m.len < q && make_room(static_cast<size_t>(q - m.len) * per_token_, epoch)) {
     const size_t bytes = static_cast<size_t>(q - m.len) * per_token_;
     if (void* p = ops_.alloc(bytes)) {
       ops_.store(p, m.len, q - m.len, m.len, q);
@@ -228,13 +302,14 @@ std::vector<std::pair<int, int>> PrefixKvTree::insert(const std::vector<int>& pr
         n.end = e;
         n.tokens.assign(head.begin() + start, head.begin() + e);
         n.buf = buf;
+        n.scope = scope;
         n.used = epoch;
         bufs_[buf].refs += 1;
         nodes_[parent].kids.push_back(k);
         parent = k;
         start = e;
       }
-      m = match(head);
+      m = match(head, scope);
     }
   }
   std::vector<std::pair<int, int>> want;
@@ -267,6 +342,13 @@ int PrefixKvTree::nodes() const {
 int PrefixKvTree::states() const {
   int n = 0;
   for (size_t i = 1; i < nodes_.size(); ++i) n += nodes_[i].live && nodes_[i].state;
+  return n;
+}
+
+int PrefixKvTree::pages_held() const {
+  int n = 0;
+  for (size_t i = 1; i < nodes_.size(); ++i)
+    if (nodes_[i].live) n += static_cast<int>(nodes_[i].pages.size());
   return n;
 }
 
