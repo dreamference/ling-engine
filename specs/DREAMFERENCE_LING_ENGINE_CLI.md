@@ -2,13 +2,14 @@
 
 Part of the ling-engine specification; the index is [README.md](./README.md). Written on 2026-10-09 from the code (`src/serve/main.cpp`, `tools/*.cpp`, `src/core/engine.cpp`), which is the source of truth: when the two differ, the code is right and this document is behind.
 
-Four programs are built from the repository (`CMakeLists.txt`): `ling-serve`, the HTTP server; `ling-run`, the offline generator and checker; `ling-tokenize` and `ling-template`, two small reference tools the Python test harness drives. The test binaries (`ling-kernel-tests`, `ling-stream-tests`, `ling-prefill-tests`, `ling-spec-tests`, `ling-sampling-tests`, `ling-api-tests`) take no arguments. Every program parses its arguments by hand: an unknown argument prints `unknown argument …` and exits 2, a flag that needs a value and has none prints `… needs a value` and exits 2, and a missing required argument prints the usage line and exits 2.
+Four programs are built from the repository (`CMakeLists.txt`): `ling-serve`, the HTTP server; `ling-run`, the offline generator and checker; `ling-tokenize` and `ling-template`, two small reference tools the Python test harness drives. The test binaries (`ling-kernel-tests`, `ling-stream-tests`, `ling-prefill-tests`, `ling-spec-tests`, `ling-draft-guard-tests`, `ling-sampling-tests`, `ling-api-tests`) take no arguments. Every program parses its arguments by hand: an unknown argument prints `unknown argument …` and exits 2, a flag that needs a value and has none prints `… needs a value` and exits 2, and a missing required argument prints the usage line and exits 2.
 
 ## 1. `ling-serve`
 
 ```
 ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N]
-           [--draft DIR [--draft-block N] [--tree N] [--lookup 0|1|2] [--lookup-min N] [--draft-bf16]]
+           [--draft DIR [--draft-block N] [--tree N] [--lookup 0|1|2] [--lookup-min N] [--draft-bf16]
+                        [--draft-off-below X]]
            [--pretokenizer production|checkpoint] [--prefix-checkpoints N]
            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N]
            [--prefill-bf16] [--sessions N] [--session-protect-seconds S]
@@ -30,6 +31,7 @@ ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-cont
 | `--draft DIR` | none | The DFlash2 drafter's checkpoint. Without it every request decodes plainly. |
 | `--draft-block N` | `12` | Draft tokens per speculative step. The default follows production, which runs 12 since 2026-10-09 (measured +7% single-stream over the drafter's published block of 16; the owner's decision of 2026-10-10 made 12 the code default too). The M0 reference container on the development machine keeps 16 on purpose. |
 | `--tree N` | `7` | Tree verification ([BACKLOG §19](./DREAMFERENCE_LING_ENGINE_BACKLOG.md) item 26): N of the drafter's candidates beyond the chain verified as a tree in the same pass, on one-stream steps of a full block (batches, lookup chains and `logprobs` requests take the chain). The default shape, on since 2026-10-19 (the owner's decision), is the chain's first 8 drafts plus 7 nodes at temperature 1.5 (16 rows); `0` verifies the chain alone. Exact (`ling-run --spec-check`; `tests/tree_tests.cu`). `LING_TREE` overrides it, and `LING_TREE_T`, `LING_TREE_CHAIN`, `LING_TREE_W`, `LING_TREE_DEPTH` and `LING_TREE_MIN` set the rest of the shape (section 4). |
+| `--draft-off-below X` | `1.5` | The drafter-off guard ([BACKLOG §19](./DREAMFERENCE_LING_ENGINE_BACKLOG.md) item 10, [SPECULATION §10](./DREAMFERENCE_LING_ENGINE_SPECULATION.md)): a session whose running mean of tokens per speculative step (accepted drafts + 1, an EMA over about 16 steps, after 16 steps of warm-up) falls below X decodes one plain row per step with no drafter pass, probing the drafter with one speculative step after every 16 plain ones until the mean is back at X + 0.25. A plain step's session takes it alone, outside a batch. Greedy output is token for token the same; sampled output keeps its distribution. `0` turns the guard off. `LING_DRAFT_OFF_BELOW` overrides it; `LING_DRAFT_ON_MARGIN` sets the 0.25, and `LING_DRAFT_OFF_SAMPLED=0` keeps the guard to greedy requests. Counted in `/spec_stats` (`drafter_off_steps`, `drafter_switches`) and `/metrics` (`ling:drafter_off_steps_total`, `ling:drafter_switches_total`). |
 | `--draft-bf16` | off | The drafter's fc and conv kernel projections in BF16 as its checkpoint has them, instead of the NVFP4 copies rounded at load ([BACKLOG §19](./DREAMFERENCE_LING_ENGINE_BACKLOG.md) item 33; the copies are the default since 2026-10-20, the owner's decision). Only the drafter's proposals change, so only acceptance can move: the verify decides every token either way. The copies are bit for bit `bench/quant/drafter_variants.py --nvfp4-copy`'s (`ling-stream-tests --nvfp4-oracle DIR`); the fc keeps its BF16 original for the prompt's chunks over 32 rows, the conv projections do not. `LING_DRAFT_NVFP4` overrides it. |
 | `--lookup 0\|1\|2` | `1` | The context-lookup draft source ([SPECULATION §10](./DREAMFERENCE_LING_ENGINE_SPECULATION.md)): 0 off, 1 on, 2 shadow mode (counted in `/spec_stats`, not used). |
 | `--lookup-min N` | `8` | The shortest match the lookup accepts. |
@@ -57,7 +59,8 @@ Startup prints `loading DIR …`, then `loaded X GB of weights`, then with a dra
 ling-run --model DIR (--text T | --chat T | --ids 1,2,3 | --prompts-file F)
          [--max-tokens N] [--max-context N] [--temperature T] [--seed N]
          [--ids-out] [--prompt-ids-out]
-         [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N] [--draft-bf16]]
+         [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N] [--draft-bf16]
+                      [--draft-off-below X]]
          [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N]]
          [--batch-check]
          [--graphs] [--graph-check] [--pdl] [--attn-bulk] [--attn-prefetch N]
@@ -80,7 +83,8 @@ Loads the model and generates from a prompt; prints the text, the timings and, a
 | `--ids-out`, `--prompt-ids-out` | off | Print the generated ids, or the prompt's ids, one list per prompt. |
 | `--draft DIR`, `--block N`, `--lookup`, `--lookup-min`, `--draft-bf16` | none, `12`, `1`, `8`, off | The drafter and its settings, as `ling-serve`'s `--draft`, `--draft-block`, `--lookup`, `--lookup-min`, `--draft-bf16`. |
 | `--spec` | off | Decode speculatively with the drafter. |
-| `--spec-check` | off | Greedy only: decode each prompt plainly, then speculatively, and check that the tokens are identical and that the recurrent state after the speculative run equals a plain run's over the same tokens, bit for bit. Prints `spec check passed` or `SPEC CHECK FAILED`. |
+| `--spec-check` | off | Greedy only: decode each prompt plainly, then speculatively, and check that the tokens are identical and that the recurrent state and the drafter's context after the speculative run equal a plain run's over the same tokens, bit for bit. Prints `spec check passed` or `SPEC CHECK FAILED`. With `--draft-off-below X` the speculative run is made three times: the guard off, the guard at X (a high X such as 100 trips it after its warm-up; use `--max-tokens 512` or more), and the guard at X with every probe switching the drafter back on and its next step off again; each must pass the same comparisons. |
+| `--draft-off-below X` | `1.5` | As for `ling-serve`: the drafter-off guard; with `--spec-check`, its check. |
 | `--prefix-check` | off | Prefill each prompt after the one before it (resuming from a kept state or a prefix checkpoint), then again from scratch, and check that the DeltaNet and conv state and the next token agree (M2). With `--draft`, also decode 64 tokens speculatively (greedy) after each prefill and check that the tokens, the state, the steps and the accepted drafts agree (the drafter's context ring after a resume, M4). |
 | `--sessions N` | `1` | With `--prefix-check`: N resident sessions, each prompt bound to one as `ling-serve` binds a request, so each resumes from its own session's state, the shared checkpoint store, or another session's KV (M4 stage 1). |
 | `--chunk-check N` | off | Prefill each prompt from a cold engine twice, in full chunks and in chunks of N tokens (what `ling-serve` runs beside another request's decode), and check that the state and the next token are the same both ways; with `--draft` also the drafter's context ring after the prefill, bit for bit, and a 64-token speculative continuation's tokens, state, steps and accepted drafts. Exit 1 on a difference (M4 stage 2). |

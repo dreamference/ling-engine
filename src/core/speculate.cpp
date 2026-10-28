@@ -207,6 +207,11 @@ void Engine::alloc_drafter() {
   if (const char* e = std::getenv("LING_TREE_DEPTH")) opts_.tree_max_depth = std::atoi(e);
   if (const char* e = std::getenv("LING_TREE_CHAIN")) opts_.tree_chain = std::atoi(e);
   if (const char* e = std::getenv("LING_TREE_MIN")) opts_.tree_min_mass = std::atof(e);
+  // The drafter-off guard (BACKLOG 10; core/draft_guard.hpp).
+  if (const char* e = std::getenv("LING_DRAFT_OFF_BELOW")) opts_.draft_off_below = std::atof(e);
+  if (const char* e = std::getenv("LING_DRAFT_ON_MARGIN")) opts_.draft_on_margin = std::atof(e);
+  if (const char* e = std::getenv("LING_DRAFT_OFF_SAMPLED")) opts_.draft_off_sampled = std::atoi(e) != 0;
+  set_draft_guard(opts_.draft_off_below, opts_.draft_on_margin);
   tree_dev_ = reinterpret_cast<kernels::TreeDesc*>(alloc<uint8_t>(sizeof(kernels::TreeDesc)));
   gather_rows_dev_ = alloc<int>(kernels::kMaxStreamRows);
   tree_grid_ = std::min(kernels::kMaxTreeVariants, 1 + std::max(0, opts_.tree_nodes));
@@ -893,6 +898,9 @@ void Engine::plan_count(StepPlan& sp) {
   }
   s.spec.accepted += accepted;
   s.spec.accept_hist[accepted] += 1;
+  // The drafter-off guard (BACKLOG 10) sees every speculative step of the requests it applies to, alone or batched,
+  // probes included: the step's tokens per target pass.
+  if (guarded(*sp.p) && s.guard.observe(guard_cfg_, n)) s.spec.drafter_switches += 1;
   if (sp.use_lookup) {
     s.spec.lookup_steps += 1;
     s.spec.lookup_accepted += accepted;
@@ -914,8 +922,26 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   const int room = opts_.max_context - s_->pos;
   if (room < 1) throw std::runtime_error("context is longer than max_context");
   const int B = std::min(opts_.draft_block, room);
-  if (B < 2) {  // no room to draft: one plain step
+  // The drafter-off guard (BACKLOG 10; core/draft_guard.hpp): while the session's recent steps produce too few tokens
+  // to pay for the draft and the wider verify, its steps are plain one-row decodes, the path of a request that cannot
+  // speculate, until a probe finds the drafter winning again. Why switching is free and exact:
+  //   - the drafter's context stays what it would have been: Engine::step runs the target over the row (forward()
+  //     writes the feature layers' rows into cap_ on every pass, decode included) and then draft_materialize(1, ...)
+  //     turns them into the ring's entry for that position, as a commit does for its accepted rows, so the ring
+  //     holds every position whichever path processed it and the next speculative step drafts from it unchanged
+  //     (ling-run --spec-check --draft-off-below compares the ring with a plain replay's, bit for bit);
+  //   - the recurrent state: forward() joins an overlapped commit first, and the plain pass advances the DeltaNet and
+  //     conv state over the row itself;
+  //   - the tokens: the rows path is row-invariant, so a plain row's logits are bit for bit a verify row's, and a
+  //     greedy request's tokens are plain decoding's on either path. A sampled request keeps its distribution (the
+  //     verify's rejection rule against sample()'s single draw), not its tokens, as speculation already does.
+  const bool off = guarded(p) && !s_->guard.speculate();
+  if (B < 2 || off) {  // no room to draft, or the guard off: one plain step
     step(anchor);
+    if (off) {
+      s_->guard.plain();
+      s_->spec.drafter_off_steps += 1;
+    }
     if (row_logits) *row_logits = logits_;
     return {sample(logits_, p, s_->history)};
   }
@@ -1037,7 +1063,14 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
 
 bool Engine::can_batch(int session, const SamplingParams& p) const {
   const Session& s = sessions_.at(session);
-  return can_speculate(p) && opts_.max_context - s.pos >= opts_.draft_block;
+  // A session whose drafter-off guard has its next step plain takes it alone (speculate() runs it), as a request that
+  // decodes plainly does: a batch's verify holds speculative steps only. A probe is a speculative step and may join.
+  return can_speculate(p) && opts_.max_context - s.pos >= opts_.draft_block && !drafter_off(session, p);
+}
+
+bool Engine::drafter_off(int session, const SamplingParams& p) const {
+  const Session& s = sessions_.at(session);
+  return draft_ && can_speculate(p) && guarded(p) && !s.guard.speculate();
 }
 
 void Engine::verify_batch_launch(std::span<StepPlan> plans, int V) {
