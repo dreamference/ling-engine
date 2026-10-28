@@ -71,11 +71,12 @@ struct EngineOptions {
   // back at draft_off_below + draft_on_margin. 0: the guard off. A negative margin is for ling-run's check only
   // (set_draft_guard). Greedy output is token for token the same either
   // way; sampled output keeps its distribution but not its tokens (as speculative against plain decoding already
-  // does), so draft_off_sampled = false keeps the guard to greedy requests. LING_DRAFT_OFF_BELOW,
+  // does), so the guard is kept to greedy requests by default (the standing rule: a change merged without the owner
+  // leaves every output token as it was); draft_off_sampled = true extends it to sampled ones. LING_DRAFT_OFF_BELOW,
   // LING_DRAFT_ON_MARGIN and LING_DRAFT_OFF_SAMPLED=0/1 override these.
   double draft_off_below = 1.5;
   double draft_on_margin = 0.25;
-  bool draft_off_sampled = true;
+  bool draft_off_sampled = false;
   // Prefix checkpoints: DeltaNet and conv states kept at chosen prompt positions (the end of the first two
   // messages, i.e. after `boundary_token`, and multiples of prefill_chunk up to checkpoint_limit), so a later
   // prompt that shares the prefix resumes there. Each costs ~157 MB; 0 turns them off.
