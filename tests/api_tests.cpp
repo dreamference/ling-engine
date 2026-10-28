@@ -316,11 +316,13 @@ int main() {
 
   {
     // P4c: X-Ling-Share-Scope is opaque; absent or empty is the unscoped scope 0, any value a scope that is never 0.
-    EXPECT(ling::serve::share_scope_of("") == 0);
-    EXPECT(ling::serve::share_scope_of("team-a") != 0 && ling::serve::share_scope_of("team-a") == ling::serve::share_scope_of("team-a"));
-    EXPECT(ling::serve::share_scope_of("team-a") != ling::serve::share_scope_of("team-b"));
-    EXPECT(ling::serve::share_scope_of("team-a") != ling::serve::share_scope_of("Team-a"));
-    EXPECT((ling::serve::share_scope_of("x") & 1) == 1);
+    using ling::serve::share_scope_of;
+    auto scope = [](const char* v) { return share_scope_of(v); };
+    EXPECT(scope("") == 0);
+    EXPECT(scope("team-a") != 0 && scope("team-a") == scope("team-a"));
+    EXPECT(scope("team-a") != scope("team-b"));
+    EXPECT(scope("team-a") != scope("Team-a"));
+    EXPECT((scope("x") & 1) == 1);
   }
   const json tools = json::parse(R"([{"type":"function","function":{"name":"shell","parameters":{"type":"object",
     "properties":{"command":{"type":"array"},"timeout_ms":{"type":"integer"},"workdir":{"type":"string"}}}}}])");
