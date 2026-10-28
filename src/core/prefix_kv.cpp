@@ -352,6 +352,13 @@ int PrefixKvTree::pages_held() const {
   return n;
 }
 
+std::vector<std::vector<int>> PrefixKvTree::page_lists() const {
+  std::vector<std::vector<int>> out;
+  for (size_t i = 1; i < nodes_.size(); ++i)
+    if (nodes_[i].live && !nodes_[i].pages.empty()) out.push_back(nodes_[i].pages);
+  return out;
+}
+
 int PrefixKvTree::buffers() const {
   int n = 0;
   for (const Buffer& b : bufs_) n += b.refs > 0;

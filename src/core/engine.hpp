@@ -399,7 +399,15 @@ class Engine {
   // Free pages, after retiring the released ones whose readers have all finished.
   int kv_pages_free();
   int kv_pages_pending() const { return kv_book_ ? kv_book_->pending_pages() : 0; }
-  int kv_session_pages(int session) const;  // pages session i maps
+  // The pages evicting session i frees (P4c: those it shares with another session or the prefix KV store stay).
+  int kv_session_pages(int session) const;
+  // P4c: the pages freed once the listed sessions and, with `store`, the prefix KV store let go of theirs (a page
+  // every one of whose references is among them).
+  int kv_reclaimable(const std::vector<int>& sessions, bool store) const;
+  // P4c: the pages evicting the whole prefix KV store frees, and the eviction of its least recently used leaf (the
+  // pool's first reclaim, before idle sessions); false when the store is empty.
+  int kv_store_pages() const;
+  bool kv_store_evict();
   // What begin_prefill of a prompt of `prompt_len` tokens in session i draws from the pool, net: every page index below
   // the prompt's end plus kKvGrowthPages pages (kv_admit_pages) that the session does not map yet, less the pages it
   // maps past that point, which begin_prefill gives back first (0 when those are more). Exact: begin_prefill rewrites
@@ -466,7 +474,7 @@ class Engine {
   bool kv_pages_ = false;                 // opts_.kv_pages or LING_KV_PAGES (P4)
   __nv_bfloat16* kv_pool_ = nullptr;      // P4: the pool, [page][layer][K, V][kv head][kKvPageTokens][D]; page 0 unused
   size_t kv_page_elems_ = 0;              // P4: elements per page (all full-attention layers' K and V)
-  // P4: copies the KV of positions [0, n) of session `from` into the active session's pages, whole pages.
+  // P4c: the active session maps session `from`'s pages for positions [0, n) (shared, no copy).
   void kv_pages_adopt(const Session& from, int n);
   // P4b: the pool's bookkeeping (core/kv_pool.hpp), with kv_pages.
   std::unique_ptr<KvPool> kv_book_;
@@ -491,6 +499,8 @@ class Engine {
   void kv_release(Session& s, int n);
   void kv_table_sync(Session& s, cudaStream_t st);  // the device table to s.kv_ids, the changed entries only
   void kv_record_release();
+  // Runs a prefix KV store call that may drop page references, recording the release when it did.
+  void kv_store_dropped(const std::function<void()>& op);
   bool prefill_bf16_ = false;             // opts_.prefill_bf16 or LING_PREFILL_BF16: BF16 DeltaNet intermediates
   // RMSNorm; on the rows path it also leaves the FP16 copy for the next linear call (x_ready).
   // On the prefill path it writes the quantized input of the next GEMMs instead (input scale `in_scale`,

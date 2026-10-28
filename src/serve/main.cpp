@@ -456,6 +456,21 @@ class Scheduler {
         throw KvPoolTooSmall(j.prompt.size(), eng.kv_pages_total());
       eng.activate_session(j.session, j.req.session_key, j.fresh);
       r->cur = eng.begin_prefill(j.prompt, false, j.images.empty() ? nullptr : &j.images);
+    } catch (const KvPoolExhausted& e) {
+      // P4c: the pool is short after all (pages shared at admission's count were let go of meanwhile): while a
+      // request runs, the job goes back to the front of the queue and is admitted again once one ends.
+      const int session = j.session;
+      if (running_.empty()) {
+        fail(*r, e);
+      } else {
+        std::fprintf(stderr, "KV pool: a prompt of %zu tokens waits (%s)\n", j.prompt.size(), e.what());
+        std::lock_guard<std::mutex> l(mu_);
+        queue_.push_front(std::move(j));
+        std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+        ctx_.metrics.queued += 1;
+      }
+      eng.touch_session(session);
+      return;
     } catch (const std::exception& e) {
       fail(*r, e);
       eng.touch_session(j.session);
@@ -590,6 +605,22 @@ class Scheduler {
   // *evicted: whether it evicted a session.
   bool kv_make_room(int need, int keep, bool* evicted = nullptr) {
     Engine& eng = *ctx_.engine;
+    // P4c: the prefix KV store's pages are reclaimed first (least recently used leaf first), when it and the idle
+    // sessions together free enough; a page the store shares with a session is freed only with both, so the sessions'
+    // counts below are taken after.
+    if (need > eng.kv_pages_free() + eng.kv_pages_pending()) {
+      std::vector<int> idle;
+      const KvPoolView v0 = kv_view(keep, &idle);
+      if (need <= v0.free + v0.pending + eng.kv_reclaimable(idle, true)) {
+        int dropped = 0;
+        while (need > eng.kv_pages_free() + eng.kv_pages_pending() && eng.kv_store_evict()) ++dropped;
+        if (dropped > 0) {
+          if (evicted) *evicted = true;
+          std::fprintf(stderr, "KV pool: %d prefix KV store entries evicted for %d pages; %d free, %d pending\n",
+                       dropped, need, eng.kv_pages_free(), eng.kv_pages_pending());
+        }
+      }
+    }
     std::vector<int> lru, pages;
     const KvPoolView v = kv_view(keep, &lru, &pages);
     const KvVerdict verdict = kv_verdict(need, v);
