@@ -5,7 +5,9 @@
 // tiles, L2 prefetch on and off, eager and with a device position over fixed ranges as a graph launches it, a tree
 // verify whose path crosses a page), attention_rows_seqs and attn_prepare_seqs over three sequences, attn_prepare's
 // writes, tree_gather and kv_pages_copy. memcmp of the outputs, and of the caches read back position by position.
-// P4b: kv_table_set, the page table's update. Exits 0 when everything is identical.
+// P4b: kv_table_set, the page table's update. Exits 0 when everything is identical. With the argument `head-major`,
+// the pool is laid out as LING_KV_HEAD_MAJOR=1 lays it out ([layer][K, V][kv head][page][PT][D], the table in units of
+// one head's run).
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -57,8 +59,12 @@ std::vector<__nv_bfloat16> randb(size_t n, float scale = 1.f) {
   return v;
 }
 
+// The pool's layout: its head stride and the elements per page id in a table (set by Pool).
+bool g_head_major = false;
+size_t g_hs = size_t(PT) * D, g_unit = kPageElems;
+
 void flat_layout(int max_ctx) { k::set_kv_layout(size_t(max_ctx) * D, D); }
-void paged_layout() { k::set_kv_layout(size_t(PT) * D, D); }
+void paged_layout() { k::set_kv_layout(g_hs, D); }
 
 // One sequence's KV of one layer in both layouts. The pool holds every sequence's pages (page 0 unused); a sequence's
 // table maps its pages in a shuffled order, so neighbouring positions across a page boundary are far apart.
@@ -68,11 +74,13 @@ struct Pool {
   int pages = 0;
   explicit Pool(int n) : host(kPageElems * (n + 1)), pages(n + 1) {
     std::memset(host.data(), 0x3f, host.size() * 2);  // 0.746 wherever nothing is mapped (page 0, the other layer)
+    g_hs = g_head_major ? size_t(pages) * PT * D : size_t(PT) * D;
+    g_unit = g_head_major ? size_t(PT) * D : kPageElems;
   }
-  __nv_bfloat16* kbase() const { return dev + size_t(LAYER) * 2 * Hkv * PT * D; }
-  __nv_bfloat16* vbase() const { return kbase() + size_t(Hkv) * PT * D; }
+  __nv_bfloat16* kbase() const { return dev + size_t(LAYER) * 2 * Hkv * g_hs; }
+  __nv_bfloat16* vbase() const { return kbase() + size_t(Hkv) * g_hs; }
   size_t at(uint64_t page_off, int kv, int h, int p) const {
-    return page_off + (size_t(LAYER) * 2 + kv) * Hkv * PT * D + size_t(h) * PT * D + size_t(p % PT) * D;
+    return page_off + (size_t(LAYER) * 2 + kv) * Hkv * g_hs + size_t(h) * g_hs + size_t(p % PT) * D;
   }
 };
 
@@ -92,7 +100,7 @@ Seq make_seq(Pool& pool, int max_ctx, std::vector<int>& ids) {
   s.v = randb(s.k.size());
   const int np = (max_ctx + PT - 1) / PT;
   for (int j = 0; j < np; ++j) {
-    s.table.push_back(uint64_t(ids.back()) * kPageElems);
+    s.table.push_back(uint64_t(ids.back()) * g_unit);
     ids.pop_back();
   }
   for (int h = 0; h < Hkv; ++h)
@@ -152,7 +160,9 @@ bool attention_case(const Seq& s, const Pool& pool, const float* dq, int P, int 
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  g_head_major = argc > 1 && std::strcmp(argv[1], "head-major") == 0;
+  std::printf("pool layout: %s\n", g_head_major ? "head-major" : "interleaved");
   k::prepare_kernels();
   const int kMaxCtx = 131072 + 64;
   Pool pool((kMaxCtx / PT + 1) + 3 * (8192 / PT) + 8);
@@ -243,8 +253,8 @@ int main() {
     for (int h = 0; h < Hkv; ++h) {
       gf.push_back({reinterpret_cast<char*>(big.dk + size_t(h) * big.max_ctx * D), D * 2, D * 2, 1});
       gf.push_back({reinterpret_cast<char*>(big.dv + size_t(h) * big.max_ctx * D), D * 2, D * 2, 1});
-      gp.push_back({reinterpret_cast<char*>(pool.kbase() + size_t(h) * PT * D), D * 2, D * 2, 1, big.dtable, 2});
-      gp.push_back({reinterpret_cast<char*>(pool.vbase() + size_t(h) * PT * D), D * 2, D * 2, 1, big.dtable, 2});
+      gp.push_back({reinterpret_cast<char*>(pool.kbase() + size_t(h) * g_hs), D * 2, D * 2, 1, big.dtable, 2});
+      gp.push_back({reinterpret_cast<char*>(pool.vbase() + size_t(h) * g_hs), D * 2, D * 2, 1, big.dtable, 2});
     }
     k::GatherBuf* dgf = upload(gf);
     k::GatherBuf* dgp = upload(gp);
@@ -317,6 +327,7 @@ int main() {
     __nv_bfloat16* buf;
     cudaMalloc(&buf, bn * 2);
     cudaMemset(buf, 0, bn * 2);
+    paged_layout();  // kv_pages_copy reads the pool's head stride
     k::kv_pages_copy(pool.dev, big.dtable, NL * 2, Hkv, D, buf, buf_start, buf_len, from, to, true, nullptr);
     const std::vector<__nv_bfloat16> b = download(buf, bn), fk = download(big.dk, big.k.size()),
                                      fv = download(big.dv, big.v.size());

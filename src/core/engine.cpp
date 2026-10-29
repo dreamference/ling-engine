@@ -181,10 +181,16 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     // are one contiguous run, as in the head-major slots. Page 0 is never mapped: a masked key's address lands there.
     // P4b: the pool holds opts_.kv_pool_pages pages (at most what every session at max_context could map), handed out
     // as passes reach them (kv_ensure). Zeroed here, so its memory is committed at start, not while serving.
-    kernels::set_kv_layout(size_t(PT) * c.head_dim, c.head_dim);
+    // LING_KV_HEAD_MAJOR=1: the pool is [layer][K, V][kv head][page][PT][D] instead, so a page's run of one head is
+    // next to the run of the page with the next id (consecutive pages are one stream, as the flat caches are) and
+    // the table holds id * PT * D. The kernels see only a larger head stride: the same values, the same results.
     kv_page_elems_ = size_t(n_full) * 2 * kvsize * PT;
     const long cap = long(opts_.sessions) * pages_per_session;
     const int pool_pages = static_cast<int>(opts_.kv_pool_pages > 0 ? std::min<long>(opts_.kv_pool_pages, cap) : cap);
+    if (const char* e = std::getenv("LING_KV_HEAD_MAJOR")) kv_head_major_ = std::atoi(e) != 0;
+    kv_head_stride_ = kv_head_major_ ? (size_t(pool_pages) + 1) * PT * c.head_dim : size_t(PT) * c.head_dim;
+    kv_page_unit_ = kv_head_major_ ? size_t(PT) * c.head_dim : kv_page_elems_;
+    kernels::set_kv_layout(kv_head_stride_, c.head_dim);
     kv_pool_ = alloc<__nv_bfloat16>(kv_page_elems_ * (size_t(pool_pages) + 1));
     check(cudaMemset(kv_pool_, 0, kv_page_elems_ * (size_t(pool_pages) + 1) * sizeof(__nv_bfloat16)), "KV pool");
     kv_book_ = std::make_unique<KvPool>(pool_pages + 1);
@@ -201,9 +207,10 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   std::random_device seed_source;
   for (Session& s : sessions_) {
     if (kv_pages_) {
+      const size_t lkv = size_t(c.kv_heads) * kv_head_stride_;  // one layer's K (or V) block
       for (int i = 0; i < n_full; ++i) {
-        s.kcache.push_back(kv_pool_ + size_t(i) * 2 * kvsize * PT);
-        s.vcache.push_back(kv_pool_ + (size_t(i) * 2 + 1) * kvsize * PT);
+        s.kcache.push_back(kv_pool_ + size_t(i) * 2 * lkv);
+        s.vcache.push_back(kv_pool_ + (size_t(i) * 2 + 1) * lkv);
       }
       // Every entry at page 0 until a pass maps the page (kv_ensure).
       s.page_host.assign(pages_per_session, 0);
@@ -821,7 +828,7 @@ void Engine::kv_table_sync(Session& s, cudaStream_t st) {
   std::vector<int> idx;
   std::vector<uint64_t> val;
   for (size_t j = 0; j < s.page_host.size(); ++j) {
-    const uint64_t want = j < s.kv_ids.size() ? uint64_t(s.kv_ids[j]) * kv_page_elems_ : 0;
+    const uint64_t want = j < s.kv_ids.size() ? uint64_t(s.kv_ids[j]) * kv_page_unit_ : 0;
     if (want == s.page_host[j]) continue;
     idx.push_back(static_cast<int>(j));
     val.push_back(want);
@@ -848,10 +855,13 @@ void Engine::kv_ensure(Session& s, int from, int to, cudaStream_t st) {
                           std::to_string(kv_book_->free_pages()) + " free of " +
                           std::to_string(kv_book_->capacity()));
   // Copy-on-write (P4c; no page is shared in P4b): each copy on the writer's stream before its table entry changes.
-  const size_t page_bytes = kv_page_elems_ * sizeof(__nv_bfloat16);
+  // A page is one run (interleaved) or one run per layer, K/V and head, kv_head_stride_ apart (head-major).
+  const size_t unit_bytes = kv_page_unit_ * sizeof(__nv_bfloat16);
+  const size_t pitch = kv_head_major_ ? kv_head_stride_ * sizeof(__nv_bfloat16) : unit_bytes;
+  const size_t runs = kv_page_elems_ / kv_page_unit_;
   for (const KvPool::Copy& c : copies)
-    check(cudaMemcpyAsync(kv_pool_ + size_t(c.dst) * kv_page_elems_, kv_pool_ + size_t(c.src) * kv_page_elems_,
-                          page_bytes, cudaMemcpyDeviceToDevice, st),
+    check(cudaMemcpy2DAsync(kv_pool_ + size_t(c.dst) * kv_page_unit_, pitch, kv_pool_ + size_t(c.src) * kv_page_unit_,
+                            pitch, unit_bytes, runs, cudaMemcpyDeviceToDevice, st),
           "KV page copy");
   kv_table_sync(s, st);
   if (kv_book_->pending_pages() > pending) kv_record_release();  // a copied page this holder let go of
