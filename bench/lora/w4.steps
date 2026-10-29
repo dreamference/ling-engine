@@ -9,6 +9,8 @@ MKOFF="LING_MK_GDN=0 LING_MK_ATTN=0 LING_MK_SPAN=0 LING_MK_LAYERS=0"
 step main-mkoff env $MKOFF $MAIN/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --spec-check --graphs --pdl
 step main-gdnoff env LING_MK_GDN=0 LING_MK_SPAN=0 $MAIN/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --spec-check --graphs --pdl
 step main-attnoff env LING_MK_ATTN=0 LING_MK_LAYERS=0 $MAIN/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --spec-check --graphs --pdl
+# The same unfused paths on the branch with the zero adapter and no LoRA launch: the adapter plumbing alone.
+step lora-nolaunch env LING_LORA_SITES=0 LING_LORA_DRAFT_SITES=0 $B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --spec-check --graphs --pdl --lora $LIB/zero
 A=$HOME/lora-agree; mkdir -p $A
 for f in ids.jsonl ids-long.jsonl sets.json prompts.jsonl; do [ -f $A/$f ] || cp ~/m2/agreement/$f $A/; done
 # SGLang wraps only the modules --lora-target-modules names (rand-split's config says all-linear, so its own list is
