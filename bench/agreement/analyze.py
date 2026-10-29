@@ -18,6 +18,8 @@ gen = [json.loads(l) for l in open(D + "prod-gen48.jsonl")]
 ref = [json.loads(l) for l in open(D + "prod-force-cold-c1.jsonl")]
 passes = {k: [json.loads(l) for l in open(D + f"prod-force-{k}.jsonl")] for k in ["warm-c1", "cold-c4", "warm-c4"]}
 BUILDS = [("m1", "M1"), ("b44", "44c92c5"), ("m2", "M2 final")]
+if os.environ.get("LING_AGREE_BUILDS"):  # other labels, comma-separated (the adapter study: bench/lora/agree.sh)
+    BUILDS = [(b, b) for b in os.environ["LING_AGREE_BUILDS"].split(",")]
 eng = {}
 for b, _ in BUILDS:
     try:

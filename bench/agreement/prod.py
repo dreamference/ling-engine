@@ -5,6 +5,7 @@ http://127.0.0.1:8000) and does not change its configuration.
   prod.py force IDS GEN OUT CONC        teacher-forced top-20 over prompt + production's continuation, CONC requests at once
   prod.py flush                         empties the prefix cache (POST /flush_cache), for a cold pass
 
+LING_REF_LORA=NAME runs every request on the reference's adapter NAME (SGLang's lora_path).
 IDS: one {"ids": [...]} per line (ling_force tokenize). Stops at <|im_end|> (id 248046).
 """
 import json, os, sys, time, urllib.request
@@ -12,9 +13,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 URL = os.environ.get("LING_REF_URL", "http://127.0.0.1:8000")
 K = 20
+LORA = os.environ.get("LING_REF_LORA")  # an adapter the reference server has loaded: every /generate names it
 
 
 def post(path, body):
+    if LORA and path == "/generate":
+        body = dict(body, lora_path=LORA)
     req = urllib.request.Request(URL + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=1800) as r:
         return json.loads(r.read() or b"{}")

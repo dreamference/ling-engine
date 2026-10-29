@@ -1,0 +1,21 @@
+# Adapters window 5: the engine on w4's cases with the adapter rand-split (ling-force, LING_LORA), then the per-adapter
+# cost on ling-serve (cost.py: two streams on the base, on one zero adapter, on two; one stream on the base and on
+# rand). Afterwards, on any machine: LING_AGREE_BUILDS=lora python3 bench/agreement/analyze.py ~/lora-agree.
+source $(dirname ${BASH_SOURCE[0]})/common.sh
+A=$HOME/lora-agree
+[ -d $LIB/zero2 ] || cp -r $LIB/zero $LIB/zero2
+score() { cd $A; LING_LORA=$LIB/rand-split $B/ling-force score $M 20 < cases.jsonl > eng-lora.jsonl 2> eng-lora.err; }
+gen400() { cd $A; LING_LORA=$LIB/rand-split $B/ling-force gen $M 400 < cases-long.jsonl > gen400-lora.jsonl 2>> eng-lora.err; }
+cost() {
+  setsid $B/ling-serve --model $M --draft $D --port 8300 --served-model-name $BASE --max-context 65536 \
+    --draft-block 12 --graphs --pdl --lora-library $LIB --lora-paths zero,zero2,rand,rand-attn \
+    > $V/cost.serve.log 2>&1 8>&- < /dev/null &
+  local srv=$!
+  for i in $(seq 1 120); do curl -sf -m 2 localhost:8300/health > /dev/null && break; sleep 3; done
+  python3 $SRC/bench/lora/cost.py http://127.0.0.1:8300 300 B,B B+zero,B+zero B+zero,B+zero2 B B+zero B+rand \
+    B+rand,B+rand-attn
+  kill $srv; wait $srv 2>/dev/null
+}
+step score score
+step gen400 gen400
+step cost cost

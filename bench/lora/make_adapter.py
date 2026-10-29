@@ -6,7 +6,9 @@
 
 --zero writes every B as zeros (the zero adapter: output identical to the base); otherwise A ~ N(0, 1/K) and
 B ~ N(0, b_std), a small perturbation that changes some greedy tokens. `attn` is q, k, v and o on the full-attention
-layers, `gdn` in_proj_qkv, in_proj_z and out_proj on the DeltaNet layers. --drafter adds a drafter/ part (q, k, v, o
+layers, `gdn` in_proj_qkv, in_proj_z and out_proj on the DeltaNet layers, `gdn-split` the same with in_proj_qkv as
+in_proj_q, in_proj_k and in_proj_v (the only form SGLang v0.5.19 serves beside in_proj_z: it takes the four split
+projections or one merged in_proj_qkvz). --drafter adds a drafter/ part (q, k, v, o
 on every drafter layer).
 """
 
@@ -56,10 +58,15 @@ def modules(cfg, targets, drafter):
                 yield layer, "self_attn", "k_proj", kv * hd, H
                 yield layer, "self_attn", "v_proj", kv * hd, H
                 yield layer, "self_attn", "o_proj", H, heads * hd
-        elif "gdn" in targets:
+        elif "gdn" in targets or "gdn-split" in targets:
             qk = t["linear_num_key_heads"] * t["linear_key_head_dim"]
             v = t["linear_num_value_heads"] * t["linear_value_head_dim"]
-            yield layer, "linear_attn", "in_proj_qkv", 2 * qk + v, H
+            if "gdn-split" in targets:
+                yield layer, "linear_attn", "in_proj_q", qk, H
+                yield layer, "linear_attn", "in_proj_k", qk, H
+                yield layer, "linear_attn", "in_proj_v", v, H
+            else:
+                yield layer, "linear_attn", "in_proj_qkv", 2 * qk + v, H
             yield layer, "linear_attn", "in_proj_z", v, H
             yield layer, "linear_attn", "out_proj", H, v
 
@@ -84,7 +91,9 @@ def write_adapter(model_dir, out, args, targets, drafter, rng):
         "bias": "none",
         "use_rslora": False,
         "use_dora": False,
-        "target_modules": sorted(names),
+        # SGLang names the split projections' module in_proj_qkvz and wraps only the modules target_modules names:
+        # "all-linear" with --lora-target-modules all wraps them all (the engine reads the keys, not this list).
+        "target_modules": "all-linear" if "gdn-split" in targets and not drafter else sorted(names),
         "base_model_name_or_path": os.path.basename(os.path.normpath(model_dir)),
     }
     json.dump(conf, open(os.path.join(out, "adapter_config.json"), "w"), indent=2)

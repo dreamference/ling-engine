@@ -1,0 +1,67 @@
+# Adapters window 4: the agreement study's reference with an adapter (LORA §6). A scratch SGLang with production's
+# flags and the adapter rand-split (attention and DeltaNet in the split form SGLang serves), then prod.py's passes as
+# bench/agreement/run.sh makes them, every request on the adapter; the base's greedy continuation once more, to count
+# what the adapter changes. The prompts are the M2 study's (A gets its ids). w5 runs the engine on the same cases.
+source $(dirname ${BASH_SOURCE[0]})/common.sh
+A=$HOME/lora-agree; mkdir -p $A
+for f in ids.jsonl ids-long.jsonl sets.json prompts.jsonl; do [ -f $A/$f ] || cp ~/m2/agreement/$f $A/; done
+# SGLang wraps only the modules --lora-target-modules names (rand-split's config says all-linear, so its own list is
+# not read); serve.py's --set takes one value, so the command is printed and the four names appended.
+SGARGS="lora-sg --port 30000 --add enable-lora --set max-lora-rank 16 --set max-loras-per-batch 2
+    --set lora-paths rand-split=/root/.cache/dreamference/lora-lib/rand-split"
+SG() {
+  local cmd=$(python3 $SRC/bench/sglang/serve.py $SGARGS "$@" --print | tail -n 1)
+  docker rm -f lora-sg > /dev/null 2>&1
+  eval "$cmd --lora-target-modules qkv_proj o_proj out_proj in_proj_qkvz"
+}
+sg_wait() {
+  for i in $(seq 1 200); do
+    curl -sf -m 3 localhost:30000/v1/models > /dev/null && return 0
+    [ "$(docker inspect -f '{{.State.Running}}' lora-sg 2>/dev/null)" = true ] || return 1
+    sleep 5
+  done
+  return 1
+}
+# Production's flags first; if SGLang refuses LoRA with them, without DFlash and torch.compile (greedy output is the
+# target's either way).
+sg_up() {
+  SG && sg_wait && return 0
+  docker logs lora-sg 2>&1 | tail -n 40; echo "=== again without speculation and torch.compile"
+  SG --drop speculative-algorithm --drop speculative-draft-model-path --drop speculative-num-draft-tokens \
+      --drop enable-torch-compile --drop torch-compile-max-bs && sg_wait
+}
+ref() {
+  cd $A
+  local P="env LING_REF_URL=http://127.0.0.1:30000 LING_REF_LORA=rand-split python3 $SRC/bench/agreement/prod.py"
+  set -e
+  $P gen ids.jsonl prod-gen48.jsonl 48 1
+  $P gen ids.jsonl prod-gen48-c1-run2.jsonl 48 1
+  $P gen ids.jsonl prod-gen48-c4.jsonl 48 4
+  $P flush
+  $P force ids.jsonl prod-gen48.jsonl prod-force-cold-c1.jsonl 1
+  $P force ids.jsonl prod-gen48.jsonl prod-force-warm-c1.jsonl 1
+  $P flush
+  $P force ids.jsonl prod-gen48.jsonl prod-force-cold-c4.jsonl 4
+  $P force ids.jsonl prod-gen48.jsonl prod-force-warm-c4.jsonl 4
+  LING_REF_URL=http://127.0.0.1:30000 python3 $SRC/bench/agreement/prod.py gen ids.jsonl base-gen48.jsonl 48 1
+  $P gen ids-long.jsonl prod-gen400-long.jsonl 400 1
+  $P gen ids-long.jsonl prod-gen400-long-run2.jsonl 400 1
+  python3 - <<'PY'
+import json
+ids = [json.loads(l)["ids"] for l in open("ids.jsonl")]
+gen = [json.loads(l) for l in open("prod-gen48.jsonl")]
+base = [json.loads(l) for l in open("base-gen48.jsonl")]
+ref = [json.loads(l) for l in open("prod-force-cold-c1.jsonl")]
+with open("cases.jsonl", "w") as f:
+    for p, g, r in zip(ids, gen, ref):
+        f.write(json.dumps({"prompt": p, "cont": g["cont"], "want": [[c[0] for c in pos] for pos in r["top"]]}) + "\n")
+with open("cases-long.jsonl", "w") as f:
+    for p in ids[30:]:
+        f.write(json.dumps({"prompt": p}) + "\n")
+changed = sum(g["cont"] != b["cont"] for g, b in zip(gen, base))
+print(f"the adapter changes {changed} of {len(gen)} greedy continuations (48 tokens)")
+PY
+}
+step sg-up sg_up
+step ref ref
+docker logs lora-sg > $V/sg.log 2>&1; docker rm -f lora-sg > /dev/null 2>&1
