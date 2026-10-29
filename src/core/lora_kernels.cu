@@ -12,17 +12,11 @@ constexpr int kMaxRank = kLoraRankRows / 4;
 
 static_assert(kTileRows <= 32, "a tile's rows are one mask");
 
-__device__ __forceinline__ int row_slot(const LoraRows& rows, int r) {
-  int i = 0;
-  while (i + 1 < rows.n && r >= rows.row0[i + 1]) ++i;
-  return rows.slot_dev ? rows.slot_dev[i] : rows.slot[i];
-}
-
 // The tile's rows on slot s, as a mask (the same for every thread of the block).
 __device__ __forceinline__ unsigned tile_mask(const LoraRows& rows, int r0, int M, int s) {
   unsigned mask = 0;
   for (int i = 0; i < kTileRows && r0 + i < M; ++i)
-    if (row_slot(rows, r0 + i) == s) mask |= 1u << i;
+    if (lora_row_slot(rows, r0 + i) == s) mask |= 1u << i;
   return mask;
 }
 
@@ -106,7 +100,7 @@ __global__ void __launch_bounds__(kThreads) lora_expand_kernel(const float* __re
     for (int jj = 0; jj < kMaxRank; ++jj)
       if (jj < R) acc = fmaf(bv[jj], ts[i][jj], acc);
     float& out = y[size_t(r0 + i) * ld + n];
-    out = out + d.scale * acc;
+    out = lora_add(out, acc, d.scale);
   }
 }
 

@@ -1538,7 +1538,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       // verify (BACKLOG 26) too, with the tree conv and the per-path recurrence (on by default since 2026-10-20:
       // -2.2 to -2.6 ms per step with trees at 24K and 59K; LING_MK_GDN_TREE=0 gives a tree the graph path's mixer).
       static const bool gdn_tree = !std::getenv("LING_MK_GDN_TREE") || std::atoi(std::getenv("LING_MK_GDN_TREE")) != 0;
-      bool mk_gdn = mk_gdn_ > 0 && !lora_on && verify && (!tree_ || gdn_tree) && !multi && !quantized_ && xn_half && L.in_a.N == L.in_b.N &&
+      bool mk_gdn = mk_gdn_ > 0 && (!lora_on || lora_mk_) && verify && (!tree_ || gdn_tree) && !multi && !quantized_ && xn_half && L.in_a.N == L.in_b.N &&
                     L.in_a.N == c.lin_v_heads;
       if (mk_gdn) {
         const Seg& sg = segs[0];
@@ -1595,6 +1595,16 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
           p.tail = tails ? &post_tail : nullptr;
           if (span_done) pre_normed_next = span_next.norm_w != nullptr;
         }
+        if (shapes && lora_on && (lora_site_mask_ >> static_cast<unsigned>(LoraSite::Gdn) & 1u)) {
+          // LING_LORA_MK: the Gdn site's shrink of xn now, its expand in the in_qkv and in_z tiles (no tail with an
+          // adapter, so the Out site's delta goes after the kernel, as the unfused path adds it).
+          const kernels::LoraSiteDev* d = lora_sites_ + size_t(li) * kLoraSites + static_cast<size_t>(LoraSite::Gdn);
+          kernels::lora_shrink(xn_, H, M, lrows, d, c.layers * kLoraSites, opts_.lora_slots, lora_t_, stream_);
+          p.lora_rows = &lrows;
+          p.lora_site = d;
+          p.lora_stride = c.layers * kLoraSites;
+          p.lora_t = lora_t_;
+        }
         mk_gdn = span_done || (shapes && kernels::gdn_persistent(p, stream_));
       }
       if (span_done) {
@@ -1602,6 +1612,12 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       } else if (mk_gdn) {
         if (tails) post_normed = true;
         else kernels::add_inplace(h_, t1_, M * H, stream_);
+        if (lora_on) {  // LING_LORA_MK: (h + W x) + the Out site's delta, from the kernel's normed
+          kernels::LoraOuts outs;
+          outs.y[0] = h_;
+          outs.ld[0] = H;
+          lora_site(lrows, li, LoraSite::Out, normed_, Vs, M, outs, H);
+        }
         mark("gdn_proj");
       } else if (fork) {
         // The overlap probe (LING_GDN_FORK): in_qkv alone, then in_z on stream_ while the chain runs on fork_stream_

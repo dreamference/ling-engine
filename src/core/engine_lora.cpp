@@ -44,6 +44,7 @@ void Engine::lora_alloc() {
       alloc<uint8_t>(size_t(opts_.lora_slots) * c.layers * kLoraSites * sizeof(kernels::LoraSiteDev)));
   if (const char* e = std::getenv("LING_LORA_SITES")) lora_site_mask_ = static_cast<unsigned>(std::atoi(e));
   if (const char* e = std::getenv("LING_LORA_DRAFT_SITES")) lora_draft_mask_ = static_cast<unsigned>(std::atoi(e));
+  if (const char* e = std::getenv("LING_LORA_MK")) lora_mk_ = std::atoi(e) != 0;
   lora_seq_dev_ = alloc<int>(kernels::kMaxSeqs);
   const std::vector<int> base(kernels::kMaxSeqs, -1);
   check(cudaMemcpy(lora_seq_dev_, base.data(), base.size() * sizeof(int), cudaMemcpyHostToDevice), "slots");

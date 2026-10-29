@@ -21,6 +21,7 @@
 // for the weights (A) and the activations (B) alike.
 #include "core/kernels.cuh"
 #include "core/launch.cuh"
+#include "core/lora_kernels.cuh"
 #include "core/attention_body.cuh"
 
 #include <cuda_fp16.h>
@@ -1125,7 +1126,38 @@ struct MkGdnArgs {
   // A tree verify (BACKLOG 26), or nullptr: the conv takes each row's taps from its ancestors (gdn_conv_tree_kernel's)
   // and the recurrence runs per gdn path (gdn_recurrent_tree_body), as the graph path's tree kernels.
   const TreeDesc* td;
+  // LING_LORA_MK (MkGdnParams): lt == nullptr, no adapter delta.
+  LoraRows lrows;
+  const LoraSiteDev* lsite = nullptr;
+  int lstride = 0;
+  const float* lt = nullptr;
 };
+
+// LING_LORA_MK: the Gdn site's delta on one in_qkv (out 0) or in_z (out 1) tile, its columns [n0, n0 + 32) of every row
+// on a slot, as lora_expand_kernel adds it (the fmaf chain in rank order, then lora_add). After the tile's writes (the
+// barrier), before its mk_done.
+__device__ __forceinline__ void mk_lora_tile(const MkGdnArgs& a, int out, int n0) {
+  __syncthreads();
+  float* y = a.inp.y[out];
+  const int N = a.inp.N[out];
+  for (int e = threadIdx.x; e < a.M * 32; e += blockDim.x) {
+    const int r = e / 32, n = n0 + e % 32;
+    const int s = lora_row_slot(a.lrows, r);
+    if (n >= N || s < 0) continue;
+    const LoraSiteDev& d = a.lsite[size_t(s) * a.lstride];
+    if (!d.a) continue;
+    for (int sg = 0; sg < d.nsegs; ++sg) {
+      const LoraSegDev seg = d.segs[sg];
+      if (seg.out != out || n < seg.n0 || n >= seg.n1) continue;
+      const __nv_bfloat16* b = d.b + seg.b_off + size_t(n - seg.n0) * d.rank;
+      const float* t = a.lt + size_t(r) * kLoraRankRows + seg.block * d.rank;
+      float acc = 0.f;
+      for (int jj = 0; jj < d.rank; ++jj) acc = fmaf(__bfloat162float(b[jj]), t[jj], acc);
+      float& o = y[size_t(r) * N + n];
+      o = lora_add(o, acc, d.scale);
+    }
+  }
+}
 constexpr int kMkGdnOutDone = 10;  // a spare word of kMkGdnWords: out-projection tiles done (TAIL)
 
 __device__ __forceinline__ float mk_silu(float x) { return x / (1.f + __expf(-x)); }  // kernels.cu's silu
@@ -1290,6 +1322,7 @@ __device__ __forceinline__ void gdn_mixer_body(const MkGdnArgs& a) {
     if (i >= a.n_qkv) break;
     stream_gemm_body<NT, 2, false, PF, false, false, SPAN>(a.xh, a.xinv, a.M, a.inp, a.K, 1, nullptr, i, 0,
                                                           MaybePdl{&waited});
+    if (a.lt) mk_lora_tile(a, 0, i * 32);
     mk_done(&c[kQkvDone]);
   }
   MK_STAMP(2)
@@ -1350,6 +1383,7 @@ __device__ __forceinline__ void gdn_mixer_body(const MkGdnArgs& a) {
     if (j >= a.n_z) break;
     stream_gemm_body<NT, 2, false, PF, false, false, SPAN>(a.xh, a.xinv, a.M, a.inp, a.K, 1, nullptr, a.n_qkv + j, 0,
                                                           MaybePdl{&waited});
+    if (a.lt) mk_lora_tile(a, 1, j * 32);
     mk_done(&c[kZDone]);
   }
   MaybePdl{&waited}();
@@ -1995,6 +2029,13 @@ static bool gdn_build(const MkGdnParams& p, MkGdnArgs& a) {
   a.times = p.times;
   a.c = p.counters;
   a.td = p.td;
+  if (p.lora_t) {
+    a.lrows = *p.lora_rows;
+    a.lsite = p.lora_site;
+    a.lstride = p.lora_stride;
+    a.lt = p.lora_t;
+  }
+  if (p.lora_t && p.tail) return false;  // the Out site's delta goes after the out-projection, not before a tail
   if (p.tail) {  // stage 4: rows 9 to 16 only (mk_tail_rows)
     if (!mk_tail_rows(p.M) || p.tail->eps != p.eps) return false;
     a.outp.y[0] = p.tail->h;

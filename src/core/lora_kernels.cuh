@@ -61,4 +61,18 @@ void lora_shrink(const float* x, int ldx, int M, const LoraRows& rows, const Lor
 void lora_expand(const float* t, int M, const LoraRows& rows, const LoraSiteDev* site, int slot_stride, int slots,
                  const LoraOuts& outs, int max_n, cudaStream_t stream);
 
+#ifdef __CUDACC__
+// Row r's slot (-1: the base), from slot_dev in a captured graph.
+__device__ __forceinline__ int lora_row_slot(const LoraRows& rows, int r) {
+  int i = 0;
+  while (i + 1 < rows.n && r >= rows.row0[i + 1]) ++i;
+  return rows.slot_dev ? rows.slot_dev[i] : rows.slot[i];
+}
+
+// y + scale * acc, rounded as written: the expand kernel and the megakernels' epilogues (LING_LORA_MK) add an
+// adapter's delta with this one formula, acc being the fmaf chain over j < rank in order, so neither can contract
+// into a different fma and the fused and unfused paths stay bit for bit.
+__device__ __forceinline__ float lora_add(float y, float acc, float scale) { return __fadd_rn(y, __fmul_rn(scale, acc)); }
+#endif
+
 }  // namespace ling::kernels

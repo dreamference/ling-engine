@@ -360,6 +360,8 @@ inline bool mk_tail_rows(int M) { return M > 8 && M <= 16; }
 // the gated norm's into normed and its FP16 copy into xh2/xinv2. Bit for bit the graph path's kernels. `counters` is
 // kMkGdnWords zeroed words owned by the call site. False: a shape or override it does not reproduce; nothing launched.
 constexpr int kMkGdnWords = 12 + kMaxStreamRows;
+struct LoraRows;
+struct LoraSiteDev;
 struct MkGdnParams {
   const __half* xh;
   const float* xinv;
@@ -384,6 +386,12 @@ struct MkGdnParams {
   unsigned long long* times = nullptr;  // LING_MK_TIMES: [blocks][kMkTimesPerBlock] stamps of the last launch
   const MkTail* tail = nullptr;  // stage 4: the out-projection into tail->h, then tail's norm
   const TreeDesc* td = nullptr;  // a tree verify (BACKLOG 26): the tree conv and the per-path recurrence
+  // LING_LORA_MK: the Gdn site's delta on the in_qkv and in_z tiles, from lora_t (lora_shrink's of xn, run before),
+  // as lora_expand adds it; lora_t == nullptr, none. The rows' slots and the site in slot 0 (slot s's at s * stride).
+  const LoraRows* lora_rows = nullptr;
+  const LoraSiteDev* lora_site = nullptr;
+  int lora_stride = 0;
+  const float* lora_t = nullptr;
 };
 bool gdn_persistent(const MkGdnParams& p, cudaStream_t s);
 // The megakernel's stage 4 (LING_MK_SPAN): a verify's DeltaNet layer, its mixer (as gdn_persistent with gp.tail) and
