@@ -2,6 +2,7 @@
 // a rank-16 adapter on every site, the descriptor table the kernels read, and a site's shrink and expand for the rows
 // of the sequences on an adapter. A batch with no such row launches nothing, so the base path is main's bit for bit.
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -41,6 +42,8 @@ void Engine::lora_alloc() {
   for (int s = 0; s < opts_.lora_slots; ++s) lora_pool_.push_back(alloc<__nv_bfloat16>(elems));
   lora_sites_ = reinterpret_cast<kernels::LoraSiteDev*>(
       alloc<uint8_t>(size_t(opts_.lora_slots) * c.layers * kLoraSites * sizeof(kernels::LoraSiteDev)));
+  if (const char* e = std::getenv("LING_LORA_SITES")) lora_site_mask_ = static_cast<unsigned>(std::atoi(e));
+  if (const char* e = std::getenv("LING_LORA_DRAFT_SITES")) lora_draft_mask_ = static_cast<unsigned>(std::atoi(e));
   lora_seq_dev_ = alloc<int>(kernels::kMaxSeqs);
   const std::vector<int> base(kernels::kMaxSeqs, -1);
   check(cudaMemcpy(lora_seq_dev_, base.data(), base.size() * sizeof(int), cudaMemcpyHostToDevice), "slots");
@@ -194,13 +197,14 @@ kernels::LoraRows Engine::lora_rows(std::span<const Seg> segs) const {
   }
   if (!any) return rows;  // n == 0: nothing launches
   rows.n = n;
-  if (use_dev_pos_) rows.slot_dev = lora_seq_dev_;  // a captured graph: the slots written before each replay
+  // A captured graph: the slots written before each replay (a batched commit's from its own slot, as its position).
+  if (use_dev_pos_) rows.slot_dev = lora_seq_dev_ + dpos_slot_;
   return rows;
 }
 
 void Engine::lora_site(const kernels::LoraRows& rows, int layer, LoraSite site, const float* x, int ldx, int M,
                        const kernels::LoraOuts& outs, int max_n) {
-  if (rows.n == 0) return;
+  if (rows.n == 0 || !(lora_site_mask_ >> static_cast<unsigned>(site) & 1u)) return;
   const int stride = model_->config().layers * kLoraSites;
   const kernels::LoraSiteDev* d = lora_sites_ + size_t(layer) * kLoraSites + static_cast<size_t>(site);
   kernels::lora_shrink(x, ldx, M, rows, d, stride, opts_.lora_slots, lora_t_, stream_);
@@ -221,7 +225,7 @@ kernels::LoraRows Engine::lora_draft_rows(std::span<Session* const> s, std::span
 
 void Engine::lora_draft_site(const kernels::LoraRows& rows, int layer, LoraSite site, const float* x, int ldx, int M,
                              const kernels::LoraOuts& outs, int max_n) {
-  if (rows.n == 0) return;
+  if (rows.n == 0 || !(lora_draft_mask_ >> static_cast<unsigned>(site) & 1u)) return;
   const int stride = draft_->config().layers * kLoraSites;
   const kernels::LoraSiteDev* d = lora_dsites_ + size_t(layer) * kLoraSites + static_cast<size_t>(site);
   kernels::lora_shrink(x, ldx, M, rows, d, stride, opts_.lora_slots, lora_t_, stream_);

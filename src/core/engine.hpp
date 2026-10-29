@@ -754,6 +754,8 @@ class Engine {
   kernels::LoraSiteDev* lora_sites_ = nullptr;
   int* lora_seq_dev_ = nullptr;
   float* lora_t_ = nullptr;  // the shrink's output, [max(prefill_chunk, kMaxStreamRows)][kLoraRankRows]
+  // The diagnosis probe (LING_LORA_SITES, LING_LORA_DRAFT_SITES): the sites that launch, one bit per LoraSite.
+  unsigned lora_site_mask_ = ~0u, lora_draft_mask_ = ~0u;
   // The drafter's pool and table, the same per slot (lora_dsites_[(slot * draft layers + layer) * kLoraSites + site],
   // Qkv and O only): a slot whose adapter has no drafter/ has every entry empty, so the drafter runs as the base.
   std::vector<__nv_bfloat16*> lora_dpool_;

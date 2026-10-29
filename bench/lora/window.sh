@@ -1,7 +1,7 @@
 #!/bin/bash
 # One GPU window for the adapters work (LORA §6), as the images work's (bench/vision/window.sh): takes
 # ~/.ling-gpu.lock, stops m0-prod8000, runs STEPS (a bash file of steps, each a line `step NAME COMMAND...` run with
-# its output in V/NAME.log), starts m0 again and waits for it, logs the hold. At most 45 minutes: a step that would
+# its output in V/NAME.log), starts m0 again unless another job waits for the lock, logs the hold. At most 45 minutes: a step that would
 # start after 40 minutes is skipped, and one still running then is stopped.
 #   window.sh LABEL DESCRIPTION STEPS V        (run it with setsid nohup ... < /dev/null &)
 set -u
@@ -34,9 +34,14 @@ step() {
   echo "$(date -u +%T) $name exit $?"
 }
 source $STEPS
-if [ "$M0" = true ]; then
+# m0 comes back only if nobody else waits for the lock (the next holder would stop it again): the other processes
+# that have the lock file open, this window's own shell aside.
+WAITERS=$(for p in $(fuser $HOME/.ling-gpu.lock 2>/dev/null); do [ "$p" != $$ ] && echo $p; done | wc -l)
+RESTART=$M0
+[ "$M0" = true ] && [ "$WAITERS" -gt 0 ] && RESTART=false
+if [ "$RESTART" = true ]; then
   docker start m0-prod8000 > /dev/null
   for i in $(seq 1 120); do curl -sf -m 3 http://127.0.0.1:8000/v1/models > /dev/null && { echo "m0 healthy $(date -u +%T)"; break; }; sleep 5; done
 fi
 echo "=== released $(date -u +%T)"
-echo "$(date -u -d @$T0 +%F\ %T)-$(date -u +%T) UTC lora-agent adapters $LABEL (m0 was running: $M0; restarted: $M0)" >> ~/.ling-gpu-holds.log
+echo "$(date -u -d @$T0 +%F\ %T)-$(date -u +%T) UTC lora-agent adapters $LABEL (m0 was running: $M0; restarted: $RESTART$([ "$M0" = true ] && [ "$RESTART" = false ] && echo ", left stopped for $WAITERS waiters"))" >> ~/.ling-gpu-holds.log

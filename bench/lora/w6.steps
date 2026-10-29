@@ -1,0 +1,11 @@
+# Adapters window 6: why w3's spec-check and batch-check on the random adapter left a different state or drafter
+# context with the same tokens. The zero adapter (the adapter path, no delta), then the random one on part of its
+# sites (LING_LORA_SITES / LING_LORA_DRAFT_SITES: one bit per site, Qkv 1, O 2, Gdn 4, Out 8).
+source $(dirname ${BASH_SOURCE[0]})/common.sh
+SC="$B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --spec-check --graphs --pdl"
+step spec-zero $SC --lora $LIB/zero
+step spec-rand-target env LING_LORA_DRAFT_SITES=0 $SC --lora $LIB/rand
+step spec-rand-drafter env LING_LORA_SITES=0 $SC --lora $LIB/rand
+step spec-rand-attn env LING_LORA_SITES=3 LING_LORA_DRAFT_SITES=0 $SC --lora $LIB/rand
+step spec-rand-gdn env LING_LORA_SITES=12 LING_LORA_DRAFT_SITES=0 $SC --lora $LIB/rand
+step batch-rand-target env LING_LORA_DRAFT_SITES=0 $B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --batch-check --sessions 2 --graphs --pdl --lora $LIB/rand
