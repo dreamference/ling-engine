@@ -678,6 +678,354 @@ void admission() {
   check(!run(p4b, &need, &p4b), "admission: P4b's count would have admitted a prefill that cannot map its pages");
 }
 
+namespace {
+
+// The calls a resume plan stands for (Engine::begin_prefill, as resume() plays them), on `pool` and `table`: share the
+// donor's pages for [0, reuse), truncate past `pages`, unshare past reuse, retire, ensure(reuse, pages). False when the
+// pool cannot map them.
+bool play_resume(KvPool& pool, std::vector<int>& table, int reuse, int pages, const std::vector<int>* donor) {
+  if (donor && reuse > 0) pool.share(table, *donor, reuse);
+  pool.truncate(table, pages * T);
+  pool.unshare(table, reuse);
+  pool.retire();
+  return pool.ensure(table, reuse, pages * T, nullptr);
+}
+
+// Releases every reference a holder's table (or the store's list) holds and empties it.
+void release_all(KvPool& pool, std::vector<int>& refs) {
+  for (int& p : refs)
+    if (p) pool.release(p);
+  refs.clear();
+}
+
+}  // namespace
+
+// P4c follow-up: KvPool::needed and resume_need with `gone`, the references treated as released (Engine::KvGone).
+void gone_counts() {
+  {
+    KvPool pool(10);
+    std::vector<int> a, store, b;
+    pool.ensure(a, 0, 3 * T, nullptr);  // a: pages 0..2
+    store = {a[0], a[1], a[2]};         // the store references all three
+    for (int p : store) pool.retain(p);
+    check(pool.needed(a, T, 3 * T) == 2, "gone: without it, writing pages 1 and 2 shared with the store copies both");
+    const KvPool::Refs g_store = {&store};
+    check(pool.needed(a, T, 3 * T, &g_store) == 0, "gone: pages shared only with a gone holder count as private");
+    pool.share(b, a, 2 * T);  // b shares pages 0 and 1 as well
+    check(pool.needed(a, T, 3 * T, &g_store) == 1, "gone: page 1, also shared with b (not listed), still copies");
+    const KvPool::Refs g_b = {&b};
+    check(pool.needed(a, T, 3 * T, &g_b) == 2, "gone: b listed alone leaves both pages shared with the store");
+    const KvPool::Refs g_both = {&store, &b};
+    check(pool.needed(a, T, 3 * T, &g_both) == 0, "gone: page 1 named by two gone holders is subtracted twice");
+    // An unmapped index counts whatever is gone.
+    check(pool.needed(a, T, 4 * T, &g_both) == 1, "gone: an unmapped page index still takes a page");
+    const std::vector<int> nothing;
+    const KvPool::Refs g_empty = {&nothing, nullptr};
+    check(pool.needed(a, T, 3 * T, &g_empty) == pool.needed(a, T, 3 * T), "gone: an empty list and a null entry change nothing");
+  }
+  {
+    KvPool pool(16);
+    std::vector<int> a, store, b;
+    pool.ensure(a, 0, 5 * T, nullptr);  // a: 5 pages
+    for (int i = 0; i < 4; ++i) {       // the store holds the first four
+      pool.retain(a[i]);
+      store.push_back(a[i]);
+    }
+    check(pool.resume_need(a, T, 5, nullptr) == 3, "gone: resume at T unshares the store's pages 1..3 and maps them afresh");
+    const KvPool::Refs g_store = {&store};
+    check(pool.resume_need(a, T, 5, nullptr, &g_store) == 0, "gone: with the store gone, a rewrites its own pages");
+    pool.share(b, a, 3 * T);  // b shares pages 0..2
+    check(pool.resume_need(a, T, 5, nullptr, &g_store) == 2, "gone: pages 1, 2 still shared with b are mapped afresh");
+    const KvPool::Refs g_both = {&store, &b};
+    check(pool.resume_need(a, T, 5, nullptr, &g_both) == 0, "gone: both holders listed, nothing is shared");
+    // A donor: c resumes from b's pages; listing b as gone does not stop c from sharing them (the donor is the plan's).
+    std::vector<int> c;
+    pool.ensure(c, 0, 2 * T, nullptr);
+    const int with_donor = pool.resume_need(c, 2 * T, 4, &b);
+    check(with_donor == pool.resume_need(c, 2 * T, 4, &b, &g_store), "gone: references the plan does not touch change nothing");
+  }
+  // Against the calls: random holders sharing prefixes; the gone holders really released on a copy of the pool, then
+  // the calls the need stands for played there: it draws exactly needed / resume_need with `gone` from the free list.
+  std::mt19937 rng(29);
+  int cases = 0, lowered = 0;
+  for (int round = 0; round < 3000; ++round) {
+    KvPool pool(48);
+    std::vector<std::vector<int>> h(4);
+    for (int i = 0; i < 4; ++i) {
+      const int n = 1 + static_cast<int>(rng() % (8 * T));
+      if (i > 0 && rng() % 3) {
+        const int src = static_cast<int>(rng() % i), k = std::min<int>(n, int(h[src].size()) * T);
+        if (k > 0) pool.share(h[i], h[src], k);
+      }
+      pool.ensure(h[i], std::min<int>(static_cast<int>(h[i].size()) * T, n), n, nullptr);
+    }
+    pool.retire();
+    const int self = static_cast<int>(rng() % 4);
+    KvPool::Refs gone;
+    std::vector<int> gone_idx;
+    for (int i = 0; i < 4; ++i)
+      if (i != self && rng() % 2) {
+        gone.push_back(&h[i]);
+        gone_idx.push_back(i);
+      }
+    const bool step = rng() % 2;
+    int need = 0, need_plain = 0, from = 0, to = 0, reuse = 0, pages = 0;
+    if (step) {
+      from = static_cast<int>(rng() % (int(h[self].size()) * T + 1));
+      to = from + 1 + static_cast<int>(rng() % 16);
+      need = pool.needed(h[self], from, to, &gone);
+      need_plain = pool.needed(h[self], from, to);
+    } else {
+      reuse = static_cast<int>(rng() % (int(h[self].size()) * T + 1));
+      pages = KvPool::pages_for(reuse + 1 + static_cast<int>(rng() % (4 * T)));
+      need = pool.resume_need(h[self], reuse, pages, nullptr, &gone);
+      need_plain = pool.resume_need(h[self], reuse, pages, nullptr);
+    }
+    check(need <= need_plain, "gone: releasing other holders never raises the need");
+    lowered += need < need_plain;
+    KvPool play = pool;
+    std::vector<std::vector<int>> ph = h;
+    for (int i : gone_idx) release_all(play, ph[i]);
+    play.retire();
+    const int free0 = play.free_pages();
+    std::vector<KvPool::Copy> copies;
+    int used = 0;
+    if (step) {
+      check(play.needed(ph[self], from, to) == need, "gone: needed with gone equals needed once they are released");
+      if (!play.ensure(ph[self], from, to, &copies)) continue;
+      used = free0 - play.free_pages();
+    } else {
+      if (!play_resume(play, ph[self], reuse, pages, nullptr)) {
+        check(need > free0, "gone: the calls fail only when the need exceeds the free pages");
+        continue;
+      }
+      play.retire();
+      used = std::max(free0 - play.free_pages(), 0);
+    }
+    if (used != need) {
+      std::printf("  round %d: %s need %d, used %d\n", round, step ? "step" : "resume", need, used);
+      check(false, "gone: the need equals what the calls draw once the gone holders are released");
+    }
+    ++cases;
+  }
+  check(cases > 2000 && lowered > 300, "gone: enough cases, many where a gone holder lowers the need");
+}
+
+// P4c follow-up: kv_reclaim's gates at their edges, with counters for what was evicted.
+void reclaim_gates() {
+  using namespace ling::serve;
+  int cur_need = 0, cur_have = 0, kept_left = 0, source_left = 0, kept_ev = 0, source_ev = 0;
+  auto need = [&] { return cur_need; };
+  auto have = [&] { return cur_have; };
+  const std::vector<KvEvictNext> kept = {[&] {
+    if (kept_left == 0) return false;
+    --kept_left, ++kept_ev, ++cur_have;
+    return true;
+  }};
+  const std::vector<KvEvictNext> source = {[&] {
+    if (source_left == 0) return false;
+    --source_left, ++source_ev, cur_have += 2;
+    return true;
+  }};
+  auto reset = [&](int n, int h, int k, int s) {
+    cur_need = n, cur_have = h, kept_left = k, source_left = s, kept_ev = source_ev = 0;
+  };
+  // An empty kept tier and need_kept <= reach_kept: nothing to evict; the answer is need() <= have().
+  reset(3, 5, 0, 2);
+  check(kv_reclaim(need, have, {}, 3, 5, source, 3, 9, false) && source_ev == 0, "gates: fits already, empty kept: true");
+  reset(6, 5, 0, 2);
+  check(!kv_reclaim(need, have, {}, 5, 5, source, 6, 9, false) && source_ev == 0,
+        "gates: empty kept with need_kept <= reach_kept: false, the source untouched");
+  check(!kv_reclaim(need, have, {}, 5, 5, source, 6, 9, true) && source_ev == 0,
+        "gates: must does not reach the source while the kept gate holds");
+  // need_kept > reach_kept, need_all <= reach_all, an empty source tier: the kept tier alone is evicted.
+  reset(8, 5, 2, 0);
+  check(!kv_reclaim(need, have, kept, 8, 7, {}, 7, 7, false) && kept_ev == 2 && cur_have == 7,
+        "gates: empty source tier: the whole kept tier goes, then false");
+  reset(7, 5, 3, 0);
+  check(kv_reclaim(need, have, kept, 8, 7, {}, 7, 8, false) && kept_ev == 2,
+        "gates: empty source tier: kept evicted until it fits, no further");
+  // Both gates fail and !must: nothing is evicted, not even the kept tier.
+  reset(9, 5, 2, 1);
+  check(!kv_reclaim(need, have, kept, 9, 7, source, 10, 9, false) && kept_ev == 0 && source_ev == 0,
+        "gates: both gates fail without must: nothing evicted");
+  // must with both tiers empty: no eviction to make, the answer is need() <= have().
+  reset(9, 5, 0, 0);
+  check(!kv_reclaim(need, have, {}, 9, 5, {}, 9, 5, true), "gates: must with both tiers empty and short: false");
+  reset(4, 5, 0, 0);
+  check(kv_reclaim(need, have, {}, 9, 5, {}, 9, 5, true), "gates: must with both tiers empty and enough: true");
+  // must with both gates failing: everything goes, kept before source, until it fits.
+  reset(9, 5, 2, 2);
+  check(kv_reclaim(need, have, kept, 9, 7, source, 10, 9, true) && kept_ev == 2 && source_ev == 1,
+        "gates: must evicts kept first, then the source until it fits");
+}
+
+// P4c follow-up: a random walk of holders (sessions sharing prefixes, prefix KV store leaves holding a prefix's pages),
+// with running sessions nothing may evict, and a unit (an admission resuming from a donor session or a store leaf, or
+// a decode step) given kv_reclaim's tiers as Scheduler::pick gives them. Whenever kv_reclaim returns true the unit's
+// calls succeed; it never returns false when evicting the whole kept tier would have made the unit fit; and with must
+// it never returns false when evicting every holder would have (each played out on a copy of the pool).
+void reclaim_walk() {
+  using namespace ling::serve;
+  std::mt19937 rng(41);
+  int cases = 0, trues = 0, kept_fits = 0, source_used = 0, refused = 0;
+  for (int round = 0; round < 8000; ++round) {
+    const int P = 8 + static_cast<int>(rng() % 10);
+    KvPool pool(P + 1);
+    const int S = 3 + static_cast<int>(rng() % 3);
+    std::vector<std::vector<int>> sess(S), leaves;
+    std::vector<bool> running(S, false);
+    for (int s = 0; s < S; ++s) {
+      const int n = 1 + static_cast<int>(rng() % (6 * T));
+      if (s > 0 && rng() % 2) {
+        const int src = static_cast<int>(rng() % s), k = std::min<int>(n, int(sess[src].size()) * T);
+        if (k > 0) pool.share(sess[s], sess[src], k);
+      }
+      const int from = std::min<int>(static_cast<int>(sess[s].size()) * T, n);
+      if (!pool.ensure(sess[s], from, n, nullptr)) {
+        pool.truncate(sess[s], from);  // the pool is full: this one keeps what it shares
+        sess[s].resize(KvPool::pages_for(from));
+      }
+      running[s] = rng() % 4 == 0;
+    }
+    const int nl = static_cast<int>(rng() % 4);
+    for (int l = 0; l < nl; ++l) {  // a store leaf: the first pages of a session (kv_insert holds a prefix)
+      const int s = static_cast<int>(rng() % S);
+      int m = 0;
+      while (m < static_cast<int>(sess[s].size()) && sess[s][m]) ++m;
+      if (m == 0) continue;
+      m = 1 + static_cast<int>(rng() % m);
+      leaves.emplace_back(sess[s].begin(), sess[s].begin() + m);
+      for (int p : leaves.back()) pool.retain(p);
+    }
+    pool.retire();
+    const int self = static_cast<int>(rng() % S);
+    running[self] = false;
+    const bool step = rng() % 3 == 0;
+    // The plan's source: another session (a donor) or a store leaf, for an admission only.
+    int donor_s = -1, donor_l = -1, reuse = 0, pages = 0, from = 0, to = 0;
+    if (step) {
+      from = static_cast<int>(rng() % (int(sess[self].size()) * T + 1));
+      to = from + 1 + static_cast<int>(rng() % 16);
+    } else {
+      pages = 1 + static_cast<int>(rng() % 12);
+      const int pick = static_cast<int>(rng() % 3);
+      if (pick == 1) {
+        const int s = static_cast<int>(rng() % S);
+        if (s != self && !running[s] && !sess[s].empty() && sess[s][0]) donor_s = s;
+      } else if (pick == 2 && !leaves.empty()) {
+        donor_l = static_cast<int>(rng() % leaves.size());
+      }
+      const std::vector<int>* d = donor_s >= 0 ? &sess[donor_s] : donor_l >= 0 ? &leaves[donor_l] : nullptr;
+      int covered = 0;  // positions the source holds from 0 with no hole
+      if (d) {
+        while (covered < static_cast<int>(d->size()) && (*d)[covered]) ++covered;
+        covered *= T;
+      } else {
+        covered = static_cast<int>(sess[self].size()) * T;  // its own history
+      }
+      reuse = std::min<int>(static_cast<int>(rng() % (pages * T)), covered);
+      if (d && reuse == 0) donor_s = donor_l = -1;
+    }
+    auto source_table = [&]() -> std::vector<int>* {
+      return donor_s >= 0 ? &sess[donor_s] : donor_l >= 0 ? &leaves[donor_l] : nullptr;
+    };
+    // The tiers: the kept tier is every store leaf but the source, then every idle session but self and the donor,
+    // in a random (LRU) order; the source tier the donor or the source leaf.
+    std::vector<std::vector<int>*> kept_h;
+    for (int l = 0; l < static_cast<int>(leaves.size()); ++l)
+      if (l != donor_l) kept_h.push_back(&leaves[l]);
+    for (int s = 0; s < S; ++s)
+      if (s != self && s != donor_s && !running[s]) kept_h.push_back(&sess[s]);
+    std::shuffle(kept_h.begin(), kept_h.end(), rng);
+    std::vector<std::vector<int>*> source_h;
+    if (source_table()) source_h.push_back(source_table());
+    KvPool::Refs gone_kept(kept_h.begin(), kept_h.end()), gone_all = gone_kept;
+    for (auto* t : source_h) gone_all.push_back(t);
+    bool source_gone = false;
+    auto need = [&] {
+      if (step) return pool.needed(sess[self], from, to);
+      if (source_gone) return pool.resume_need(sess[self], 0, pages, nullptr);  // planned again: cold
+      const std::vector<int>* d = source_table();
+      return pool.resume_need(sess[self], reuse, pages, d);
+    };
+    auto have = [&] { return pool.free_pages() + pool.pending_pages(); };
+    const int base = have();
+    const int need_kept = step ? pool.needed(sess[self], from, to, &gone_kept)
+                               : pool.resume_need(sess[self], reuse, pages, source_table(), &gone_kept);
+    const int reach_kept = base + pool.reclaimable(gone_kept);
+    const int need_all = step ? pool.needed(sess[self], from, to, &gone_all)
+                              : pool.resume_need(sess[self], 0, pages, nullptr, &gone_all);
+    const int reach_all = base + pool.reclaimable(gone_all);
+    const bool must = rng() % 2;
+    // Played out on copies: the unit after the whole kept tier is gone, and after every holder is.
+    auto play = [&](bool all) {
+      KvPool q = pool;
+      std::vector<std::vector<int>> qs = sess, ql = leaves;
+      auto local = [&](std::vector<int>* t) -> std::vector<int>* {
+        for (int s = 0; s < S; ++s)
+          if (t == &sess[s]) return &qs[s];
+        for (size_t l = 0; l < leaves.size(); ++l)
+          if (t == &leaves[l]) return &ql[l];
+        return nullptr;
+      };
+      for (auto* t : kept_h) release_all(q, *local(t));
+      if (all)
+        for (auto* t : source_h) release_all(q, *local(t));
+      q.retire();
+      if (step) return q.ensure(qs[self], from, to, nullptr);
+      const std::vector<int>* d = all ? nullptr : (source_table() ? local(source_table()) : nullptr);
+      return play_resume(q, qs[self], all ? 0 : reuse, pages, d);
+    };
+    const bool fits_kept = play(false), fits_all = play(true);
+    size_t kept_i = 0;
+    const std::vector<KvEvictNext> kept = {[&] {
+      if (kept_i >= kept_h.size()) return false;
+      release_all(pool, *kept_h[kept_i++]);
+      return true;
+    }};
+    const std::vector<KvEvictNext> source = {[&] {
+      if (source_gone || source_h.empty()) return false;
+      release_all(pool, *source_h[0]);
+      source_gone = true;
+      return true;
+    }};
+    const bool ok = kv_reclaim(need, have, kept, need_kept, reach_kept, source, need_all, reach_all, must);
+    ++cases;
+    if (fits_kept && !ok) {
+      std::printf("  round %d: kept tier fits but kv_reclaim refused (need_kept %d reach_kept %d, %s)\n", round, need_kept,
+                  reach_kept, step ? "step" : "admission");
+      check(false, "walk: kv_reclaim never refuses a unit the kept tier's eviction makes fit");
+    }
+    if (must && fits_all && !ok) {
+      std::printf("  round %d: everything gone fits but kv_reclaim refused with must\n", round);
+      check(false, "walk: with must, kv_reclaim never refuses a unit that fits once everything is gone");
+    }
+    kept_fits += fits_kept;
+    refused += !ok;
+    if (!ok) continue;
+    ++trues;
+    source_used += source_gone;
+    // The unit's calls, as the engine makes them after the reclaim (the deferred frees retired first).
+    pool.retire();
+    bool ran = false;
+    if (step) {
+      ran = pool.ensure(sess[self], from, to, nullptr);
+    } else {
+      const std::vector<int>* d = source_gone ? nullptr : source_table();
+      ran = play_resume(pool, sess[self], source_gone ? 0 : reuse, pages, d);
+    }
+    if (!ran) {
+      std::printf("  round %d: kv_reclaim true but the %s failed (source gone %d)\n", round, step ? "step" : "prefill",
+                  source_gone);
+      check(false, "walk: whenever kv_reclaim returns true the unit's calls succeed");
+    }
+  }
+  std::printf("  reclaim walk: %d cases, %d true (%d after evicting the source), %d refused, %d where the kept tier fits\n",
+              cases, trues, source_used, refused, kept_fits);
+  check(trues > 4000 && refused > 400 && source_used > 40, "walk: enough cases of each outcome");
+}
+
 int main() {
   basics();
   sharing();
@@ -686,6 +1034,9 @@ int main() {
   random_walk();
   plan();
   policy();
+  gone_counts();
+  reclaim_gates();
+  reclaim_walk();
   std::printf(failures ? "KV POOL TESTS FAILED (%d)\n" : "all kv pool tests passed\n", failures);
   return failures ? 1 : 0;
 }
