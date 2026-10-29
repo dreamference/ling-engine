@@ -102,6 +102,29 @@ void Engine::lora_upload(int slot, const LoraAdapter& adapter) {
         "upload table");
 }
 
+LoraModelShape Engine::lora_shape() const {
+  const ModelConfig c = model_->config();
+  LoraModelShape m;
+  m.layers = c.layers;
+  m.gdn_q = m.gdn_k = c.lin_k_heads * c.lin_k_dim;
+  m.gdn_v = c.lin_value_size();
+  m.shape = [c](int layer, LoraProj p) -> std::pair<int, int> {
+    const int H = c.hidden, qsize = c.heads * c.head_dim, kvsize = c.kv_heads * c.head_dim;
+    const bool attn = c.full_attention[layer];
+    switch (p) {  // {out, in}; {0, 0}: the layer has no such projection
+      case LoraProj::Q: return attn ? std::pair{2 * qsize, H} : std::pair{0, 0};  // q and its gate
+      case LoraProj::K:
+      case LoraProj::V: return attn ? std::pair{kvsize, H} : std::pair{0, 0};
+      case LoraProj::O: return attn ? std::pair{H, qsize} : std::pair{0, 0};
+      case LoraProj::InQkv: return attn ? std::pair{0, 0} : std::pair{c.lin_conv_channels(), H};
+      case LoraProj::InZ: return attn ? std::pair{0, 0} : std::pair{c.lin_value_size(), H};
+      case LoraProj::Out: return attn ? std::pair{0, 0} : std::pair{H, c.lin_value_size()};
+    }
+    return {0, 0};
+  };
+  return m;
+}
+
 kernels::LoraRows Engine::lora_rows(std::span<const Seg> segs) const {
   kernels::LoraRows rows;
   if (opts_.lora_slots <= 0) return rows;

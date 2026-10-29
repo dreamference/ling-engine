@@ -426,6 +426,8 @@ class Engine {
   // does not fit the slot (it was checked against the model at load, so only a bug).
   int lora_slots() const { return opts_.lora_slots; }
   void lora_upload(int slot, const LoraAdapter& adapter);
+  // The target's projection shapes the loader checks an adapter against (LoraLibrary's target).
+  LoraModelShape lora_shape() const;
   // Makes session i active for the next pass, with no other effect (the scheduler switches between the
   // sessions of its running requests, M4 §3).
   void select_session(int i);

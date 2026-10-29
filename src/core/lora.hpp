@@ -138,6 +138,8 @@ class LoraSlots {
   explicit LoraSlots(int n) : slots_(static_cast<size_t>(n)) {}
   int acquire(uint64_t id, bool* upload);
   void release(int slot);
+  // The slot holds no adapter after all (its upload failed): the next acquire of any id may take it, and uploads.
+  void forget(int slot) { slots_[static_cast<size_t>(slot)].id = 0; }
   int slot_of(uint64_t id) const;  // -1: not resident
   int refs(int slot) const { return slots_[static_cast<size_t>(slot)].refs; }
   uint64_t id(int slot) const { return slots_[static_cast<size_t>(slot)].id; }

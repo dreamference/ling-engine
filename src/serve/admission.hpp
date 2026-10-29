@@ -46,6 +46,8 @@ inline constexpr size_t kDraftRingBytes = size_t(5) * 2 * 8224 * 1024 * 2;
 // the side prefill, logits, the checkpoint store, graphs), measured on node-b on 2026-10-27: 2.5-3.4 GB at one to
 // four sessions; 4 GB with margin.
 inline constexpr size_t kScratchBytes = size_t(4) << 30;
+// One LoRA GPU slot (Engine::lora_alloc: rank 16 on every site of the 64 layers, about 95 MB), rounded up.
+inline constexpr size_t kLoraSlotPlanBytes = size_t(100) << 20;
 
 // The full-attention layers' BF16 K and V of one position.
 inline size_t kv_bytes_per_token(const ModelConfig& c) {

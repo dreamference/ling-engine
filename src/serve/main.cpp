@@ -99,6 +99,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <deque>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -256,6 +257,12 @@ struct ServerContext {
   int image_pad = -1;
   ImageRegistry* images = nullptr;
   ProcessorConfig processor;
+  // LoRA adapters (LORA §4): the loaded set (nullptr: no --lora-library), read and changed on the HTTP threads under
+  // lora_mu; the GPU slots, the engine thread's only; the key the adapter routes ask for (empty: they are off).
+  LoraLibrary* lora_lib = nullptr;
+  std::mutex lora_mu;
+  LoraSlots* lora_slots = nullptr;
+  std::string api_key;
 };
 
 // What a job reports back, called on the engine thread.
@@ -285,6 +292,11 @@ struct Job {
   std::shared_ptr<std::atomic<bool>> cancelled;
   int session = -1;    // the session it runs in (bound when the scheduler admits it)
   bool fresh = false;  // a new session in that slot
+  // Its adapter (nullptr: the base), held until it ends even if the adapter is unloaded meanwhile; the GPU slot it
+  // holds from admission on (-1: none), and whether the slot still has to be filled with the adapter's weights.
+  std::shared_ptr<const LoraAdapter> lora;
+  int lora_slot = -1;
+  bool lora_upload = false;
 };
 
 // P4b (--kv-pages): a prompt whose KV pages (with the two of growth it is admitted with) exceed the whole page pool
@@ -425,9 +437,16 @@ class Scheduler {
           continue;
         }
       }
+      // LORA §3: a job on an adapter is admitted with the adapter's GPU slot, and waits while every slot holds another
+      // adapter a running request uses (max_loras_per_batch); the jobs behind it may still run.
+      int lslot = -1;
+      bool upload = false;
+      if (queue_[j].lora && (lslot = ctx_.lora_slots->acquire(queue_[j].lora->id, &upload)) < 0) continue;
       out = std::move(queue_[j]);
       out.session = s;
       out.fresh = fresh;
+      out.lora_slot = lslot;
+      out.lora_upload = upload;
       queue_.erase(queue_.begin() + j);
       std::lock_guard<std::mutex> m(ctx_.metrics.mu);
       ctx_.metrics.queued -= 1;
@@ -475,7 +494,11 @@ class Scheduler {
       if (exceeds_context(j.prompt.size(), eng.max_context())) throw ContextOverflow(j.prompt.size(), eng.max_context());
       if (eng.kv_paged() && eng.kv_admit_pages(j.prompt.size()) > eng.kv_pages_total())
         throw KvPoolTooSmall(j.prompt.size(), eng.kv_pages_total());
-      eng.activate_session(j.session, j.req.session_key, j.fresh, j.req.share_scope);
+      if (j.lora_upload) {
+        eng.lora_upload(j.lora_slot, *j.lora);
+        j.lora_upload = false;
+      }
+      eng.activate_session(j.session, j.req.session_key, j.fresh, j.req.share_scope, j.lora_slot);
       try {
         r->cur = eng.begin_prefill(j.prompt, false, j.images.empty() ? nullptr : &j.images);
       } catch (const KvPoolExhausted&) {
@@ -489,6 +512,7 @@ class Scheduler {
       // P4c: the pool is short after all (pages shared at admission's count were let go of meanwhile): while a
       // request runs, the job goes back to the front of the queue and is admitted again once one ends.
       const int session = j.session;
+      release_lora(j);  // taken again when it is admitted again
       if (running_.empty()) {
         fail(*r, e);
       } else {
@@ -502,6 +526,7 @@ class Scheduler {
       return;
     } catch (const std::exception& e) {
       fail(*r, e);
+      release_lora(j);
       eng.touch_session(j.session);
       return;
     }
@@ -510,6 +535,16 @@ class Scheduler {
     ctx_.metrics.running = static_cast<int>(running_.size());
     ctx_.metrics.sessions_resident = eng.sessions_resident();
     ctx_.metrics.session_evictions = static_cast<double>(eng.session_evictions());
+  }
+
+  // Gives back the job's GPU slot (it ended, failed or went back to the queue); a slot whose upload did not finish
+  // holds no adapter.
+  void release_lora(Job& j) {
+    if (j.lora_slot < 0) return;
+    ctx_.lora_slots->release(j.lora_slot);
+    if (j.lora_upload) ctx_.lora_slots->forget(j.lora_slot);
+    j.lora_slot = -1;
+    j.lora_upload = false;
   }
 
   void fail(Running& r, const std::exception& e) {
@@ -569,6 +604,7 @@ class Scheduler {
       for (Running* e : ended) {
         if (e->side_flight) ctx_.engine->side_abandon();  // its chunk's pass finishes before the session is reused
         ctx_.engine->touch_session(e->job.session);  // the session's clock restarts however the request ended
+        release_lora(e->job);
         running_.erase(std::find_if(running_.begin(), running_.end(), [&](const auto& p) { return p.get() == e; }));
       }
       {
@@ -1120,7 +1156,13 @@ void emit_event(Exchange& ex, const std::string& type, json payload) {
 
 void send_json(proxygen::ResponseHandler* d, int status, const json& body) {
   ResponseBuilder(d)
-      .status(status, status == 200 ? "OK" : status == 400 ? "Bad Request" : status == 404 ? "Not Found" : "Error")
+      .status(status, status == 200   ? "OK"
+                      : status == 400 ? "Bad Request"
+                      : status == 401 ? "Unauthorized"
+                      : status == 403 ? "Forbidden"
+                      : status == 404 ? "Not Found"
+                      : status == 413 ? "Payload Too Large"
+                                      : "Error")
       .header("Content-Type", "application/json")
       .body(dump_json(body))
       .sendWithEOM();
@@ -1145,6 +1187,7 @@ class Handler : public proxygen::RequestHandler {
     method_ = headers->getMethodString();
     path_ = headers->getPath();
     share_scope_ = share_scope_of(headers->getHeaders().getSingleOrEmpty("X-Ling-Share-Scope"));
+    authorization_ = headers->getHeaders().getSingleOrEmpty("Authorization");
     ex_->downstream = downstream_;
     ex_->evb = folly::EventBaseManager::get()->getEventBase();
   }
@@ -1197,7 +1240,17 @@ class Handler : public proxygen::RequestHandler {
       json model = {{"id", ctx_.model_name}, {"object", "model"}, {"created", std::time(nullptr)},
                     {"owned_by", "ling-engine"}, {"root", ctx_.model_name},
                     {"max_model_len", ctx_.engine->max_context()}};
-      send_json(downstream_, 200, json{{"object", "list"}, {"data", json::array({model})}});
+      json data = json::array({model});
+      if (ctx_.lora_lib) {  // each loaded adapter as base+name (LORA §4), after the base the launcher reads first
+        std::lock_guard<std::mutex> l(ctx_.lora_mu);
+        for (const std::string& n : ctx_.lora_lib->names()) {
+          json m = model;
+          m["id"] = ctx_.model_name + "+" + n;
+          m["parent"] = ctx_.model_name;
+          data.push_back(m);
+        }
+      }
+      send_json(downstream_, 200, json{{"object", "list"}, {"data", data}});
     } else if (method_ == "GET" && (path_ == "/model_info" || path_ == "/get_model_info")) {
       // SGLang's answer, which Mightling's launcher reads to advertise image input (VISION §20.6).
       send_json(downstream_, 200,
@@ -1210,6 +1263,9 @@ class Handler : public proxygen::RequestHandler {
           .sendWithEOM();
     } else if (method_ == "GET" && path_ == "/spec_stats") {
       send_json(downstream_, 200, ctx_.metrics.spec_json());
+    } else if (method_ == "POST" && (path_ == "/load_lora_adapter" || path_ == "/v1/load_lora_adapter" ||
+                                     path_ == "/unload_lora_adapter" || path_ == "/v1/unload_lora_adapter")) {
+      lora_route(path_.find("unload") == std::string::npos);
     } else if (method_ == "POST" && (path_ == "/v1/responses" || path_ == "/v1/chat/completions" ||
                                      path_ == "/v1/completions") &&
                refuse_for_memory()) {
@@ -1221,6 +1277,92 @@ class Handler : public proxygen::RequestHandler {
     } else {
       send_json(downstream_, 404, error_body("no route for " + method_ + " " + path_, "not_found"));
     }
+  }
+
+  // Whether the request carries the server's key (--api-key) as a Bearer token; answers 403 (no key: the routes are
+  // off) or 401 when it does not.
+  bool authorized() {
+    if (ctx_.api_key.empty()) {
+      send_json(downstream_, 403, error_body("the adapter routes are off: the server was started without --api-key",
+                                             "invalid_request_error", "forbidden"));
+      return false;
+    }
+    const std::string want = "Bearer " + ctx_.api_key;
+    size_t diff = want.size() ^ authorization_.size();  // compared in full, whatever differs
+    for (size_t i = 0; i < want.size(); ++i)
+      diff |= size_t(static_cast<unsigned char>(want[i]) ^ (i < authorization_.size() ? static_cast<unsigned char>(authorization_[i]) : 0u));
+    if (diff == 0) return true;
+    send_json(downstream_, 401, error_body("a wrong or missing API key", "invalid_request_error", "invalid_api_key"));
+    return false;
+  }
+
+  // POST /load_lora_adapter {"lora_name": N[, "lora_path": D]} and /unload_lora_adapter {"lora_name": N} (LORA §4,
+  // SGLang's routes; also under /v1/, vLLM's). A load reads the adapter from the library's directory D (default N):
+  // one name in the library, never a path the request gives, and the library's realpath check keeps symlinks in it.
+  void lora_route(bool load) {
+    if (!authorized()) return;
+    if (!ctx_.lora_lib) {
+      send_json(downstream_, 400,
+                error_body("the engine was started without an adapter library (--lora-library)", "invalid_request_error"));
+      return;
+    }
+    std::string name, dir;
+    try {
+      std::string text;
+      if (auto buf = body_.move()) text = buf->moveToFbString().toStdString();
+      const json body = json::parse(text);
+      name = body.value("lora_name", std::string());
+      dir = body.value("lora_path", name);
+    } catch (const std::exception& e) {
+      send_json(downstream_, 400, error_body(std::string("bad request body: ") + e.what(), "invalid_request_error"));
+      return;
+    }
+    if (!lora_name_ok(name) || !lora_name_ok(dir)) {
+      send_json(downstream_, 400,
+                error_body("lora_name and lora_path are each one name in the adapter library (1 to 64 of A-Z a-z 0-9 . _ -)",
+                           "invalid_request_error"));
+      return;
+    }
+    std::lock_guard<std::mutex> l(ctx_.lora_mu);
+    if (!load) {
+      if (!ctx_.lora_lib->unload(name)) {
+        send_json(downstream_, 404, error_body("adapter " + name + " is not loaded", "invalid_request_error", "model_not_found"));
+        return;
+      }
+      std::fprintf(stderr, "lora: unloaded %s\n", name.c_str());
+      send_json(downstream_, 200, json{{"success", true}, {"message", "unloaded " + name}, {"loaded_adapters", ctx_.lora_lib->names()}});
+      return;
+    }
+    try {
+      const auto a = ctx_.lora_lib->load(name, ctx_.lora_lib->root() + "/" + dir);
+      std::fprintf(stderr, "lora: loaded %s (rank %d, %zu MB%s)\n", name.c_str(), a->target.rank, a->bytes() >> 20,
+                   a->has_drafter ? ", with the drafter's" : "");
+    } catch (const std::exception& e) {
+      send_json(downstream_, 400, error_body(e.what(), "invalid_request_error"));
+      return;
+    }
+    send_json(downstream_, 200, json{{"success", true}, {"message", "loaded " + name}, {"loaded_adapters", ctx_.lora_lib->names()}});
+  }
+
+  // The request's adapter from its model (adapter_of, LORA §4): nullptr for the base. Throws std::invalid_argument (a
+  // malformed name) or ModelNotFound (another base, an adapter not loaded); mixes the adapter into the share scope, so
+  // its sessions and prefix entries are its own.
+  std::shared_ptr<const LoraAdapter> resolve_adapter(Request& req) {
+    const std::string name = adapter_of(req.model, ctx_.model_name);
+    if (name.empty()) return nullptr;
+    std::shared_ptr<const LoraAdapter> a;
+    if (ctx_.lora_lib) {
+      std::lock_guard<std::mutex> l(ctx_.lora_mu);
+      a = ctx_.lora_lib->find(name);
+    }
+    if (!a) throw ModelNotFound("the model " + req.model + " does not exist: no adapter " + name + " is loaded");
+    req.share_scope = lora_scope(req.share_scope, a.get());
+    return a;
+  }
+
+  // The model a response names: the base, or base+adapter.
+  std::string model_of(const Job& job) const {
+    return job.lora ? ctx_.model_name + "+" + job.lora->name : ctx_.model_name;
   }
 
   // Images (VISION §20.3 (c), §20.6): each URL decoded and preprocessed here, on the HTTP thread; each <|image_pad|>
@@ -1247,6 +1389,7 @@ class Handler : public proxygen::RequestHandler {
       json body = json::parse(text);
       job.req = parse_request(body, chat, ctx_.vision);
       job.req.share_scope = share_scope_;
+      job.lora = resolve_adapter(job.req);
       job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
       job.prompt = job.req.prompt_ids.empty() ? ctx_.tok->encode(job.req.prompt_text) : job.req.prompt_ids;
       if (!job.req.prompt_ids.empty())
@@ -1256,6 +1399,9 @@ class Handler : public proxygen::RequestHandler {
       attach_images(job);
     } catch (const ImageError& e) {
       send_json(downstream_, 400, error_body(e.what(), "invalid_request_error", e.code));
+      return;
+    } catch (const ModelNotFound& e) {
+      send_json(downstream_, 404, error_body(e.what(), "invalid_request_error", "model_not_found"));
       return;
     } catch (const std::exception& e) {
       send_json(downstream_, 400, error_body(e.what(), "invalid_request_error"));
@@ -1268,7 +1414,7 @@ class Handler : public proxygen::RequestHandler {
     job.cancelled = ex_->cancelled;
     const std::string id = new_id(chat ? "chatcmpl-" : "cmpl-");
     const long created = std::time(nullptr);
-    const std::string model = ctx_.model_name;
+    const std::string model = model_of(job);
     auto ex = ex_;
     const Request req = job.req;
 
@@ -1473,11 +1619,15 @@ class Handler : public proxygen::RequestHandler {
       if (auto buf = body_.move()) text = buf->moveToFbString().toStdString();
       job.req = parse_responses_request(json::parse(text), ctx_.vision);
       job.req.share_scope = share_scope_;
+      job.lora = resolve_adapter(job.req);
       job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
       job.prompt = ctx_.tok->encode(job.req.prompt_text);
       attach_images(job);
     } catch (const ImageError& e) {
       send_json(downstream_, 400, error_body(e.what(), "invalid_request_error", e.code));
+      return;
+    } catch (const ModelNotFound& e) {
+      send_json(downstream_, 404, error_body(e.what(), "invalid_request_error", "model_not_found"));
       return;
     } catch (const std::exception& e) {
       send_json(downstream_, 400, error_body(e.what(), "invalid_request_error"));
@@ -1487,7 +1637,7 @@ class Handler : public proxygen::RequestHandler {
     const Request req = job.req;
     const bool repetition_completed = ctx_.repetition_completed;
     auto ex = ex_;
-    const std::string model = ctx_.model_name;
+    const std::string model = model_of(job);
     const long created = std::time(nullptr);
 
     // Events are numbered when they are written, on the event base (emit_event), so a keep-alive written
@@ -1594,6 +1744,7 @@ class Handler : public proxygen::RequestHandler {
   Scheduler& scheduler_;
   std::string method_, path_;
   uint64_t share_scope_ = 0;  // X-Ling-Share-Scope (P4c, share_scope_of)
+  std::string authorization_;  // the Authorization header (the adapter routes' key)
   folly::IOBufQueue body_{folly::IOBufQueue::cacheChainLength()};
   bool too_large_ = false;
   std::shared_ptr<Exchange> ex_ = std::make_shared<Exchange>();
@@ -1637,6 +1788,10 @@ int main(int argc, char** argv) {
   std::string vision = "on", jpeg = "gpu";  // images (VISION §20.3)
   long vision_max_pixels = 16777216;
   int vision_cache_mb = 512;
+  // LoRA adapters (LORA §4): the library, the adapters loaded at start (name=dir, each dir one name in the library),
+  // the adapters in one batch (the base counts as one, as in SGLang: max-1 GPU slots), those held in host memory.
+  std::string lora_library, lora_paths, api_key, api_key_file;
+  int max_loras_per_batch = 4, max_loaded_loras = 8;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -1688,13 +1843,19 @@ int main(int argc, char** argv) {
     else if (a == "--plan-only") plan_only = true;
     else if (a == "--repetition-detection") repetition_arg = next();
     else if (a == "--repetition-report") repetition_report = next();
+    else if (a == "--lora-library") lora_library = next();
+    else if (a == "--lora-paths") lora_paths = next();
+    else if (a == "--max-loras-per-batch") max_loras_per_batch = std::stoi(next());
+    else if (a == "--max-loaded-loras") max_loaded_loras = std::stoi(next());
+    else if (a == "--api-key") api_key = next();
+    else if (a == "--api-key-file") api_key_file = next();
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N]] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N]] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
     return 2;
   }
   for (auto [flag, v] : {std::pair<const char*, std::optional<int>>{"--sessions", sessions_arg},
@@ -1778,6 +1939,23 @@ int main(int argc, char** argv) {
   ling::serve::set_jpeg_decoder(jpeg == "gpu" ? ling::serve::JpegDecoder::Gpu : ling::serve::JpegDecoder::Cpu);
   opts.vision = vision == "on";
   opts.vision_max_pixels = vision_max_pixels;
+  if (!lora_library.empty() && (max_loras_per_batch < 2 || max_loras_per_batch > 9 || max_loaded_loras < 1)) {
+    std::cerr << "--max-loras-per-batch is 2 to 9 (the base counts as one), --max-loaded-loras at least 1\n";
+    return 2;
+  }
+  if (!lora_paths.empty() && lora_library.empty()) {
+    std::cerr << "--lora-paths needs --lora-library\n";
+    return 2;
+  }
+  opts.lora_slots = lora_library.empty() ? 0 : max_loras_per_batch - 1;
+  if (const char* e = std::getenv("LING_API_KEY"); e && api_key.empty()) api_key = e;  // kept out of the process list
+  if (!api_key_file.empty()) {
+    std::ifstream f(api_key_file);
+    if (!f || !std::getline(f, api_key) || api_key.empty()) {
+      std::cerr << "--api-key-file " << api_key_file << ": no key in it\n";
+      return 2;
+    }
+  }
   opts.vision_cache_mb = vision_cache_mb;
   for (auto [var, dst] : {std::pair<const char*, long*>{"LING_HOST_RESERVE_MB", &host_reserve_mb},
                           std::pair<const char*, long*>{"LING_ADMIT_RESERVE_MB", &admit_reserve_mb},
@@ -1802,7 +1980,8 @@ int main(int argc, char** argv) {
     const size_t weights = as::checkpoint_bytes(model_dir) + as::checkpoint_bytes(draft_dir);
     // With images on (VISION §20.4) the tower's scratch at the largest image and the embedding cache come on top of
     // the checkpoint's bytes (which hold the tower's weights): 1,100 MB at 65,536 patches, an upper bound below it.
-    const size_t scratch = as::kScratchBytes + (opts.vision ? size_t(1100 + vision_cache_mb) << 20 : 0);
+    const size_t scratch = as::kScratchBytes + (opts.vision ? size_t(1100 + vision_cache_mb) << 20 : 0) +
+                           size_t(opts.lora_slots) * as::kLoraSlotPlanBytes;
     const long avail = as::mem_available_mb();
     const int full_context = as::model_full_context(model_dir + "/config.json");  // 0: sized from 65,536
     const as::SizeChoice size = as::choose_size(cfg, weights, scratch, !draft_dir.empty(), avail, host_reserve_mb,
@@ -1856,7 +2035,8 @@ int main(int argc, char** argv) {
     namespace as = ling::serve;
     const ling::ModelConfig cfg = ling::ModelConfig::from_file(model_dir + "/config.json");
     const size_t weights = as::checkpoint_bytes(model_dir) + as::checkpoint_bytes(draft_dir);
-    const size_t scratch = as::kScratchBytes + (opts.vision ? size_t(1100 + vision_cache_mb) << 20 : 0);
+    const size_t scratch = as::kScratchBytes + (opts.vision ? size_t(1100 + vision_cache_mb) << 20 : 0) +
+                           size_t(opts.lora_slots) * as::kLoraSlotPlanBytes;
     const as::MemoryPlan mp = as::plan_memory(cfg, weights, sessions, max_context, !draft_dir.empty(), false, scratch);
     std::cout << "{\"sessions\":" << sessions << ",\"batch\":" << std::min(batch, sessions)
               << ",\"max_context\":" << max_context << ",\"planned_bytes\":" << mp.total() << "}\n";
@@ -1909,6 +2089,34 @@ int main(int argc, char** argv) {
     name = name.substr(name.find_last_of('/') + 1);
   }
   ctx.model_name = name;
+  ctx.api_key = api_key;
+  std::unique_ptr<ling::LoraLibrary> lora_lib;
+  std::unique_ptr<ling::LoraSlots> lora_slots;
+  if (!lora_library.empty()) {
+    try {
+      lora_lib = std::make_unique<ling::LoraLibrary>(lora_library, max_loaded_loras, engine.lora_shape(),
+                                                     ling::LoraModelShape{});
+      for (size_t at = 0; at < lora_paths.size();) {
+        const size_t comma = std::min(lora_paths.find(',', at), lora_paths.size());
+        const std::string item = lora_paths.substr(at, comma - at);
+        at = comma + 1;
+        const size_t eq = item.find('=');
+        const std::string n = item.substr(0, eq), dir = eq == std::string::npos ? n : item.substr(eq + 1);
+        if (!ling::lora_name_ok(dir)) throw std::runtime_error("--lora-paths " + item + ": DIR is one name in the library");
+        const auto a = lora_lib->load(n, lora_lib->root() + "/" + dir);
+        std::cerr << "lora: loaded " << n << " (rank " << a->target.rank << ", " << (a->bytes() >> 20) << " MB)\n";
+      }
+    } catch (const std::exception& e) {
+      std::cerr << "lora: " << e.what() << "\n";
+      return 2;
+    }
+    lora_slots = std::make_unique<ling::LoraSlots>(engine.lora_slots());
+    ctx.lora_lib = lora_lib.get();
+    ctx.lora_slots = lora_slots.get();
+    std::cerr << "lora: library " << lora_lib->root() << ", " << engine.lora_slots() << " GPU slots, at most "
+              << max_loaded_loras << " loaded; adapter routes " << (api_key.empty() ? "off (no --api-key)" : "on")
+              << "\n";
+  }
   ling::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended, side_share);
 
   proxygen::HTTPServerOptions options;
