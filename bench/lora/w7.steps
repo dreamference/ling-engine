@@ -1,0 +1,13 @@
+# Adapters window 7: the LoRA kernels' missing pdl_begin() (0a76aa8). w4 found origin/main's unfused paths pass
+# spec-check with no adapter; w6 found the branch fails it with the zero adapter, every run with --pdl.
+source $(dirname ${BASH_SOURCE[0]})/common.sh
+# The branch with the LoRA kernels' missing pdl_begin() fixed: the zero adapter, then the rand adapter on the
+# target, then the same without --pdl (if the fix is the whole story, all three pass).
+SC="$B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --spec-check --graphs"
+step fix-zero $SC --pdl --lora $LIB/zero
+step fix-rand-target env LING_LORA_DRAFT_SITES=0 $SC --pdl --lora $LIB/rand
+step fix-zero-nopdl $SC --lora $LIB/zero
+# Then the rest of w6's spec-check with the fix: the drafter's sites and the target's split by site.
+step fix-rand-drafter env LING_LORA_SITES=0 $SC --pdl --lora $LIB/rand
+step fix-rand-attn env LING_LORA_SITES=3 LING_LORA_DRAFT_SITES=0 $SC --pdl --lora $LIB/rand
+step fix-rand-gdn env LING_LORA_SITES=12 LING_LORA_DRAFT_SITES=0 $SC --pdl --lora $LIB/rand
