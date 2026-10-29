@@ -7,7 +7,7 @@
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
 //              [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0]
-//              [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--no-kv-pages | --kv-pool-mb N]
+//              [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N] | --no-kv-pages]
 //
 // --sessions N (default: chosen at start, --auto-size below; 2 without it; M4 §1) keeps N resident sessions, each with
 // its own KV cache and state, so N agent tasks that alternate keep their histories warm. A request runs in the session
@@ -46,9 +46,9 @@
 // how often a streamed request that has produced no token yet is sent a keep-alive (API §3, §4).
 // --prefill-bf16 keeps the prefill's DeltaNet intermediates in BF16 as production does (B34; not exact, off
 // by default: MILESTONES §14).
-// The full-attention KV is kept in 64-position pages behind a page table per session (BATCHING §5.3, P4; on by
-// default since P4d, --no-kv-pages the flat slots; exact: only addresses change; LING_KV_PAGES=0/1 overrides; a bare
-// --kv-pages is still accepted). The pages come from one pool allocated
+// With --kv-pages the full-attention KV is kept in 64-position pages behind a page table per session (BATCHING
+// §5.3, P4; off by default, the flat slots, --no-kv-pages says so explicitly; exact: only addresses change;
+// LING_KV_PAGES=0/1 overrides). The pages come from one pool allocated
 // at start: what MemAvailable leaves after the memory plan, the prefix KV store's budget and --host-reserve-mb, at most
 // --sessions x --max-context positions; or --kv-pool-mb N, refused at start when the plan with it does not fit. A
 // session then costs its fixed part (~0.5 GB) and 64 KB for each position it holds, so --sessions 4 --max-context
@@ -1624,7 +1624,7 @@ int main(int argc, char** argv) {
   int port = 8000, max_context = 0, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 7, prefix_kv_mb = -1;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
-  bool kv_pages = true;  // P4d: paged KV by default; --no-kv-pages the flat slots
+  bool kv_pages = false;  // the flat slots by default (P4d kept them: paged passes are slower, BATCHING §5.3)
   long kv_pool_mb = -1;  // P4b: -1, the pool from the memory plan
   bool plan_only = false;  // print the start plan as one JSON line and exit 0 before anything is allocated
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 0, batch = 0, contended = 256, side_prefill = 40, side_share = 16;
@@ -1672,7 +1672,7 @@ int main(int argc, char** argv) {
     else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
     else if (a == "--keepalive-seconds") keepalive_seconds = std::stoi(next());
     else if (a == "--prefill-bf16") prefill_bf16 = true;
-    else if (a == "--kv-pages") kv_pages = true;  // the default since P4d, still accepted
+    else if (a == "--kv-pages") kv_pages = true;
     else if (a == "--no-kv-pages") kv_pages = false;
     else if (a == "--kv-pool-mb") kv_pool_mb = std::stol(next());
     else if (a == "--draft-bf16") draft_bf16 = true;
@@ -1697,7 +1697,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--no-kv-pages | --kv-pool-mb N] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N] | --no-kv-pages] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu]\n";
     return 2;
   }
   for (auto [flag, v] : {std::pair<const char*, std::optional<int>>{"--sessions", sessions_arg},
@@ -1796,7 +1796,7 @@ int main(int argc, char** argv) {
   // P4b: the engine reads LING_KV_PAGES itself; the plan must agree with it.
   if (const char* e = std::getenv("LING_KV_PAGES")) kv_pages = std::atoi(e) != 0;
   if (kv_pool_mb >= 0 && !kv_pages) {
-    std::cerr << "--kv-pool-mb needs the paged KV cache (not --no-kv-pages or LING_KV_PAGES=0)\n";
+    std::cerr << "--kv-pool-mb needs --kv-pages (or LING_KV_PAGES=1)\n";
     return 2;
   }
   ling::serve::MemoryPlan plan;  // the start's plan, which --plan-only reports

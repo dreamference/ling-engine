@@ -124,9 +124,10 @@ struct EngineOptions {
   // P4 (BATCHING §5.3): the full-attention KV in 64-position pages of one pool, each session reading and writing its
   // positions through a page table, instead of a flat slot per session. Only addresses change, so every result is the
   // flat layout's bit for bit. P4b: a session maps pages lazily, as its passes reach them, and gives back the ones past
-  // a new prompt's end (Engine's KV page pool, below). P4d: on by default (false: the flat slots, ling-serve's and
-  // ling-run's --no-kv-pages). LING_KV_PAGES=0/1 overrides.
-  bool kv_pages = true;
+  // a new prompt's end (Engine's KV page pool, below). Off by default (ling-serve's and ling-run's --kv-pages turn it
+  // on, --no-kv-pages keeps it off): P4d found its passes slower than the flat slots' (BATCHING §5.3), so the flat
+  // slots stay the default until that is fixed. LING_KV_PAGES=0/1 overrides.
+  bool kv_pages = false;
   // P4b: the pool's size in pages (each kKvPageTokens positions of every full-attention layer's K and V, 4 MiB for
   // Qwen3.8-27B), besides the reserved page 0. 0, or more than can ever be mapped: sessions x max_context positions.
   // ling-serve sets it from its memory plan (serve/admission.hpp) or --kv-pool-mb.

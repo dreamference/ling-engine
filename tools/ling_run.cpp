@@ -6,7 +6,7 @@
 //            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N] [--draft-off-below X]]
 //            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16] [--graph-check] [--seed N]
 //            [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N]]
-//            [--batch-check] [--side-prefill N] [--draft-bf16] [--no-kv-pages | --kv-pool-mb N]
+//            [--batch-check] [--side-prefill N] [--draft-bf16] [--kv-pages [--kv-pool-mb N] | --no-kv-pages]
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -14,9 +14,9 @@
 // (default 2, 0 off; M3); --prefill-bf16 keeps the prefill's DeltaNet intermediates in BF16 as production does
 // (B34; not exact, off by default: MILESTONES §14); --draft-bf16 reads the drafter's fc and conv kernel projections
 // in BF16 instead of the NVFP4 copies rounded at load (BACKLOG 33, the default; LING_DRAFT_NVFP4=0/1 overrides).
-// The full-attention KV is kept in 64-position pages behind a page table per session (BATCHING §5.3, P4; on by default
-// since P4d, --no-kv-pages the flat slots, a bare --kv-pages still accepted; exact: only addresses change;
-// LING_KV_PAGES=0/1 overrides). --kv-pool-mb N gives the page pool N MB instead of
+// --kv-pages keeps the full-attention KV in 64-position pages behind a page table per session (BATCHING §5.3, P4; off
+// by default, the flat slots, --no-kv-pages says so explicitly; exact: only addresses change; LING_KV_PAGES=0/1
+// overrides). --kv-pool-mb N gives the page pool N MB instead of
 // --sessions x --max-context positions (P4b), so the checks run with sessions that map pages as they go, give back the
 // ones past a new prompt and, in --prefix-check, evict idle sessions (least recently used first) when the pool is short,
 // as ling-serve's scheduler does.
@@ -327,7 +327,7 @@ int main(int argc, char** argv) {
   float temperature = 0.f;
   bool ids_out = false, prompt_ids_out = false, spec = false, spec_check = false, prefix_check = false;
   bool graphs = false, pdl = false, attn_bulk = false, graph_check = false, prefill_bf16 = false;
-  bool kv_pages = true;  // P4d: paged by default; --no-kv-pages the flat slots
+  bool kv_pages = false;  // the flat slots by default (P4d kept them); --kv-pages the page pool
   long kv_pool_mb = -1;
   uint64_t seed = 0;
   int attn_prefetch = 2;
@@ -404,7 +404,7 @@ int main(int argc, char** argv) {
   }
   if (const char* e = std::getenv("LING_KV_PAGES")) kv_pages = std::atoi(e) != 0;  // as the engine reads it
   if (kv_pool_mb >= 0 && !kv_pages) {
-    std::cerr << "--kv-pool-mb needs the paged KV cache (not --no-kv-pages or LING_KV_PAGES=0)\n";
+    std::cerr << "--kv-pool-mb needs --kv-pages (or LING_KV_PAGES=1)\n";
     return 2;
   }
   try {
