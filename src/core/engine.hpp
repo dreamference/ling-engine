@@ -535,7 +535,7 @@ class Engine {
   bool kv_pages_ = false;                 // opts_.kv_pages or LING_KV_PAGES (P4)
   __nv_bfloat16* kv_pool_ = nullptr;      // P4: the pool, [page][layer][K, V][kv head][kKvPageTokens][D]; page 0 unused
   size_t kv_page_elems_ = 0;              // P4: elements per page (all full-attention layers' K and V)
-  bool kv_head_major_ = false;            // the pool [layer][K, V][kv head][page][PT][D] (LING_KV_HEAD_MAJOR)
+  bool kv_head_major_ = true;             // the pool [layer][K, V][kv head][page][PT][D] (LING_KV_HEAD_MAJOR=0: not)
   size_t kv_head_stride_ = 0;             // P4: elements between a page's KV heads (set_kv_layout's head stride)
   size_t kv_page_unit_ = 0;               // P4: elements per page id in the table (a page, or one head's run)
   // P4c: the active session maps session `from`'s pages for positions [0, n) (shared, no copy).

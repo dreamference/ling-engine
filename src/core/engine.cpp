@@ -181,9 +181,10 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     // are one contiguous run, as in the head-major slots. Page 0 is never mapped: a masked key's address lands there.
     // P4b: the pool holds opts_.kv_pool_pages pages (at most what every session at max_context could map), handed out
     // as passes reach them (kv_ensure). Zeroed here, so its memory is committed at start, not while serving.
-    // LING_KV_HEAD_MAJOR=1: the pool is [layer][K, V][kv head][page][PT][D] instead, so a page's run of one head is
-    // next to the run of the page with the next id (consecutive pages are one stream, as the flat caches are) and
-    // the table holds id * PT * D. The kernels see only a larger head stride: the same values, the same results.
+    // By default the pool is head-major instead, [layer][K, V][kv head][page][PT][D]: a page's run of one head is next
+    // to the run of the page with the next id (consecutive pages are one stream, as the flat caches are) and the table
+    // holds id * PT * D. The kernels see only a larger head stride: the same values, the same results. Verify passes
+    // read faster so (4 sessions at 65,536: 35.1 tok/s against 33.8 interleaved). LING_KV_HEAD_MAJOR=0 interleaves.
     kv_page_elems_ = size_t(n_full) * 2 * kvsize * PT;
     const long cap = long(opts_.sessions) * pages_per_session;
     const int pool_pages = static_cast<int>(opts_.kv_pool_pages > 0 ? std::min<long>(opts_.kv_pool_pages, cap) : cap);
