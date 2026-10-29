@@ -14,13 +14,15 @@ step lora-nolaunch env LING_LORA_SITES=0 LING_LORA_DRAFT_SITES=0 $B/ling-run --m
 A=$HOME/lora-agree; mkdir -p $A
 for f in ids.jsonl ids-long.jsonl sets.json prompts.jsonl; do [ -f $A/$f ] || cp ~/m2/agreement/$f $A/; done
 # SGLang wraps only the modules --lora-target-modules names (rand-split's config says all-linear, so its own list is
-# not read); serve.py's --set takes one value, so the command is printed and the four names appended.
+# not read). Its choices name no DeltaNet module (w4 on 10-29: "invalid choice: 'out_proj'"), so the flag is `all`,
+# as make_adapter.py has it: the pinned image resolves `all` from the base model's modules (lora_manager.py), its
+# utils.py lists out_proj, and lora.py stacks in_proj_q/k/v/z into in_proj_qkvz; serve.py's --set takes one value, so the command is printed and the flag appended.
 SGARGS="lora-sg --port 30000 --add enable-lora --set max-lora-rank 16 --set max-loras-per-batch 2
     --set lora-paths rand-split=/root/.cache/dreamference/lora-lib/rand-split"
 SG() {
   local cmd=$(python3 $SRC/bench/sglang/serve.py $SGARGS "$@" --print | tail -n 1)
   docker rm -f lora-sg > /dev/null 2>&1
-  eval "$cmd --lora-target-modules qkv_proj o_proj out_proj in_proj_qkvz"
+  eval "$cmd --lora-target-modules all"
 }
 sg_wait() {
   for i in $(seq 1 200); do
