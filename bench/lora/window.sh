@@ -10,8 +10,12 @@ exec 8> $HOME/.ling-gpu.lock
 echo "$(date -u +%FT%TZ) lora-agent waiting for the lock (adapters $LABEL: $DESC; <= 45 min, m0 stopped)" >> ~/.ling-gpu-holds.log
 flock 8; T0=$(date -u +%s)
 # Nights (20:30 to 08:00 UTC) are not ours: a window that would end in one does not start.
+# LORA_END (HHMM UTC, default 2015) is when m0 must be up again: the steps stop 5 minutes before it, and a window
+# with less than 15 minutes of steps left does not start.
+END=${LORA_END:-2015}
 NOW=$((10#$(date -u +%H%M)))
-if [ $NOW -ge 1945 ] || [ $NOW -lt 800 ]; then
+STOP=$(( $(date -u -d "today ${END:0:2}:${END:2:2}" +%s) - 5 * 60 ))
+if [ $(( STOP - $(date -u +%s) )) -lt $(( 15 * 60 )) ] || [ $NOW -lt 800 ]; then
   echo "$(date -u +%FT%TZ) lora-agent lock released unused ($LABEL: too close to the night)" >> ~/.ling-gpu-holds.log
   echo "=== not started: $(date -u +%T) is too close to the night"; exit 3
 fi
@@ -20,7 +24,8 @@ M0=$(docker inspect -f '{{.State.Running}}' m0-prod8000 2>/dev/null || echo fals
 [ "$M0" = true ] && docker stop m0-prod8000 > /dev/null
 step() {
   local name=$1; shift
-  local left=$(( T0 + 40 * 60 - $(date -u +%s) ))
+  local end=$(( T0 + 40 * 60 )); [ $STOP -lt $end ] && end=$STOP
+  local left=$(( end - $(date -u +%s) ))
   if [ $left -le 0 ]; then echo "$(date -u +%T) $name skipped (window over)"; return; fi
   echo "$(date -u +%T) $name"
   # A subshell, so a step may be a shell function; past the window's end its children and it are stopped.

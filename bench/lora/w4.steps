@@ -3,6 +3,12 @@
 # bench/agreement/run.sh makes them, every request on the adapter; the base's greedy continuation once more, to count
 # what the adapter changes. The prompts are the M2 study's (A gets its ids). w5 runs the engine on the same cases.
 source $(dirname ${BASH_SOURCE[0]})/common.sh
+# First, origin/main with no adapter on the paths an adapter switches to (the GDN and attention megakernels, span and
+# tails off): does the unfused fallback pass spec-check (w6 found it fails with a zero adapter)? Then GDN alone.
+MKOFF="LING_MK_GDN=0 LING_MK_ATTN=0 LING_MK_SPAN=0 LING_MK_LAYERS=0"
+step main-mkoff env $MKOFF $MAIN/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --spec-check --graphs --pdl
+step main-gdnoff env LING_MK_GDN=0 LING_MK_SPAN=0 $MAIN/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --spec-check --graphs --pdl
+step main-attnoff env LING_MK_ATTN=0 LING_MK_LAYERS=0 $MAIN/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --spec-check --graphs --pdl
 A=$HOME/lora-agree; mkdir -p $A
 for f in ids.jsonl ids-long.jsonl sets.json prompts.jsonl; do [ -f $A/$f ] || cp ~/m2/agreement/$f $A/; done
 # SGLang wraps only the modules --lora-target-modules names (rand-split's config says all-linear, so its own list is
