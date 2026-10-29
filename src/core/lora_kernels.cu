@@ -80,6 +80,7 @@ __global__ void __launch_bounds__(kThreads) lora_expand_kernel(const float* __re
   const LoraSiteDev& d = site[size_t(s) * slot_stride];
   if (!d.a || sg >= d.nsegs) return;
   const LoraSegDev seg = d.segs[sg];
+  if (!outs.y[seg.out]) return;  // an output the pass does not compute (the drafter's context rows have no q)
   const int R = d.rank;
   __shared__ float ts[kTileRows][kMaxRank];
   for (int e = threadIdx.x; e < kTileRows * kMaxRank; e += kThreads) {

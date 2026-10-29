@@ -100,7 +100,8 @@ void Engine::alloc_scratch() {
   beta_ = alloc<float>(M * c.lin_v_heads);
   core_ = alloc<float>(M * Vs);
   normed_ = alloc<float>(M * Vs);
-  lora_t_ = opts_.lora_slots > 0 ? alloc<float>(M * kernels::kLoraRankRows) : nullptr;
+  lora_t_ = opts_.lora_slots > 0 ? alloc<float>(std::max<size_t>(M, kernels::kMaxStreamRows) * kernels::kLoraRankRows)
+                                 : nullptr;  // the drafter's rows too
   q_gate_ = alloc<float>(M * 2 * qsize);
   k_ = alloc<float>(M * kvsize);
   v_ = alloc<float>(M * kvsize);
@@ -231,6 +232,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     if (const char* e = std::getenv("LING_DRAFT_NVFP4")) nvfp4 = std::atoi(e) != 0;
     draft_ = std::make_unique<DraftModel>(opts_.draft_dir, nvfp4);
     alloc_drafter();
+    if (opts_.lora_slots > 0) lora_alloc_drafter();
     alloc_sparse_head();
     std::fprintf(stderr, "drafter: %.2f GB, block %d, fc and conv projections %s\n", draft_->device_bytes() / 1e9,
                  opts_.draft_block,

@@ -2095,7 +2095,7 @@ int main(int argc, char** argv) {
   if (!lora_library.empty()) {
     try {
       lora_lib = std::make_unique<ling::LoraLibrary>(lora_library, max_loaded_loras, engine.lora_shape(),
-                                                     ling::LoraModelShape{});
+                                                     engine.lora_draft_shape());
       for (size_t at = 0; at < lora_paths.size();) {
         const size_t comma = std::min(lora_paths.find(',', at), lora_paths.size());
         const std::string item = lora_paths.substr(at, comma - at);

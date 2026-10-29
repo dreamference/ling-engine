@@ -142,10 +142,10 @@ struct Run {
     for (float* p : y) cudaFree(p);
     cudaFree(table);
   }
-  void go(const k::LoraRows& rows) {
+  void go(const k::LoraRows& rows, bool skip_q = false) {
     k::LoraOuts outs;
     for (int o = 0; o < 3; ++o) {
-      outs.y[o] = y[o];
+      outs.y[o] = skip_q && o == 0 ? nullptr : y[o];
       outs.ld[o] = kN[o];
     }
     k::lora_shrink(x, K, M, rows, table, 1, slots, t, nullptr);
@@ -253,6 +253,16 @@ int main() {
     for (int o = 0; o < 3; ++o) none &= std::memcmp(r2.out(o).data(), hy[o].data(), hy[o].size() * 4) == 0;
     report("every slot -1 on the device: no output written", none);
     cudaFree(dslot);
+  }
+
+  // A null output (the drafter's context rows: k and v, no q) is skipped; the others get the batch's bits.
+  {
+    Run r(hx, hy, M, sites);
+    r.go(rows, true);
+    const bool q_kept = r.out(0) == hy[0];
+    bool same = true;
+    for (int o = 1; o < 3; ++o) same &= std::memcmp(r.out(o).data(), batch[o].data(), batch[o].size() * 4) == 0;
+    report("a null output is skipped, the site's other outputs as in the batch", q_kept && same);
   }
 
   for (void* p : owned) cudaFree(p);

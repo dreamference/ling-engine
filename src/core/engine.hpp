@@ -428,6 +428,8 @@ class Engine {
   void lora_upload(int slot, const LoraAdapter& adapter);
   // The target's projection shapes the loader checks an adapter against (LoraLibrary's target).
   LoraModelShape lora_shape() const;
+  // The DFlash2 drafter's (its q, k, v and o on every layer; layers == 0 without a drafter, so no drafter/ is loaded).
+  LoraModelShape lora_draft_shape() const;
   // Makes session i active for the next pass, with no other effect (the scheduler switches between the
   // sessions of its running requests, M4 §3).
   void select_session(int i);
@@ -751,14 +753,24 @@ class Engine {
   size_t lora_slot_bytes_ = 0;
   kernels::LoraSiteDev* lora_sites_ = nullptr;
   int* lora_seq_dev_ = nullptr;
-  float* lora_t_ = nullptr;  // the shrink's output, [prefill_chunk][kLoraRankRows]
-  void lora_alloc();  // in the constructor, with the other buffers (freed with them)
+  float* lora_t_ = nullptr;  // the shrink's output, [max(prefill_chunk, kMaxStreamRows)][kLoraRankRows]
+  // The drafter's pool and table, the same per slot (lora_dsites_[(slot * draft layers + layer) * kLoraSites + site],
+  // Qkv and O only): a slot whose adapter has no drafter/ has every entry empty, so the drafter runs as the base.
+  std::vector<__nv_bfloat16*> lora_dpool_;
+  size_t lora_dslot_bytes_ = 0;
+  kernels::LoraSiteDev* lora_dsites_ = nullptr;
+  void lora_alloc();          // in the constructor, with the other buffers (freed with them)
+  void lora_alloc_drafter();  // after alloc_drafter
   void clear_session_graphs(Session& s);
   // The batch's rows on adapters, from the segments' sessions; n == 0 when none is on one (nothing to launch).
   kernels::LoraRows lora_rows(std::span<const Seg> segs) const;
   // One site's shrink and expand for the rows on adapters: x is FP32 [M][ldx]; the outputs as LoraSite names them.
   void lora_site(const kernels::LoraRows& rows, int layer, LoraSite site, const float* x, int ldx, int M,
                  const kernels::LoraOuts& outs, int max_n);
+  // The drafter's: its rows (sessions s[i] with rows[i] rows each, in order) and a site of its layer.
+  kernels::LoraRows lora_draft_rows(std::span<Session* const> s, std::span<const int> rows) const;
+  void lora_draft_site(const kernels::LoraRows& rows, int layer, LoraSite site, const float* x, int ldx, int M,
+                       const kernels::LoraOuts& outs, int max_n);
 
   EngineOptions opts_;
   std::unique_ptr<Model> model_;

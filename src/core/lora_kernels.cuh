@@ -45,7 +45,7 @@ struct LoraRows {
   const int* slot_dev = nullptr;
 };
 
-// The outputs a site's segments add into, FP32 [M][ld].
+// The outputs a site's segments add into, FP32 [M][ld]; a null one is skipped.
 struct LoraOuts {
   float* y[kLoraOuts] = {};
   int ld[kLoraOuts] = {};
