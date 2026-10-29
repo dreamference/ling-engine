@@ -31,6 +31,7 @@ __device__ __forceinline__ unsigned tile_mask(const LoraRows& rows, int r0, int 
 __global__ void __launch_bounds__(kThreads) lora_shrink_kernel(const float* __restrict__ x, int ldx, int M, LoraRows rows,
                                                                 const LoraSiteDev* __restrict__ site, int slot_stride,
                                                                 float* __restrict__ t) {
+  pdl_begin();  // first statement: see launch.cuh (x and the slots are a previous kernel's output)
   const int s = blockIdx.z, j = blockIdx.x, r0 = blockIdx.y * kTileRows;
   const unsigned mask = tile_mask(rows, r0, M, s);
   if (!mask) return;
@@ -74,6 +75,7 @@ __global__ void __launch_bounds__(kThreads) lora_shrink_kernel(const float* __re
 __global__ void __launch_bounds__(kThreads) lora_expand_kernel(const float* __restrict__ t, int M, LoraRows rows,
                                                                 const LoraSiteDev* __restrict__ site, int slot_stride,
                                                                 LoraOuts outs, int tiles) {
+  pdl_begin();  // first statement: see launch.cuh (y is the GEMM's output, read and written here)
   const int s = blockIdx.z / tiles, r0 = (blockIdx.z % tiles) * kTileRows, sg = blockIdx.y;
   const unsigned mask = tile_mask(rows, r0, M, s);
   if (!mask) return;
