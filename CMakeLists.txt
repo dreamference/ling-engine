@@ -118,6 +118,10 @@ target_link_libraries(ling-mk-tests PRIVATE ling_core)
 add_test(NAME megakernel COMMAND ling-mk-tests)
 add_executable(ling-paged-tests tests/paged_tests.cu)
 target_link_libraries(ling-paged-tests PRIVATE ling_core)
+
+# The paged-attention microbenchmark (bench/micro/paged_attn_bench.cu): flat against paged KV at the engine's geometry.
+add_executable(ling-paged-attn-bench bench/micro/paged_attn_bench.cu)
+target_link_libraries(ling-paged-attn-bench PRIVATE ling_core)
 add_test(NAME paged COMMAND ling-paged-tests)
 add_executable(ling-stream-tests tests/stream_tests.cu)
 target_link_libraries(ling-stream-tests PRIVATE ling_core CUDA::cuda_driver)
