@@ -230,8 +230,9 @@ void Engine::alloc_drafter() {
     std::vector<kernels::GatherBuf> g = shared;
     for (size_t l = 0; l < s.kcache.size(); ++l)
       for (int h = 0; h < c.kv_heads; ++h) {
-        // P4: a head's run inside each page, rows through the session's page table (in element units)
-        const size_t off = size_t(h) * (s.pages ? kernels::kKvPageTokens : opts_.max_context) * D;
+        // P4: a head's run inside each page, rows through the session's page table (in element units); kv_head_stride
+        // is the head stride of either layout
+        const size_t off = size_t(h) * kernels::kv_head_stride(D);
         const int unit = s.pages ? int(sizeof(__nv_bfloat16)) : 0;
         g.push_back({reinterpret_cast<char*>(s.kcache[l] + off), D * 2, int(D * 2), 1, s.pages, unit});
         g.push_back({reinterpret_cast<char*>(s.vcache[l] + off), D * 2, int(D * 2), 1, s.pages, unit});

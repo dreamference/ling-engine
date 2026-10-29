@@ -509,16 +509,17 @@ __global__ void kv_table_set_kernel(uint64_t* __restrict__ table, KvTableEntries
 }
 
 // kv_pages_copy: block (i, lkv) moves position from + i of layer-and-K/V lkv, every KV head, 16 bytes a thread.
+// hs: the pool's head stride (set_kv_layout), so a layer-and-K/V block is Hkv * hs elements in either page layout.
 __global__ void kv_pages_copy_kernel(__nv_bfloat16* __restrict__ pool, const uint64_t* __restrict__ pages, int Hkv, int D,
-                                     __nv_bfloat16* __restrict__ buf, int buf_start, int buf_len, int from, bool to_buf) {
+                                     size_t hs, __nv_bfloat16* __restrict__ buf, int buf_start, int buf_len, int from,
+                                     bool to_buf) {
   pdl_begin();  // first statement: see launch.cuh
   const int p = from + blockIdx.x, lkv = blockIdx.y, per_head = D / 8;
-  const size_t page = pages[p / kKvPageTokens] + size_t(lkv) * Hkv * kKvPageTokens * D +
-                      static_cast<size_t>(p % kKvPageTokens) * D;
+  const size_t page = pages[p / kKvPageTokens] + size_t(lkv) * Hkv * hs + static_cast<size_t>(p % kKvPageTokens) * D;
   const size_t flat = (size_t(lkv) * Hkv * buf_len + static_cast<size_t>(p - buf_start)) * D;
   for (int i = threadIdx.x; i < Hkv * per_head; i += blockDim.x) {
     const int h = i / per_head, c = i % per_head;
-    int4* a = reinterpret_cast<int4*>(pool + page + size_t(h) * kKvPageTokens * D) + c;
+    int4* a = reinterpret_cast<int4*>(pool + page + size_t(h) * hs) + c;
     int4* b = reinterpret_cast<int4*>(buf + flat + size_t(h) * buf_len * D) + c;
     if (to_buf) *b = *a;
     else *a = *b;
@@ -694,6 +695,7 @@ void set_kv_layout(size_t head_stride, size_t pos_stride) {
   g_kv_ps = pos_stride;
 }
 
+
 // Rows per warp: with one or two token rows each warp streams 2 weight rows (measured best of 1, 2, 4, 8:
 // 235 GB/s NVFP4 and 263 GB/s FP8 at M = 1, against 262 GB/s for a plain read); more rows need the registers.
 template <int MT, int R>
@@ -823,7 +825,7 @@ void kv_pages_copy(__nv_bfloat16* pool, const uint64_t* pages, int layer_kv, int
   if (to <= from) return;
   if (D % 8) throw std::runtime_error("kv_pages_copy: head_dim a multiple of 8");
   launch_kernel("kv_pages_copy", kv_pages_copy_kernel, dim3(to - from, layer_kv), dim3(128), 0, s, pool, pages, Hkv, D,
-                buf, buf_start, buf_len, from, to_buf);
+                kv_hs(D), buf, buf_start, buf_len, from, to_buf);
 }
 
 void kv_table_set(uint64_t* table, const int* idx, const uint64_t* val, int n, cudaStream_t s) {
