@@ -153,6 +153,15 @@ void trace_line() {
   const std::string got = ling::serve::format_step(s);
   if (got != want) std::printf("got  %s\nwant %s\n", got.c_str(), want.c_str());
   expect(got == want, "one trace line");
+  // A decode line with the partner choice's view (`cand`); bench/agentlong/fair_gate_test.py parses this literal.
+  s.cand = {{3, 11, 2, 1, 40}, {1, 9, 0, 0, 0}, {2, 8, 1, 2, 30}, {0, 7, 1, 3, 41}};
+  const std::string want_cand =  // trace line with cand
+      "{\"t\":1.500000,\"pass\":42,\"kind\":\"decode\",\"turn\":3,\"sessions\":[0,2],\"rows\":[16,16],"
+      "\"tokens\":[4,7],\"left\":[0,0],\"cand\":[[3,11,2,1,40],[1,9,0,0,0],[2,8,1,2,30],[0,7,1,3,41]],"
+      "\"ms\":12.250,\"side\":true}";
+  const std::string got_cand = ling::serve::format_step(s);
+  if (got_cand != want_cand) std::printf("got  %s\nwant %s\n", got_cand.c_str(), want_cand.c_str());
+  expect(got_cand == want_cand, "one trace line with the candidates");
 }
 
 }  // namespace
