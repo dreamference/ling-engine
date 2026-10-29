@@ -100,6 +100,7 @@ void Engine::alloc_scratch() {
   beta_ = alloc<float>(M * c.lin_v_heads);
   core_ = alloc<float>(M * Vs);
   normed_ = alloc<float>(M * Vs);
+  lora_t_ = opts_.lora_slots > 0 ? alloc<float>(M * kernels::kLoraRankRows) : nullptr;
   q_gate_ = alloc<float>(M * 2 * qsize);
   k_ = alloc<float>(M * kvsize);
   v_ = alloc<float>(M * kvsize);
@@ -141,6 +142,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   pos_dev_ = alloc<int>(kernels::kMaxSeqs);
   rdelta_dev_ = alloc<int>(kernels::kMaxSeqs);
   check(cudaMemset(rdelta_dev_, 0, kernels::kMaxSeqs * sizeof(int)), "rope deltas");
+  if (opts_.lora_slots > 0) lora_alloc();
   mrope_dev_ = alloc<int>(size_t(std::max(opts_.prefill_chunk, kernels::kMaxStreamRows)) * 3);
   // The vision tower and the embedding cache's reserve (VISION §20.4), before the prefix KV store sizes itself.
   if (opts_.vision) {
@@ -606,7 +608,7 @@ int Engine::free_session(double protect_seconds, const std::vector<bool>& pinned
   return best;
 }
 
-void Engine::activate_session(int i, const std::string& key, bool fresh, uint64_t scope) {
+void Engine::activate_session(int i, const std::string& key, bool fresh, uint64_t scope, int lora_slot) {
   if (i < 0 || i >= static_cast<int>(sessions_.size())) throw std::runtime_error("no such session");
   side_join();  // a side chunk's session, store entries and donor KV are complete before anything binds or copies
   s_ = &sessions_[i];
@@ -623,6 +625,11 @@ void Engine::activate_session(int i, const std::string& key, bool fresh, uint64_
     s_->shadow.clear();
     s_->scope = scope;
   }
+  if (lora_slot >= opts_.lora_slots) throw std::runtime_error("activate_session: no such LoRA slot");
+  // LORA §3: the session's graphs were captured with or without the adapter launches; a flip between the base and an
+  // adapter drops them (another adapter keeps them: the slots are read on the device). The batch graphs are keyed by it.
+  if ((s_->lora_slot >= 0) != (lora_slot >= 0)) clear_session_graphs(*s_);
+  s_->lora_slot = lora_slot;
   if (fresh) {
     if (s_->owned) ++evictions_;
     s_->owned = true;
@@ -1314,6 +1321,11 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   // A prompt's tokens take the prefill path whatever the chunk's size, so the state a prompt leaves does
   // not depend on how its prefill was split or where it resumed (the prefix checkpoints rely on it).
   quantized_ = pass == Pass::Prefill;
+  // LORA §3: the rows of the sequences on an adapter. With any, the fused paths that keep a projection's input or
+  // output inside one kernel step aside (megakernels, tails, the fork, the BF16 prefill), so every site's input is in
+  // FP32 for its shrink; without, nothing below changes.
+  const kernels::LoraRows lrows = lora_rows(segs);
+  const bool lora_on = lrows.n > 0;
   if (verify && !rows) throw std::runtime_error("verify: at most 32 rows");
   NvtxRange range(verify ? "verify" : M == 1 ? "decode" : "prefill_chunk");
   const int H = c.hidden, I = c.intermediate, C = c.lin_conv_channels(), Vs = c.lin_value_size();
@@ -1344,8 +1356,8 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   // The megakernel's stage 4 (LING_MK_LAYERS): a persistent kernel adds its output into h_ itself and computes the next
   // norm (rmsnorm_half's, exactly) into xn_, xh_ and xinv_, so the add and the norm kernels are skipped. pre_normed: the
   // previous layer's FFN left this layer's input norm; post_normed: this layer's mixer left the post-attention norm.
-  const bool tails = mk_layers_ > 0 && !quantized_ && kernels::mk_tail_rows(M);
-  const bool span = mk_span_ > 0 && !quantized_ && kernels::mk_tail_rows(M);
+  const bool tails = mk_layers_ > 0 && !quantized_ && !lora_on && kernels::mk_tail_rows(M);
+  const bool span = mk_span_ > 0 && !quantized_ && !lora_on && kernels::mk_tail_rows(M);
   bool pre_normed = false;
   for (int li = 0; li < c.layers; ++li) {
     const LayerWeights& L = model_->layers()[li];
@@ -1354,7 +1366,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
     bool post_normed = false;
     bool span_done = false, pre_normed_next = false;  // stage 4 (LING_MK_SPAN): this layer's mixer and FFN in one launch
     // --prefill-bf16 (B34): a DeltaNet layer of a prefill takes the BF16 branch below, which runs its own norm.
-    const bool bf16_gdn = !L.full && quantized_ && prefill_bf16_;
+    const bool bf16_gdn = !L.full && quantized_ && prefill_bf16_ && !lora_on;
     // The prefill path quantizes the norm's output for the projections that follow; the DeltaNet's a and b
     // projections (BF16) also read it in FP32.
     // (FP32 too wherever the projections' input scales differ, so the others can quantize it themselves.)
@@ -1362,11 +1374,11 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         pre_normed ? true
         : bf16_gdn ? false
         : L.full   ? norm_rows(h_, L.input_norm, xn_, M, L.q.in_scale, false,
-                               L.k.in_scale != L.q.in_scale || L.v.in_scale != L.q.in_scale)
+                               lora_on || L.k.in_scale != L.q.in_scale || L.v.in_scale != L.q.in_scale)
                    : norm_rows(h_, L.input_norm, xn_, M, L.in_qkv.in_scale, false, true);
     pre_normed = false;
     // The megakernel's stage 3 (LING_MK_ATTN): the whole attention layer of one chain verify as one persistent kernel.
-    bool mk_attn = L.full && mk_attn_ > 0 && verify && !multi && !quantized_ && xn_half && L.q.K == H &&
+    bool mk_attn = L.full && mk_attn_ > 0 && !lora_on && verify && !multi && !quantized_ && xn_half && L.q.K == H &&
                    L.k.K == H && L.v.K == H && L.o.K == qsize && L.o.N == H;
     if (mk_attn) {
       const Seg& g = segs[0];
@@ -1413,6 +1425,16 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
     } else if (L.full) {
       NvtxRange r("attention");
       linear_fp8_multi({{&L.q, q_gate_}, {&L.k, k_}, {&L.v, v_}}, xn_, M, xn_half);
+      if (lora_on) {
+        kernels::LoraOuts outs;
+        outs.y[0] = q_gate_;
+        outs.ld[0] = 2 * qsize;
+        outs.y[1] = k_;
+        outs.ld[1] = c.kv_heads * c.head_dim;
+        outs.y[2] = v_;
+        outs.ld[2] = c.kv_heads * c.head_dim;
+        lora_site(lrows, li, LoraSite::Qkv, xn_, H, M, outs, std::max(2 * qsize, c.kv_heads * c.head_dim));
+      }
       if (!quantized_) kernels::l2_prefetch_weights(L.o.w, false, false, L.o.N, L.o.K, hint_attn, stream_);
       mark("attn_proj");
       // Per sequence (M4 §2): its rows' q/k norms and RoPE at its positions, their KV into its cache, and their
@@ -1450,11 +1472,18 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       if (quantized_) {
         kernels::sigmoid_mul_fp8(attn_, gate_, size_t(M) * qsize, L.o.in_scale, xq_, stream_);
         set_xq(L.o.in_scale, false);
+        if (lora_on) kernels::sigmoid_mul(attn_, gate_, M * qsize, stream_);  // the O site's FP32 input
       } else {
         kernels::sigmoid_mul(attn_, gate_, M * qsize, stream_);
       }
       mark("attn_core");
       linear_fp8_residual(L.o, attn_, M, quantized_);
+      if (lora_on) {
+        kernels::LoraOuts outs;
+        outs.y[0] = h_;
+        outs.ld[0] = H;
+        lora_site(lrows, li, LoraSite::O, attn_, qsize, M, outs, H);
+      }
       mark("attn_proj");
     } else if (bf16_gdn) {
       // --prefill-bf16 (B34; off by default under MILESTONES §14's exactness policy): the DeltaNet layer of a
@@ -1502,12 +1531,12 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       float* mixed = verify ? v_post_[slot] : mixed_;
       float* g = verify ? v_g_[slot] : g_;
       float* beta = verify ? v_beta_[slot] : beta_;
-      const bool fork = fork_ > 0 && verify && !tree_ && !multi && !quantized_ && L.in_a.N == L.in_b.N;
+      const bool fork = fork_ > 0 && !lora_on && verify && !tree_ && !multi && !quantized_ && L.in_a.N == L.in_b.N;
       // The megakernel's stage 2 (LING_MK_GDN): the whole mixer of one verify sequence as one persistent kernel; a tree
       // verify (BACKLOG 26) too, with the tree conv and the per-path recurrence (on by default since 2026-10-20:
       // -2.2 to -2.6 ms per step with trees at 24K and 59K; LING_MK_GDN_TREE=0 gives a tree the graph path's mixer).
       static const bool gdn_tree = !std::getenv("LING_MK_GDN_TREE") || std::atoi(std::getenv("LING_MK_GDN_TREE")) != 0;
-      bool mk_gdn = mk_gdn_ > 0 && verify && (!tree_ || gdn_tree) && !multi && !quantized_ && xn_half && L.in_a.N == L.in_b.N &&
+      bool mk_gdn = mk_gdn_ > 0 && !lora_on && verify && (!tree_ || gdn_tree) && !multi && !quantized_ && xn_half && L.in_a.N == L.in_b.N &&
                     L.in_a.N == c.lin_v_heads;
       if (mk_gdn) {
         const Seg& sg = segs[0];
@@ -1600,7 +1629,16 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         mark("gdn_proj");
       } else {
       // The prefill path convolves out of place: the projection goes to t2_ (free until the MLP).
-      linear_fp8_multi({{&L.in_qkv, verify ? v_pre_[slot] : quantized_ ? t2_ : mixed}, {&L.in_z, z_}}, xn_, M, xn_half);
+      float* qkv_out = verify ? v_pre_[slot] : quantized_ ? t2_ : mixed;
+      linear_fp8_multi({{&L.in_qkv, qkv_out}, {&L.in_z, z_}}, xn_, M, xn_half);
+      if (lora_on) {
+        kernels::LoraOuts outs;
+        outs.y[0] = qkv_out;
+        outs.ld[0] = C;
+        outs.y[1] = z_;
+        outs.ld[1] = Vs;
+        lora_site(lrows, li, LoraSite::Gdn, xn_, H, M, outs, std::max(C, Vs));
+      }
       if (!quantized_) kernels::l2_prefetch_weights(L.out.w, false, false, L.out.N, L.out.K, hint_gdn, stream_);
       if (quantized_) {  // tensor cores, row-invariant for any M
         kernels::narrow_bf16(xn_, M, L.in_a.w, L.in_b.w, a_, b_, L.in_a.N, L.in_a.K, stream_);
@@ -1659,10 +1697,18 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         kernels::gated_rmsnorm_fp8(core_, z_, L.lin_norm, M * c.lin_v_heads, c.lin_v_dim, c.eps, L.out.in_scale, xq_,
                                    stream_);
         set_xq(L.out.in_scale, false);
+        if (lora_on)  // the Out site's FP32 input
+          kernels::gated_rmsnorm(core_, z_, L.lin_norm, normed_, M * c.lin_v_heads, c.lin_v_dim, c.eps, stream_);
       } else {
         kernels::gated_rmsnorm(core_, z_, L.lin_norm, normed_, M * c.lin_v_heads, c.lin_v_dim, c.eps, stream_);
       }
       linear_fp8_residual(L.out, normed_, M, quantized_);
+      if (lora_on) {
+        kernels::LoraOuts outs;
+        outs.y[0] = h_;
+        outs.ld[0] = H;
+        lora_site(lrows, li, LoraSite::Out, normed_, Vs, M, outs, H);
+      }
       mark("gdn_proj");
       }  // not forked
     }

@@ -53,6 +53,7 @@ add_library(ling_core STATIC
   src/core/sampling.cpp
   src/core/model.cu
   src/core/engine.cpp
+  src/core/engine_lora.cpp
   src/core/prefix_kv.cpp
   src/core/lora.cpp
   src/core/lora_kernels.cu

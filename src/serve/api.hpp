@@ -56,6 +56,7 @@ struct Request {
   bool chat = true;
   bool stream = false;
   bool include_usage = false;
+  std::string model;                // as the request names it; empty when it names none (adapter_of)
   std::string prompt_text;          // the rendered prompt (chat) or the given prompt (completions)
   std::vector<int> prompt_ids;      // set when a completions request sends token ids
   // With vision (VISION §20.6): the URL of each image, in the order of the `<|image_pad|>` placeholders in
@@ -82,6 +83,16 @@ struct Request {
   // default; `false` sets them all to 0 (off). resolve_repetition() makes the rule the request runs with.
   RepetitionDetection repetition{-1, -1, -1, -1};
 };
+
+// A model the server does not serve: a 404 with code model_not_found (LORA §5), where std::invalid_argument is a 400.
+struct ModelNotFound : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+// The adapter a request's `model` selects (LORA §5): "<base>+<adapter>" names one, any name without a '+' the base
+// (empty), as before adapters. A malformed adapter name throws std::invalid_argument, another base ModelNotFound;
+// whether the adapter is loaded is the caller's to check (a ModelNotFound too).
+std::string adapter_of(const std::string& model, const std::string& base);
 
 // The request's repetition rule: its own fields over the server's default, validated (std::invalid_argument).
 RepetitionDetection resolve_repetition(const Request& r, const RepetitionDetection& server);

@@ -444,29 +444,32 @@ void Engine::set_step_graphs(bool on) {
 
 void Engine::clear_graphs() {
   if (commit_stream_) cudaStreamSynchronize(commit_stream_);  // a replay may still run there
-  for (Session& s : sessions_) {
-    if (s.draft_graph) cudaGraphExecDestroy(s.draft_graph);
-    s.draft_graph = nullptr;
-    if (s.draft_graph_sparse) cudaGraphExecDestroy(s.draft_graph_sparse);
-    s.draft_graph_sparse = nullptr;
-    for (auto& [k, g] : s.verify_graphs) cudaGraphExecDestroy(g);
-    s.verify_graphs.clear();
-    for (auto& [k, g] : s.tree_verify_graphs) cudaGraphExecDestroy(g);
-    s.tree_verify_graphs.clear();
-    for (cudaGraphExec_t g : s.commit_graphs)
-      if (g) cudaGraphExecDestroy(g);
-    s.commit_graphs.clear();
-    for (auto& [k, g] : s.batch_commit_graphs) cudaGraphExecDestroy(g);
-    s.batch_commit_graphs.clear();
-    for (auto& [k, g] : s.state_commit_graphs) cudaGraphExecDestroy(g);
-    s.state_commit_graphs.clear();
-  }
+  for (Session& s : sessions_) clear_session_graphs(s);
   for (auto& [order, bg] : batch_graphs_) {
     if (bg.draft) cudaGraphExecDestroy(bg.draft);
     for (auto& [k, g] : bg.draft_sparse) cudaGraphExecDestroy(g);
     for (auto& [k, g] : bg.verify) cudaGraphExecDestroy(g);
   }
   batch_graphs_.clear();
+}
+
+void Engine::clear_session_graphs(Session& s) {
+  if (commit_stream_) cudaStreamSynchronize(commit_stream_);  // a replay may still run there
+  if (s.draft_graph) cudaGraphExecDestroy(s.draft_graph);
+  s.draft_graph = nullptr;
+  if (s.draft_graph_sparse) cudaGraphExecDestroy(s.draft_graph_sparse);
+  s.draft_graph_sparse = nullptr;
+  for (auto& [k, g] : s.verify_graphs) cudaGraphExecDestroy(g);
+  s.verify_graphs.clear();
+  for (auto& [k, g] : s.tree_verify_graphs) cudaGraphExecDestroy(g);
+  s.tree_verify_graphs.clear();
+  for (cudaGraphExec_t g : s.commit_graphs)
+    if (g) cudaGraphExecDestroy(g);
+  s.commit_graphs.clear();
+  for (auto& [k, g] : s.batch_commit_graphs) cudaGraphExecDestroy(g);
+  s.batch_commit_graphs.clear();
+  for (auto& [k, g] : s.state_commit_graphs) cudaGraphExecDestroy(g);
+  s.state_commit_graphs.clear();
 }
 
 cudaGraphExec_t Engine::capture(const std::function<void()>& body, cudaStream_t st) {
@@ -964,6 +967,10 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
     check(cudaMemcpyAsync(pos_dev_, &pin_->pos, sizeof(int), cudaMemcpyHostToDevice, stream_), "position");
     pin_->rdelta = s_->rope_delta;  // the rope delta after the prompt's images (VISION §20.3 (b))
     check(cudaMemcpyAsync(rdelta_dev_, &pin_->rdelta, sizeof(int), cudaMemcpyHostToDevice, stream_), "rope delta");
+    if (lora_seq_dev_) {  // and its adapter's slot (LORA §3)
+      pin_->lora_slot[0] = s_->lora_slot;
+      check(cudaMemcpyAsync(lora_seq_dev_, pin_->lora_slot, sizeof(int), cudaMemcpyHostToDevice, stream_), "lora slot");
+    }
   }
   if (!sp.use_lookup) plan_draft(sp, B, graph);
   if (tree_step(p, sp.use_lookup, row_logits != nullptr, B)) {  // BACKLOG 26: the chain and its tree
@@ -1145,7 +1152,8 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     sp.anchor = seqs[i].anchor;
     plan_begin(sp, B);
     any_lookup = any_lookup || sp.use_lookup;
-    order[i] = seqs[i].session;
+    // A session on an adapter as -1 - its index: its graphs have the adapter launches, the base's do not (LORA §3).
+    order[i] = sp.s->lora_slot >= 0 ? -1 - seqs[i].session : seqs[i].session;
   }
   // 1. The drafter over every sequence's block at once (stage 4), then each sequence's lattice walk; a batch with a
   // lookup chain (whose rows replace the drafter's) drafts per sequence, eagerly, as stage 3 did. With step graphs
@@ -1159,6 +1167,11 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     for (int i = 0; i < n; ++i) pin_->seq_rdelta[i] = plans[i].s->rope_delta;
     check(cudaMemcpyAsync(rdelta_dev_, pin_->seq_rdelta, n * sizeof(int), cudaMemcpyHostToDevice, stream_),
           "rope deltas");
+    if (lora_seq_dev_) {
+      for (int i = 0; i < n; ++i) pin_->lora_slot[i] = plans[i].s->lora_slot;
+      check(cudaMemcpyAsync(lora_seq_dev_, pin_->lora_slot, n * sizeof(int), cudaMemcpyHostToDevice, stream_),
+            "lora slots");
+    }
   }
   if (together) {
     for (int i = 0; i < n; ++i) {

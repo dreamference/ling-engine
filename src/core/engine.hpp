@@ -34,6 +34,8 @@
 #include "core/drafter.hpp"
 #include "core/kernels.cuh"
 #include "core/kv_pool.hpp"
+#include "core/lora.hpp"
+#include "core/lora_kernels.cuh"
 #include "core/model.hpp"
 #include "core/prefix_kv.hpp"
 #include "core/sampling.hpp"
@@ -57,6 +59,9 @@ struct EngineOptions {
   int max_context = 65536;
   int prefill_chunk = 2048;  // measured: 647 tokens/s against 582 at 1024 on a 7.7K-token prompt
   std::string draft_dir;     // the DFlash2 drafter's checkpoint; empty: no speculation
+  // LoRA (specs/DREAMFERENCE_LING_ENGINE_LORA.md): the GPU pool's adapter slots (max_loras_per_batch - 1; 0: no
+  // adapter is served and nothing of LoRA is allocated).
+  int lora_slots = 0;
   int draft_block = 16;      // rows per verify: the anchor and block - 1 drafted tokens (2 .. 32)
   // BACKLOG 33: the drafter's fc and conv kernel projections as NVFP4 copies rounded at load, read on the rows path
   // instead of BF16 (the conv projections' BF16 originals are then not kept; the fc's stay for the prompt's chunks).
@@ -412,7 +417,15 @@ class Engine {
   // Nothing is copied out or cleared: the slot's tokens stay usable as KV by a prompt that shares them.
   // `scope` (P4c): the request's share scope; a slot that held another scope's session keeps its pages (rewritten or
   // given back by begin_prefill) but nothing of its history is reused.
-  void activate_session(int i, const std::string& key, bool fresh, uint64_t scope = 0);
+  // `lora_slot` (LORA §3): the GPU pool's slot of the request's adapter, -1 for the base. The scope already keeps the
+  // adapters' histories apart; a session switched between the base and an adapter drops its graphs (captured with or
+  // without the adapter's kernels).
+  void activate_session(int i, const std::string& key, bool fresh, uint64_t scope = 0, int lora_slot = -1);
+  // LoRA (LORA §2): the pool's slot count, and the upload of an adapter's target weights into slot `slot` (whose
+  // previous adapter no session uses: LoraSlots decides). Synchronous; throws std::runtime_error for an adapter that
+  // does not fit the slot (it was checked against the model at load, so only a bug).
+  int lora_slots() const { return opts_.lora_slots; }
+  void lora_upload(int slot, const LoraAdapter& adapter);
   // Makes session i active for the next pass, with no other effect (the scheduler switches between the
   // sessions of its running requests, M4 §3).
   void select_session(int i);
@@ -724,8 +737,26 @@ class Engine {
     int topk_ids[kernels::kMaxStreamRows * 64];
     kernels::TreeDesc tree;                     // a tree verify's description (BACKLOG 26)
     int gather_rows[kernels::kMaxStreamRows];  // its accepted path's rows
+    int lora_slot[kernels::kMaxSeqs];          // the step's sequences' adapter slots (-1: the base), for lora_seq_dev_
   };
   StepPinned* pin_ = nullptr;
+
+  // ---- LoRA (LORA §3). ----
+  // The pool: per slot one device buffer of lora_slot_bytes_ for the adapter's A and B, and the descriptor table
+  // lora_sites_[(slot * layers + layer) * kLoraSites + site] (a == nullptr: the slot's adapter skips the site). A step's
+  // rows read their sequence's slot from LoraRows; a captured graph from lora_seq_dev_[i], written beside pos_dev_.
+  std::vector<__nv_bfloat16*> lora_pool_;
+  size_t lora_slot_bytes_ = 0;
+  kernels::LoraSiteDev* lora_sites_ = nullptr;
+  int* lora_seq_dev_ = nullptr;
+  float* lora_t_ = nullptr;  // the shrink's output, [prefill_chunk][kLoraRankRows]
+  void lora_alloc();  // in the constructor, with the other buffers (freed with them)
+  void clear_session_graphs(Session& s);
+  // The batch's rows on adapters, from the segments' sessions; n == 0 when none is on one (nothing to launch).
+  kernels::LoraRows lora_rows(std::span<const Seg> segs) const;
+  // One site's shrink and expand for the rows on adapters: x is FP32 [M][ldx]; the outputs as LoraSite names them.
+  void lora_site(const kernels::LoraRows& rows, int layer, LoraSite site, const float* x, int ldx, int M,
+                 const kernels::LoraOuts& outs, int max_n);
 
   EngineOptions opts_;
   std::unique_ptr<Model> model_;
@@ -948,6 +979,7 @@ class Engine {
     bool owned = false;  // a session has been bound to the slot
     std::string key;     // the prompt_cache_key it was bound with ("" without one)
     uint64_t scope = 0;  // P4c: the share scope of its requests (X-Ling-Share-Scope; 0: unscoped)
+    int lora_slot = -1;  // LORA §3: its request's adapter slot in the GPU pool (-1: the base)
     std::chrono::steady_clock::time_point last_used{};
   };
   std::vector<Session> sessions_;
@@ -983,7 +1015,7 @@ class Engine {
   X(h_) X(xn_) X(t1_) X(t2_) X(mixed_) X(z_) X(a_) X(b_) X(g_) X(beta_) X(core_) X(normed_) X(q_gate_) X(k_)     \
   X(v_) X(q_) X(gate_) X(attn_) X(attn_scratch_) X(logits_dev_) X(x_bf16_) X(xn_bf16_) X(t2_bf16_) X(z_bf16_)    \
   X(mixed_bf16_) X(core_bf16_) X(xq_) X(xsf_) X(xq2_) X(xsf2_) X(xh_) X(xinv_) X(ids_dev_) X(conv_tmp_) X(cap_)  \
-  X(xh_fc_) X(dctx_) X(dk_) X(dv_) X(stream_) X(s_) X(quantized_) X(xq_scale_) X(xq_nvfp4_) X(logits_host_)
+  X(xh_fc_) X(dctx_) X(dk_) X(dv_) X(stream_) X(s_) X(quantized_) X(xq_scale_) X(xq_nvfp4_) X(logits_host_) X(lora_t_)
 #define LING_SIDE_DECL(m) decltype(Engine::m) m{};
   struct SideSet {
     LING_SIDE_SET(LING_SIDE_DECL)

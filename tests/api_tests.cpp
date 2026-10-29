@@ -1111,6 +1111,46 @@ EOF
     }
     EXPECT(model_full_context("/nonexistent/config.json") == 0);
   }
+  {
+    // LORA §5: the model a request names, and the adapter it selects.
+    using ling::serve::adapter_of;
+    using ling::serve::ModelNotFound;
+    using ling::serve::parse_request;
+    using ling::serve::parse_responses_request;
+    const std::string base = "qwen3.8-27b";
+    EXPECT(adapter_of("", base).empty());
+    EXPECT(adapter_of(base, base).empty());
+    EXPECT(adapter_of("anything-else", base).empty());  // no '+': the base, as before adapters
+    EXPECT(adapter_of(base + "+style_v2.1", base) == "style_v2.1");
+    auto throws = [&](const std::string& model, bool not_found) {
+      try {
+        adapter_of(model, base);
+      } catch (const ModelNotFound&) {
+        return not_found;
+      } catch (const std::invalid_argument&) {
+        return !not_found;
+      }
+      return false;
+    };
+    EXPECT(throws(base + "+", false));
+    EXPECT(throws(base + "+../x", false));
+    EXPECT(throws(base + "+a/b", false));
+    EXPECT(throws(base + "+.hidden", false));
+    EXPECT(throws("other+style", true));
+    EXPECT(throws(base + "x+style", true));
+    const json chat = {{"model", base + "+style"}, {"messages", json::array({{{"role", "user"}, {"content", "hi"}}})}};
+    EXPECT(parse_request(chat, true).model == base + "+style");
+    const json responses = {{"model", base + "+style"}, {"input", "hi"}};
+    EXPECT(parse_responses_request(responses).model == base + "+style");
+    EXPECT(parse_request(json{{"prompt", "hi"}}, false).model.empty());
+    bool bad_type = false;
+    try {
+      parse_request(json{{"model", 3}, {"prompt", "hi"}}, false);
+    } catch (const std::invalid_argument&) {
+      bad_type = true;
+    }
+    EXPECT(bad_type);
+  }
   if (known_gaps) std::printf("%d known gaps (not failures; see reports/engine-issues-2026-10-09.md)\n", known_gaps);
   std::printf(failures ? "%d API TEST FAILURES\n" : "all api tests passed\n", failures);
   return failures ? 1 : 0;

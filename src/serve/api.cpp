@@ -7,6 +7,7 @@
 #include <random>
 #include <stdexcept>
 
+#include "core/lora.hpp"
 #include "tokenizer/chat_template.hpp"
 
 namespace ling::serve {
@@ -103,6 +104,17 @@ uint64_t share_scope_of(const std::string& value) {
   return h | 1;
 }
 
+std::string adapter_of(const std::string& model, const std::string& base) {
+  const size_t plus = model.find('+');
+  if (plus == std::string::npos) return {};
+  const std::string name = model.substr(plus + 1);
+  if (!lora_name_ok(name))
+    throw std::invalid_argument("model " + model + ": the adapter's name must be 1 to 64 of A-Z a-z 0-9 . _ -");
+  if (model.compare(0, plus, base) != 0 || plus != base.size())
+    throw ModelNotFound("the model " + model + " does not exist: this server serves " + base + " and its adapters");
+  return name;
+}
+
 std::string new_id(const std::string& prefix) {
   static thread_local std::mt19937_64 rng{std::random_device{}()};
   static const char* hex = "0123456789abcdef";
@@ -186,6 +198,10 @@ Request parse_request(const json& body, bool chat, bool vision) {
   Request r;
   r.chat = chat;
   r.stream = get_or(body, "stream", false);
+  if (body.contains("model") && !body["model"].is_null()) {
+    if (!body["model"].is_string()) throw std::invalid_argument("model must be a string");
+    r.model = body["model"].get<std::string>();
+  }
   if (body.contains("stream_options") && body["stream_options"].is_object())
     r.include_usage = body["stream_options"].value("include_usage", false);
   if (body.contains("max_completion_tokens") && body["max_completion_tokens"].is_number())
@@ -836,7 +852,7 @@ Request parse_responses_request(const json& body, bool vision) {
     }
   }
   if (!tools.empty() && body.value("tool_choice", json("auto")) != "none") chat["tools"] = tools;
-  for (const char* k : {"stream", "temperature", "top_p", "top_k", "min_p", "presence_penalty",
+  for (const char* k : {"model", "stream", "temperature", "top_p", "top_k", "min_p", "presence_penalty",
                         "repetition_penalty", "seed", "stop", "chat_template_kwargs", "repetition_detection"})
     if (body.contains(k)) chat[k] = body[k];
   if (body.contains("max_output_tokens") && body["max_output_tokens"].is_number()) chat["max_tokens"] = body["max_output_tokens"];
