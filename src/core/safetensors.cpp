@@ -49,31 +49,35 @@ Checkpoint::Checkpoint(const std::string& dir) : dir_(dir) {
     throw std::runtime_error("no model.safetensors.index.json or model.safetensors in " + dir);
   }
 
-  for (const std::string& shard : shards) {
-    auto file = std::make_unique<MappedFile>(dir + "/" + shard);
-    if (file->size() < 8) throw std::runtime_error("truncated shard " + shard);
-    uint64_t header_len = 0;
-    std::memcpy(&header_len, file->data(), 8);
-    if (8 + header_len > file->size()) throw std::runtime_error("bad header in " + shard);
-    nlohmann::json header = nlohmann::json::parse(
-        std::string(reinterpret_cast<const char*>(file->data() + 8), header_len));
-    const uint8_t* base = file->data() + 8 + header_len;
-    for (auto& [name, info] : header.items()) {
-      if (name == "__metadata__") continue;
-      TensorView view;
-      view.dtype = info["dtype"].get<std::string>();
-      view.shape = info["shape"].get<std::vector<int64_t>>();
-      auto offsets = info["data_offsets"].get<std::vector<size_t>>();
-      if (offsets.size() != 2 || offsets[1] < offsets[0] ||
-          8 + header_len + offsets[1] > file->size()) {
-        throw std::runtime_error("bad offsets for " + name);
-      }
-      view.data = base + offsets[0];
-      view.bytes = offsets[1] - offsets[0];
-      tensors_[name] = view;
+  for (const std::string& shard : shards) add_shard(shard);
+}
+
+Checkpoint::Checkpoint(const std::string& dir, const std::string& file) : dir_(dir) { add_shard(file); }
+
+void Checkpoint::add_shard(const std::string& shard) {
+  auto file = std::make_unique<MappedFile>(dir_ + "/" + shard);
+  if (file->size() < 8) throw std::runtime_error("truncated shard " + shard);
+  uint64_t header_len = 0;
+  std::memcpy(&header_len, file->data(), 8);
+  if (header_len > file->size() - 8) throw std::runtime_error("bad header in " + shard);
+  nlohmann::json header = nlohmann::json::parse(
+      std::string(reinterpret_cast<const char*>(file->data() + 8), header_len));
+  const uint8_t* base = file->data() + 8 + header_len;
+  for (auto& [name, info] : header.items()) {
+    if (name == "__metadata__") continue;
+    TensorView view;
+    view.dtype = info["dtype"].get<std::string>();
+    view.shape = info["shape"].get<std::vector<int64_t>>();
+    auto offsets = info["data_offsets"].get<std::vector<size_t>>();
+    if (offsets.size() != 2 || offsets[1] < offsets[0] ||
+        offsets[1] > file->size() - 8 - header_len) {
+      throw std::runtime_error("bad offsets for " + name);
     }
-    files_.push_back(std::move(file));
+    view.data = base + offsets[0];
+    view.bytes = offsets[1] - offsets[0];
+    tensors_[name] = view;
   }
+  files_.push_back(std::move(file));
 }
 
 const TensorView& Checkpoint::get(const std::string& name) const {

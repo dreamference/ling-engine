@@ -54,6 +54,7 @@ add_library(ling_core STATIC
   src/core/model.cu
   src/core/engine.cpp
   src/core/prefix_kv.cpp
+  src/core/lora.cpp
   src/core/kv_pool.cpp
   src/core/vision.cu
 )
@@ -142,6 +143,9 @@ target_link_libraries(ling-kv-pool-tests PRIVATE ling_core)
 add_test(NAME kv_pool COMMAND ling-kv-pool-tests)
 add_executable(ling-prefix-kv-tests tests/prefix_kv_tests.cpp)
 target_link_libraries(ling-prefix-kv-tests PRIVATE ling_core)
+add_executable(ling-lora-tests tests/lora_tests.cpp)
+target_link_libraries(ling-lora-tests PRIVATE ling_core)
+add_test(NAME lora COMMAND ling-lora-tests)
 
 add_executable(ling-api-tests tests/api_tests.cpp)
 target_link_libraries(ling-api-tests PRIVATE ling_api)

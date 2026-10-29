@@ -39,13 +39,18 @@ class Checkpoint {
  public:
   // `dir` holds config.json, model.safetensors.index.json and the shards.
   explicit Checkpoint(const std::string& dir);
+  // One named file of a directory (a LoRA adapter's adapter_model.safetensors), without an index.
+  Checkpoint(const std::string& dir, const std::string& file);
 
   bool has(const std::string& name) const { return tensors_.count(name) != 0; }
   const TensorView& get(const std::string& name) const;
   const std::string& dir() const { return dir_; }
   size_t count() const { return tensors_.size(); }
+  const std::map<std::string, TensorView>& tensors() const { return tensors_; }
 
  private:
+  void add_shard(const std::string& shard);
+
   std::string dir_;
   std::vector<std::unique_ptr<MappedFile>> files_;
   std::map<std::string, TensorView> tensors_;
