@@ -16,6 +16,9 @@ cost() {
     B+rand,B+rand-attn
   kill $srv; wait $srv 2>/dev/null
 }
+# The speed lost to the adapter path itself (the megakernels off, no LoRA launch) against w3's al-zero and w2's al-lora.
+al_off() { export LING_LORA_SITES=0 LING_LORA_DRAFT_SITES=0; al al-off $B $BASE+zero --lora-library $LIB --lora-paths zero; }
+step al-off al_off
 step score score
 step gen400 gen400
 step cost cost
