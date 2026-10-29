@@ -8,6 +8,8 @@
 //            [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N]]
 //            [--batch-check] [--side-prefill N] [--draft-bf16] [--kv-pages [--kv-pool-mb N]]
 //
+// --lora LIBRARY/NAME loads that adapter (LORA §3) into one GPU slot and runs every session on it, so each check
+// below holds with an adapter as well as on the base.
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
 // tiles with bulk copies (M3); --attn-prefetch N sets how many KV tiles ahead its attention prefetches into L2
@@ -330,7 +332,7 @@ int main(int argc, char** argv) {
   long kv_pool_mb = -1;
   uint64_t seed = 0;
   int attn_prefetch = 2;
-  std::string draft;
+  std::string draft, lora;
   int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256, side_prefill = 0;
   bool interleave_check = false, batch_check = false, batch_bench = false, draft_bf16 = false;
   double draft_off_below = -1;  // the drafter-off guard (BACKLOG 10): the engine's default unless given
@@ -358,6 +360,7 @@ int main(int argc, char** argv) {
     else if (a == "--ids-out") ids_out = true;
     else if (a == "--prompt-ids-out") prompt_ids_out = true;
     else if (a == "--draft") draft = next();
+    else if (a == "--lora") lora = next();
     else if (a == "--block") block = std::stoi(next());
     else if (a == "--spec") spec = true;
     else if (a == "--lookup") lookup = std::stoi(next());
@@ -500,7 +503,25 @@ int main(int argc, char** argv) {
     if (batch_check) opts.tree_nodes = 0;  // the chain alone, as a batch verifies (see --batch-check above)
     opts.side_prefill = side_prefill;
     opts.vision = !all_images.empty() || !vision_check.empty();
+    if (!lora.empty()) opts.lora_slots = 1;
     ling::Engine engine(model, opts);
+    // --lora: the adapter in slot 0, and every session activated on it (activate below, for the checks' sessions).
+    uint64_t lora_sc = 0;
+    int lora_slot = -1;
+    if (!lora.empty()) {
+      const std::filesystem::path p = std::filesystem::path(lora).lexically_normal();
+      ling::LoraLibrary lib(p.parent_path().string(), 1, engine.lora_shape(), engine.lora_draft_shape());
+      const auto adapter = lib.load(p.filename().string(), p.string());
+      engine.lora_upload(0, *adapter);
+      lora_sc = ling::lora_scope(0, adapter.get());
+      lora_slot = 0;
+      std::fprintf(stderr, "adapter %s (%zu bytes%s)\n", adapter->name.c_str(), adapter->bytes(),
+                   adapter->has_drafter ? ", with a drafter part" : "");
+    }
+    auto activate = [&](int i, const std::string& key, bool fresh) {
+      engine.activate_session(i, key, fresh, lora_sc, lora_slot);
+    };
+    if (lora_slot >= 0) activate(0, "", false);
     const std::vector<ling::PromptImage>* IMG = all_images.empty() ? nullptr : &all_images;
     if (!vision_check.empty()) return vision_check_run(engine, vision_check, vision_bench, vision_dump);
     auto t1 = std::chrono::steady_clock::now();
@@ -665,7 +686,7 @@ int main(int argc, char** argv) {
         ling::EngineStats st[2];
         for (int k = 0; k < 2; ++k) {
           engine.reset_all();
-          engine.activate_session(0, "", true);
+          activate(0, "", true);
           ling::Engine::PrefillCursor cur = engine.begin_prefill(prompts[i], false, IMG);
           while (!engine.prefill_chunk(cur, k ? chunk_check : 0)) {
           }
@@ -710,7 +731,7 @@ int main(int argc, char** argv) {
             Result alone[2];
             for (int k = 0; k < 2; ++k) {
               engine.reset_all();
-              engine.activate_session(0, "", true);
+              activate(0, "", true);
               engine.prefill(k ? B : A, nullptr, false, IMG);
               Seq q;
               q.sp = sp;
@@ -725,11 +746,11 @@ int main(int argc, char** argv) {
             a.session = 0;
             b.session = 1;
             a.sp = b.sp = sp;
-            engine.activate_session(0, "", true);
+            activate(0, "", true);
             engine.prefill(A, nullptr, false, IMG);
             a.pending = {engine.sample(engine.logits(), sp, engine.history())};
             for (int k = 0; k < 2 && !a.done; ++k) advance(a, max_tokens);
-            engine.activate_session(1, "", true);
+            activate(1, "", true);
             ling::Engine::PrefillCursor cur = engine.begin_prefill(B, false, IMG);
             int chunks_beside = 0;
             while (!a.done || !b.done) {
@@ -818,7 +839,7 @@ int main(int argc, char** argv) {
       };
       auto start = [&](Seq& q, int session, const std::vector<int>& prompt) {
         q.session = session;
-        engine.activate_session(session, "", true);
+        activate(session, "", true);
         engine.prefill(prompt, nullptr, false, IMG);
         q.pending = {engine.sample(engine.logits(), q.sp, engine.history())};
       };
@@ -873,7 +894,7 @@ int main(int argc, char** argv) {
               start(q[f], 0, *P[f]);
               for (int k = 0; k < 2 && !q[f].done; ++k) advance(q[f], max_tokens);
               q[o].session = 1;
-              engine.activate_session(1, "", true);
+              activate(1, "", true);
               ling::Engine::PrefillCursor cur = engine.begin_prefill(*P[o], false, IMG);
               while (!cur.done()) {
                 if (engine.prefill_chunk(cur, q[f].done ? 0 : contended))
@@ -970,7 +991,7 @@ int main(int argc, char** argv) {
           }
         };
         make_room([&] { return engine.kv_admit_need(si, prompts[i]) > engine.kv_pages_free(); });
-        engine.activate_session(si, "", fresh_session);
+        activate(si, "", fresh_session);
         ling::EngineStats st;
         const std::vector<float> resumed_logits = engine.prefill(prompts[i], &st, false, IMG);
         const int resumed = argmax(resumed_logits);

@@ -1,0 +1,7 @@
+# Adapters window 2: agentlong greedy, origin/main against the branch with no adapter (16 of 16 identical), and the
+# branch against its base+zero run of w3.
+source $(dirname ${BASH_SOURCE[0]})/common.sh
+step al-main al al-main $MAIN
+step al-lora al al-lora $B
+step al-compare python3 $SRC/bench/agentlong/run.py --compare $V/al-main.jsonl $V/al-lora.jsonl
+step al-zero-compare python3 $SRC/bench/agentlong/run.py --compare $V/al-lora.jsonl $V/../w3/al-zero.jsonl

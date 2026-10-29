@@ -1,0 +1,8 @@
+# Adapters window 1: the test binaries (the LoRA kernels first) and the no-adapter checks on the branch.
+source $(dirname ${BASH_SOURCE[0]})/common.sh
+step test-lora-kernel $B/ling-lora-kernel-tests
+for f in $B/ling-*-tests; do t=${f##*/ling-}; t=${t%-tests}; [ $t = lora-kernel ] || step test-$t $f; done
+step spec-check $B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --spec-check --graphs --pdl
+step batch-check $B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --batch-check --sessions 2 --graphs --pdl
+step graph-check $B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 400 --graph-check --seed 7 --pdl
+step prefix-check $B/ling-run --model $M --draft $D --prompts-file $PB --prefix-check --sessions 1 --pdl

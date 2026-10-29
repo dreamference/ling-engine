@@ -16,6 +16,7 @@ can be compared token for token (--compare).
 Usage:
   run.py --url http://127.0.0.1:8300 --mode greedy|seedN --out RUN.jsonl [--label L]
          [--bodies ~/bench-sets/agentlong/bodies.jsonl] [--manifest manifest.json] [--only t00,t03]
+         [--model base+ADAPTER]
   run.py --compare A.jsonl B.jsonl       per-turn output identity and the two summaries
   run.py --summary RUN.jsonl [RUN.jsonl ...]
 """
@@ -163,6 +164,7 @@ def main():
     ap.add_argument("--bodies", default=f"{HOME}/bench-sets/agentlong/bodies.jsonl")
     ap.add_argument("--manifest", default=os.path.join(HERE, "manifest.json"))
     ap.add_argument("--only", default="")
+    ap.add_argument("--model", default="", help="the request's model (base+ADAPTER for an adapter); default the body's")
     ap.add_argument("--no-warmup", action="store_true")
     ap.add_argument("--compare", nargs=2)
     ap.add_argument("--summary", nargs="+")
@@ -215,6 +217,8 @@ def main():
         if only and b["id"] not in only:
             continue
         body = dict(b["body"])
+        if a.model:
+            body["model"] = a.model
         if greedy:
             body["temperature"] = 0.0
         else:

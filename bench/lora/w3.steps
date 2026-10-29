@@ -1,0 +1,11 @@
+# Adapters window 3: with adapters. The checks on the random adapter (speculation, batching, graphs and the prefix
+# store exact with an adapter), then agentlong on base+zero (identical to the base, LORA §6 item 2) and base+rand
+# (the speed of one adapter against the base's al-lora, w2).
+source $(dirname ${BASH_SOURCE[0]})/common.sh
+step spec-rand $B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --spec-check --graphs --pdl --lora $LIB/rand
+step batch-rand $B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --batch-check --sessions 2 --graphs --pdl --lora $LIB/rand
+step graph-rand $B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 400 --graph-check --seed 7 --pdl --lora $LIB/rand
+step prefix-rand $B/ling-run --model $M --draft $D --prompts-file $PB --prefix-check --sessions 1 --pdl --lora $LIB/rand
+LORA_FLAGS="--lora-library $LIB --lora-paths zero,rand"
+step al-zero al al-zero $B $BASE+zero $LORA_FLAGS
+step al-rand al al-rand $B $BASE+rand $LORA_FLAGS
