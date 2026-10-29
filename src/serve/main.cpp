@@ -563,6 +563,7 @@ class Scheduler {
       // last resort may end one (kv_stalled).
       const bool kv_blocked = ctx_.engine->kv_paged() && !r.prefilling && !kv_room(r);
       r.kv_wait = kv_blocked;
+      cand_.clear();
       std::vector<Running*> batch = kv_blocked ? std::vector<Running*>() : batch_with(r);
       const double t0 = trace_.on() ? trace_.now() : 0;
       unit_kind_ = nullptr;
@@ -580,7 +581,7 @@ class Scheduler {
           done = true;
         }
         if (done) ended.push_back(&r);
-        batch = {&r};
+        batch.assign(1, &r);
       }
       if (trace_.on() && unit_kind_) trace_unit(t0, k, batch);
       if (ended.empty()) continue;
@@ -608,6 +609,7 @@ class Scheduler {
   // P4b: only requests whose step's KV pages are free join (r's are: kv_room).
   std::vector<Running*> batch_with(Running& r) const {
     std::vector<Running*> b;
+    if (trace_.on()) snapshot_candidates();
     if (!batchable(r)) return b;
     b.push_back(&r);
     Engine& eng = *ctx_.engine;
@@ -619,7 +621,10 @@ class Scheduler {
       if (o.get() != &r && static_cast<int>(b.size()) < fit && batchable(*o)) {
         if (eng.kv_paged()) {
           const int n = eng.kv_step_need(o->job.session, true);
-          if (kv_need + n > kv_free) continue;
+          if (kv_need + n > kv_free) {
+            if (trace_.on()) cand_[i].state = 2;
+            continue;
+          }
           kv_need += n;
         }
         b.push_back(o.get());
@@ -635,6 +640,13 @@ class Scheduler {
       for (size_t i = 0; i < running_.size(); ++i)
         c[i] = {false, running_[i]->window.count(decode_passes_), running_[i]->window.last()};
     return pair_order(c, fair_pairing_);
+  }
+  // The running requests as the partner choice sees them, for the step trace's `cand` (serve/step_trace.hpp).
+  void snapshot_candidates() const {
+    cand_.clear();
+    for (const auto& o : running_)
+      cand_.push_back({o->job.session, o->admitted, batchable(*o) ? 1 : 0, o->window.count(decode_passes_),
+                       o->window.last()});
   }
 
   // One line of the step trace (LING_STEP_TRACE) for the unit just run: `batch` holds its requests.
@@ -657,6 +669,7 @@ class Scheduler {
       s.tokens.push_back(decode ? static_cast<int>(r->pending.size()) : 0);
       s.left.push_back(r->prefilling ? prefill_left(*r) : 0);
     }
+    if (decode) s.cand = cand_;
     s.side = ctx_.engine->side_busy();
     trace_.write(s);
   }
@@ -1123,6 +1136,7 @@ class Scheduler {
   bool fair_pairing_;  // --fair-pairing: partners by fewest recent decode passes (serve/pairing.hpp)
   StepTrace trace_{std::getenv("LING_STEP_TRACE")};  // the per-step trace, when the variable names a file
   const char* unit_kind_ = nullptr;  // what the last unit did, for the trace (null: nothing worth a line)
+  mutable std::vector<StepCandidate> cand_;  // the partner choice's view for the trace (filled while it is on)
   long decode_passes_ = 0;  // decode passes run (a batched step counts once), for --side-share
   long side_mark_ = -1;     // decode_passes_ when the last side chunk finished (--side-share)
   std::mutex mu_;
@@ -1977,6 +1991,7 @@ int main(int argc, char** argv) {
     name = name.substr(name.find_last_of('/') + 1);
   }
   ctx.model_name = name;
+  std::fprintf(stderr, "pairing: %s\n", fair_pairing ? "fair (--fair-pairing 1)" : "running order (--fair-pairing 0)");
   ling::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended, side_share, fair_pairing != 0);
 
   proxygen::HTTPServerOptions options;

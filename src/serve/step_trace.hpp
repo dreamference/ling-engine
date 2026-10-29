@@ -2,7 +2,8 @@
 // conversation can be followed pass by pass (bench/agentlong/step_trace.py sums it up). Off when the variable is
 // unset; the file is buffered and flushed when no request is running and at exit.
 //
-// A line: {"t":S,"pass":N,"kind":K,"turn":I,"sessions":[..],"rows":[..],"tokens":[..],"left":[..],"ms":X,"side":B}
+// A line: {"t":S,"pass":N,"kind":K,"turn":I,"sessions":[..],"rows":[..],"tokens":[..],"left":[..],"cand":[[..]],"ms":X,
+//          "side":B}
 //   t        seconds since the trace was opened, at the end of the unit
 //   pass     decode passes run so far (a batched step counts once)
 //   kind     decode | side_launch | side_finish | chunk | hold | yield
@@ -13,7 +14,14 @@
 //   left     the prompt tokens each has still to prefill (0 once decoding)
 //   ms       the unit's wall time
 //   side     whether a prefill chunk is in flight on the side stream after the unit
-// Host only: tests/pairing_tests.cpp checks one formatted line.
+//   cand     decode lines only: every running request as the partner choice saw it, in running order (so cand[turn]
+//            is the request whose turn it was), each [session, request, state, recent, last]: request is its
+//            admission number (a session holds many requests in turn), state 0 not batchable, 1 batchable, 2
+//            batchable but tried and skipped because its KV pages did not fit (P4b), recent its decode passes in
+//            the trailing window and last its last decode pass (serve/pairing.hpp), both before the unit.
+//            bench/agentlong/fair_gate.py checks fair pairing pass by pass from it.
+// Host only: tests/pairing_tests.cpp checks one formatted line, and bench/agentlong/fair_gate_test.py parses the
+// same line.
 #pragma once
 
 #include <chrono>
@@ -23,12 +31,22 @@
 
 namespace ling::serve {
 
+// One running request as the partner choice saw it (the trace's `cand`).
+struct StepCandidate {
+  int session = 0;
+  long request = 0;  // Running::admitted
+  int state = 0;     // 0 not batchable, 1 batchable, 2 batchable but skipped for its KV pages
+  int recent = 0;    // decode passes in the trailing window, before the unit
+  long last = 0;     // its last decode pass (0: none yet), before the unit
+};
+
 struct StepRecord {
   double t = 0;
   long pass = 0;
   const char* kind = "decode";
   size_t turn = 0;
   std::vector<int> sessions, rows, tokens, left;
+  std::vector<StepCandidate> cand;  // decode lines only (empty: no `cand` key)
   double ms = 0;
   bool side = false;
 };
@@ -43,8 +61,18 @@ inline std::string format_step(const StepRecord& s) {
   std::snprintf(head, sizeof head, "{\"t\":%.6f,\"pass\":%ld,\"kind\":\"%s\",\"turn\":%zu,", s.t, s.pass, s.kind,
                 s.turn);
   std::snprintf(tail, sizeof tail, ",\"ms\":%.3f,\"side\":%s}", s.ms, s.side ? "true" : "false");
+  std::string cand;
+  if (!s.cand.empty()) {
+    cand = ",\"cand\":[";
+    for (size_t i = 0; i < s.cand.size(); ++i) {
+      const StepCandidate& c = s.cand[i];
+      cand += (i ? ",[" : "[") + std::to_string(c.session) + "," + std::to_string(c.request) + "," +
+              std::to_string(c.state) + "," + std::to_string(c.recent) + "," + std::to_string(c.last) + "]";
+    }
+    cand += "]";
+  }
   return std::string(head) + "\"sessions\":" + list(s.sessions) + ",\"rows\":" + list(s.rows) +
-         ",\"tokens\":" + list(s.tokens) + ",\"left\":" + list(s.left) + tail;
+         ",\"tokens\":" + list(s.tokens) + ",\"left\":" + list(s.left) + cand + tail;
 }
 
 class StepTrace {
