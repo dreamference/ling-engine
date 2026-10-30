@@ -1,6 +1,7 @@
-# The adapters windows' common names (sourced by each wN.steps): SRC the branch's checkout, MAIN origin/main's,
+# The adapters windows' common names (sourced by each wN.steps): SRC the branch's checkout, MAIN origin/main's build
+# (LORA_SRC and LORA_MAIN override them),
 # LIB the test adapters (make_adapter.py: zero, rand, rand-attn), the model, the production drafter and the prompts.
-SRC=~/ling-engine-lora; B=$SRC/build; MAIN=$HOME/ling-engine-lmain/build; LIB=$HOME/lora-lib
+SRC=${LORA_SRC:-$HOME/ling-engine-lora}; B=$SRC/build; MAIN=${LORA_MAIN:-$HOME/ling-engine-lmain/build}; LIB=$HOME/lora-lib
 M=$(ls -d ~/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4/snapshots/*)
 D=$HOME/.cache/dreamference/drafters/dflash2-nvfp4-scalesearch
 S=$HOME/integ-exact/spec.jsonl; PB=$HOME/lv/prefix-branch.jsonl

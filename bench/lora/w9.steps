@@ -1,0 +1,18 @@
+# Adapters window 9: the tree to be merged (lora/adapters with origin/main merged in, paged KV and fair pairing
+# included) before it lands: spec-check and batch-check with no adapter, zero and rand, agentlong with no adapter
+# token for token against origin/main's build, and the speed gate on the same tree.
+#   LORA_SRC=<merged tree> LORA_MAIN=<origin/main's build> window.sh w9 "..." w9.steps OUT
+source $(dirname ${BASH_SOURCE[0]})/common.sh
+SC="$B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --spec-check --graphs --pdl"
+LORA_FLAGS="--lora-library $LIB --lora-paths zero,rand"
+step m-none $SC
+step m-zero $SC --lora $LIB/zero
+step m-rand $SC --lora $LIB/rand
+step m-mk-rand env LING_LORA_MK=1 $SC --lora $LIB/rand
+step m-batch-rand $B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --batch-check --sessions 2 --graphs --pdl --lora $LIB/rand
+step al-main al al-main $MAIN
+step al-base al al-base $B
+step al-ident python3 $SRC/bench/agentlong/run.py --compare $V/al-main.jsonl $V/al-base.jsonl
+al_rand_mk() { export LING_LORA_MK=1; al al-rand-mk $B $BASE+rand $LORA_FLAGS; }
+step al-rand-mk al_rand_mk
+step al-speed python3 $SRC/bench/agentlong/run.py --compare $V/al-base.jsonl $V/al-rand-mk.jsonl
