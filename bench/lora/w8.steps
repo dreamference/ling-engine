@@ -1,0 +1,9 @@
+# Adapters window 8: the speed gate (one adapter within 5 % of the base) on one build: agentlong greedy on the base,
+# on the rand adapter with the megakernels off (the default), and with the GDN megakernel kept (LING_LORA_MK=1).
+source $(dirname ${BASH_SOURCE[0]})/common.sh
+LORA_FLAGS="--lora-library $LIB --lora-paths zero,rand"
+al_rand_mk() { export LING_LORA_MK=1; al al-rand-mk $B $BASE+rand $LORA_FLAGS; }
+step al-base al al-base $B
+step al-rand al al-rand $B $BASE+rand $LORA_FLAGS
+step al-rand-mk al_rand_mk
+step al-mk-compare python3 $SRC/bench/agentlong/run.py --compare $V/al-rand.jsonl $V/al-rand-mk.jsonl

@@ -6,6 +6,12 @@ source $(dirname ${BASH_SOURCE[0]})/common.sh
 SC="$B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --spec-check --graphs"
 step fix-zero $SC --pdl --lora $LIB/zero
 step fix-rand-target env LING_LORA_DRAFT_SITES=0 $SC --pdl --lora $LIB/rand
+# The whole adapter (target and drafter), w3's batch-check, then the same spec-check with the GDN megakernel kept
+# (LING_LORA_MK=1, e851760), which the speed gate needs.
+step fix-rand $SC --pdl --lora $LIB/rand
+step batch-rand $B/ling-run --model $M --draft $D --prompts-file $S --max-tokens 200 --batch-check --sessions 2 --graphs --pdl --lora $LIB/rand
+step mk-zero env LING_LORA_MK=1 $SC --pdl --lora $LIB/zero
+step mk-rand env LING_LORA_MK=1 $SC --pdl --lora $LIB/rand
 step fix-zero-nopdl $SC --lora $LIB/zero
 # Then the rest of w6's spec-check with the fix: the drafter's sites and the target's split by site.
 step fix-rand-drafter env LING_LORA_SITES=0 $SC --pdl --lora $LIB/rand
