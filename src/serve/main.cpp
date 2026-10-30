@@ -6,8 +6,9 @@
 //              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N] [--draft-off-below X]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
-//              [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0]
-//              [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages] [--kv-pages [--kv-pool-mb N]]
+//              [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N]
+//              [--auto-size 1|0] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]
+//              [--kv-pages [--kv-pool-mb N] | --no-kv-pages]
 //
 // --sessions N (default: chosen at start, --auto-size below; 2 without it; M4 §1) keeps N resident sessions, each with
 // its own KV cache and state, so N agent tasks that alternate keep their histories warm. A request runs in the session
@@ -32,6 +33,10 @@
 // decoding conversations take some steps at their speed alone instead of every step beside a chunk. At four warm
 // agent conversations (node-b, 2026-10-27) 16 raised the pooled decode from 25.7 to 35.6 tok/s with the rounds'
 // time unchanged (139.3 / 140.9 s). Only the order of units changes, as with the shortest prefill first.
+// --fair-pairing 1|0 (C3, design A1; default 0; LING_FAIR_PAIRING overrides): the request that joins a batched step
+// is the one with the fewest decode passes in the trailing 16 (serve/pairing.hpp), not the first in running order,
+// so at four decoding conversations each takes 2 passes in 4 instead of 4/2/1/1. Only which requests step together
+// changes. LING_STEP_TRACE=FILE writes one JSON line per scheduler unit (serve/step_trace.hpp).
 //
 // --draft-off-below X (BACKLOG 10; default 1.5, 0 off; LING_DRAFT_OFF_BELOW overrides it): the drafter-off guard. A
 // session whose running mean of tokens per speculative step falls below X decodes one plain row per step, with no
@@ -46,8 +51,9 @@
 // how often a streamed request that has produced no token yet is sent a keep-alive (API §3, §4).
 // --prefill-bf16 keeps the prefill's DeltaNet intermediates in BF16 as production does (B34; not exact, off
 // by default: MILESTONES §14).
-// --kv-pages keeps the full-attention KV in 64-position pages behind a page table per session (BATCHING §5.3, P4;
-// off by default; exact: only addresses change; LING_KV_PAGES=0/1 overrides). The pages come from one pool allocated
+// With --kv-pages the full-attention KV is kept in 64-position pages behind a page table per session (BATCHING
+// §5.3, P4; off by default, the flat slots, --no-kv-pages says so explicitly; exact: only addresses change;
+// LING_KV_PAGES=0/1 overrides). The pages come from one pool allocated
 // at start: what MemAvailable leaves after the memory plan, the prefix KV store's budget and --host-reserve-mb, at most
 // --sessions x --max-context positions; or --kv-pool-mb N, refused at start when the plan with it does not fit. A
 // session then costs its fixed part (~0.5 GB) and 64 KB for each position it holds, so --sessions 4 --max-context
@@ -68,7 +74,8 @@
 // would leave less than the first of MemAvailable, and answers a generation request HTTP 503 (code host_memory_low)
 // while MemAvailable is below the second. 0 switches either off. Neither changes what an admitted request computes.
 //
-// --plan-only: print the start plan (sessions, batch, context, planned_bytes) as one JSON line on stdout and exit 0 before
+// --plan-only: print the start plan (sessions, batch, context, planned_bytes; with paged KV the page pool, which
+// planned_bytes includes, and the host reserve) as one JSON line on stdout and exit 0 before
 // anything is allocated; the launcher's pre-load host-safety check runs it so it checks the engine's own plan.
 // --auto-size 1|0 (default 1; LING_AUTO_SIZE overrides; BATCHING §5.6, the owner's decision of 2026-10-28): what is
 // not given of --sessions and --max-context is chosen at start from MemAvailable by the same plan the start check
@@ -97,6 +104,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <deque>
 #include <fstream>
@@ -113,6 +121,8 @@
 #include "tokenizer/tokenizer.hpp"
 #include "serve/image_input.hpp"
 #include "serve/kv_policy.hpp"
+#include "serve/pairing.hpp"
+#include "serve/step_trace.hpp"
 
 namespace ling::serve {
 namespace {
@@ -353,6 +363,7 @@ struct Running {
   long admitted = 0;     // the order of admission (P4b: the last resort ends the request admitted last)
   bool kv_wait = false;  // its last decode turn waited for KV pages (P4b)
   Periods alone, beside;  // step periods without and with another request's prefill in between
+  PassWindow window;      // the decode passes it took part in, in the trailing kFairWindow (--fair-pairing)
 };
 
 // The engine thread (M4 §3). Up to `batch` requests run at once, each in its own resident session: a request
@@ -367,12 +378,14 @@ struct Running {
 // one-row step on its turn; a prefill chunk still alternates with the decode steps.
 class Scheduler {
  public:
-  Scheduler(ServerContext& ctx, double protect_seconds, int batch, int contended, int side_share = 0)
+  Scheduler(ServerContext& ctx, double protect_seconds, int batch, int contended, int side_share = 0,
+            bool fair_pairing = false)
       : ctx_(ctx),
         protect_seconds_(protect_seconds),
         batch_(batch),
         contended_(contended),
         side_share_(side_share),
+        fair_pairing_(fair_pairing),
         thread_([this] { run(); }) {}
   ~Scheduler() {
     {
@@ -585,11 +598,15 @@ class Scheduler {
       // last resort may end one (kv_stalled).
       const bool kv_blocked = ctx_.engine->kv_paged() && !r.prefilling && !kv_room(r);
       r.kv_wait = kv_blocked;
+      cand_.clear();
       std::vector<Running*> batch = kv_blocked ? std::vector<Running*>() : batch_with(r);
+      const double t0 = trace_.on() ? trace_.now() : 0;
+      unit_kind_ = nullptr;
       if (kv_blocked) {
         kv_stalled(ended);
       } else if (batch.size() >= 2) {
         batch_step(batch, ended);
+        unit_kind_ = "decode";
       } else {
         bool done = false;
         try {
@@ -599,7 +616,9 @@ class Scheduler {
           done = true;
         }
         if (done) ended.push_back(&r);
+        batch.assign(1, &r);
       }
+      if (trace_.on() && unit_kind_) trace_unit(t0, k, batch);
       if (ended.empty()) continue;
       for (Running* e : ended) {
         if (e->side_flight) ctx_.engine->side_abandon();  // its chunk's pass finishes before the session is reused
@@ -607,6 +626,7 @@ class Scheduler {
         release_lora(e->job);
         running_.erase(std::find_if(running_.begin(), running_.end(), [&](const auto& p) { return p.get() == e; }));
       }
+      if (running_.empty()) trace_.flush();
       {
         std::lock_guard<std::mutex> l(mu_);
         dirty_ = true;  // its session may be what a queued job waits for
@@ -625,22 +645,69 @@ class Scheduler {
   // P4b: only requests whose step's KV pages are free join (r's are: kv_room).
   std::vector<Running*> batch_with(Running& r) const {
     std::vector<Running*> b;
+    if (trace_.on()) snapshot_candidates();
     if (!batchable(r)) return b;
     b.push_back(&r);
     Engine& eng = *ctx_.engine;
     const int fit = kernels::kMaxStreamRows / eng.draft_block();
     int kv_need = eng.kv_paged() ? eng.kv_step_need(r.job.session, true) : 0;
     const int kv_free = eng.kv_paged() ? eng.kv_pages_free() : 0;
-    for (const auto& o : running_)
+    for (size_t i : partner_order()) {
+      const auto& o = running_[i];
       if (o.get() != &r && static_cast<int>(b.size()) < fit && batchable(*o)) {
         if (eng.kv_paged()) {
           const int n = eng.kv_step_need(o->job.session, true);
-          if (kv_need + n > kv_free) continue;
+          if (kv_need + n > kv_free) {
+            if (trace_.on()) cand_[i].state = 2;
+            continue;
+          }
           kv_need += n;
         }
         b.push_back(o.get());
       }
+    }
     return b;
+  }
+  // The order the running requests are tried in as partners (serve/pairing.hpp): running order, or with
+  // --fair-pairing 1 the fewest decode passes in the trailing kFairWindow first.
+  std::vector<size_t> partner_order() const {
+    std::vector<PairCandidate> c(running_.size());
+    if (fair_pairing_)
+      for (size_t i = 0; i < running_.size(); ++i)
+        c[i] = {false, running_[i]->window.count(decode_passes_), running_[i]->window.last()};
+    return pair_order(c, fair_pairing_);
+  }
+  // The running requests as the partner choice sees them, for the step trace's `cand` (serve/step_trace.hpp).
+  void snapshot_candidates() const {
+    cand_.clear();
+    for (const auto& o : running_)
+      cand_.push_back({o->job.session, o->admitted, batchable(*o) ? 1 : 0, o->window.count(decode_passes_),
+                       o->window.last()});
+  }
+
+  // One line of the step trace (LING_STEP_TRACE) for the unit just run: `batch` holds its requests.
+  void trace_unit(double t0, size_t turn, const std::vector<Running*>& batch) {
+    StepRecord s;
+    s.t = trace_.now();
+    s.ms = (s.t - t0) * 1e3;
+    s.pass = decode_passes_;
+    s.kind = unit_kind_;
+    s.turn = turn;
+    const bool decode = std::strcmp(unit_kind_, "decode") == 0;
+    int alone_rows = 0;
+    if (decode && batch.size() == 1) {
+      std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+      alone_rows = ctx_.metrics.batch_rows;
+    }
+    for (Running* r : batch) {
+      s.sessions.push_back(r->job.session);
+      s.rows.push_back(!decode ? 0 : batch.size() == 1 ? alone_rows : ctx_.engine->draft_block());
+      s.tokens.push_back(decode ? static_cast<int>(r->pending.size()) : 0);
+      s.left.push_back(r->prefilling ? prefill_left(*r) : 0);
+    }
+    if (decode) s.cand = cand_;
+    s.side = ctx_.engine->side_busy();
+    trace_.write(s);
   }
 
   // ---- The KV page pool (P4b, --kv-pages; serve/kv_policy.hpp). ----
@@ -791,6 +858,7 @@ class Scheduler {
       ++r.passes;
       ++r.batched;
       r.kv_wait = false;
+      r.window.record(decode_passes_ + 1);  // this pass
       steps[i].session = r.job.session;
       steps[i].anchor = r.pending.back();
       steps[i].params = &r.job.req.sampling;
@@ -885,16 +953,25 @@ class Scheduler {
       if (eng.side_enabled() && (r.side_flight || (contended && !eng.side_busy()))) {
         // A full chunk on the side stream; the decoding request's turns go on while it runs.
         if (!r.side_flight) {
-          if (hold_side(r) || yield_prefill(r)) return false;
+          if (hold_side(r)) {
+            unit_kind_ = "hold";
+            return false;
+          }
+          if (yield_prefill(r)) {
+            unit_kind_ = "yield";
+            return false;
+          }
           eng.prefill_chunk_launch(r.cur, 0);
           r.side_flight = true;
           count_interleaved(r);
+          unit_kind_ = "side_launch";
           return false;
         }
         if (contended && !eng.side_ready()) return false;
         r.side_flight = false;
         const bool last_chunk = eng.prefill_chunk_finish();
         side_mark_ = decode_passes_;
+        unit_kind_ = "side_finish";
         if (!last_chunk) {
           if (other_decoding(r) && !hold_side(r) && !yield_prefill(r)) {  // the next chunk at once, unless a short prefill waits
             eng.prefill_chunk_launch(r.cur, 0);
@@ -908,7 +985,11 @@ class Scheduler {
         return emit(r) && end(r);
       }
       if (eng.side_busy()) return false;  // another request's chunk is in flight: no prefill beside it
-      if (yield_prefill(r)) return false;
+      if (yield_prefill(r)) {
+        unit_kind_ = "yield";
+        return false;
+      }
+      unit_kind_ = "chunk";
       const bool last = eng.prefill_chunk(r.cur, contended ? contended_ : 0);
       if (contended) count_interleaved(r);
       if (!last) return false;
@@ -922,6 +1003,8 @@ class Scheduler {
     eng.select_session(r.job.session);
     ++r.passes;
     ++decode_passes_;
+    r.window.record(decode_passes_);
+    unit_kind_ = "decode";
     {
       std::lock_guard<std::mutex> m(ctx_.metrics.mu);
       ctx_.metrics.batch_rows = r.spec && !eng.drafter_off(r.job.session, r.job.req.sampling)
@@ -1086,6 +1169,10 @@ class Scheduler {
   ServerContext& ctx_;
   double protect_seconds_;
   int batch_, contended_, side_share_;
+  bool fair_pairing_;  // --fair-pairing: partners by fewest recent decode passes (serve/pairing.hpp)
+  StepTrace trace_{std::getenv("LING_STEP_TRACE")};  // the per-step trace, when the variable names a file
+  const char* unit_kind_ = nullptr;  // what the last unit did, for the trace (null: nothing worth a line)
+  mutable std::vector<StepCandidate> cand_;  // the partner choice's view for the trace (filled while it is on)
   long decode_passes_ = 0;  // decode passes run (a batched step counts once), for --side-share
   long side_mark_ = -1;     // decode_passes_ when the last side chunk finished (--side-share)
   std::mutex mu_;
@@ -1773,13 +1860,13 @@ int main(int argc, char** argv) {
   int port = 8000, max_context = 0, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 7, prefix_kv_mb = -1;
   std::string draft_dir, pretokenizer = "production";
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
-  bool kv_pages = false;
+  bool kv_pages = false;  // the flat slots by default (P4d kept them: paged passes are slower, BATCHING §5.3)
   long kv_pool_mb = -1;  // P4b: -1, the pool from the memory plan
   bool plan_only = false;  // print the start plan as one JSON line and exit 0 before anything is allocated
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 0, batch = 0, contended = 256, side_prefill = 40, side_share = 16;
   // --sessions, --max-context and --batch as given; what is not given is chosen at start (--auto-size).
   std::optional<int> sessions_arg, max_context_arg, batch_arg;
-  long host_reserve_mb = 16384, admit_reserve_mb = 8192, auto_size = 1;
+  long host_reserve_mb = 16384, admit_reserve_mb = 8192, auto_size = 1, fair_pairing = 0;
   double protect_seconds = 30;
   bool draft_bf16 = false;
   std::string repetition_arg, repetition_report = "incomplete";
@@ -1826,6 +1913,7 @@ int main(int argc, char** argv) {
     else if (a == "--keepalive-seconds") keepalive_seconds = std::stoi(next());
     else if (a == "--prefill-bf16") prefill_bf16 = true;
     else if (a == "--kv-pages") kv_pages = true;
+    else if (a == "--no-kv-pages") kv_pages = false;
     else if (a == "--kv-pool-mb") kv_pool_mb = std::stol(next());
     else if (a == "--draft-bf16") draft_bf16 = true;
     else if (a == "--draft-head") draft_head = next();  // sparse (default) or full (BACKLOG 19)
@@ -1840,6 +1928,7 @@ int main(int argc, char** argv) {
     else if (a == "--host-reserve-mb") host_reserve_mb = std::stol(next());
     else if (a == "--admit-reserve-mb") admit_reserve_mb = std::stol(next());
     else if (a == "--auto-size") auto_size = std::stol(next());
+    else if (a == "--fair-pairing") fair_pairing = std::stol(next());
     else if (a == "--plan-only") plan_only = true;
     else if (a == "--repetition-detection") repetition_arg = next();
     else if (a == "--repetition-report") repetition_report = next();
@@ -1855,7 +1944,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N]] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
+    std::cerr << "usage: ling-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N] | --no-kv-pages] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
     return 2;
   }
   for (auto [flag, v] : {std::pair<const char*, std::optional<int>>{"--sessions", sessions_arg},
@@ -1959,7 +2048,8 @@ int main(int argc, char** argv) {
   opts.vision_cache_mb = vision_cache_mb;
   for (auto [var, dst] : {std::pair<const char*, long*>{"LING_HOST_RESERVE_MB", &host_reserve_mb},
                           std::pair<const char*, long*>{"LING_ADMIT_RESERVE_MB", &admit_reserve_mb},
-                          std::pair<const char*, long*>{"LING_AUTO_SIZE", &auto_size}})
+                          std::pair<const char*, long*>{"LING_AUTO_SIZE", &auto_size},
+                          std::pair<const char*, long*>{"LING_FAIR_PAIRING", &fair_pairing}})
     if (const char* e = std::getenv(var)) {
       try {
         *dst = std::stol(e);
@@ -1971,9 +2061,10 @@ int main(int argc, char** argv) {
   // P4b: the engine reads LING_KV_PAGES itself; the plan must agree with it.
   if (const char* e = std::getenv("LING_KV_PAGES")) kv_pages = std::atoi(e) != 0;
   if (kv_pool_mb >= 0 && !kv_pages) {
-    std::cerr << "--kv-pool-mb needs --kv-pages\n";
+    std::cerr << "--kv-pool-mb needs --kv-pages (or LING_KV_PAGES=1)\n";
     return 2;
   }
+  ling::serve::MemoryPlan plan;  // the start's plan, which --plan-only reports
   {  // sizing and admission control at start (serve/admission.hpp; BATCHING §5.6), before anything is allocated
     namespace as = ling::serve;
     const ling::ModelConfig cfg = ling::ModelConfig::from_file(model_dir + "/config.json");
@@ -1984,37 +2075,34 @@ int main(int argc, char** argv) {
                            size_t(opts.lora_slots) * as::kLoraSlotPlanBytes;
     const long avail = as::mem_available_mb();
     const int full_context = as::model_full_context(model_dir + "/config.json");  // 0: sized from 65,536
-    const as::SizeChoice size = as::choose_size(cfg, weights, scratch, !draft_dir.empty(), avail, host_reserve_mb,
-                                                full_context, sessions_arg, max_context_arg, auto_size != 0);
-    sessions = size.sessions;
-    max_context = size.max_context;
-    batch = batch_arg.value_or(size.sessions_auto ? sessions : as::kDefaultBatch);
-    as::MemoryPlan mp = as::plan_memory(cfg, weights, sessions, max_context, !draft_dir.empty(), kv_pages, scratch);
+    // With paged KV the pool takes what the rest of the plan, the prefix KV store's budget and the reserve leave, or
+    // --kv-pool-mb; auto-size sizes by the same plan. Since P4c the store's arena holds DeltaNet and conv states only
+    // (its KV is pool pages); the engine allocates it after the pool at min(prefix_kv_mb, free above its own reserve),
+    // so counting prefix_kv_mb here is what it takes, not a second count.
+    as::KvPlanInputs kv{kv_pages, 0, kv_pool_mb};
     if (kv_pages) {
-      // The pool: what the rest of the plan, the prefix KV store's budget (it still holds KV in P4b and sizes itself
-      // after the engine, from what is free above its own reserve) and the reserve leave, or --kv-pool-mb.
       long store_mb = opts.prefix_kv_mb;
       if (const char* e = std::getenv("LING_PREFIX_KV_MB")) store_mb = std::atol(e);
       if (checkpoints <= 0 || store_mb < 0) store_mb = 0;
-      as::plan_kv_pool(mp, cfg, max_context, host_reserve_mb > 0 ? avail : -1, host_reserve_mb, size_t(store_mb) << 20,
-                       kv_pool_mb);
-      if (kv_pool_mb < 0 && host_reserve_mb > 0 && avail >= 0) {
-        const std::string small = as::refuse_kv_pool(mp, max_context);
-        if (!small.empty()) {
-          std::cerr << "ling-serve: refused to start: " << small << "\n";
-          return 3;
-        }
-      }
+      kv.store_bytes = size_t(store_mb) << 20;
+    }
+    const as::SizeChoice size = as::choose_size(cfg, weights, scratch, !draft_dir.empty(), avail, host_reserve_mb,
+                                                full_context, sessions_arg, max_context_arg, auto_size != 0, kv);
+    sessions = size.sessions;
+    max_context = size.max_context;
+    batch = batch_arg.value_or(size.sessions_auto ? sessions : as::kDefaultBatch);
+    const as::StartPlan start = as::start_plan(cfg, weights, scratch, !draft_dir.empty(), sessions, max_context, avail,
+                                               host_reserve_mb, kv);
+    plan = start.plan;
+    const as::MemoryPlan& mp = plan;
+    if (!start.refusal.empty()) {
+      std::cerr << "ling-serve: refused to start: " << start.refusal << "\n";
+      return 3;
+    }
+    if (kv_pages) {
       opts.kv_pool_pages = static_cast<int>(mp.kv_pool_pages);
       std::cerr << "KV page pool: " << as::describe_kv_pool(mp)
                 << (kv_pool_mb >= 0 ? " (--kv-pool-mb)" : " (from the memory plan)") << "\n";
-    }
-    if (host_reserve_mb > 0) {
-      const std::string why = as::refuse_start(mp, avail, host_reserve_mb);
-      if (!why.empty()) {
-        std::cerr << "ling-serve: refused to start: " << why << "\n";
-        return 3;
-      }
     }
     // One line: what runs, whether each was chosen here (auto), given, or a default (and why no sizing), and the
     // plan's numbers it was chosen by.
@@ -2032,14 +2120,7 @@ int main(int argc, char** argv) {
               << as::gb(mp.total()) << "; requests refused below " << admit_reserve_mb << " MB\n";
   }
   if (plan_only) {  // the host-safety check of the launcher asks for this before it loads (BATCHING §5.6)
-    namespace as = ling::serve;
-    const ling::ModelConfig cfg = ling::ModelConfig::from_file(model_dir + "/config.json");
-    const size_t weights = as::checkpoint_bytes(model_dir) + as::checkpoint_bytes(draft_dir);
-    const size_t scratch = as::kScratchBytes + (opts.vision ? size_t(1100 + vision_cache_mb) << 20 : 0) +
-                           size_t(opts.lora_slots) * as::kLoraSlotPlanBytes;
-    const as::MemoryPlan mp = as::plan_memory(cfg, weights, sessions, max_context, !draft_dir.empty(), false, scratch);
-    std::cout << "{\"sessions\":" << sessions << ",\"batch\":" << std::min(batch, sessions)
-              << ",\"max_context\":" << max_context << ",\"planned_bytes\":" << mp.total() << "}\n";
+    std::cout << ling::serve::plan_json(sessions, batch, max_context, plan, kv_pages, host_reserve_mb) << "\n";
     return 0;
   }
   opts.max_context = max_context;
@@ -2117,7 +2198,8 @@ int main(int argc, char** argv) {
               << max_loaded_loras << " loaded; adapter routes " << (api_key.empty() ? "off (no --api-key)" : "on")
               << "\n";
   }
-  ling::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended, side_share);
+  std::fprintf(stderr, "pairing: %s\n", fair_pairing ? "fair (--fair-pairing 1)" : "running order (--fair-pairing 0)");
+  ling::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended, side_share, fair_pairing != 0);
 
   proxygen::HTTPServerOptions options;
   options.threads = 2;

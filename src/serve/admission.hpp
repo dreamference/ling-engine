@@ -128,8 +128,13 @@ inline long plan_kv_pool(MemoryPlan& p, const ModelConfig& c, int max_context, l
 // P4b: why a pool sized from the plan is too small to start with (it cannot hold one conversation at max_context and
 // the two pages of growth a request is admitted with); empty when it can. An explicit --kv-pool-mb is the operator's
 // choice and is not judged here (a request that needs more pages than the pool has is refused when it arrives).
+// A pool that holds every session's max_context (sessions x max_context, the most plan_kv_pool gives) is never too
+// small: one session needs no growth pages beyond its own context.
+inline long kv_pages_one_conversation(const MemoryPlan& p, int max_context) {
+  return std::min(kv_pages_for(max_context) + 2, long(p.session_count) * kv_pages_for(max_context));
+}
 inline std::string refuse_kv_pool(const MemoryPlan& p, int max_context) {
-  const long need = kv_pages_for(max_context) + 2;
+  const long need = kv_pages_one_conversation(p, max_context);
   if (p.kv_pool_pages >= need) return "";
   std::ostringstream o;
   o << "the KV page pool would hold " << p.kv_pool_pages << " pages (" << p.kv_pool_pages * kKvPageTokens
@@ -181,6 +186,54 @@ inline std::string refuse_start(const MemoryPlan& p, long avail_mb, long reserve
   return o.str();
 }
 
+// P4d: what the plan needs to know about the KV page pool. `store_bytes` is the prefix KV store's budget the pool
+// leaves (0 when the store sizes itself after the engine), `pool_mb` --kv-pool-mb (< 0: sized from the plan).
+struct KvPlanInputs {
+  bool on = false;
+  size_t store_bytes = 0;
+  long pool_mb = -1;
+};
+
+// The start's plan and why it is refused (empty when it starts), the one computation the start check, auto-size and
+// --plan-only share: plan_memory, with --kv-pages the pool (plan_kv_pool) and its floor (refuse_kv_pool, only for a
+// pool sized from a known MemAvailable), then refuse_start. With `reserve_mb` <= 0 nothing is judged.
+struct StartPlan {
+  MemoryPlan plan;
+  std::string refusal;
+};
+inline StartPlan start_plan(const ModelConfig& c, size_t weight_bytes, size_t scratch, bool drafter, int sessions,
+                            int max_context, long avail_mb, long reserve_mb, const KvPlanInputs& kv = {}) {
+  StartPlan s{plan_memory(c, weight_bytes, sessions, max_context, drafter, kv.on, scratch), {}};
+  if (kv.on) {
+    plan_kv_pool(s.plan, c, max_context, reserve_mb > 0 ? avail_mb : -1, reserve_mb, kv.store_bytes, kv.pool_mb);
+    if (kv.pool_mb < 0 && reserve_mb > 0 && avail_mb >= 0) s.refusal = refuse_kv_pool(s.plan, max_context);
+  }
+  if (s.refusal.empty() && reserve_mb > 0) s.refusal = refuse_start(s.plan, avail_mb, reserve_mb);
+  return s;
+}
+
+// --plan-only's line (read by Mightling's pre-load check): what runs and the plan's bytes, the page pool included.
+// sessions, batch, max_context and planned_bytes are the contract; the pool's fields and the reserve are additive.
+inline std::string plan_json(int sessions, int batch, int max_context, const MemoryPlan& p, bool kv_pages,
+                             long reserve_mb) {
+  std::ostringstream o;
+  o << "{\"sessions\":" << sessions << ",\"batch\":" << std::min(batch, sessions) << ",\"max_context\":" << max_context
+    << ",\"planned_bytes\":" << p.total() << ",\"kv_pages\":" << (kv_pages ? "true" : "false")
+    << ",\"kv_pool_bytes\":" << p.kv_pool << ",\"kv_pool_pages\":" << p.kv_pool_pages
+    << ",\"host_reserve_bytes\":" << (size_t(std::max(0L, reserve_mb)) << 20) << "}";
+  return o.str();
+}
+
+// P4d, auto-size with --kv-pages (the coordinator's decision of 2026-10-28): n sessions at max_context fit when the pool
+// holds one conversation at max_context (as the start check asks) and n x max_context / kPagedFitShare positions, so
+// that n conversations at half the context can be resident at once. More than that is not asked: when n sessions
+// would need more pages than the pool has, the scheduler requeues (P4c), it does not refuse the start.
+inline constexpr long kPagedFitShare = 2;
+inline bool paged_sessions_fit(const MemoryPlan& p, int sessions, int max_context) {
+  const long half = long(sessions) * kv_pages_for(max_context) / kPagedFitShare;
+  return p.kv_pool_pages >= std::max(kv_pages_one_conversation(p, max_context), half);
+}
+
 // Auto-size (BATCHING §5.6): the most sessions chosen without --sessions (the owner's cap on node-b until a larger
 // number is approved; also the engine's kMaxSeqs), and the shortest context chosen without --max-context.
 inline constexpr int kAutoSessionsCap = 4;
@@ -209,14 +262,15 @@ struct SizeChoice {
 };
 
 // The sessions and context ling-serve starts with: each given value as given, each other one chosen by the start
-// check's own plan (plan_memory and refuse_start, nothing estimated twice) against `avail_mb` less `reserve_mb`.
+// check's own plan (start_plan, nothing estimated twice) against `avail_mb` less `reserve_mb`.
 // The context first: the full context, halved (to a multiple of 2,048) down to kAutoContextFloor, the first at which
 // the given sessions, or one session, fit; then as many sessions as fit at it, up to kAutoSessionsCap. When nothing
 // fits, the given values or one session at the floor, which the start check then refuses (exit 3). With `auto_size`
 // off, MemAvailable unknown (`avail_mb` < 0) or no reserve to keep (`reserve_mb` <= 0), the defaults fill in.
+// With `kv` on (--kv-pages) "fits" is the paged plan's: start_plan does not refuse it and paged_sessions_fit holds.
 inline SizeChoice choose_size(const ModelConfig& c, size_t weight_bytes, size_t scratch, bool drafter, long avail_mb,
                               long reserve_mb, int full_context, std::optional<int> sessions,
-                              std::optional<int> max_context, bool auto_size = true) {
+                              std::optional<int> max_context, bool auto_size = true, const KvPlanInputs& kv = {}) {
   SizeChoice s;
   s.sessions_auto = !sessions;
   s.context_auto = !max_context;
@@ -229,7 +283,8 @@ inline SizeChoice choose_size(const ModelConfig& c, size_t weight_bytes, size_t 
   }
   s.sized = true;
   auto fits = [&](int n, int ctx) {
-    return refuse_start(plan_memory(c, weight_bytes, n, ctx, drafter, false, scratch), avail_mb, reserve_mb).empty();
+    const StartPlan p = start_plan(c, weight_bytes, scratch, drafter, n, ctx, avail_mb, reserve_mb, kv);
+    return p.refusal.empty() && (!kv.on || paged_sessions_fit(p.plan, n, ctx));
   };
   if (full_context <= 0) full_context = kDefaultContext;
   std::vector<int> contexts;

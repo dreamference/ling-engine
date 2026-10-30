@@ -151,7 +151,9 @@ __device__ __forceinline__ void attn_prefetch_tile(const __nv_bfloat16* __restri
     asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(vcache + off), "r"(bytes) : "memory");
 }
 
-// The keys [k0, k0 + TK) of one KV head into a stage (zero-filled past khi).
+// The keys [k0, k0 + TK) of one KV head into a stage (zero-filled past khi). A tile never crosses a page, so its
+// page is looked up once and every key is base + j * ps: the same addresses as kv_off per key, without a dependent
+// read of the page table before each copy.
 template <int TK>
 __device__ __forceinline__ void attn_load_tile(__nv_bfloat16* stage, const __nv_bfloat16* __restrict__ kcache,
                                                const __nv_bfloat16* __restrict__ vcache, int k0, int khi, int kvh,
@@ -159,10 +161,11 @@ __device__ __forceinline__ void attn_load_tile(__nv_bfloat16* stage, const __nv_
   constexpr int D = kMmaD, KS = kMmaKS;
   __nv_bfloat16* ks = stage;
   __nv_bfloat16* vs = stage + TK * KS;
+  const size_t base = kv_off(pages, kvh, k0 < khi ? k0 : 0, hs, ps);
   for (int i = threadIdx.x; i < TK * (D / 8); i += blockDim.x) {
     const int j = i / (D / 8), c = i % (D / 8), key = k0 + j;
     const bool valid = key < khi;
-    const size_t off = kv_off(pages, kvh, valid ? key : 0, hs, ps) + 8 * c;
+    const size_t off = (valid ? base + static_cast<size_t>(j) * ps : base) + 8 * c;
     cp_async16(ks + j * KS + 8 * c, kcache + off, valid);
     cp_async16(vs + j * KS + 8 * c, vcache + off, valid);
   }

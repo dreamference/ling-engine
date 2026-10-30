@@ -129,7 +129,9 @@ struct EngineOptions {
   // P4 (BATCHING §5.3): the full-attention KV in 64-position pages of one pool, each session reading and writing its
   // positions through a page table, instead of a flat slot per session. Only addresses change, so every result is the
   // flat layout's bit for bit. P4b: a session maps pages lazily, as its passes reach them, and gives back the ones past
-  // a new prompt's end (Engine's KV page pool, below). LING_KV_PAGES=0/1 overrides.
+  // a new prompt's end (Engine's KV page pool, below). Off by default (ling-serve's and ling-run's --kv-pages turn it
+  // on, --no-kv-pages keeps it off): P4d found its passes slower than the flat slots' (BATCHING §5.3), so the flat
+  // slots stay the default until that is fixed. LING_KV_PAGES=0/1 overrides.
   bool kv_pages = false;
   // P4b: the pool's size in pages (each kKvPageTokens positions of every full-attention layer's K and V, 4 MiB for
   // Qwen3.8-27B), besides the reserved page 0. 0, or more than can ever be mapped: sessions x max_context positions.
@@ -550,6 +552,9 @@ class Engine {
   bool kv_pages_ = false;                 // opts_.kv_pages or LING_KV_PAGES (P4)
   __nv_bfloat16* kv_pool_ = nullptr;      // P4: the pool, [page][layer][K, V][kv head][kKvPageTokens][D]; page 0 unused
   size_t kv_page_elems_ = 0;              // P4: elements per page (all full-attention layers' K and V)
+  bool kv_head_major_ = true;             // the pool [layer][K, V][kv head][page][PT][D] (LING_KV_HEAD_MAJOR=0: not)
+  size_t kv_head_stride_ = 0;             // P4: elements between a page's KV heads (set_kv_layout's head stride)
+  size_t kv_page_unit_ = 0;               // P4: elements per page id in the table (a page, or one head's run)
   // P4c: the active session maps session `from`'s pages for positions [0, n) (shared, no copy).
   void kv_pages_adopt(const Session& from, int n);
   // P4b: the pool's bookkeeping (core/kv_pool.hpp), with kv_pages.
